@@ -1,0 +1,22 @@
+[package]
+name = "oxideav-pdf"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust PDF writer for the oxideav framework — vector-stays-vector path"
+repository = "https://github.com/OxideAV/oxideav-pdf"
+homepage = "https://github.com/OxideAV/oxideav-pdf"
+readme = "README.md"
+keywords = ["multimedia", "pdf", "vector", "writer", "pure-rust"]
+categories = ["multimedia::encoding"]
+
+[dependencies]
+oxideav-core = "0.1"
+# Pure-Rust DEFLATE for FlateDecode-compressed content streams and
+# embedded RGBA image XObjects. Same crate the wider workspace already
+# uses (oxideav-png pulls in miniz_oxide; flate2 is the higher-level
+# wrapper crate that ships pure-Rust miniz_oxide as its default backend
+# — see flate2's `rust_backend` feature, which is on by default).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
