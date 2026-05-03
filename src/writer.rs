@@ -83,6 +83,10 @@ fn emit_node(op: &mut OpBuf, node: &Node, resources: &mut ResourceCollector) {
         Node::Group(g) => emit_group(op, g, resources),
         Node::Path(p) => emit_path_node(op, p, resources),
         Node::Image(img) => emit_image(op, img, resources),
+        // Node is `#[non_exhaustive]` (text / mask / filter variants
+        // will land in future rounds). Round 1 silently skips
+        // unknown node kinds so the writer stays forward-compatible.
+        _ => {}
     }
 }
 

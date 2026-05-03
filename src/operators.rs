@@ -190,6 +190,12 @@ pub fn emit_path(op: &mut OpBuf, path: &Path) {
                 op.newline();
                 current = subpath_start;
             }
+            // PathCommand is `#[non_exhaustive]` — future smooth /
+            // shorthand cubic + quad variants land here, but the
+            // workspace IR doesn't carry them yet (the SVG parser
+            // expands shorthands at parse time). Round 1 silently
+            // drops anything we don't know about.
+            _ => {}
         }
     }
 }
@@ -266,6 +272,9 @@ pub fn set_fill_paint(op: &mut OpBuf, paint: &Paint, resources: &mut ResourceCol
             let name = resources.add_radial_gradient(g);
             emit_pattern(op, &name, /* stroke = */ false);
         }
+        // Paint is `#[non_exhaustive]` — fall back to a sensible
+        // black solid for any future variant we don't yet handle.
+        _ => emit_rgb(op, Rgba::opaque(0, 0, 0), /* stroke = */ false),
     }
 }
 
@@ -283,6 +292,7 @@ pub fn set_stroke_paint(op: &mut OpBuf, paint: &Paint, resources: &mut ResourceC
             let name = resources.add_radial_gradient(g);
             emit_pattern(op, &name, /* stroke = */ true);
         }
+        _ => emit_rgb(op, Rgba::opaque(0, 0, 0), /* stroke = */ true),
     }
 }
 
