@@ -205,11 +205,11 @@ impl Document {
         out.extend_from_slice(header_line.as_bytes());
         // Free-list head — slot 0 always 0000000000 65535 f.
         out.extend_from_slice(b"0000000000 65535 f \n");
-        for n in 1..=max_id {
+        for offset in offsets.iter().skip(1) {
             // 10-digit zero-padded byte offset, 5-digit zero-padded
             // generation, 'n' (in-use) marker, exact two-character
             // newline terminator (space + LF) per §7.5.4.
-            let line = format!("{:010} {:05} n \n", offsets[n], 0);
+            let line = format!("{:010} {:05} n \n", offset, 0);
             out.extend_from_slice(line.as_bytes());
         }
 
@@ -383,7 +383,7 @@ mod tests {
         assert_eq!(write_one(&Object::Real(1.0)), b"1");
         assert_eq!(write_one(&Object::Real(0.5)), b"0.5");
         assert_eq!(write_one(&Object::Real(-1.25)), b"-1.25");
-        assert_eq!(write_one(&Object::Real(3.141592653589)), b"3.141593");
+        assert_eq!(write_one(&Object::Real(2.345678987654)), b"2.345679");
     }
 
     #[test]

@@ -15,7 +15,7 @@ use crate::error::PdfError;
 use crate::objects::Document;
 use crate::operators::{
     concat_matrix, emit_clip_marker, emit_path, paint, restore, save, set_ext_gstate,
-    set_fill_paint, set_stroke_paint, set_stroke_style, OpBuf, PaintMode,
+    set_fill_paint, set_stroke_style, OpBuf, PaintMode,
 };
 use crate::page::build_page;
 use crate::resources::ResourceCollector;
@@ -151,10 +151,10 @@ fn emit_image(op: &mut OpBuf, image: &ImageRef, resources: &mut ResourceCollecto
         concat_matrix(op, &image.transform);
     }
 
-    let bx = image.bounds.x as f32;
-    let by = image.bounds.y as f32;
-    let bw = image.bounds.width as f32;
-    let bh = image.bounds.height as f32;
+    let bx = image.bounds.x;
+    let by = image.bounds.y;
+    let bw = image.bounds.width;
+    let bh = image.bounds.height;
     // CTM = T(bx, by + bh) * S(bw, -bh) — flip vertically so row 0
     // appears at the top of the painted area.
     let ctm = oxideav_core::vector::Transform2D {

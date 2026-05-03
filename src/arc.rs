@@ -7,7 +7,9 @@
 //! quarter-circle cubic approximation `k = 4 * (sqrt(2) - 1) / 3` —
 //! standard PDF / Postscript trick.
 
-use oxideav_core::vector::{PathCommand, Point};
+#[cfg(test)]
+use oxideav_core::vector::PathCommand;
+use oxideav_core::vector::Point;
 
 /// Flatten one SVG elliptic arc segment from `start` to `end` into a
 /// list of cubic segments. The emitter calls this once per

@@ -490,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn stroke_style_emits_w_J_j_M_d() {
+    fn stroke_style_emits_w_j_join_miter_dash() {
         let mut op = OpBuf::new();
         let mut res = ResourceCollector::new();
         let stroke = Stroke {
