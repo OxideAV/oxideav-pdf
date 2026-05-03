@@ -43,7 +43,12 @@ fn linear_gradient_emits_pattern_type_2_function_type_2() {
     };
 
     let bytes = oxideav_pdf::write_pdf(&frame).unwrap();
-    let s = std::str::from_utf8(&bytes).unwrap();
+    // The PDF binary marker (`%\xE2\xE3\xCF\xD3`) sits in the header
+    // and is not valid UTF-8 — `from_utf8` would fail. The marker is
+    // the only non-UTF-8 byte run in a round-1 vector PDF (everything
+    // else is plain ASCII operators), so a lossy conversion is fine
+    // for the assertion strings we're searching for.
+    let s = String::from_utf8_lossy(&bytes);
 
     // Pattern resource registered.
     assert!(s.contains("/Pattern"), "expected /Pattern resource");

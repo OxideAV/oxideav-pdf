@@ -49,7 +49,12 @@ fn single_rect_emits_valid_pdf_envelope() {
     assert!(contains(&bytes, b"/MediaBox [0 0 200 100]"));
 
     // Path operators in order: m → l → l → l → h → f --------------
-    let s = std::str::from_utf8(&bytes).expect("valid utf-8");
+    // The PDF binary marker (`%\xE2\xE3\xCF\xD3` per ISO 32000-1
+    // §7.5.2) sits in the header and is not valid UTF-8, so a strict
+    // `from_utf8` would fail. A lossy conversion is fine — we only
+    // scan for ASCII operator strings, all of which round-trip
+    // verbatim through UTF-8 lossy decoding.
+    let s = String::from_utf8_lossy(&bytes);
     let m_pos = s.find(" m\n").expect("m operator");
     // Between the first `m` and the `h`, there should be at least
     // three `l` operators.

@@ -33,7 +33,10 @@ fn group_opacity_emits_extgstate_ca_and_capital_ca() {
     };
 
     let bytes = oxideav_pdf::write_pdf(&frame).unwrap();
-    let s = std::str::from_utf8(&bytes).unwrap();
+    // The PDF binary marker (`%\xE2\xE3\xCF\xD3`) sits in the header
+    // and is not valid UTF-8 — use lossy conversion since we only
+    // need to scan for ASCII operator strings.
+    let s = String::from_utf8_lossy(&bytes);
 
     // ExtGState resource present + named GS0.
     assert!(s.contains("/ExtGState"));
@@ -62,7 +65,7 @@ fn fully_opaque_group_emits_no_extgstate() {
         time_base: TimeBase::new(1, 1),
     };
     let bytes = oxideav_pdf::write_pdf(&frame).unwrap();
-    let s = std::str::from_utf8(&bytes).unwrap();
+    let s = String::from_utf8_lossy(&bytes);
     // No `/ExtGState` resource entry should be added when no group
     // needed alpha.
     assert!(!s.contains("/ExtGState"));
