@@ -20,6 +20,9 @@
 //! [`Transform2D`]: oxideav_core::vector::Transform2D
 
 pub mod content;
+pub mod document;
 pub mod lex;
 pub mod parse;
 pub mod xref;
+
+pub use document::{read_pdf_to_scene, DocumentReader};
