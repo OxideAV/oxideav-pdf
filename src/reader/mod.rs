@@ -19,6 +19,7 @@
 //! [`PathCommand`]: oxideav_core::vector::PathCommand
 //! [`Transform2D`]: oxideav_core::vector::Transform2D
 
+pub mod content;
 pub mod lex;
 pub mod parse;
 pub mod xref;
