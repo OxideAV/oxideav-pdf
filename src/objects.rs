@@ -120,12 +120,20 @@ pub struct IndirectObject {
 }
 
 /// The whole PDF document — an append-only list of indirect objects
-/// plus a /Root reference for the trailer dictionary.
+/// plus a /Root reference (and optional /Info reference) for the
+/// trailer dictionary.
 #[derive(Default)]
 pub struct Document {
     objects: Vec<IndirectObject>,
     next_id: u32,
     pub root: Option<ObjectId>,
+    /// Optional document-level information dictionary. When set, the
+    /// reference is written into the trailer as `/Info <n> <gen> R` —
+    /// PDF readers surface the dictionary's `/Title`, `/Author`, etc.
+    /// keys as the document's metadata. ISO 32000-1 §14.3.3 also
+    /// allows arbitrary additional keys, used by the round-2 writer
+    /// to round-trip custom scene metadata.
+    pub info: Option<ObjectId>,
 }
 
 impl Document {
@@ -134,6 +142,7 @@ impl Document {
             objects: Vec::new(),
             next_id: 1,
             root: None,
+            info: None,
         }
     }
 
@@ -215,11 +224,13 @@ impl Document {
 
         // ---- Trailer + startxref + EOF -------------------------------
         out.extend_from_slice(b"trailer\n");
-        let trailer = Object::Dict(
-            Dict::new()
-                .with("Size", Object::Integer((max_id + 1) as i64))
-                .with("Root", Object::Reference(root)),
-        );
+        let mut trailer_dict = Dict::new()
+            .with("Size", Object::Integer((max_id + 1) as i64))
+            .with("Root", Object::Reference(root));
+        if let Some(info_id) = self.info {
+            trailer_dict.set("Info", Object::Reference(info_id));
+        }
+        let trailer = Object::Dict(trailer_dict);
         write_object(out, &trailer).map_err(PdfError::Io)?;
         out.extend_from_slice(b"\nstartxref\n");
         out.extend_from_slice(format!("{}\n", xref_off).as_bytes());

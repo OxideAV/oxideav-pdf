@@ -18,7 +18,8 @@ use oxideav_core::vector::{FillRule, Group, ImageRef, Node, PathNode, VectorFram
 use oxideav_scene::Scene;
 
 use crate::error::PdfError;
-use crate::objects::Document;
+use crate::info::{build_info_dict, has_metadata};
+use crate::objects::{Document, Object};
 use crate::operators::{
     concat_matrix, emit_clip_marker, emit_path, paint, restore, save, set_ext_gstate,
     set_fill_paint, set_stroke_style, OpBuf, PaintMode,
@@ -53,9 +54,10 @@ pub fn write_pdf(frame: &VectorFrame) -> Result<Vec<u8>, PdfError> {
 /// `Some(empty)` — the scene is in timeline mode and the PNG / MP4 /
 /// RTMP writers (not this crate) should handle it.
 ///
-/// `scene.metadata` is **not** wired into the `/Info` dictionary by
-/// this commit — that lands in the round-2 metadata follow-up commit
-/// alongside the [`crate::info`] module.
+/// `scene.metadata` is wired into the PDF `/Info` dictionary via
+/// [`build_info_dict`]. Standard fields (`Title`, `Author`, `Subject`,
+/// `Keywords`, `Creator`, `Producer`, `CreationDate`, `ModDate`) land
+/// directly; `Metadata::custom` lands in the follow-up commit.
 pub fn write_pdf_from_scene(scene: &Scene) -> Result<Vec<u8>, PdfError> {
     let pages = scene
         .pages
@@ -105,6 +107,14 @@ pub fn write_pdf_from_scene(scene: &Scene) -> Result<Vec<u8>, PdfError> {
 
     let mut doc = Document::new();
     let _ = build_pages(&mut doc, inputs);
+
+    // Wire scene metadata into /Info and link from the trailer. Skip
+    // when no field is populated so trivial documents stay byte-stable
+    // with the round-2-A multi-page-only output.
+    if has_metadata(&scene.metadata) {
+        let info_id = doc.add(Object::Dict(build_info_dict(&scene.metadata)));
+        doc.info = Some(info_id);
+    }
 
     let mut out = Vec::with_capacity(4096);
     doc.write_to(&mut out)?;

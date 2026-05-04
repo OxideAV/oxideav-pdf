@@ -44,6 +44,7 @@
 
 pub mod arc;
 pub mod error;
+pub mod info;
 pub mod objects;
 pub mod operators;
 pub mod page;
