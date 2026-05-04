@@ -48,6 +48,7 @@ pub mod info;
 pub mod objects;
 pub mod operators;
 pub mod page;
+pub mod reader;
 pub mod resources;
 pub mod writer;
 
