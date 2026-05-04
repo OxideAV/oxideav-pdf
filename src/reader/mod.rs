@@ -20,3 +20,4 @@
 //! [`Transform2D`]: oxideav_core::vector::Transform2D
 
 pub mod lex;
+pub mod parse;
