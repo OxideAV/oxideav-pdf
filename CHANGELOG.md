@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0](https://github.com/OxideAV/oxideav-pdf/compare/v0.0.2...v0.1.0) - 2026-05-04
+
+### Other
+
+- promote to 0.1
+- clippy 1.95: drop useless .into_iter() in zip; switch test literal off PI
+- round 3: top-level walker — bytes → Scene roundtrip
+- round 3: content-stream operator parser (inverse of operators.rs)
+- round 3: cross-reference table + trailer parser
+- round 3: PDF object parser (tokens → Object tree)
+- round 3: PDF reader scaffold + tokenizer (ISO 32000-1 §7.2)
+- round 2: scene Metadata::custom map → /Info custom keys
+- round 2: scene Metadata standard fields → PDF /Info dict
+- round 2: multi-page output via write_pdf_from_scene
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-pdf/compare/v0.0.1...v0.0.2) - 2026-05-03
 
 ### Other
