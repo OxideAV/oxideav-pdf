@@ -187,7 +187,7 @@ pub fn build_pages(doc: &mut Document, inputs: Vec<PageInput<'_>>) -> PagesBuild
     );
 
     // Per-page Page + Resources + Contents -----------------------
-    for (page_id, input) in page_ids.iter().zip(inputs.into_iter()) {
+    for (page_id, input) in page_ids.iter().zip(inputs) {
         let resources_id = doc.allocate_id();
         let contents_id = doc.allocate_id();
 

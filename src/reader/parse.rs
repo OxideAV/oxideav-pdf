@@ -358,8 +358,8 @@ mod tests {
         assert!(matches!(parse_one(b"false"), Object::Bool(false)));
         assert!(matches!(parse_one(b"null"), Object::Null));
         assert!(matches!(parse_one(b"42"), Object::Integer(42)));
-        match parse_one(b"3.14") {
-            Object::Real(f) => assert!((f - 3.14).abs() < 1e-9),
+        match parse_one(b"2.5") {
+            Object::Real(f) => assert!((f - 2.5).abs() < 1e-9),
             other => panic!("expected real, got {other:?}"),
         }
         match parse_one(b"(hello)") {
