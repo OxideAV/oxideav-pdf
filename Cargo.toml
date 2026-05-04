@@ -14,6 +14,12 @@ categories = ["multimedia::encoding"]
 
 [dependencies]
 oxideav-core = "0.1"
+# Scene model — round 2 adds multi-page output via `Scene::pages` and
+# scene-level `Metadata` plumbing into the PDF `/Info` dictionary. The
+# `default-features = false` cut drops the `raster` feature (and its
+# `oxideav-raster` transitive) — PDF is a vector-target writer and
+# never rasterises, so we don't need the raster fallback.
+oxideav-scene = { version = "0.1", default-features = false }
 # Pure-Rust DEFLATE for FlateDecode-compressed content streams and
 # embedded RGBA image XObjects. Same crate the wider workspace already
 # uses (oxideav-png pulls in miniz_oxide; flate2 is the higher-level

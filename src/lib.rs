@@ -51,7 +51,7 @@ pub mod resources;
 pub mod writer;
 
 pub use error::PdfError;
-pub use writer::write_pdf;
+pub use writer::{write_pdf, write_pdf_from_scene};
 
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, ContainerRegistry,

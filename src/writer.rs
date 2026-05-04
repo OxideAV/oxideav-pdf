@@ -1,15 +1,21 @@
 //! Top-level PDF writer.
 //!
-//! [`write_pdf`] is the one-shot entry point: it takes an
+//! [`write_pdf`] is the one-shot single-page entry point: it takes an
 //! [`oxideav_core::VectorFrame`], walks the scene graph, emits a
-//! single-page PDF 1.4 document, and returns the bytes. The walker
-//! lives in [`emit_group`] — it dispatches each [`Node`] variant to
-//! the matching [`crate::operators`] helper, and remembers any
-//! gradient / opacity / image it encounters via the
+//! single-page PDF 1.4 document, and returns the bytes.
+//!
+//! [`write_pdf_from_scene`] is the round-2 multi-page entry point: it
+//! takes an [`oxideav_scene::Scene`] in pages mode and emits one PDF
+//! Page per [`oxideav_scene::Page`].
+//!
+//! The walker lives in [`emit_group`] — it dispatches each [`Node`]
+//! variant to the matching [`crate::operators`] helper, and remembers
+//! any gradient / opacity / image it encounters via the
 //! [`crate::resources::ResourceCollector`] so the page's `/Resources`
 //! dictionary stays in sync.
 
 use oxideav_core::vector::{FillRule, Group, ImageRef, Node, PathNode, VectorFrame};
+use oxideav_scene::Scene;
 
 use crate::error::PdfError;
 use crate::objects::Document;
@@ -17,7 +23,7 @@ use crate::operators::{
     concat_matrix, emit_clip_marker, emit_path, paint, restore, save, set_ext_gstate,
     set_fill_paint, set_stroke_style, OpBuf, PaintMode,
 };
-use crate::page::build_page;
+use crate::page::{build_page, build_pages, PageInput};
 use crate::resources::ResourceCollector;
 
 /// Render a [`VectorFrame`] as a single-page PDF 1.4 document.
@@ -26,14 +32,7 @@ use crate::resources::ResourceCollector;
 /// crate README is emitted. Future rounds will add text, JPEG
 /// passthrough, multi-page, etc.
 pub fn write_pdf(frame: &VectorFrame) -> Result<Vec<u8>, PdfError> {
-    let mut op = OpBuf::new();
-    let mut resources = ResourceCollector::new();
-
-    // Walk the root group. The root group's transform is applied
-    // exactly like any nested group's — wrapped in `q ... Q`.
-    emit_group(&mut op, &frame.root, &mut resources);
-
-    let content = op.into_bytes();
+    let (content, resources) = render_frame(frame);
 
     let mut doc = Document::new();
     let _ = build_page(&mut doc, frame, content, &resources);
@@ -41,6 +40,85 @@ pub fn write_pdf(frame: &VectorFrame) -> Result<Vec<u8>, PdfError> {
     let mut out = Vec::with_capacity(2048);
     doc.write_to(&mut out)?;
     Ok(out)
+}
+
+/// Render a [`Scene`] in pages mode as a multi-page PDF 1.4 document.
+///
+/// Round 2 entry point — accepts only paged scenes (`scene.pages` is
+/// `Some(non-empty)`) and emits one PDF Page per [`oxideav_scene::Page`],
+/// each carrying its own MediaBox derived from the page's own width /
+/// height.
+///
+/// Returns [`PdfError::Other`] if `scene.pages` is `None` or
+/// `Some(empty)` — the scene is in timeline mode and the PNG / MP4 /
+/// RTMP writers (not this crate) should handle it.
+///
+/// `scene.metadata` is **not** wired into the `/Info` dictionary by
+/// this commit — that lands in the round-2 metadata follow-up commit
+/// alongside the [`crate::info`] module.
+pub fn write_pdf_from_scene(scene: &Scene) -> Result<Vec<u8>, PdfError> {
+    let pages = scene
+        .pages
+        .as_ref()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            PdfError::other(
+                "write_pdf_from_scene: scene is not in pages mode (scene.pages is None or empty)",
+            )
+        })?;
+
+    // Render each page's vector content into its own (op-buf,
+    // resources) pair so per-page resource tables stay independent.
+    // Holding the rendered bytes + resources in a `Vec` lets us hand
+    // borrowed references to the page builder in one shot.
+    struct Rendered<'a> {
+        frame: &'a VectorFrame,
+        width: f32,
+        height: f32,
+        content_bytes: Vec<u8>,
+        resources: ResourceCollector,
+    }
+    let rendered: Vec<Rendered<'_>> = pages
+        .iter()
+        .map(|page| {
+            let (content_bytes, resources) = render_frame(&page.content);
+            Rendered {
+                frame: &page.content,
+                width: page.width,
+                height: page.height,
+                content_bytes,
+                resources,
+            }
+        })
+        .collect();
+
+    let inputs: Vec<PageInput<'_>> = rendered
+        .into_iter()
+        .map(|r| PageInput {
+            width: r.width,
+            height: r.height,
+            content_bytes: r.content_bytes,
+            resources: r.resources,
+            frame: r.frame,
+        })
+        .collect();
+
+    let mut doc = Document::new();
+    let _ = build_pages(&mut doc, inputs);
+
+    let mut out = Vec::with_capacity(4096);
+    doc.write_to(&mut out)?;
+    Ok(out)
+}
+
+/// Walk a single [`VectorFrame`] into a content stream + the per-page
+/// [`ResourceCollector`]. Shared by [`write_pdf`] and
+/// [`write_pdf_from_scene`].
+fn render_frame(frame: &VectorFrame) -> (Vec<u8>, ResourceCollector) {
+    let mut op = OpBuf::new();
+    let mut resources = ResourceCollector::new();
+    emit_group(&mut op, &frame.root, &mut resources);
+    (op.into_bytes(), resources)
 }
 
 fn emit_group(op: &mut OpBuf, group: &Group, resources: &mut ResourceCollector) {
