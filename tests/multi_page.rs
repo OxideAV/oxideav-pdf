@@ -126,6 +126,84 @@ fn standard_metadata_lands_in_info_dict() {
 }
 
 #[test]
+fn custom_metadata_lands_in_info_dict() {
+    let mut custom = std::collections::BTreeMap::new();
+    custom.insert("Trapped".into(), "False".into());
+    custom.insert("dc:rights".into(), "(c) 2026 Karpeles Lab Inc.".into());
+    let scene = Scene {
+        pages: Some(vec![page_with(100.0, 100.0, Rgba::opaque(0, 0, 0))]),
+        metadata: oxideav_scene::Metadata {
+            // Mix in one standard field too so we can confirm the
+            // custom entries don't displace it.
+            title: Some("With Custom".into()),
+            custom,
+            ..oxideav_scene::Metadata::default()
+        },
+        ..Scene::default()
+    };
+    let bytes = oxideav_pdf::write_pdf_from_scene(&scene).unwrap();
+    let s = String::from_utf8_lossy(&bytes);
+
+    // Standard key still present.
+    assert!(s.contains("/Title (With Custom)"));
+    // Custom key with no special chars.
+    assert!(s.contains("/Trapped (False)"));
+    // Custom key with ':' — `:` (0x3A) is in the legal Name alphabet,
+    // emitted verbatim.
+    let dc_pos = s
+        .find("dc:rights")
+        .unwrap_or_else(|| panic!("dc:rights key not found in: {s}"));
+    let after = &s[dc_pos..];
+    // The literal-string serialiser escapes `(` and `)` per ISO
+    // 32000-1 §7.3.4.2 — so `(c)` round-trips as `\(c\)`.
+    assert!(
+        after.contains("(\\(c\\) 2026 Karpeles Lab Inc.)"),
+        "expected literal-string value after dc:rights, got: {}",
+        &after[..after.len().min(120)]
+    );
+}
+
+#[test]
+fn custom_only_metadata_still_emits_info_dict() {
+    // No standard fields populated, but a custom entry should still
+    // trigger /Info emission.
+    let mut custom = std::collections::BTreeMap::new();
+    custom.insert("dc:rights".into(), "(c) 2026".into());
+    let scene = Scene {
+        pages: Some(vec![page_with(100.0, 100.0, Rgba::opaque(0, 0, 0))]),
+        metadata: oxideav_scene::Metadata {
+            custom,
+            ..oxideav_scene::Metadata::default()
+        },
+        ..Scene::default()
+    };
+    let bytes = oxideav_pdf::write_pdf_from_scene(&scene).unwrap();
+    let s = String::from_utf8_lossy(&bytes);
+    assert!(s.contains("/Info "));
+    assert!(s.contains("dc:rights"));
+}
+
+#[test]
+fn custom_key_shadowing_standard_is_dropped() {
+    // A custom entry named "Title" must NOT shadow the typed Title.
+    let mut custom = std::collections::BTreeMap::new();
+    custom.insert("Title".into(), "OVERRIDDEN".into());
+    let scene = Scene {
+        pages: Some(vec![page_with(100.0, 100.0, Rgba::opaque(0, 0, 0))]),
+        metadata: oxideav_scene::Metadata {
+            title: Some("Real".into()),
+            custom,
+            ..oxideav_scene::Metadata::default()
+        },
+        ..Scene::default()
+    };
+    let bytes = oxideav_pdf::write_pdf_from_scene(&scene).unwrap();
+    let s = String::from_utf8_lossy(&bytes);
+    assert!(s.contains("/Title (Real)"));
+    assert!(!s.contains("OVERRIDDEN"));
+}
+
+#[test]
 fn no_metadata_omits_info_dict() {
     let scene = Scene {
         pages: Some(vec![page_with(100.0, 100.0, Rgba::opaque(0, 0, 0))]),

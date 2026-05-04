@@ -2,10 +2,18 @@
 //!
 //! Maps [`oxideav_scene::Metadata`] onto the PDF `/Info` dictionary —
 //! the standard keys (`/Title`, `/Author`, `/Subject`, `/Keywords`,
-//! `/Creator`, `/Producer`, `/CreationDate`, `/ModDate`).
+//! `/Creator`, `/Producer`, `/CreationDate`, `/ModDate`) plus any
+//! additional entries supplied via the [`Metadata::custom`] map.
 //!
-//! `/Info` custom keys (round-tripping `Metadata::custom`) land in
-//! the follow-up commit.
+//! ISO 32000-1 §14.3.3 explicitly permits arbitrary additional keys
+//! in `/Info`, with the constraint that the keys be PDF Name objects
+//! (printable ASCII excluding the delimiters). The
+//! [`crate::objects::Object::Name`] serialiser handles `#xx`
+//! escaping for any character that doesn't satisfy that rule, so a
+//! caller-supplied `custom` key like `"dc:rights"` round-trips
+//! verbatim (`:` is in the legal Name alphabet).
+//!
+//! [`Metadata::custom`]: oxideav_scene::Metadata::custom
 //!
 //! # Date conversion
 //!
@@ -23,10 +31,12 @@ use oxideav_scene::Metadata;
 
 use crate::objects::{Dict, Object};
 
-/// True iff `metadata` carries any populated standard field. The
-/// writer skips emitting the `/Info` dict entirely when this returns
-/// false so trivial documents stay byte-stable with the round-1
-/// output.
+/// True iff `metadata` carries any populated field — either a
+/// standard one or a [`Metadata::custom`] entry. The writer skips
+/// emitting the `/Info` dict entirely when this returns false so
+/// trivial documents stay byte-stable with the round-1 output.
+///
+/// [`Metadata::custom`]: oxideav_scene::Metadata::custom
 pub fn has_metadata(metadata: &Metadata) -> bool {
     metadata.title.is_some()
         || metadata.author.is_some()
@@ -36,10 +46,20 @@ pub fn has_metadata(metadata: &Metadata) -> bool {
         || metadata.producer.is_some()
         || metadata.created_at.is_some()
         || metadata.modified_at.is_some()
+        || !metadata.custom.is_empty()
 }
 
 /// Build the PDF `/Info` dictionary from a [`Metadata`]. Standard
-/// keys land in the order ISO 32000-1 documents them.
+/// keys land in the order ISO 32000-1 documents them; [`Metadata::custom`]
+/// entries follow.
+///
+/// `custom` entries that share a name with a standard key (e.g. a
+/// `custom["Title"]`) are dropped — the standard slot was already
+/// filled and `Dict::set` would silently overwrite it. This keeps
+/// the typed [`Metadata`] fields authoritative and gives `custom` a
+/// predictable round-trip shape.
+///
+/// [`Metadata::custom`]: oxideav_scene::Metadata::custom
 pub fn build_info_dict(metadata: &Metadata) -> Dict {
     let mut info = Dict::new();
     if let Some(title) = &metadata.title {
@@ -71,7 +91,38 @@ pub fn build_info_dict(metadata: &Metadata) -> Dict {
     if let Some(modified_at) = &metadata.modified_at {
         info.set("ModDate", text_string(&iso8601_to_pdf_date(modified_at)));
     }
+    for (k, v) in &metadata.custom {
+        if is_standard_info_key(k) {
+            continue;
+        }
+        info.set(k, text_string(v));
+    }
     info
+}
+
+/// The standard `/Info` keys this writer emits from
+/// [`Metadata`]'s typed fields. A `custom` map entry that uses one of
+/// these names is dropped during dict assembly so the scene's
+/// authoritative value isn't shadowed.
+///
+/// Note: `/Trapped` is a standard PDF key but is **not** modelled by
+/// [`Metadata`] (it carries pre-press info specific to print
+/// workflows), so it's intentionally allowed through the `custom`
+/// map — useful for callers that need to mark a PDF as
+/// `/Trapped /True` without the scene struct growing a print-only
+/// field.
+fn is_standard_info_key(name: &str) -> bool {
+    matches!(
+        name,
+        "Title"
+            | "Author"
+            | "Subject"
+            | "Keywords"
+            | "Creator"
+            | "Producer"
+            | "CreationDate"
+            | "ModDate"
+    )
 }
 
 /// PDF "text string" — a literal string. Round 2 emits PDFDocEncoding
@@ -332,6 +383,74 @@ mod tests {
         assert!(entries.contains(&"Producer"));
         assert!(entries.contains(&"CreationDate"));
         assert!(entries.contains(&"ModDate"));
+    }
+
+    #[test]
+    fn has_metadata_detects_custom_only_metadata() {
+        let mut custom = std::collections::BTreeMap::new();
+        custom.insert("dc:rights".into(), "(c) 2026".into());
+        let m = Metadata {
+            custom,
+            ..Metadata::default()
+        };
+        assert!(has_metadata(&m));
+    }
+
+    #[test]
+    fn custom_keys_land_in_info_dict() {
+        let mut custom = std::collections::BTreeMap::new();
+        custom.insert("Trapped".into(), "False".into());
+        custom.insert("dc:rights".into(), "(c) 2026 Karpeles Lab".into());
+        let m = Metadata {
+            custom,
+            ..Metadata::default()
+        };
+        let d = build_info_dict(&m);
+        let entries: Vec<&str> = d.entries().iter().map(|(k, _)| k.as_str()).collect();
+        assert!(entries.contains(&"Trapped"));
+        assert!(entries.contains(&"dc:rights"));
+    }
+
+    #[test]
+    fn standard_key_in_custom_is_dropped() {
+        // A custom entry that names a standard key must NOT shadow
+        // the scene's authoritative value.
+        let mut custom = std::collections::BTreeMap::new();
+        custom.insert("Title".into(), "OVERRIDDEN".into());
+        let m = Metadata {
+            title: Some("Real".into()),
+            custom,
+            ..Metadata::default()
+        };
+        let d = build_info_dict(&m);
+        let title = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Title")
+            .map(|(_, v)| v)
+            .expect("Title set");
+        match title {
+            Object::LiteralString(b) => assert_eq!(b.as_slice(), b"Real"),
+            other => panic!("expected literal string, got {other:?}"),
+        }
+        // Title appears exactly once — the custom entry was dropped.
+        let title_count = d.entries().iter().filter(|(k, _)| k == "Title").count();
+        assert_eq!(title_count, 1);
+    }
+
+    #[test]
+    fn standard_key_in_custom_dropped_even_when_typed_field_unset() {
+        // Drop the conflict regardless of whether the typed field is
+        // populated — the typed slot is the source of truth, and
+        // /Info-key shadowing would surprise readers either way.
+        let mut custom = std::collections::BTreeMap::new();
+        custom.insert("Title".into(), "TitleViaCustom".into());
+        let m = Metadata {
+            custom,
+            ..Metadata::default()
+        };
+        let d = build_info_dict(&m);
+        assert!(d.entries().iter().all(|(k, _)| k != "Title"));
     }
 
     #[test]

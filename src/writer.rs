@@ -57,7 +57,9 @@ pub fn write_pdf(frame: &VectorFrame) -> Result<Vec<u8>, PdfError> {
 /// `scene.metadata` is wired into the PDF `/Info` dictionary via
 /// [`build_info_dict`]. Standard fields (`Title`, `Author`, `Subject`,
 /// `Keywords`, `Creator`, `Producer`, `CreationDate`, `ModDate`) land
-/// directly; `Metadata::custom` lands in the follow-up commit.
+/// directly; the [`oxideav_scene::Metadata::custom`] map flows into
+/// the same dict as additional keys (ISO 32000-1 §14.3.3 allows
+/// arbitrary `/Info` entries).
 pub fn write_pdf_from_scene(scene: &Scene) -> Result<Vec<u8>, PdfError> {
     let pages = scene
         .pages
