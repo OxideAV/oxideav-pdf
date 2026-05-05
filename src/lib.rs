@@ -58,7 +58,8 @@ pub use writer::{write_pdf, write_pdf_from_scene};
 
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, ContainerRegistry,
-    Encoder, Error, Frame, MediaType, Muxer, Packet, Result, StreamInfo, TimeBase, WriteSeek,
+    Encoder, Error, Frame, MediaType, Muxer, Packet, Result, RuntimeContext, StreamInfo, TimeBase,
+    WriteSeek,
 };
 
 /// String form of the [`oxideav_core::CodecId`] this crate registers
@@ -189,11 +190,12 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
     reg.register_extension("pdf", "pdf");
 }
 
-/// Combined registration — convenience wrapper that calls
-/// [`register_codecs`] and [`register_containers`].
-pub fn register(codecs: &mut CodecRegistry, containers: &mut ContainerRegistry) {
-    register_codecs(codecs);
-    register_containers(containers);
+/// Unified registration entry point — installs the PDF encoder into
+/// the codec sub-registry and the PDF muxer into the container
+/// sub-registry of the supplied [`RuntimeContext`].
+pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+    register_containers(&mut ctx.containers);
 }
 
 #[cfg(test)]
@@ -202,10 +204,25 @@ mod tests {
 
     #[test]
     fn registration_adds_encoder_and_muxer() {
-        let mut codecs = CodecRegistry::new();
-        let mut containers = ContainerRegistry::new();
-        register(&mut codecs, &mut containers);
-        assert!(codecs.has_encoder(&CodecId::new(CODEC_ID_STR)));
-        assert!(containers.muxer_names().any(|n| n == "pdf"));
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        assert!(ctx.codecs.has_encoder(&CodecId::new(CODEC_ID_STR)));
+        assert!(ctx.containers.muxer_names().any(|n| n == "pdf"));
+    }
+
+    #[test]
+    fn register_via_runtime_context_installs_both_sides() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let id = CodecId::new(CODEC_ID_STR);
+        assert!(
+            ctx.codecs.has_encoder(&id),
+            "PDF encoder factory not installed via RuntimeContext"
+        );
+        assert_eq!(
+            ctx.containers.container_for_extension("pdf"),
+            Some("pdf"),
+            "PDF container extension not installed via RuntimeContext"
+        );
     }
 }
