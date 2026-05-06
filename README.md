@@ -5,9 +5,7 @@ single-page PDF 1.4 document from a vector-graphics
 [`VectorFrame`](https://docs.rs/oxideav-core) — paths stay paths, fills
 stay fills, no rasterisation along the way. Zero C dependencies.
 
-Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
-framework — a 100% pure Rust media stack. No C libraries, no FFI
-wrappers, no `*-sys` crates.
+Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace) framework — a pure-Rust media stack. Codec, container, and filter crates are implemented from the spec (no C codec libraries linked or wrapped, no `*-sys` crates).
 
 ## What round 1 supports
 
