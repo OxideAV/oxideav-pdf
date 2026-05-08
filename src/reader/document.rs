@@ -33,6 +33,7 @@ use oxideav_scene::{Metadata, Page, Scene};
 use crate::decrypt::{open_with_password, StandardHandler};
 use crate::error::PdfError;
 use crate::objects::{Dict, Object, ObjectId, Stream};
+use crate::pubsec::{open_with_certificate, PubSecCredential};
 use crate::reader::content::parse_content_stream;
 use crate::reader::parse::Parser;
 use crate::reader::xref::{parse_xref, XrefEntry, XrefTable};
@@ -72,6 +73,26 @@ impl<'a> DocumentReader<'a> {
     pub fn open_with_password(input: &'a [u8], password: &[u8]) -> Result<Self, PdfError> {
         let xref = parse_xref(input)?;
         let crypt = build_crypt(&xref, input, password)?;
+        Ok(Self {
+            input,
+            xref,
+            cache: HashMap::new(),
+            crypt,
+        })
+    }
+
+    /// Parse the cross-reference table + trailer and unlock a
+    /// public-key-protected PDF using `credential`. Round-10
+    /// implementation; see [`crate::pubsec`] for the supported
+    /// SubFilters and crypt methods. Returns `PdfError::Other` when
+    /// the PDF is encrypted but the supplied certificate doesn't
+    /// match any recipient slot in any envelope of `/Recipients`.
+    pub fn open_with_certificate(
+        input: &'a [u8],
+        credential: &PubSecCredential,
+    ) -> Result<Self, PdfError> {
+        let xref = parse_xref(input)?;
+        let crypt = build_crypt_pubsec(&xref, input, credential)?;
         Ok(Self {
             input,
             xref,
@@ -343,6 +364,55 @@ fn build_crypt(
         .map(Some)
 }
 
+/// Public-key analogue of [`build_crypt`] — fetches the trailer's
+/// `/Encrypt` dict (resolving any indirect reference) and asks
+/// [`crate::pubsec::open_with_certificate`] to derive a
+/// [`StandardHandler`] from the user's certificate. Returns
+/// `Ok(None)` when no `/Encrypt` is present (so a non-encrypted PDF
+/// still opens via the certificate-based entry point).
+fn build_crypt_pubsec(
+    xref: &XrefTable,
+    input: &[u8],
+    credential: &PubSecCredential,
+) -> Result<Option<StandardHandler>, PdfError> {
+    let encrypt_ref = xref.trailer.entries().iter().find(|(k, _)| k == "Encrypt");
+    let Some((_, encrypt_obj)) = encrypt_ref else {
+        return Ok(None);
+    };
+    let encrypt_dict = match encrypt_obj {
+        Object::Dict(d) => d.clone(),
+        Object::Reference(id) => {
+            let off = xref
+                .offset_of(*id)
+                .ok_or_else(|| PdfError::other("PDF reader: /Encrypt refers to missing object"))?;
+            let mut p = Parser::new(input);
+            p.lexer_mut().seek(off as usize);
+            let (_, body) = p.parse_indirect()?;
+            match body {
+                Object::Dict(d) => d,
+                other => {
+                    return Err(PdfError::other(format!(
+                        "PDF reader: /Encrypt must resolve to a dict (got {other:?})"
+                    )))
+                }
+            }
+        }
+        other => {
+            return Err(PdfError::other(format!(
+                "PDF reader: /Encrypt must be a dict or reference (got {other:?})"
+            )))
+        }
+    };
+    let handler = open_with_certificate(&encrypt_dict, credential)?;
+    handler
+        .ok_or_else(|| {
+            PdfError::other(
+                "PDF reader: certificate did not match any recipient in /Recipients (round-10)",
+            )
+        })
+        .map(Some)
+}
+
 /// In-place decrypt: walk the parsed [`Object`] tree, decrypting every
 /// string and stream payload it contains. Encrypted PDFs only encrypt
 /// strings + streams — not numeric / boolean / name / array structure
@@ -490,11 +560,32 @@ pub fn read_pdf_to_scene(input: &[u8]) -> Result<Scene, PdfError> {
 /// for encrypted PDFs.
 ///
 /// Round-4 supports the standard security handler (R=2, R=3, R=4
-/// — RC4-40, RC4-128, AES-128 CBC). R=5 / R=6 (AES-256) and
-/// public-key handlers are deferred.
+/// — RC4-40, RC4-128, AES-128 CBC). R=5 / R=6 (AES-256) (round 5).
+/// Public-key handlers go via
+/// [`read_pdf_to_scene_with_certificate`] (round 10).
 pub fn read_pdf_to_scene_with_password(input: &[u8], password: &[u8]) -> Result<Scene, PdfError> {
-    let mut reader = DocumentReader::open_with_password(input, password)?;
+    let reader = DocumentReader::open_with_password(input, password)?;
+    decode_to_scene(reader)
+}
 
+/// Like [`read_pdf_to_scene`] but unlocks a public-key-encrypted PDF
+/// (`adbe.pkcs7.s3` / `s4` / `s5`) using the supplied X.509
+/// certificate + RSA private key. Round-10 implementation; see
+/// [`crate::pubsec`] for SubFilter and crypt-method coverage.
+///
+/// Returns `PdfError::Other` when the PDF is encrypted but the
+/// supplied certificate doesn't match any recipient slot in
+/// `/Recipients` — analogous to the wrong-password error from
+/// [`read_pdf_to_scene_with_password`].
+pub fn read_pdf_to_scene_with_certificate(
+    input: &[u8],
+    credential: &PubSecCredential,
+) -> Result<Scene, PdfError> {
+    let reader = DocumentReader::open_with_certificate(input, credential)?;
+    decode_to_scene(reader)
+}
+
+fn decode_to_scene(mut reader: DocumentReader<'_>) -> Result<Scene, PdfError> {
     // Catalog → /Pages reference.
     let root_id = reader.xref.root()?;
     let catalog = reader.resolve(root_id)?;

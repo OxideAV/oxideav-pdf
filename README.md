@@ -65,8 +65,41 @@ match oxideav_pdf::read_pdf_to_scene(&pdf) {
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Public-key handlers (`adbe.pkcs7.s3` / `s4` / `s5`) and per-stream
-crypt-filter overrides land in a follow-up round.
+Per-stream crypt-filter overrides land in a follow-up round.
+
+## Public-key encryption decode
+
+Round 10 unlocks **public-key-encrypted PDFs** under the
+`adbe.pkcs7.s3` / `s4` / `s5` SubFilters of the public-key security
+handler (ISO 32000-1 §7.6.4 + ISO 32000-2 §7.6.5):
+
+- **`adbe.pkcs7.s3`** — RC4-40, V=1, SHA-1 file-key derivation.
+- **`adbe.pkcs7.s4`** — RC4-128, V=2, SHA-1.
+- **`adbe.pkcs7.s5`, V=4** — RC4-128 or AES-128 CBC via `CFM` (V2 / AESV2).
+- **`adbe.pkcs7.s5`, V=5** — AES-256 CBC, `CFM=AESV3`, SHA-256.
+
+The trailer's `/Recipients` array (or `/CF /<StmF> /Recipients` for
+s5) carries one CMS `EnvelopedData` (RFC 5652 §6.1) per access-
+permission set; each envelope's `KeyTransRecipientInfo` SET wraps the
+content-encryption key with `RSAES-PKCS1-v1_5` to a recipient's RSA
+public key. The reader matches by `IssuerAndSerialNumber`,
+RSA-decrypts the wrapped CEK, decrypts the envelope contents (RC4 /
+AES-128 / AES-256 CBC), then derives the file encryption key per
+§7.6.4.3 / §7.6.5.3.
+
+```rust,ignore
+use oxideav_pdf::{read_pdf_to_scene_with_certificate, PubSecCredential};
+
+let cert_der    = std::fs::read("user.cert.der")?;
+let pkcs8_der   = std::fs::read("user.key.pkcs8.der")?;
+let credential  = PubSecCredential::from_der(&cert_der, &pkcs8_der)?;
+let scene = read_pdf_to_scene_with_certificate(&pdf_bytes, &credential)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The encoder side (writer-emitted public-key PDFs), recipient
+identification by `SubjectKeyIdentifier`, and per-crypt-filter
+recipient lists are deferred.
 
 ## Encryption encode (writer side)
 
@@ -163,7 +196,10 @@ land alongside outline / annotation support.
   CIDFont built via `oxideav-ttf`/`oxideav-otf`).
 - JPEG passthrough on `ImageRef` (DCTDecode XObject) — needs core
   IR support for "raw codec bytes" alongside the decoded VideoFrame.
-- Public-key security handlers (`adbe.pkcs7.*`).
+- Public-key security handler **encoder side** (writer emitting
+  `/Recipients` arrays — round 10 covers reader only).
+- Recipient identification by `SubjectKeyIdentifier` (only the
+  `IssuerAndSerialNumber` recipient ID form matches today).
 - Shared-object / thumbnail / outline / generic hint tables for
   linearized output (only the mandatory page-offset hint table is
   emitted).

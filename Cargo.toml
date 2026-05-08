@@ -41,3 +41,19 @@ cbc = { version = "0.1", default-features = false, features = ["block-padding"] 
 # pure-Rust + constant-time; it shares the `digest` trait surface
 # already pulled in transitively by the AES cipher dep.
 sha2 = { version = "0.10", default-features = false }
+# Pure-Rust SHA-1 (RustCrypto). Round-10 public-key handler uses
+# SHA-1 over `seed ‖ recipient_blobs [‖ 0xFFFFFFFF]` for
+# `adbe.pkcs7.s3` and `adbe.pkcs7.s4` (ISO 32000-1 §7.6.4.3) — and
+# also for the legacy SHA-1 digest of the AES-128 key derivation
+# in `adbe.pkcs7.s5`. SHA-1 is broken for collision attacks but
+# the spec mandates it for these subfilters; SHA-256 is only used
+# for the ISO 32000-2 AES-256 path.
+sha1 = { version = "0.10", default-features = false }
+# Pure-Rust RSA (RustCrypto). Round-10 public-key handler unwraps
+# the CMS RecipientInfo encrypted content-encryption key using
+# RSAES-PKCS1-v1_5 (the only key-encryption algorithm OID we need
+# for `adbe.pkcs7.s3`/`s4`/`s5` per RFC 5652 + ISO 32000-1 §7.6.4).
+# The crate is pure-Rust on top of `num-bigint-dig`; no `*-sys`.
+# `std` is needed for `OsRng` (used by tests + by the encoder side
+# in round 11) and for the `pkcs8` feature's PKCS#8 PEM/DER reader.
+rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }

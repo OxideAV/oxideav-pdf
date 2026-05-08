@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round-10 reader: **public-key encryption decode** for the
+  `adbe.pkcs7.s3` / `s4` / `s5` SubFilters of the public-key
+  security handler (ISO 32000-1 §7.6.4 + ISO 32000-2 §7.6.5).
+  New `pubsec` module + top-level `PubSecCredential` (X.509 cert
+  + RSA private key) + `read_pdf_to_scene_with_certificate`. The
+  reader parses each `/Recipients` CMS `EnvelopedData` (RFC 5652
+  §6.1) — minimal in-tree DER + CMS parsers, no external library
+  code consulted — matches a recipient slot by
+  `IssuerAndSerialNumber`, RSA-PKCS1-v1.5 unwraps the
+  content-encryption key, then decrypts the envelope contents
+  (RC4 / AES-128 CBC / AES-256 CBC). The file encryption key is
+  the first n/8 bytes of `SHA-1(seed || all_recipient_blobs)`
+  for the V≤4 paths and `SHA-256(...)` for the AES-256 path,
+  per §7.6.4.3 / §7.6.5.3. Reader hands the resulting key off
+  to the existing `decrypt::StandardHandler` so per-object
+  string + stream decryption uses the same Algorithm 1 path the
+  password-based reader already exercises. Encoder side is round 11+.
+- Round-10 deps: pure-Rust `rsa` (RustCrypto, RSAES-PKCS1-v1_5)
+  and `sha1` (RustCrypto). No `*-sys` wrappers; both crates are
+  used purely on the decoder path. The CMS / X.509 / DER parsers
+  are hand-rolled from RFC 5652 / RFC 5280 / X.690 — no
+  pkcs / cms / x509-cert crate dependency.
+- Round-10 tests: 17 new tests — 12 unit tests covering the DER
+  TLV parser/writer round-trip, OID encoding, an AES-256 CMS
+  envelope round-trip, X.509 issuer/serial extraction from a
+  synthetic certificate, and `open_with_certificate` against
+  s4 / s5-V4 / s5-V5 envelopes; 5 integration tests in
+  `tests/pubsec.rs` building a complete public-key-encrypted PDF
+  + verifying `read_pdf_to_scene_with_certificate` recovers
+  the encrypted `/Title` + content stream end-to-end across
+  RC4-128, AES-128 CBC, and AES-256 CBC profiles, plus a wrong-
+  certificate negative test and an unencrypted-PDF passthrough.
+
 - Round-9 writer: **Linearization (Fast Web View)**, ISO 32000-1
   §7.5.6 + Annex F. New `write_pdf_from_scene_linearized(scene)`
   emits a PDF whose first 1024 bytes carry a complete linearization
