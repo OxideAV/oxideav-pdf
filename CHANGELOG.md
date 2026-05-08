@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round-12: **per-crypt-filter recipient lists** — multiple named
+  crypt filters under `/CF`, each with its own permission mask, all
+  sharing one `/Recipients` array of multi-envelope PKCS#7 blobs (one
+  envelope per permission set). New
+  `write_pdf_from_scene_pubsec_multi_cf(scene, PubSecMultiCfConfig)`
+  + `PubSecCfGroup` (group = one permission set: full-access /
+  read-only constructors provided). The reader gains
+  `open_with_certificate_with_permissions` returning a `PubSecMatch
+  { handler, permissions, crypt_filter_name }`, so a caller can
+  surface "you have read-only access" alongside the decrypted scene.
+  Per ISO 32000-1 §7.6.4.2 + §7.6.5.4, every recipient walks every
+  envelope; the first match wins. Provenance: ISO 32000-1 §7.6.4.2 +
+  §7.6.5.4 only.
+- Round-12: **CMS KARI decoder** (RFC 5652 §6.2.2) — KeyAgreeRecipientInfo
+  parsing. Surfaces originator (IAS / SKI / OriginatorPublicKey) +
+  ukm + keyEncryptionAlgorithm OID + recipientEncryptedKeys via the
+  new `cms::RecipientInfoVariant::KeyAgree` arm + `KeyAgreeRecipientInfo`
+  / `OriginatorId` / `KeyAgreeRecipientId` types. KARI envelopes
+  (alone or mixed with KTRI) parse cleanly through `parse_envelope`;
+  the KTRI side still drives the actual unwrap (DH/ECDH key
+  agreement + RFC 5753 KDFs are out of scope). Encoder-side helper
+  `cms_build::build_envelope_kari_aes256` builds fixture envelopes.
+  Provenance: RFC 5652 §6.2.2 only.
+- Round-12 tests: 9 new tests — 7 round-12 integration tests in
+  `tests/pubsec_round12.rs` (multi-CF round-trip + permissions
+  surfacing + neither-group-matches + non-s5-rejection +
+  empty-groups-rejection + KARI structural parse + mixed-KARI/KTRI),
+  2 unit tests in `cms_build` (KARI round-trip + alternate-CHOICE
+  KARI variant).
+
 - Round-11 writer: **public-key encryption encode** — the symmetric
   encoder side of round 10. New top-level
   `write_pdf_from_scene_pubsec_encrypted(scene, &PubSecEncoderConfig)`

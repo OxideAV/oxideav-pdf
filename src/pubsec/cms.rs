@@ -6,10 +6,12 @@
 //!
 //! * `ContentInfo` whose `contentType` is the OID
 //!   `1.2.840.113549.1.7.3` (`id-envelopedData`).
-//! * `EnvelopedData` versions 0 and 2.
-//! * `RecipientInfo` of variant `KeyTransRecipientInfo` (no
-//!   key-agreement, no KEK, no password, no other) — the only one
-//!   the spec lets `adbe.pkcs7.s3`/`s4`/`s5` use in practice.
+//! * `EnvelopedData` versions 0, 2, and 3.
+//! * `RecipientInfo` of variant `KeyTransRecipientInfo` (RFC 5652
+//!   §6.2.1) and `KeyAgreeRecipientInfo` (§6.2.2 — round 12 decoder
+//!   side: ECDH / DH / static-static recipients; the originator
+//!   public key + UKM are surfaced; the wrapped CEK lands as a
+//!   `RecipientEncryptedKey` slot inside the KARI).
 //! * `RecipientIdentifier` of variant `IssuerAndSerialNumber` (CMS
 //!   v0) or `[0] SubjectKeyIdentifier` (CMS v2). Round 11 wires the
 //!   SKI variant through to the matcher (the pubsec module computes
@@ -114,15 +116,119 @@ pub struct KeyTransRecipientInfo {
     pub encrypted_key: Vec<u8>,
 }
 
+/// `OriginatorPublicKey` (RFC 5652 §6.2.2) — the originator's
+/// ephemeral or static public key carried as a BIT STRING with an
+/// `AlgorithmIdentifier` describing the curve / group. Used by the
+/// recipient (along with their own private key) to derive the shared
+/// secret that wraps the content-encryption key in a KARI envelope.
+#[derive(Debug, Clone)]
+pub struct OriginatorPublicKey {
+    /// AlgorithmIdentifier OID (e.g. ecPublicKey, dhpublicnumber).
+    pub algorithm_oid: Vec<u64>,
+    /// Raw AlgorithmIdentifier `parameters` field bytes (e.g. an OID
+    /// for the named curve). Empty when the encoded form was a NULL
+    /// or absent.
+    pub algorithm_params: Vec<u8>,
+    /// `subjectPublicKey` BIT STRING contents (no leading unused-bits
+    /// byte). For ECDH this is the encoded EC point.
+    pub public_key: Vec<u8>,
+}
+
+/// `OriginatorIdentifierOrKey` (RFC 5652 §6.2.2) — the CHOICE that
+/// identifies the originator side of a key-agreement recipient. We
+/// surface every arm so callers can route on the originator type
+/// (an importing client may, for example, prefer one originator to
+/// another when multiple KARIs are present).
+#[derive(Debug, Clone)]
+pub enum OriginatorId {
+    /// Originator is identified by their `IssuerAndSerialNumber`.
+    IssuerAndSerial(IssuerAndSerial),
+    /// Originator is identified by their SubjectKeyIdentifier (the
+    /// 20-byte SHA-1 of their cert's SPKI BIT STRING contents).
+    SubjectKeyIdentifier(Vec<u8>),
+    /// Originator's public key is carried in-band (no certificate
+    /// reference required).
+    OriginatorKey(OriginatorPublicKey),
+}
+
+/// `KeyAgreeRecipientIdentifier` (RFC 5652 §6.2.2) — identifies one
+/// recipient inside a KARI's `recipientEncryptedKeys` SEQUENCE. Either
+/// the legacy `IssuerAndSerial` form or a `RecipientKeyIdentifier` —
+/// which carries an SKI plus optional `date` + `other` attributes.
+#[derive(Debug, Clone)]
+pub enum KeyAgreeRecipientId {
+    /// Legacy `IssuerAndSerialNumber` — same shape as KTRI v0.
+    IssuerAndSerial(IssuerAndSerial),
+    /// `[0] IMPLICIT RecipientKeyIdentifier`. We surface the SKI body
+    /// only; the OPTIONAL `date` and `other` fields are skipped (the
+    /// PDF public-key handler doesn't consume them).
+    RecipientKeyIdentifier { ski: Vec<u8> },
+}
+
+/// `RecipientEncryptedKey` (RFC 5652 §6.2.2) — one wrapped CEK inside
+/// a KARI envelope. The KARI itself holds a SEQUENCE OF these.
+#[derive(Debug, Clone)]
+pub struct RecipientEncryptedKey {
+    /// Recipient identifier (CHOICE issuerAndSerial / RKID-via-SKI).
+    pub rid: KeyAgreeRecipientId,
+    /// Wrapped content-encryption key. The unwrap algorithm is named
+    /// by the parent KARI's `keyEncryptionAlgorithm` (typically a
+    /// key-wrap algorithm such as `id-aes128-wrap` paired with a
+    /// key-derivation function like `dhSinglePass-stdDH-sha256kdf-scheme`).
+    pub encrypted_key: Vec<u8>,
+}
+
+/// `KeyAgreeRecipientInfo` (RFC 5652 §6.2.2) — the second
+/// `RecipientInfo` CHOICE arm. Used with ECDH / DH-based recipients
+/// (vs RSA-based KTRI). `version` is always 3.
+#[derive(Debug, Clone)]
+pub struct KeyAgreeRecipientInfo {
+    /// Originator side identifier / key.
+    pub originator: OriginatorId,
+    /// Optional UserKeyingMaterial — extra randomness mixed into the
+    /// KDF on both sides. Empty `Vec` means "absent".
+    pub ukm: Vec<u8>,
+    /// `keyEncryptionAlgorithm` OID — names the KDF + key-wrap
+    /// combination (e.g. `dhSinglePass-stdDH-sha256kdf-scheme`).
+    pub key_encryption_oid: Vec<u64>,
+    /// Raw `keyEncryptionAlgorithm` parameters bytes. For
+    /// `dhSinglePass-stdDH-sha*-kdf` this is itself a SEQUENCE
+    /// containing the key-wrap algorithm's OID + parameters.
+    pub key_encryption_params: Vec<u8>,
+    /// One or more recipient slots; each slot's `encryptedKey` is the
+    /// CEK wrapped using the shared secret derived from the originator
+    /// + recipient pair (and the `keyEncryptionAlgorithm`'s KDF).
+    pub recipient_encrypted_keys: Vec<RecipientEncryptedKey>,
+}
+
+/// `RecipientInfo` CHOICE — round 12 surfaces both KTRI (RSA) and
+/// KARI (DH/ECDH) variants. KEKRI (`[2] kekri`), PWRI (`[3] pwri`),
+/// and ORI (`[4] ori`) are still skipped — the PDF spec does not
+/// reference them and adding them would expand the threat surface
+/// without serving a use case.
+#[derive(Debug, Clone)]
+pub enum RecipientInfoVariant {
+    /// `KeyTransRecipientInfo` — RSA-based, the round-10/11 path.
+    KeyTrans(KeyTransRecipientInfo),
+    /// `KeyAgreeRecipientInfo` — DH/ECDH-based, round 12 decoder.
+    KeyAgree(KeyAgreeRecipientInfo),
+}
+
 /// Parsed CMS `EnvelopedData` reduced to the fields the PDF public-key
-/// handler consumes. Recipients other than `KeyTransRecipientInfo`
-/// are ignored (skipped over with a debug-only warning) so a
-/// pre-existing PDF written with mixed recipient types can still be
-/// opened by a `KeyTrans` user.
+/// handler consumes. Recipients of unsupported variants (`kekri`,
+/// `pwri`, `ori`) are skipped over silently so a pre-existing PDF
+/// written with mixed recipient types can still be opened by a
+/// supported variant's user.
 #[derive(Debug, Clone)]
 pub struct EnvelopedData {
-    /// The unique-set-of recipient infos. Each is one wrapped CEK.
+    /// Backwards-compatible KTRI-only view of the recipients SET. Code
+    /// written against round 10/11 keeps working — only KTRI slots are
+    /// surfaced through this list. Round 12 introduces [`Self::all`]
+    /// for callers that want the KARI slots too.
     pub recipients: Vec<KeyTransRecipientInfo>,
+    /// Round-12 view: every recognised RecipientInfo (KTRI + KARI) in
+    /// declaration order. KEKRI / PWRI / ORI are still skipped.
+    pub all_recipients: Vec<RecipientInfoVariant>,
     /// Symmetric algorithm used to protect the envelope's content.
     pub content_encryption: ContentEncryption,
     /// The encrypted enveloped data (the bytes that decrypt to the
@@ -183,17 +289,21 @@ pub fn parse_enveloped_data(data: &[u8]) -> Result<EnvelopedData, PdfError> {
     // RecipientInfos
     let (ri_set, body) = read_set(body)?;
     let mut recipients = Vec::new();
+    let mut all_recipients = Vec::new();
     let mut cursor = ri_set;
     while !cursor.is_empty() {
         let (parsed, tail) = parse_recipient_info(cursor)?;
         if let Some(p) = parsed {
-            recipients.push(p);
+            if let RecipientInfoVariant::KeyTrans(ktri) = &p {
+                recipients.push(ktri.clone());
+            }
+            all_recipients.push(p);
         }
         cursor = tail;
     }
-    if recipients.is_empty() {
+    if all_recipients.is_empty() {
         return Err(PdfError::other(
-            "CMS: EnvelopedData has no KeyTransRecipientInfo entries",
+            "CMS: EnvelopedData has no recognised RecipientInfo entries",
         ));
     }
 
@@ -226,19 +336,31 @@ pub fn parse_enveloped_data(data: &[u8]) -> Result<EnvelopedData, PdfError> {
 
     Ok(EnvelopedData {
         recipients,
+        all_recipients,
         content_encryption,
         encrypted_content,
     })
 }
 
 /// Parse a single `RecipientInfo` element from the SET body. Returns
-/// `Ok(None)` for non-`ktri` variants (which are skipped silently).
-fn parse_recipient_info(data: &[u8]) -> Result<(Option<KeyTransRecipientInfo>, &[u8]), PdfError> {
+/// `Ok(None)` for variants this implementation doesn't recognise
+/// (`[2] kekri`, `[3] pwri`, `[4] ori`); KTRI (untagged SEQUENCE) and
+/// KARI (`[1]` IMPLICIT) are surfaced as separate enum arms.
+fn parse_recipient_info(data: &[u8]) -> Result<(Option<RecipientInfoVariant>, &[u8]), PdfError> {
     // Peek at the tag to decide which CHOICE branch we're in.
     let (peek, peek_tail) = super::der::read_tlv(data)?;
     if peek.class == Class::ContextSpecific {
-        // [1] kari, [2] kekri, [3] pwri, [4] ori — skip whole element.
-        return Ok((None, peek_tail));
+        match peek.tag_number {
+            1 => {
+                // [1] IMPLICIT KeyAgreeRecipientInfo — body is the
+                // KARI SEQUENCE contents (the implicit tag replaces
+                // the SEQUENCE's universal tag).
+                let kari = parse_kari(peek.body)?;
+                return Ok((Some(RecipientInfoVariant::KeyAgree(kari)), peek_tail));
+            }
+            // [2] kekri, [3] pwri, [4] ori — skipped silently.
+            _ => return Ok((None, peek_tail)),
+        }
     }
     // Otherwise it's a KeyTransRecipientInfo SEQUENCE.
     let (ktri_body, tail) = read_sequence(data)?;
@@ -315,11 +437,235 @@ fn parse_recipient_info(data: &[u8]) -> Result<(Option<KeyTransRecipientInfo>, &
         ));
     }
     Ok((
-        Some(KeyTransRecipientInfo {
+        Some(RecipientInfoVariant::KeyTrans(KeyTransRecipientInfo {
             rid,
             key_encryption_oid: kea_oid,
             encrypted_key: enc_key.to_vec(),
-        }),
+        })),
+        tail,
+    ))
+}
+
+/// Parse the body of a `[1] IMPLICIT KeyAgreeRecipientInfo` per RFC
+/// 5652 §6.2.2. The implicit tag replaces the SEQUENCE's universal
+/// tag, so `data` here is the KARI's body bytes — the same shape we
+/// would otherwise see *inside* a `read_sequence(...)` call.
+///
+/// ```asn.1
+/// KeyAgreeRecipientInfo ::= SEQUENCE {
+///   version                CMSVersion,                 -- always 3
+///   originator         [0] EXPLICIT OriginatorIdentifierOrKey,
+///   ukm                [1] EXPLICIT UserKeyingMaterial OPTIONAL,
+///   keyEncryptionAlgorithm KeyEncryptionAlgorithmIdentifier,
+///   recipientEncryptedKeys RecipientEncryptedKeys
+/// }
+/// ```
+fn parse_kari(data: &[u8]) -> Result<KeyAgreeRecipientInfo, PdfError> {
+    let (version, body) = read_integer_u64(data)?;
+    if version != 3 {
+        return Err(PdfError::other(format!(
+            "CMS: KeyAgreeRecipientInfo version must be 3 (got {version})"
+        )));
+    }
+    // [0] EXPLICIT OriginatorIdentifierOrKey
+    let (orig_body, body) = read_context(body, 0)?;
+    let originator = parse_originator(orig_body)?;
+    // [1] EXPLICIT UserKeyingMaterial OPTIONAL
+    let (ukm_opt, body) = maybe_read_context(body, 1)?;
+    let ukm = match ukm_opt {
+        Some(b) => {
+            // The UKM body is itself an OCTET STRING.
+            let (ukm_bytes, rest) = read_octet_string(b)?;
+            if !rest.is_empty() {
+                return Err(PdfError::other(
+                    "CMS: KARI ukm context wrapper has trailing bytes",
+                ));
+            }
+            ukm_bytes.to_vec()
+        }
+        None => Vec::new(),
+    };
+    // KeyEncryptionAlgorithmIdentifier
+    let (alg_body, body) = read_sequence(body)?;
+    let (kea_oid, alg_params) = read_oid(alg_body)?;
+    // recipientEncryptedKeys SEQUENCE OF RecipientEncryptedKey
+    let (rek_body, body) = read_sequence(body)?;
+    if !body.is_empty() {
+        return Err(PdfError::other(
+            "CMS: KARI has trailing bytes after recipientEncryptedKeys",
+        ));
+    }
+    let mut recipient_encrypted_keys = Vec::new();
+    let mut cursor = rek_body;
+    while !cursor.is_empty() {
+        let (rek, tail) = parse_recipient_encrypted_key(cursor)?;
+        recipient_encrypted_keys.push(rek);
+        cursor = tail;
+    }
+    if recipient_encrypted_keys.is_empty() {
+        return Err(PdfError::other("CMS: KARI recipientEncryptedKeys is empty"));
+    }
+    Ok(KeyAgreeRecipientInfo {
+        originator,
+        ukm,
+        key_encryption_oid: kea_oid,
+        key_encryption_params: alg_params.to_vec(),
+        recipient_encrypted_keys,
+    })
+}
+
+/// Parse `OriginatorIdentifierOrKey` (RFC 5652 §6.2.2).
+///
+/// ```asn.1
+/// OriginatorIdentifierOrKey ::= CHOICE {
+///   issuerAndSerialNumber  IssuerAndSerialNumber,
+///   subjectKeyIdentifier  [0] SubjectKeyIdentifier,
+///   originatorKey         [1] OriginatorPublicKey
+/// }
+/// ```
+fn parse_originator(data: &[u8]) -> Result<OriginatorId, PdfError> {
+    let (peek, _) = super::der::read_tlv(data)?;
+    if peek.class == Class::ContextSpecific {
+        match peek.tag_number {
+            0 => {
+                // [0] IMPLICIT SubjectKeyIdentifier (OCTET STRING).
+                if peek.constructed {
+                    return Err(PdfError::other(
+                        "CMS: KARI originator [0] SKI must be primitive",
+                    ));
+                }
+                Ok(OriginatorId::SubjectKeyIdentifier(peek.body.to_vec()))
+            }
+            1 => {
+                // [1] IMPLICIT OriginatorPublicKey — body is the SPKI
+                // SEQUENCE contents.
+                let opk = parse_originator_public_key(peek.body)?;
+                Ok(OriginatorId::OriginatorKey(opk))
+            }
+            other => Err(PdfError::other(format!(
+                "CMS: KARI originator unknown context-tag {other}"
+            ))),
+        }
+    } else {
+        // Untagged SEQUENCE — IssuerAndSerialNumber.
+        let (ias_body, rest) = read_sequence(data)?;
+        if !rest.is_empty() {
+            return Err(PdfError::other(
+                "CMS: KARI originator IAS has trailing bytes",
+            ));
+        }
+        let (issuer_tlv, ias_after_issuer) = super::der::read_tlv(ias_body)?;
+        if issuer_tlv.class != Class::Universal
+            || issuer_tlv.tag_number != super::der::tag::SEQUENCE
+        {
+            return Err(PdfError::other(
+                "CMS: KARI originator IAS issuer must be a SEQUENCE",
+            ));
+        }
+        let issuer_total = ias_body.len() - ias_after_issuer.len();
+        let issuer_der = ias_body[..issuer_total].to_vec();
+        let (serial_body, _) = read_integer_bytes(ias_after_issuer)?;
+        Ok(OriginatorId::IssuerAndSerial(IssuerAndSerial {
+            issuer_der,
+            serial: serial_body.to_vec(),
+        }))
+    }
+}
+
+/// Parse `OriginatorPublicKey` (RFC 5652 §6.2.2). Body shape is
+/// `SEQUENCE { algorithm AlgorithmIdentifier, publicKey BIT STRING }`.
+fn parse_originator_public_key(data: &[u8]) -> Result<OriginatorPublicKey, PdfError> {
+    let (alg_body, after_alg) = read_sequence(data)?;
+    let (alg_oid, alg_params) = read_oid(alg_body)?;
+    // BIT STRING — body has a leading unused-bits byte we drop.
+    let (bs, rest) = super::der::read_tlv(after_alg)?;
+    if bs.class != Class::Universal || bs.tag_number != super::der::tag::BIT_STRING {
+        return Err(PdfError::other(
+            "CMS: KARI OriginatorPublicKey expects BIT STRING for publicKey",
+        ));
+    }
+    if !rest.is_empty() {
+        return Err(PdfError::other(
+            "CMS: KARI OriginatorPublicKey has trailing bytes",
+        ));
+    }
+    if bs.body.is_empty() {
+        return Err(PdfError::other(
+            "CMS: KARI OriginatorPublicKey BIT STRING empty",
+        ));
+    }
+    Ok(OriginatorPublicKey {
+        algorithm_oid: alg_oid,
+        algorithm_params: alg_params.to_vec(),
+        public_key: bs.body[1..].to_vec(),
+    })
+}
+
+/// Parse one `RecipientEncryptedKey` (RFC 5652 §6.2.2).
+///
+/// ```asn.1
+/// RecipientEncryptedKey ::= SEQUENCE {
+///   rid          KeyAgreeRecipientIdentifier,
+///   encryptedKey EncryptedKey
+/// }
+/// KeyAgreeRecipientIdentifier ::= CHOICE {
+///   issuerAndSerialNumber  IssuerAndSerialNumber,
+///   rKeyId             [0] IMPLICIT RecipientKeyIdentifier
+/// }
+/// RecipientKeyIdentifier ::= SEQUENCE {
+///   subjectKeyIdentifier SubjectKeyIdentifier,
+///   date GeneralizedTime OPTIONAL,
+///   other OtherKeyAttribute OPTIONAL
+/// }
+/// ```
+fn parse_recipient_encrypted_key(data: &[u8]) -> Result<(RecipientEncryptedKey, &[u8]), PdfError> {
+    let (rek_body, tail) = read_sequence(data)?;
+    let (peek, _) = super::der::read_tlv(rek_body)?;
+    let (rid, after_rid) = if peek.class == Class::ContextSpecific && peek.tag_number == 0 {
+        // [0] IMPLICIT RecipientKeyIdentifier — body is the RKID's
+        // SEQUENCE contents. Consume the [0] TLV from the parent
+        // body to compute `after`, then peel its body for the SKI.
+        let (rkid_tlv, after) = super::der::read_tlv(rek_body)?;
+        let (ski, _ignored) = read_octet_string(rkid_tlv.body)?;
+        // The rest of the RKID body (date / other) is skipped — the
+        // PDF public-key handler doesn't consume it.
+        (
+            KeyAgreeRecipientId::RecipientKeyIdentifier { ski: ski.to_vec() },
+            after,
+        )
+    } else {
+        // Untagged SEQUENCE → IssuerAndSerialNumber.
+        let (ias_body, after) = read_sequence(rek_body)?;
+        let (issuer_tlv, ias_after_issuer) = super::der::read_tlv(ias_body)?;
+        if issuer_tlv.class != Class::Universal
+            || issuer_tlv.tag_number != super::der::tag::SEQUENCE
+        {
+            return Err(PdfError::other(
+                "CMS: KARI REK IAS issuer must be a SEQUENCE",
+            ));
+        }
+        let issuer_total = ias_body.len() - ias_after_issuer.len();
+        let issuer_der = ias_body[..issuer_total].to_vec();
+        let (serial_body, _) = read_integer_bytes(ias_after_issuer)?;
+        (
+            KeyAgreeRecipientId::IssuerAndSerial(IssuerAndSerial {
+                issuer_der,
+                serial: serial_body.to_vec(),
+            }),
+            after,
+        )
+    };
+    let (enc_key, after_key) = read_octet_string(after_rid)?;
+    if !after_key.is_empty() {
+        return Err(PdfError::other(
+            "CMS: KARI RecipientEncryptedKey has trailing bytes",
+        ));
+    }
+    Ok((
+        RecipientEncryptedKey {
+            rid,
+            encrypted_key: enc_key.to_vec(),
+        },
         tail,
     ))
 }

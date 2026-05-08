@@ -59,13 +59,34 @@
 //!   are supported on read; the writer emits IAS by default but
 //!   accepts SKI per-recipient.
 //!
+//! ## Round-12 additions
+//!
+//! * **Per-crypt-filter recipient lists** — multiple named crypt
+//!   filters under `/CF`, each with its own `/Recipients` array. The
+//!   matcher tries every CF in turn; the first CF that contains a
+//!   recipient slot matching the user's certificate determines the
+//!   permissions surfaced. ISO 32000-1 §7.6.4.2 + §7.6.5.4 explicitly
+//!   permit different permission masks per recipient set (the "read
+//!   only" recipient is in one CF, the "full access" recipient in
+//!   another — both can decrypt with their respective rights). The
+//!   public read-side API is unchanged (the matched CF's permissions
+//!   are surfaced through the returned [`StandardHandler`] same as
+//!   before); the [`open_with_certificate_with_permissions`] variant
+//!   surfaces both the handler and the per-CF P value.
+//! * **CMS KARI variant** (decoder side, RFC 5652 §6.2.2) — KeyAgree
+//!   recipients (ECDH / DH) are now parsed structurally. The
+//!   originator + UKM + recipientEncryptedKeys fields are surfaced via
+//!   [`crate::pubsec::cms::RecipientInfoVariant::KeyAgree`]; the
+//!   [`open_with_certificate`] handler still requires KTRI for actual
+//!   unwrap because RFC 5753 KDF + key-wrap implementations are out of
+//!   scope here. Mixed-recipient envelopes (KTRI + KARI) decode
+//!   correctly via the KTRI side.
+//!
 //! ## Remaining deferrals
 //!
 //! * `RC2 / 3DES / DES` envelope content algorithms (deprecated in
 //!   PDF 2.0; we accept RC4 / AES-128 / AES-256 only).
-//! * Recipient lists per *crypt filter* (the `Recipients` entry in
-//!   `/CF/<name>` for `s5`) — only the document-level + the
-//!   single-StmF crypt-filter `Recipients` slot is wired.
+//! * KARI *unwrap* — DH/ECDH key agreement + RFC 5753 KDFs.
 
 pub mod cms;
 pub mod cms_build;
@@ -73,7 +94,9 @@ pub mod der;
 pub mod encode;
 pub mod x509;
 
-pub use encode::{PubSecEncoderConfig, PubSecEncryptionState, PubSecRecipient};
+pub use encode::{
+    PubSecCfGroup, PubSecEncoderConfig, PubSecEncryptionState, PubSecMultiCfConfig, PubSecRecipient,
+};
 
 use crate::decrypt::{CryptMethod, StandardHandler};
 use crate::error::PdfError;
@@ -211,11 +234,35 @@ impl PubSecCredential {
     }
 }
 
+/// Per-CF surface returned by [`open_with_certificate_with_permissions`].
+/// The standard [`open_with_certificate`] discards the permission /
+/// CF-name fields and surfaces only the [`StandardHandler`] for
+/// backwards compatibility with round-10 callers.
+#[derive(Debug, Clone)]
+pub struct PubSecMatch {
+    /// File-encryption handler the matched CF derived. Feeds straight
+    /// into the per-object decrypt path.
+    pub handler: StandardHandler,
+    /// Permission mask carried by the matched envelope's plaintext
+    /// trailer (4-byte signed integer, per ISO 32000-1 §7.6.4.3 / ISO
+    /// 32000-2 §7.6.5.3). `None` when the envelope plaintext is the
+    /// 20-byte seed alone.
+    pub permissions: Option<i32>,
+    /// Name of the crypt filter under `/CF` whose `/Recipients` slot
+    /// matched. `None` for the document-level `/Recipients` path used
+    /// by `s3` / `s4` (no per-CF differentiation possible).
+    pub crypt_filter_name: Option<String>,
+}
+
 /// Open a public-key-encrypted PDF given the trailer's `/Encrypt`
-/// dict, the trailer's `/ID[0]` bytes (used by `Algorithm 1` for
-/// per-object key derivation in V≤4 — public-key handlers don't use
-/// it for the document key derivation itself, but the already-built
-/// per-object key path consumes it), and the user's credential.
+/// dict and the user's credential. Returns the file-encryption
+/// handler the matched recipient set produced.
+///
+/// For `s5` envelopes that thread different permission sets through
+/// distinct named crypt filters (per ISO 32000-1 §7.6.4.2 + §7.6.5.4),
+/// every `/CF /<name> /Recipients` array is tried in declaration
+/// order. The first CF whose recipient slot matches the user's
+/// certificate determines the file encryption key + permissions.
 ///
 /// Returns `Ok(None)` when no recipient slot in any envelope matches
 /// the supplied certificate (analogous to a wrong password).
@@ -223,78 +270,149 @@ pub fn open_with_certificate(
     encrypt: &Dict,
     credential: &PubSecCredential,
 ) -> Result<Option<StandardHandler>, PdfError> {
+    Ok(open_with_certificate_with_permissions(encrypt, credential)?.map(|m| m.handler))
+}
+
+/// Round-12 extended entry point — same matching rules as
+/// [`open_with_certificate`] but surfaces the matched CF's name +
+/// envelope permissions alongside the handler. Lets a caller display
+/// "you have read-only access via the `ReadOnlyCF` recipient set"
+/// without re-parsing the trailer.
+pub fn open_with_certificate_with_permissions(
+    encrypt: &Dict,
+    credential: &PubSecCredential,
+) -> Result<Option<PubSecMatch>, PdfError> {
     let sub_filter = PubSecSubFilter::from_dict(encrypt)?;
-    let recipients_blobs = recipients_array(encrypt)?;
-    if recipients_blobs.is_empty() {
+    let candidates = collect_recipient_arrays(encrypt)?;
+    if candidates.is_empty() {
         return Err(PdfError::other(
-            "PDF pubsec: /Recipients array is empty (or missing)",
+            "PDF pubsec: no /Recipients arrays found (document-level or per-CF)",
         ));
     }
 
-    // Walk recipient blobs, attempt to find one whose RecipientInfos
-    // SET carries our cert. The first match wins per ISO 32000-1
-    // §7.6.4.2 ("There shall be only one PKCS#7 object per unique set
-    // of access permissions; if a recipient appears in more than one
-    // list, the permissions used shall be those in the first matching
-    // list").
-    for blob in &recipients_blobs {
-        let envelope = cms::parse_envelope(blob)?;
-        let Some(plaintext) = try_unwrap(&envelope, credential)? else {
-            continue;
-        };
-        // The plaintext is `seed (20 bytes) [|| 4 bytes permissions]`.
-        if plaintext.len() < 20 {
-            return Err(PdfError::other(format!(
-                "PDF pubsec: enveloped content too short ({} < 20 bytes)",
-                plaintext.len()
-            )));
-        }
-        let seed = &plaintext[..20];
+    let encrypt_metadata = match encrypt
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "EncryptMetadata")
+    {
+        Some((_, Object::Bool(b))) => *b,
+        _ => true,
+    };
 
-        // Derive the file encryption key from seed || all_recipients [|| 0xFFFF_FFFF].
-        let encrypt_metadata = match encrypt
-            .entries()
-            .iter()
-            .find(|(k, _)| k == "EncryptMetadata")
-        {
-            Some((_, Object::Bool(b))) => *b,
-            _ => true,
-        };
-        let key = derive_file_key(
-            sub_filter,
-            seed,
-            &recipients_blobs,
-            encrypt_metadata,
-            key_length_bits(sub_filter, encrypt)?,
-        );
+    // Walk every CF candidate, then within it walk every recipient
+    // blob until one matches. ISO 32000-1 §7.6.4.2: "There shall be
+    // only one PKCS#7 object per unique set of access permissions; if
+    // a recipient appears in more than one list, the permissions used
+    // shall be those in the first matching list."
+    for candidate in &candidates {
+        for blob in &candidate.blobs {
+            let envelope = cms::parse_envelope(blob)?;
+            let Some(plaintext) = try_unwrap(&envelope, credential)? else {
+                continue;
+            };
+            // Plaintext is `seed (20 bytes) [|| 4 bytes permissions]`.
+            if plaintext.len() < 20 {
+                return Err(PdfError::other(format!(
+                    "PDF pubsec: enveloped content too short ({} < 20 bytes)",
+                    plaintext.len()
+                )));
+            }
+            let seed = &plaintext[..20];
+            let permissions = if plaintext.len() >= 24 {
+                // ISO 32000-2 stores MSB-first; ISO 32000-1 stores
+                // LSB-first. We pick by SubFilter.
+                let p_bytes = &plaintext[20..24];
+                let p_arr: [u8; 4] = [p_bytes[0], p_bytes[1], p_bytes[2], p_bytes[3]];
+                let p = match sub_filter {
+                    PubSecSubFilter::Pkcs7S5V5 => i32::from_be_bytes(p_arr),
+                    _ => i32::from_le_bytes(p_arr),
+                };
+                Some(p)
+            } else {
+                None
+            };
 
-        let (method, revision) = match sub_filter {
-            PubSecSubFilter::Pkcs7S3 => (CryptMethod::Rc4, 2u8),
-            PubSecSubFilter::Pkcs7S4 => (CryptMethod::Rc4, 3),
-            PubSecSubFilter::Pkcs7S5V4 { aes } => (
-                if aes {
-                    CryptMethod::Aes128
-                } else {
-                    CryptMethod::Rc4
+            // Per-CF candidate determines its own algorithm + key
+            // length (the dict-level CFM is overridden when the
+            // matched filter has its own CFM).
+            let (method, revision) = candidate
+                .method_revision
+                .unwrap_or_else(|| default_method_revision(sub_filter));
+            let default_key_bits = match sub_filter {
+                PubSecSubFilter::Pkcs7S3 => 40,
+                PubSecSubFilter::Pkcs7S4 => 128,
+                PubSecSubFilter::Pkcs7S5V4 { .. } => 128,
+                PubSecSubFilter::Pkcs7S5V5 => 256,
+            };
+            let key_bits = candidate.key_length_bits.unwrap_or(default_key_bits);
+            let key = derive_file_key(
+                sub_filter,
+                seed,
+                &candidate.blobs,
+                encrypt_metadata,
+                key_bits,
+            );
+            return Ok(Some(PubSecMatch {
+                handler: StandardHandler {
+                    key,
+                    method,
+                    revision,
                 },
-                4,
-            ),
-            PubSecSubFilter::Pkcs7S5V5 => (CryptMethod::Aes256, 6),
-        };
-        return Ok(Some(StandardHandler {
-            key,
-            method,
-            revision,
-        }));
+                permissions,
+                crypt_filter_name: candidate.cf_name.clone(),
+            }));
+        }
     }
     Ok(None)
 }
 
-/// Resolve the `/Recipients` array of byte-string PKCS#7 envelopes.
-/// For `s3` / `s4` it lives at `/Encrypt /Recipients`; for `s5` it
-/// lives at `/Encrypt /CF /<StmF> /Recipients` per Table 27 (the
-/// document-level `/Recipients` slot is reserved for `s3`/`s4`).
-fn recipients_array(encrypt: &Dict) -> Result<Vec<Vec<u8>>, PdfError> {
+fn default_method_revision(sub_filter: PubSecSubFilter) -> (CryptMethod, u8) {
+    match sub_filter {
+        PubSecSubFilter::Pkcs7S3 => (CryptMethod::Rc4, 2u8),
+        PubSecSubFilter::Pkcs7S4 => (CryptMethod::Rc4, 3),
+        PubSecSubFilter::Pkcs7S5V4 { aes } => (
+            if aes {
+                CryptMethod::Aes128
+            } else {
+                CryptMethod::Rc4
+            },
+            4,
+        ),
+        PubSecSubFilter::Pkcs7S5V5 => (CryptMethod::Aes256, 6),
+    }
+}
+
+/// One candidate recipient set — either the document-level
+/// `/Recipients` (for `s3` / `s4`) or one named crypt filter under
+/// `/CF` (for `s5`). For per-CF candidates the CFM + Length determine
+/// the symmetric algorithm; the document-level fallback inherits from
+/// the encrypt dict (`StmF` lookup or default 128-bit RC4).
+struct RecipientCandidate {
+    /// Named crypt filter the candidate originated from. `None` for
+    /// the document-level `/Recipients` slot.
+    cf_name: Option<String>,
+    /// One PKCS#7 EnvelopedData blob per "permission set".
+    blobs: Vec<Vec<u8>>,
+    /// Per-CF key length override (None = inherit from dict-level).
+    key_length_bits: Option<usize>,
+    /// Per-CF (method, revision) override (None = inherit from
+    /// dict-level via `default_method_revision`).
+    method_revision: Option<(CryptMethod, u8)>,
+}
+
+/// Collect every `/Recipients` candidate the encrypt dict references.
+///
+/// Round 12 generalises the round-10/11 single-CF lookup: we walk
+/// every named crypt filter under `/CF`, surfacing each filter's
+/// `/Recipients` (when present) plus its `/CFM` + `/Length` overrides.
+/// The document-level `/Recipients` slot is also surfaced where
+/// applicable (always for `s3` / `s4`; as a "compatibility-fallback"
+/// for `s5` when no per-CF list matched).
+///
+/// Returned candidates are walked in order — the first one whose
+/// recipient slot matches the user's certificate wins, mirroring ISO
+/// 32000-1 §7.6.4.2's first-match rule.
+fn collect_recipient_arrays(encrypt: &Dict) -> Result<Vec<RecipientCandidate>, PdfError> {
     let lookup = |dict: &Dict, k: &str| {
         dict.entries()
             .iter()
@@ -305,86 +423,121 @@ fn recipients_array(encrypt: &Dict) -> Result<Vec<Vec<u8>>, PdfError> {
         Some(Object::Name(n)) => n,
         _ => return Err(PdfError::other("PDF pubsec: /SubFilter required")),
     };
-    let array = if sub == "adbe.pkcs7.s5" {
-        // /CF /<StmF> /Recipients
-        let stmf = match lookup(encrypt, "StmF") {
-            Some(Object::Name(n)) => n,
-            _ => return Err(PdfError::other("PDF pubsec: s5 requires /StmF")),
-        };
+    let mut out: Vec<RecipientCandidate> = Vec::new();
+
+    if sub == "adbe.pkcs7.s5" {
+        // Walk every CF entry. Track the StmF candidate so it lands
+        // first (callers typically default to the StmF crypt filter).
         let cf = match lookup(encrypt, "CF") {
             Some(Object::Dict(d)) => d,
             _ => return Err(PdfError::other("PDF pubsec: s5 requires /CF dictionary")),
         };
-        let cf_filter = match lookup(&cf, &stmf) {
-            Some(Object::Dict(d)) => d,
-            _ => {
-                return Err(PdfError::other(format!(
-                    "PDF pubsec: /CF/{stmf} not found or not a dict"
-                )))
-            }
+        let stmf_name: Option<String> = match lookup(encrypt, "StmF") {
+            Some(Object::Name(n)) => Some(n),
+            _ => None,
         };
-        match lookup(&cf_filter, "Recipients") {
-            Some(o) => o,
-            _ => {
-                return Err(PdfError::other(format!(
-                    "PDF pubsec: /CF/{stmf}/Recipients missing"
-                )))
+        let mut entries = cf.entries().to_vec();
+        // Move the StmF entry to the front so its candidate is tried
+        // first — round-10 single-CF callers rely on the StmF being
+        // the "default" recipient set.
+        if let Some(name) = stmf_name.as_ref() {
+            if let Some(pos) = entries.iter().position(|(k, _)| k == name) {
+                let entry = entries.remove(pos);
+                entries.insert(0, entry);
+            }
+        }
+        for (name, entry) in &entries {
+            let Object::Dict(filter) = entry else {
+                continue;
+            };
+            let Some(recipients_obj) = lookup(filter, "Recipients") else {
+                continue;
+            };
+            let blobs = recipients_to_blobs(&recipients_obj)?;
+            if blobs.is_empty() {
+                continue;
+            }
+            let cfm = match lookup(filter, "CFM") {
+                Some(Object::Name(n)) => Some(n),
+                _ => None,
+            };
+            let length = match lookup(filter, "Length") {
+                Some(Object::Integer(n)) => Some(n as usize),
+                _ => None,
+            };
+            // Map CFM to (method, revision, default key length).
+            let method_revision = cfm.as_deref().and_then(|c| match c {
+                "V2" => Some((CryptMethod::Rc4, 4u8)),
+                "AESV2" => Some((CryptMethod::Aes128, 4u8)),
+                "AESV3" => Some((CryptMethod::Aes256, 6u8)),
+                _ => None,
+            });
+            let key_length_bits = match cfm.as_deref() {
+                Some("AESV2") => Some(128),
+                Some("AESV3") => Some(256),
+                _ => length.map(|len| {
+                    // /CF /Length is in bytes per Table 25 of ISO
+                    // 32000-1 (the dict-level /Length is in bits).
+                    len * 8
+                }),
+            };
+            out.push(RecipientCandidate {
+                cf_name: Some(name.clone()),
+                blobs,
+                key_length_bits,
+                method_revision,
+            });
+        }
+        // Compatibility fallback: top-level /Recipients (some s5
+        // writers — including round-11's own — emit it for legacy
+        // readers).
+        if let Some(top) = lookup(encrypt, "Recipients") {
+            let blobs = recipients_to_blobs(&top)?;
+            // Avoid duplicating a CF candidate's blobs.
+            let already = out.iter().any(|c| c.blobs == blobs);
+            if !already && !blobs.is_empty() {
+                out.push(RecipientCandidate {
+                    cf_name: None,
+                    blobs,
+                    key_length_bits: None,
+                    method_revision: None,
+                });
             }
         }
     } else {
-        match lookup(encrypt, "Recipients") {
-            Some(o) => o,
-            _ => return Err(PdfError::other("PDF pubsec: /Recipients missing")),
-        }
-    };
+        // s3 / s4 — document-level /Recipients only.
+        let top = lookup(encrypt, "Recipients").ok_or_else(|| {
+            PdfError::other("PDF pubsec: /Recipients missing for s3/s4 SubFilter")
+        })?;
+        let blobs = recipients_to_blobs(&top)?;
+        out.push(RecipientCandidate {
+            cf_name: None,
+            blobs,
+            key_length_bits: None,
+            method_revision: None,
+        });
+    }
+    Ok(out)
+}
 
-    let blobs: Vec<Vec<u8>> = match array {
+fn recipients_to_blobs(array: &Object) -> Result<Vec<Vec<u8>>, PdfError> {
+    match array {
         Object::Array(items) => items
-            .into_iter()
+            .iter()
             .map(|item| match item {
-                Object::LiteralString(s) | Object::HexString(s) => Ok(s),
+                Object::LiteralString(s) | Object::HexString(s) => Ok(s.clone()),
                 other => Err(PdfError::other(format!(
                     "PDF pubsec: /Recipients element must be a string (got {other:?})"
                 ))),
             })
-            .collect::<Result<_, _>>()?,
-        // PDF 2.0 (s5 from-CF) accepts a single string for per-stream
-        // recipients; we treat it as a one-element array here.
-        Object::LiteralString(s) | Object::HexString(s) => vec![s],
-        other => {
-            return Err(PdfError::other(format!(
-                "PDF pubsec: /Recipients must be an array of strings (got {other:?})"
-            )))
-        }
-    };
-    Ok(blobs)
-}
-
-fn key_length_bits(sub: PubSecSubFilter, encrypt: &Dict) -> Result<usize, PdfError> {
-    let dict_len = encrypt
-        .entries()
-        .iter()
-        .find(|(k, _)| k == "Length")
-        .and_then(|(_, v)| {
-            if let Object::Integer(n) = v {
-                Some(*n)
-            } else {
-                None
-            }
-        });
-    let bits = match sub {
-        PubSecSubFilter::Pkcs7S3 => 40,
-        PubSecSubFilter::Pkcs7S4 => 128,
-        PubSecSubFilter::Pkcs7S5V4 { aes } => {
-            if aes {
-                128
-            } else {
-                dict_len.unwrap_or(128) as usize
-            }
-        }
-        PubSecSubFilter::Pkcs7S5V5 => 256,
-    };
-    Ok(bits)
+            .collect(),
+        // PDF 2.0 accepts a single string for per-stream recipients;
+        // surface as a one-element list.
+        Object::LiteralString(s) | Object::HexString(s) => Ok(vec![s.clone()]),
+        other => Err(PdfError::other(format!(
+            "PDF pubsec: /Recipients must be an array of strings (got {other:?})"
+        ))),
+    }
 }
 
 /// Find a recipient slot in `envelope` whose RecipientIdentifier

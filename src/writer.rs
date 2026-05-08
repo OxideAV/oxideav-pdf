@@ -689,6 +689,78 @@ pub fn write_pdf_from_scene_pubsec_encrypted(
     Ok(out)
 }
 
+/// Round-12 sibling of [`write_pdf_from_scene_pubsec_encrypted`] —
+/// emits a public-key-encrypted PDF whose `/CF` dict carries
+/// **multiple named crypt filters**, one per
+/// [`crate::pubsec::PubSecCfGroup`]. Each group has its own
+/// permission mask + recipient list, so different recipients see
+/// different access rights.
+///
+/// Per ISO 32000-1 §7.6.4.2 + §7.6.5.4: "There shall be one PKCS#7
+/// object per unique set of access permissions". The first group's
+/// CF name becomes `/StmF` + `/StrF` (so any recognised reader can
+/// open the document); per-CF differences surface only via
+/// [`crate::pubsec::open_with_certificate_with_permissions`] on the
+/// reader side.
+pub fn write_pdf_from_scene_pubsec_multi_cf(
+    scene: &Scene,
+    config: crate::pubsec::PubSecMultiCfConfig,
+) -> Result<Vec<u8>, PdfError> {
+    let pages = scene
+        .pages
+        .as_ref()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            PdfError::other(
+                "write_pdf_from_scene_pubsec_multi_cf: scene is not in pages mode (scene.pages is None or empty)",
+            )
+        })?;
+
+    struct Rendered<'a> {
+        frame: &'a VectorFrame,
+        width: f32,
+        height: f32,
+        content_bytes: Vec<u8>,
+        resources: ResourceCollector,
+    }
+    let rendered: Vec<Rendered<'_>> = pages
+        .iter()
+        .map(|page| {
+            let (content_bytes, resources) = render_frame(&page.content);
+            Rendered {
+                frame: &page.content,
+                width: page.width,
+                height: page.height,
+                content_bytes,
+                resources,
+            }
+        })
+        .collect();
+    let inputs: Vec<PageInput<'_>> = rendered
+        .into_iter()
+        .map(|r| PageInput {
+            width: r.width,
+            height: r.height,
+            content_bytes: r.content_bytes,
+            resources: r.resources,
+            frame: r.frame,
+        })
+        .collect();
+
+    let mut doc = Document::new();
+    let _ = build_pages(&mut doc, inputs);
+    if has_metadata(&scene.metadata) {
+        let info_id = doc.add(Object::Dict(build_info_dict(&scene.metadata)));
+        doc.info = Some(info_id);
+    }
+    let pubsec_state = config.build()?;
+    doc.encryption = Some(pubsec_state.into_encryption_state());
+
+    let mut out = Vec::with_capacity(4096);
+    doc.write_to(&mut out)?;
+    Ok(out)
+}
+
 /// Walk a single [`VectorFrame`] into a content stream + the per-page
 /// [`ResourceCollector`]. Shared by [`write_pdf`] and
 /// [`write_pdf_from_scene`].

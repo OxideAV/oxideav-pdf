@@ -118,9 +118,14 @@ let pdf = write_pdf_from_scene_pubsec_encrypted(&scene, &cfg)?;
 ```
 
 `PubSecRecipient` also exposes `from_subject_key_identifier(ski, key)`
-for the CMS v2 form. Per-crypt-filter recipient lists (multiple
-permission sets per file) and `RC2 / 3DES / DES` envelope content
-algorithms are deferred.
+for the CMS v2 form. Round 12 adds **per-crypt-filter recipient
+lists** — `write_pdf_from_scene_pubsec_multi_cf` + `PubSecMultiCfConfig`
++ `PubSecCfGroup` emit a doc with multiple permission sets (each its
+own envelope), and `open_with_certificate_with_permissions` surfaces
+the matched recipient's permission mask. Round 12 also lands the
+**CMS KARI decoder** (RFC 5652 §6.2.2) — KeyAgree (ECDH/DH) recipients
+parse structurally; unwrap stays deferred. `RC2 / 3DES / DES` envelope
+content algorithms remain out of scope.
 
 ## Encryption encode (writer side)
 
@@ -221,11 +226,10 @@ fully-formed (if empty) layout. Generic (F.4.5) and named-destination
   CIDFont built via `oxideav-ttf`/`oxideav-otf`).
 - JPEG passthrough on `ImageRef` (DCTDecode XObject) — needs core
   IR support for "raw codec bytes" alongside the decoded VideoFrame.
-- Per-crypt-filter recipient lists for public-key encrypted PDFs
-  (multiple permission sets per file — round 11 wires the
-  document-level + single-StmF crypt-filter `Recipients` slots).
 - Generic / named-destination hint tables (F.4.5 / F.4.6) for
   linearized output.
+- CMS KARI *unwrap* (DH/ECDH key agreement + RFC 5753 KDFs) — round
+  12 surfaces the KARI structure but doesn't unwrap.
 - Transparency groups beyond a per-`Group` `/ca`+`/CA` opacity.
 
 ## Usage

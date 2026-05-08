@@ -312,6 +312,326 @@ impl PubSecEncryptionState {
     }
 }
 
+// ───────── Round-12: per-permission-set recipient lists ─────────
+
+/// One permission-set inside a public-key-encrypted PDF. Each group
+/// emits one PKCS#7 `EnvelopedData` whose plaintext carries the
+/// supplied permission mask `p`; only the recipients listed here can
+/// open with those permissions.
+///
+/// Per ISO 32000-1 §7.6.4.2 + §7.6.5.4: "There shall be one PKCS#7
+/// object per unique set of access permissions; if a recipient appears
+/// in more than one list, the permissions used shall be those in the
+/// first matching list." The file encryption key is derived from
+/// `SHA(seed_of_matched_envelope ‖ all_envelope_blobs_in_array_order)`
+/// — every envelope in the `/Recipients` array contributes to the
+/// hash regardless of which one matched, so all recipients share the
+/// same per-object encryption key while seeing different permissions.
+///
+/// The round-12 multi-CF encoder ALSO supports separate
+/// [`PubSecMultiCfConfig::cf_groups`] when the caller wants the
+/// `/CF` dict to enumerate distinct CRYPT FILTERS (each with its
+/// own list); see [`PubSecMultiCfConfig`] for the shape.
+#[derive(Debug, Clone)]
+pub struct PubSecCfGroup {
+    /// Name under `/CF` — typically a descriptive label like
+    /// `OwnerCryptFilter` or `ReadOnlyCryptFilter`. Must match the
+    /// dictionary-key ASCII alphabet (no `/` prefix; the encoder adds
+    /// it).
+    pub name: String,
+    /// Permission mask for this group (4-byte signed integer per ISO
+    /// 32000-1 §7.6.3.2 Table 22).
+    pub p: i32,
+    /// Recipients allowed to open with this permission set. The same
+    /// recipient may appear in multiple groups; the round-12 reader's
+    /// first-CF-match rule applies (the group order is the order
+    /// supplied here, with the StmF entry sorted to the front).
+    pub recipients: Vec<PubSecRecipient>,
+    /// Per-group seed (round-trips deterministically; production
+    /// callers should override with fresh random per group).
+    pub seed: [u8; 20],
+    /// Per-group content-encryption key. Length must match the parent
+    /// config's SubFilter (16 / 32 bytes).
+    pub cek: Vec<u8>,
+    /// Per-group AES-CBC envelope IV (s5 only).
+    pub envelope_iv: [u8; 16],
+}
+
+impl PubSecCfGroup {
+    /// Convenience constructor: full access (`p = -4`) for AES-256.
+    pub fn full_access_aes256(name: impl Into<String>, recipients: Vec<PubSecRecipient>) -> Self {
+        Self {
+            name: name.into(),
+            p: -4,
+            recipients,
+            seed: [0xA1; 20],
+            cek: vec![0xCAu8; 32],
+            envelope_iv: [0x77; 16],
+        }
+    }
+
+    /// Convenience constructor: read-only (`p` clears the print + modify
+    /// + extract bits per Table 22). The mask `0xFFFF_F0BF` corresponds
+    ///   to "view + accessibility-extract only".
+    pub fn read_only_aes256(name: impl Into<String>, recipients: Vec<PubSecRecipient>) -> Self {
+        Self {
+            name: name.into(),
+            p: i32::from_be_bytes([0xFF, 0xFF, 0xF0, 0xBF]),
+            recipients,
+            seed: [0xB2; 20],
+            cek: vec![0xDBu8; 32],
+            envelope_iv: [0x88; 16],
+        }
+    }
+}
+
+/// Configuration for a multi-permission-set public-key-encrypted PDF
+/// — one `EnvelopedData` per [`PubSecCfGroup`], all threaded into a
+/// single `/Recipients` array (which is itself referenced from one
+/// or more `/CF` entries).
+///
+/// Every group's envelope wraps the SAME 20-byte seed and the SAME
+/// content-encryption key (per ISO 32000-1 §7.6.4.3 / ISO 32000-2
+/// §7.6.5.3 — the file encryption key is derived from
+/// `SHA(seed ‖ ALL recipient blobs)`, so the seed must be identical
+/// across envelopes for every reader to converge on the same file
+/// key). Per-recipient differences surface only as different
+/// permission masks in each envelope's plaintext trailer.
+#[derive(Debug, Clone)]
+pub struct PubSecMultiCfConfig {
+    /// Symmetric algorithm + key size — `s5` only. `s3` / `s4` reject
+    /// at build time.
+    pub sub_filter: PubSecSubFilter,
+    /// Whether the document metadata stream is encrypted.
+    pub encrypt_metadata: bool,
+    /// One permission-set per `PubSecCfGroup`. Must contain at least
+    /// one group; the first group's name becomes the dict-level
+    /// `/StmF` + `/StrF` CF entry. The CFs all reference the same
+    /// `/Recipients` array (containing every group's envelope), so
+    /// any matching recipient — regardless of which CF they were
+    /// nominally tied to — recovers the file key. Each group's
+    /// `seed` field is overridden by `shared_seed` at build time to
+    /// guarantee key-derivation convergence; the per-group `seed`
+    /// slot stays in the API for forward compatibility (round-13
+    /// might add per-stream key streams).
+    pub groups: Vec<PubSecCfGroup>,
+    /// Per-object AES IV (round-trip determinism only).
+    pub aes_iv: [u8; 16],
+    /// Shared content-encryption key bytes — must match the
+    /// SubFilter's key length (16 for AES-128, 32 for AES-256).
+    pub shared_cek: Vec<u8>,
+    /// Shared 20-byte seed mixed into the file-key derivation. Must
+    /// match across every envelope or the multi-recipient story
+    /// breaks (different recipients would derive different file
+    /// keys). Defaulted by the test fixtures to `[0xA1; 20]`.
+    pub shared_seed: [u8; 20],
+}
+
+impl PubSecMultiCfConfig {
+    /// Build the writer-side state. Every group's envelope wraps the
+    /// SAME shared CEK to that group's recipients with that group's
+    /// permission mask; all envelopes go into one `/Recipients`
+    /// array. The file encryption key is derived from
+    /// `SHA(seed_of_first_group ‖ all_envelopes)` per §7.6.4.3 /
+    /// §7.6.5.3.
+    pub fn build(self) -> Result<PubSecEncryptionState, PdfError> {
+        if self.groups.is_empty() {
+            return Err(PdfError::other(
+                "PDF pubsec multi-CF: at least one group required",
+            ));
+        }
+        if !matches!(
+            self.sub_filter,
+            PubSecSubFilter::Pkcs7S5V4 { .. } | PubSecSubFilter::Pkcs7S5V5
+        ) {
+            return Err(PdfError::other(
+                "PDF pubsec multi-CF: only s5 SubFilters support per-CF recipients",
+            ));
+        }
+        let key_length_bits = key_length_bits(self.sub_filter);
+        let n = key_length_bits / 8;
+        if self.shared_cek.len() != n {
+            return Err(PdfError::other(format!(
+                "PDF pubsec multi-CF: shared CEK must be {} bytes (got {})",
+                n,
+                self.shared_cek.len()
+            )));
+        }
+        for g in &self.groups {
+            if g.recipients.is_empty() {
+                return Err(PdfError::other(format!(
+                    "PDF pubsec multi-CF: group {} has no recipients",
+                    g.name
+                )));
+            }
+        }
+        let mut group_envelopes: Vec<Vec<u8>> = Vec::with_capacity(self.groups.len());
+        for g in &self.groups {
+            let mut plaintext = Vec::with_capacity(24);
+            // The seed is SHARED across every envelope so every
+            // reader (regardless of which envelope matched) hashes
+            // over the same input and derives the same file key.
+            plaintext.extend_from_slice(&self.shared_seed);
+            // ISO 32000-2 stores MSB-first for V=5; ISO 32000-1
+            // (V≤4) stores LSB-first.
+            let p_bytes = match self.sub_filter {
+                PubSecSubFilter::Pkcs7S5V5 => (g.p as u32).to_be_bytes(),
+                _ => (g.p as u32).to_le_bytes(),
+            };
+            plaintext.extend_from_slice(&p_bytes);
+            // Each recipient gets its own RSA-wrap of the SHARED CEK.
+            let mut slots: Vec<RecipientPlain> = Vec::with_capacity(g.recipients.len());
+            for r in &g.recipients {
+                let encrypted_key = rsa_pkcs1_encrypt(&r.public_key, &self.shared_cek)?;
+                slots.push(RecipientPlain {
+                    rid: r.rid.clone(),
+                    encrypted_key,
+                });
+            }
+            let envelope = match self.sub_filter {
+                PubSecSubFilter::Pkcs7S5V4 { aes: false } => {
+                    super::cms_build::build_envelope_rc4(&slots, &plaintext, &self.shared_cek)
+                }
+                PubSecSubFilter::Pkcs7S5V4 { aes: true } => {
+                    let cek16: [u8; 16] =
+                        self.shared_cek.as_slice().try_into().map_err(|_| {
+                            PdfError::other("PDF pubsec multi-CF: AES-128 CEK length")
+                        })?;
+                    super::cms_build::build_envelope_aes128(
+                        &slots,
+                        &plaintext,
+                        &cek16,
+                        &g.envelope_iv,
+                    )
+                }
+                PubSecSubFilter::Pkcs7S5V5 => {
+                    let cek32: [u8; 32] =
+                        self.shared_cek.as_slice().try_into().map_err(|_| {
+                            PdfError::other("PDF pubsec multi-CF: AES-256 CEK length")
+                        })?;
+                    super::cms_build::build_envelope_aes256(
+                        &slots,
+                        &plaintext,
+                        &cek32,
+                        &g.envelope_iv,
+                    )
+                }
+                _ => unreachable!(),
+            };
+            group_envelopes.push(envelope);
+        }
+        // File-encryption key — derived from the SHARED seed hashed
+        // over EVERY envelope in declaration order. Any reader who
+        // matches a slot in ANY envelope recovers the same key
+        // because the seed is identical across envelopes and they
+        // all hash over the full envelope set.
+        let file_key = derive_file_key(
+            self.sub_filter,
+            &self.shared_seed,
+            &group_envelopes,
+            self.encrypt_metadata,
+            key_length_bits,
+        );
+        let (method, revision) = match self.sub_filter {
+            PubSecSubFilter::Pkcs7S5V4 { aes } => (
+                if aes {
+                    CryptMethod::Aes128
+                } else {
+                    CryptMethod::Rc4
+                },
+                4u8,
+            ),
+            PubSecSubFilter::Pkcs7S5V5 => (CryptMethod::Aes256, 6),
+            _ => unreachable!(),
+        };
+        let handler = StandardHandler {
+            key: file_key,
+            method,
+            revision,
+        };
+        let encrypt_dict = build_multi_cf_encrypt_dict(
+            self.sub_filter,
+            self.encrypt_metadata,
+            &self.groups,
+            &group_envelopes,
+            key_length_bits,
+        )?;
+        Ok(PubSecEncryptionState {
+            handler,
+            encrypt_dict,
+            aes_iv: self.aes_iv,
+            file_id: b"OXIDEAV-PUBSEC-MULTICF-ID-12345!".to_vec(),
+        })
+    }
+}
+
+/// Build the `/Encrypt` dictionary literal for a multi-permission-set
+/// public-key-encrypted PDF.
+///
+/// Each named CF in the `/CF` dict carries the FULL `/Recipients`
+/// array (every envelope, not just that CF's own group). This is the
+/// only shape that lets every reader — regardless of which envelope
+/// they matched — derive the same file encryption key per ISO 32000-1
+/// §7.6.4.3 (the hash is over the entire ordered envelope set).
+///
+/// Readers tell which CF they're "in" by which envelope they matched:
+/// the round-12 match path exposes `crypt_filter_name` so the caller
+/// can map matched-envelope index → CF group.
+fn build_multi_cf_encrypt_dict(
+    sub_filter: PubSecSubFilter,
+    encrypt_metadata: bool,
+    groups: &[PubSecCfGroup],
+    envelopes: &[Vec<u8>],
+    key_length_bits: usize,
+) -> Result<Dict, PdfError> {
+    let (sub_filter_name, v, r, cfm) = match sub_filter {
+        PubSecSubFilter::Pkcs7S5V4 { aes: true } => ("adbe.pkcs7.s5", 4, 4, "AESV2"),
+        PubSecSubFilter::Pkcs7S5V4 { aes: false } => ("adbe.pkcs7.s5", 4, 4, "V2"),
+        PubSecSubFilter::Pkcs7S5V5 => ("adbe.pkcs7.s5", 5, 6, "AESV3"),
+        _ => {
+            return Err(PdfError::other(
+                "PDF pubsec multi-CF: only s5 SubFilters supported",
+            ))
+        }
+    };
+    let cf_length_bytes = (key_length_bits / 8) as i64;
+    // Each CF entry holds the SAME (full) /Recipients array — only
+    // the per-envelope permission masks differ. This shape mirrors
+    // the way Adobe Acrobat emits multi-permission PPKLite docs.
+    let full_recipients = Object::Array(
+        envelopes
+            .iter()
+            .map(|e| Object::LiteralString(e.clone()))
+            .collect(),
+    );
+    let mut cf = Dict::new();
+    for g in groups {
+        let inner = Dict::new()
+            .with("Type", Object::Name("CryptFilter".into()))
+            .with("CFM", Object::Name(cfm.into()))
+            .with("Length", Object::Integer(cf_length_bytes))
+            .with("Recipients", full_recipients.clone());
+        cf.set(&g.name, Object::Dict(inner));
+    }
+    let stmf_name = groups[0].name.clone();
+    let mut dict = Dict::new()
+        .with("Filter", Object::Name("Adobe.PPKLite".into()))
+        .with("SubFilter", Object::Name(sub_filter_name.into()))
+        .with("V", Object::Integer(v))
+        .with("R", Object::Integer(r))
+        .with("Length", Object::Integer(key_length_bits as i64))
+        // Dict-level /P is the FIRST group's permission mask
+        // (round-trippable via the round-12 multi-match path).
+        .with("P", Object::Integer(groups[0].p as i64))
+        .with("CF", Object::Dict(cf))
+        .with("StmF", Object::Name(stmf_name.clone()))
+        .with("StrF", Object::Name(stmf_name));
+    if !encrypt_metadata {
+        dict.set("EncryptMetadata", Object::Bool(false));
+    }
+    Ok(dict)
+}
+
 fn key_length_bits(sub: PubSecSubFilter) -> usize {
     match sub {
         PubSecSubFilter::Pkcs7S3 => 40,
