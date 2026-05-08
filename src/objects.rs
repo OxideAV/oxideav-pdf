@@ -10,6 +10,7 @@
 
 use std::io::{self, Write};
 
+use crate::encrypt::EncryptionState;
 use crate::error::PdfError;
 
 /// A PDF "any" value — every primitive plus the composite ones.
@@ -134,6 +135,13 @@ pub struct Document {
     /// allows arbitrary additional keys, used by the round-2 writer
     /// to round-trip custom scene metadata.
     pub info: Option<ObjectId>,
+    /// Optional encryption state. When set, every string and stream
+    /// payload in the body is encrypted via the standard handler
+    /// (Algorithms 1 + 4/5 / 8/9 / etc.) and the trailer carries
+    /// `/Encrypt <n> 0 R` + a matching `/ID` array. The dictionary
+    /// itself (the Encrypt object) is **not** encrypted — see
+    /// ISO 32000-1 §7.6.1.
+    pub encryption: Option<EncryptionState>,
 }
 
 impl Document {
@@ -143,6 +151,7 @@ impl Document {
             next_id: 1,
             root: None,
             info: None,
+            encryption: None,
         }
     }
 
@@ -186,13 +195,52 @@ impl Document {
         // binary so PDF readers don't treat it as ASCII (ISO 32000-1
         // §7.5.2). Any byte ≥0x80 satisfies the rule; we use 0xE2 0xE3
         // 0xCF 0xD3 — the canonical pdftk / Acrobat marker.
-        out.extend_from_slice(b"%PDF-1.4\n");
+        let header_version: &[u8] = if self
+            .encryption
+            .as_ref()
+            .map(|e| e.handler.revision >= 5)
+            .unwrap_or(false)
+        {
+            // V=5 was introduced in PDF 1.7 + ISO 32000-2 (2.0). Bump
+            // the magic so PDF 2.0 readers don't flag the file as
+            // pre-1.7-using-1.7-features.
+            b"%PDF-2.0\n"
+        } else {
+            b"%PDF-1.4\n"
+        };
+        out.extend_from_slice(header_version);
         out.extend_from_slice(b"%\xE2\xE3\xCF\xD3\n");
+
+        // If encrypted, allocate an Encrypt indirect object so its body
+        // is interleaved with the rest. We do this on a clone so the
+        // public Document state stays unchanged. The Encrypt object
+        // itself is **not** encrypted (§7.6.1).
+        let mut objects_to_emit: Vec<IndirectObject> = self.objects.clone();
+        let encrypt_id_opt: Option<ObjectId> = if let Some(state) = &self.encryption {
+            let next_id = self.objects.iter().map(|o| o.id.number).max().unwrap_or(0) + 1;
+            let id = ObjectId::new(next_id);
+            // Apply per-object encryption to the cloned object list,
+            // mutating leaf strings and stream bodies in place. We do
+            // this BEFORE pushing the Encrypt indirect object so the
+            // Encrypt-object payload itself is left untouched (§7.6.1).
+            for ind in &mut objects_to_emit {
+                encrypt_object_in_place(&mut ind.object, ind.id, state)?;
+            }
+            // Push the /Encrypt indirect object now so it gets an
+            // xref slot.
+            objects_to_emit.push(IndirectObject {
+                id,
+                object: Object::Dict(state.encrypt_dict.clone()),
+            });
+            Some(id)
+        } else {
+            None
+        };
 
         // ---- Body -----------------------------------------------------
         // Sort by id so the xref subsection slot table lines up neatly.
-        let mut sorted = self.objects.iter().collect::<Vec<_>>();
-        sorted.sort_by_key(|o| o.id.number);
+        objects_to_emit.sort_by_key(|o| o.id.number);
+        let sorted: Vec<&IndirectObject> = objects_to_emit.iter().collect();
 
         // Offsets[i] = byte offset of the indirect object whose id is
         // (i+1). Slot 0 of the xref is reserved for the head of the
@@ -230,6 +278,17 @@ impl Document {
         if let Some(info_id) = self.info {
             trailer_dict.set("Info", Object::Reference(info_id));
         }
+        if let (Some(eid), Some(state)) = (encrypt_id_opt, &self.encryption) {
+            trailer_dict.set("Encrypt", Object::Reference(eid));
+            // /ID is required when /Encrypt is present (§7.5.5 + §7.6.3.3).
+            // We emit ID[0] == ID[1] (no incremental updates → both
+            // halves point to the same permanent identifier).
+            let id_array = Object::Array(vec![
+                Object::LiteralString(state.file_id.clone()),
+                Object::LiteralString(state.file_id.clone()),
+            ]);
+            trailer_dict.set("ID", id_array);
+        }
         let trailer = Object::Dict(trailer_dict);
         write_object(out, &trailer).map_err(PdfError::Io)?;
         out.extend_from_slice(b"\nstartxref\n");
@@ -238,6 +297,60 @@ impl Document {
 
         Ok(())
     }
+}
+
+/// Recursively encrypt every literal/hex string and stream payload in
+/// `obj`, in place, using the per-object key derivation associated with
+/// `id`. Numeric / boolean / name / reference values pass through
+/// unchanged. Nested dicts and arrays are walked recursively so nested
+/// strings (e.g. `/Title (...)` inside an /Info dict) are encrypted.
+fn encrypt_object_in_place(
+    obj: &mut Object,
+    id: ObjectId,
+    state: &EncryptionState,
+) -> Result<(), PdfError> {
+    match obj {
+        Object::LiteralString(s) | Object::HexString(s) => {
+            *s = state.handler.encrypt_object(id, s, &state.aes_iv)?;
+        }
+        Object::Array(items) => {
+            for item in items {
+                encrypt_object_in_place(item, id, state)?;
+            }
+        }
+        Object::Dict(d) => {
+            encrypt_dict_in_place(d, id, state)?;
+        }
+        Object::Stream(s) => {
+            // Recurse into the dict for any nested string values.
+            encrypt_dict_in_place(&mut s.dict, id, state)?;
+            // Encrypt the stream body. Note: per §7.6.1, the
+            // body-already-Filter-encoded layer is what gets encrypted —
+            // FlateDecode etc. are applied first, then the bytes are
+            // ciphered.
+            s.data = state.handler.encrypt_object(id, &s.data, &state.aes_iv)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn encrypt_dict_in_place(
+    d: &mut Dict,
+    id: ObjectId,
+    state: &EncryptionState,
+) -> Result<(), PdfError> {
+    let mut new_entries: Vec<(String, Object)> = Vec::with_capacity(d.entries().len());
+    for (k, v) in d.entries() {
+        let mut v = v.clone();
+        encrypt_object_in_place(&mut v, id, state)?;
+        new_entries.push((k.clone(), v));
+    }
+    *d = Dict::default();
+    for (k, v) in new_entries {
+        d.set(&k, v);
+    }
+    Ok(())
 }
 
 fn write_indirect(out: &mut Vec<u8>, ind: &IndirectObject) -> io::Result<()> {

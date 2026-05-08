@@ -131,6 +131,34 @@ impl StandardHandler {
         }
     }
 
+    /// Encrypt the cleartext payload of an indirect object — the inverse
+    /// of [`Self::decrypt_object`] used by the writer to populate `/Encrypt`-
+    /// protected strings + streams. RC4 is symmetric (so this re-uses
+    /// [`rc4`]); AES uses a fresh IV which must be embedded as the
+    /// leading 16 bytes of the ciphertext per §7.6.2.
+    ///
+    /// `iv` (only consulted for `Aes128` / `Aes256`) lets fixture builders
+    /// pin the IV for byte-for-byte deterministic outputs. Production
+    /// callers pass a per-call-randomised IV.
+    pub fn encrypt_object(
+        &self,
+        id: ObjectId,
+        data: &[u8],
+        iv: &[u8; 16],
+    ) -> Result<Vec<u8>, PdfError> {
+        match self.method {
+            CryptMethod::Rc4 => {
+                let obj_key = self.object_key(id);
+                Ok(rc4(&obj_key, data))
+            }
+            CryptMethod::Aes128 => {
+                let obj_key = self.object_key(id);
+                aes128_cbc_encrypt(&obj_key, data, iv)
+            }
+            CryptMethod::Aes256 => aes256_cbc_encrypt(&self.key, data, iv),
+        }
+    }
+
     /// Algorithm 1: derive the per-object encryption key for V≤4.
     ///
     /// `extended = key ‖ obj_num_le3 ‖ gen_le2 [‖ "sAlT" if AES]` →
@@ -669,6 +697,56 @@ fn aes256_cbc_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, PdfError> {
         .decrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(&mut buf)
         .map_err(|e| PdfError::other(format!("PDF decrypt: AES-256 padding error: {e:?}")))?;
     Ok(pt.to_vec())
+}
+
+/// Encrypt with AES-256 CBC (PKCS#7 padding), prepending the IV. The
+/// inverse of [`aes256_cbc_decrypt`].
+fn aes256_cbc_encrypt(key: &[u8], data: &[u8], iv: &[u8; 16]) -> Result<Vec<u8>, PdfError> {
+    use aes::cipher::{BlockEncryptMut, KeyIvInit};
+    type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+    if key.len() != 32 {
+        return Err(PdfError::other(format!(
+            "PDF encrypt: AES-256 expects a 32-byte key (got {} bytes)",
+            key.len()
+        )));
+    }
+    let enc = Aes256CbcEnc::new(key.into(), iv.into());
+    let pad_block = (data.len() / 16) + 1;
+    let mut buf = vec![0u8; pad_block * 16];
+    let n = enc
+        .encrypt_padded_b2b_mut::<aes::cipher::block_padding::Pkcs7>(data, &mut buf)
+        .map_err(|e| PdfError::other(format!("PDF encrypt: AES-256 padding error: {e:?}")))?
+        .len();
+    buf.truncate(n);
+    let mut out = Vec::with_capacity(16 + n);
+    out.extend_from_slice(iv);
+    out.extend_from_slice(&buf);
+    Ok(out)
+}
+
+/// Encrypt with AES-128 CBC (PKCS#7 padding), prepending the IV. The
+/// inverse of [`aes128_cbc_decrypt`].
+fn aes128_cbc_encrypt(key: &[u8], data: &[u8], iv: &[u8; 16]) -> Result<Vec<u8>, PdfError> {
+    use aes::cipher::{BlockEncryptMut, KeyIvInit};
+    type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
+    if key.len() != 16 {
+        return Err(PdfError::other(format!(
+            "PDF encrypt: AES-128 expects a 16-byte key (got {} bytes)",
+            key.len()
+        )));
+    }
+    let enc = Aes128CbcEnc::new(key.into(), iv.into());
+    let pad_block = (data.len() / 16) + 1;
+    let mut buf = vec![0u8; pad_block * 16];
+    let n = enc
+        .encrypt_padded_b2b_mut::<aes::cipher::block_padding::Pkcs7>(data, &mut buf)
+        .map_err(|e| PdfError::other(format!("PDF encrypt: AES-128 padding error: {e:?}")))?
+        .len();
+    buf.truncate(n);
+    let mut out = Vec::with_capacity(16 + n);
+    out.extend_from_slice(iv);
+    out.extend_from_slice(&buf);
+    Ok(out)
 }
 
 /// Decrypt an AES-128-CBC blob whose first 16 bytes are the IV

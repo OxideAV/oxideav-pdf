@@ -5,17 +5,21 @@
 //! the end of the file), then parses the cross-reference subsection
 //! list at that offset and the immediately-following trailer dict.
 //!
-//! Round 3 supports only **plain** xref tables (the `xref` keyword
-//! followed by subsection headers and 20-byte entry lines, per §7.5.4).
-//! Cross-reference *streams* (PDF 1.5+ — `/Type /XRef`) are deferred
-//! to round 4+; see the crate README for the full list of round-3
-//! deferrals.
+//! Two flavours of cross-reference table are accepted:
+//!
+//! * **Plain xref** (PDF 1.0..1.4) — the `xref` keyword followed by
+//!   subsection headers and 20-byte entry lines, per §7.5.4.
+//! * **XRef stream** (PDF 1.5+, §7.5.8) — the startxref offset points
+//!   at an indirect object whose body is a stream with `/Type /XRef`,
+//!   `/W [w1 w2 w3]` field widths, optional `/Index`, and optional
+//!   `/Predictor 12` PNG-up filter on a `/FlateDecode` body. The
+//!   stream's dict carries the same trailer-dict slots as the plain
+//!   variant (`/Size`, `/Root`, `/Info`, `/Prev`, `/Encrypt`, `/ID`).
 //!
 //! [`XrefTable`] turns into a [`Document`] of resolved indirect
-//! objects via [`Document::from_bytes`] (round-3 commit 5). The
-//! intermediate type lets the upcoming top-level walker resolve
-//! indirect references on demand without re-parsing every object up
-//! front.
+//! objects via the top-level walker — the intermediate type lets the
+//! reader resolve indirect references on demand without re-parsing
+//! every object up front.
 
 use std::collections::HashMap;
 
@@ -24,18 +28,28 @@ use crate::objects::{Dict, Object, ObjectId};
 use crate::reader::lex::{Lexer, TokenKind};
 use crate::reader::parse::Parser;
 
-/// One slot in the cross-reference table (§7.5.4 `Table 18`).
+/// One slot in the cross-reference table (§7.5.4 `Table 18` for plain
+/// xref; §7.5.8 `Table 18` for the XRef-stream form which adds
+/// `Compressed`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XrefEntry {
     /// Free entry — points to the next free object via `next` and
     /// carries the generation number to use if the slot is reused.
-    /// Round 3 doesn't read free entries beyond noting they exist;
-    /// the head-of-list `0 65535 f` is the only `Free` we ever
+    /// The head-of-list `0 65535 f` is the only `Free` we ever
     /// expect to encounter in writer-generated PDFs.
     Free { next: u32, generation: u16 },
     /// In-use entry — the indirect object is at `offset` bytes from
     /// the start of the file, with the given generation number.
     InUse { offset: u64, generation: u16 },
+    /// Type 2 entry from an XRef stream — the object lives inside an
+    /// object-stream container at `obj_stream_id`, occupying the slot
+    /// at `index_within_stream`. The reader doesn't yet decode object
+    /// streams (PDF 1.5+ `/Type /ObjStm`), but recording the entry
+    /// keeps the xref shape lossless.
+    Compressed {
+        obj_stream_id: u32,
+        index_within_stream: u32,
+    },
 }
 
 /// A parsed cross-reference table + trailer dict.
@@ -51,7 +65,8 @@ pub struct XrefTable {
 
 impl XrefTable {
     /// Look up the byte offset of an object by id. `None` if the id
-    /// doesn't appear in the xref or its slot is `Free`.
+    /// doesn't appear in the xref or its slot is `Free` / `Compressed`
+    /// (the reader can't yet resolve compressed objects).
     pub fn offset_of(&self, id: ObjectId) -> Option<u64> {
         match self.entries.get(&id.number)? {
             XrefEntry::InUse { offset, generation } if *generation == id.generation => {
@@ -136,7 +151,8 @@ pub fn find_startxref_offset(input: &[u8]) -> Result<u64, PdfError> {
 }
 
 /// Parse the cross-reference table at `xref_offset` and the trailer
-/// dict that follows it.
+/// dict that follows it. Accepts both the plain `xref`-keyword form
+/// (PDF 1.0..1.4, §7.5.4) and the XRef-stream form (PDF 1.5+, §7.5.8).
 pub fn parse_xref_at(input: &[u8], xref_offset: u64) -> Result<XrefTable, PdfError> {
     let xref_pos = xref_offset as usize;
     if xref_pos >= input.len() {
@@ -149,13 +165,19 @@ pub fn parse_xref_at(input: &[u8], xref_offset: u64) -> Result<XrefTable, PdfErr
     let mut lex = Lexer::new(input);
     lex.seek(xref_pos);
 
-    // First token must be the `xref` keyword.
+    // First token decides the flavour: `xref` keyword → plain table,
+    // integer (the `<n> <gen> obj` of an XRef stream object) → §7.5.8.
     let kw = lex
         .next_token()?
         .ok_or_else(|| PdfError::other("PDF reader: empty xref table"))?;
+    if let TokenKind::Integer(_) = kw.kind {
+        // XRef stream: re-anchor and parse the indirect object at the
+        // offset, then translate its body into a [`XrefTable`].
+        return parse_xref_stream_at(input, xref_pos);
+    }
     let TokenKind::Keyword(b"xref") = kw.kind else {
         return Err(PdfError::other(format!(
-            "PDF reader: expected `xref` keyword at offset {xref_offset} (got {:?})",
+            "PDF reader: expected `xref` keyword or XRef stream object at offset {xref_offset} (got {:?})",
             kw.kind
         )));
     };
@@ -281,6 +303,408 @@ fn parse_xref_entry(bytes: &[u8], at: usize) -> Result<XrefEntry, PdfError> {
             other as char
         ))),
     }
+}
+
+/// Parse a PDF 1.5+ XRef stream object (§7.5.8) at the given byte
+/// offset. Returns the same [`XrefTable`] shape the plain-xref parser
+/// produces — the trailer dict pulls from the stream object's own
+/// dictionary, and entries are decoded from the binary `/W`-formatted
+/// body (after applying `/Filter` decoding + `/DecodeParms /Predictor`
+/// reversal where present).
+fn parse_xref_stream_at(input: &[u8], xref_pos: usize) -> Result<XrefTable, PdfError> {
+    let mut p = Parser::new(input);
+    p.lexer_mut().seek(xref_pos);
+    let (_obj_id, body) = p.parse_indirect()?;
+    let stream = match body {
+        Object::Stream(s) => s,
+        other => {
+            return Err(PdfError::other(format!(
+                "PDF reader: XRef stream object must be a Stream (got {other:?})"
+            )));
+        }
+    };
+
+    // The stream dict carries:
+    //   /Type /XRef
+    //   /Size  N            (one past the largest object number)
+    //   /W     [w1 w2 w3]   (byte widths of the three fields per entry)
+    //   /Index [s1 c1 ...]  (subsection list; default [0 Size])
+    //   /Filter /FlateDecode
+    //   /DecodeParms << /Predictor 12 /Columns N >> (optional)
+    //   plus the standard trailer keys: /Root, /Info, /Encrypt, /Prev, /ID
+    let dict = &stream.dict;
+    let lookup = |k: &str| {
+        dict.entries()
+            .iter()
+            .find(|(kk, _)| kk == k)
+            .map(|(_, v)| v.clone())
+    };
+
+    if !matches!(lookup("Type"), Some(Object::Name(ref n)) if n == "XRef") {
+        return Err(PdfError::other(
+            "PDF reader: XRef stream object missing /Type /XRef",
+        ));
+    }
+    let size = match lookup("Size") {
+        Some(Object::Integer(n)) if n >= 0 => n as u32,
+        _ => return Err(PdfError::other("PDF reader: XRef stream missing /Size")),
+    };
+    let w = match lookup("W") {
+        Some(Object::Array(items)) if items.len() == 3 => {
+            let mut out = [0usize; 3];
+            for (i, it) in items.iter().enumerate() {
+                let Object::Integer(v) = it else {
+                    return Err(PdfError::other(format!(
+                        "PDF reader: XRef /W[{i}] must be an integer (got {it:?})"
+                    )));
+                };
+                if *v < 0 || *v > 8 {
+                    return Err(PdfError::other(format!(
+                        "PDF reader: XRef /W[{i}] = {v} out of range [0..=8]"
+                    )));
+                }
+                out[i] = *v as usize;
+            }
+            out
+        }
+        other => {
+            return Err(PdfError::other(format!(
+                "PDF reader: XRef stream /W must be a 3-array (got {other:?})"
+            )));
+        }
+    };
+    let index: Vec<(u32, u32)> = match lookup("Index") {
+        Some(Object::Array(items)) => {
+            if items.len() % 2 != 0 {
+                return Err(PdfError::other(
+                    "PDF reader: XRef /Index array length must be even",
+                ));
+            }
+            items
+                .chunks_exact(2)
+                .map(|chunk| {
+                    let (Object::Integer(s), Object::Integer(c)) = (&chunk[0], &chunk[1]) else {
+                        return Err(PdfError::other(
+                            "PDF reader: XRef /Index entries must be integers",
+                        ));
+                    };
+                    if *s < 0 || *c < 0 {
+                        return Err(PdfError::other(
+                            "PDF reader: XRef /Index entries must be non-negative",
+                        ));
+                    }
+                    Ok((*s as u32, *c as u32))
+                })
+                .collect::<Result<_, _>>()?
+        }
+        Some(other) => {
+            return Err(PdfError::other(format!(
+                "PDF reader: XRef /Index must be an array (got {other:?})"
+            )));
+        }
+        None => vec![(0, size)],
+    };
+
+    // Step 1: apply /Filter (FlateDecode is the only one writers use).
+    let raw = decode_xref_stream_body(&stream)?;
+
+    // Step 2: undo predictor (PNG-up, /Predictor 12) if requested.
+    let table_bytes = apply_predictor(&raw, dict, w[0] + w[1] + w[2])?;
+
+    // Step 3: walk the binary table.
+    let entry_size = w[0] + w[1] + w[2];
+    if entry_size == 0 {
+        return Err(PdfError::other(
+            "PDF reader: XRef stream /W = [0 0 0] is degenerate",
+        ));
+    }
+    let mut entries: HashMap<u32, XrefEntry> = HashMap::new();
+    let mut cursor = 0usize;
+    for (start, count) in &index {
+        for offset_in_section in 0..*count {
+            if cursor + entry_size > table_bytes.len() {
+                return Err(PdfError::other(format!(
+                    "PDF reader: XRef stream truncated at entry {start}+{offset_in_section} \
+                     (cursor {cursor}, need {entry_size}, have {})",
+                    table_bytes.len()
+                )));
+            }
+            let chunk = &table_bytes[cursor..cursor + entry_size];
+            cursor += entry_size;
+            let (f1, f2, f3) = split_fields(chunk, w[0], w[1], w[2]);
+            // f1 default = 1 when w[0] == 0 (§7.5.8.3).
+            let kind = if w[0] == 0 { 1 } else { f1 };
+            let id = start + offset_in_section;
+            let entry = match kind {
+                0 => XrefEntry::Free {
+                    // f2 = next free obj number; f3 = generation.
+                    next: f2 as u32,
+                    generation: f3 as u16,
+                },
+                1 => XrefEntry::InUse {
+                    offset: f2,
+                    // /W default for w[2] is 0, in which case the spec
+                    // says "0" generation.
+                    generation: f3 as u16,
+                },
+                2 => XrefEntry::Compressed {
+                    obj_stream_id: f2 as u32,
+                    index_within_stream: f3 as u32,
+                },
+                other => {
+                    return Err(PdfError::other(format!(
+                        "PDF reader: XRef stream entry has unknown type {other} at id {id}"
+                    )));
+                }
+            };
+            entries.insert(id, entry);
+        }
+    }
+
+    // The stream dict itself is the trailer dict (§7.5.8.2). Strip
+    // entries that don't belong in a trailer (Length, Filter, etc.) so
+    // downstream code can iterate it like a plain trailer.
+    let trailer = filter_trailer_dict(dict);
+
+    Ok(XrefTable { entries, trailer })
+}
+
+/// Apply the stream's `/Filter` to recover the raw xref bytes.
+fn decode_xref_stream_body(stream: &crate::objects::Stream) -> Result<Vec<u8>, PdfError> {
+    use std::io::Read;
+    let filter = stream
+        .dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Filter")
+        .map(|(_, v)| v.clone());
+    match filter {
+        None => Ok(stream.data.clone()),
+        Some(Object::Name(n)) if n == "FlateDecode" => {
+            let mut dec = flate2::read::ZlibDecoder::new(stream.data.as_slice());
+            let mut out = Vec::new();
+            dec.read_to_end(&mut out).map_err(|e| {
+                PdfError::other(format!("PDF reader: XRef stream FlateDecode failed: {e}"))
+            })?;
+            Ok(out)
+        }
+        Some(Object::Array(items)) => {
+            // Filter chain — only FlateDecode is supported here.
+            let mut data = stream.data.clone();
+            for it in items {
+                let Object::Name(n) = it else {
+                    return Err(PdfError::other(
+                        "PDF reader: XRef stream /Filter chain item must be a Name",
+                    ));
+                };
+                if n != "FlateDecode" {
+                    return Err(PdfError::other(format!(
+                        "PDF reader: XRef stream filter `{n}` not supported"
+                    )));
+                }
+                let mut dec = flate2::read::ZlibDecoder::new(data.as_slice());
+                let mut out = Vec::new();
+                dec.read_to_end(&mut out).map_err(|e| {
+                    PdfError::other(format!("PDF reader: XRef stream FlateDecode failed: {e}"))
+                })?;
+                data = out;
+            }
+            Ok(data)
+        }
+        Some(Object::Name(n)) => Err(PdfError::other(format!(
+            "PDF reader: XRef stream filter `{n}` not supported"
+        ))),
+        Some(other) => Err(PdfError::other(format!(
+            "PDF reader: XRef stream /Filter must be a Name or array (got {other:?})"
+        ))),
+    }
+}
+
+/// Reverse PNG predictor 12 (PNG-up). The `up` predictor stores each
+/// row as the byte-wise XOR difference from the previous row; the
+/// stream's `/DecodeParms /Predictor` selects the active predictor and
+/// `/Columns` gives the row width (in `/W` entry-bytes here).
+///
+/// Predictor values per §7.4.4.4:
+/// * 1 = none (no transformation; pass through),
+/// * 2 = TIFF predictor 2 (left differences — uncommon for xref),
+/// * 10..=15 = PNG predictors with a 1-byte tag prefix per row.
+///   Predictor 12 = PNG-Up. Predictor 15 = "optimum" — every row's
+///   tag picks one of the five PNG predictors.
+fn apply_predictor(raw: &[u8], dict: &Dict, entry_width: usize) -> Result<Vec<u8>, PdfError> {
+    let parms = dict.entries().iter().find(|(k, _)| k == "DecodeParms");
+    let Some((_, parms_obj)) = parms else {
+        // No DecodeParms — assume Predictor 1 (no transformation).
+        return Ok(raw.to_vec());
+    };
+    let Object::Dict(parms_dict) = parms_obj else {
+        return Err(PdfError::other("PDF reader: /DecodeParms must be a dict"));
+    };
+    let predictor = parms_dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Predictor")
+        .map(|(_, v)| v.clone());
+    let columns = parms_dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Columns")
+        .map(|(_, v)| v.clone());
+    let p = match predictor {
+        Some(Object::Integer(n)) => n,
+        None => 1,
+        other => {
+            return Err(PdfError::other(format!(
+                "PDF reader: /Predictor must be an integer (got {other:?})"
+            )));
+        }
+    };
+    if p == 1 {
+        return Ok(raw.to_vec());
+    }
+    let columns = match columns {
+        Some(Object::Integer(n)) if n > 0 => n as usize,
+        Some(other) => {
+            return Err(PdfError::other(format!(
+                "PDF reader: /Columns must be a positive integer (got {other:?})"
+            )));
+        }
+        // Default per §7.4.4.4 is 1, but for XRef streams the columns
+        // width is the per-entry width.
+        None => entry_width,
+    };
+    if !(10..=15).contains(&p) {
+        return Err(PdfError::other(format!(
+            "PDF reader: /Predictor {p} not yet supported (only PNG predictors 10..=15)"
+        )));
+    }
+    // PNG predictors store one tag byte per row + `columns` data bytes.
+    let row_size = columns + 1;
+    if raw.len() % row_size != 0 {
+        return Err(PdfError::other(format!(
+            "PDF reader: predictor row size {row_size} doesn't divide raw len {}",
+            raw.len()
+        )));
+    }
+    let row_count = raw.len() / row_size;
+    let mut out = Vec::with_capacity(row_count * columns);
+    let mut prev_row = vec![0u8; columns];
+    for row_idx in 0..row_count {
+        let row = &raw[row_idx * row_size..(row_idx + 1) * row_size];
+        let tag = row[0];
+        let data = &row[1..];
+        let mut decoded_row = vec![0u8; columns];
+        match tag {
+            0 => {
+                // None.
+                decoded_row.copy_from_slice(data);
+            }
+            1 => {
+                // Sub: each byte = data[i] + decoded[i-1].
+                for i in 0..columns {
+                    let left = if i == 0 { 0 } else { decoded_row[i - 1] };
+                    decoded_row[i] = data[i].wrapping_add(left);
+                }
+            }
+            2 => {
+                // Up: data[i] + prev_row[i].
+                for i in 0..columns {
+                    decoded_row[i] = data[i].wrapping_add(prev_row[i]);
+                }
+            }
+            3 => {
+                // Average: data[i] + floor((left + up) / 2).
+                for i in 0..columns {
+                    let left = if i == 0 {
+                        0u16
+                    } else {
+                        decoded_row[i - 1] as u16
+                    };
+                    let up = prev_row[i] as u16;
+                    decoded_row[i] = data[i].wrapping_add(((left + up) / 2) as u8);
+                }
+            }
+            4 => {
+                // Paeth.
+                for i in 0..columns {
+                    let left = if i == 0 {
+                        0i16
+                    } else {
+                        decoded_row[i - 1] as i16
+                    };
+                    let up = prev_row[i] as i16;
+                    let upper_left = if i == 0 { 0i16 } else { prev_row[i - 1] as i16 };
+                    let p_pred = paeth_predictor(left, up, upper_left);
+                    decoded_row[i] = data[i].wrapping_add(p_pred);
+                }
+            }
+            other => {
+                return Err(PdfError::other(format!(
+                    "PDF reader: PNG predictor row tag {other} unknown"
+                )));
+            }
+        }
+        out.extend_from_slice(&decoded_row);
+        prev_row = decoded_row;
+    }
+    Ok(out)
+}
+
+fn paeth_predictor(a: i16, b: i16, c: i16) -> u8 {
+    let p = a + b - c;
+    let pa = (p - a).abs();
+    let pb = (p - b).abs();
+    let pc = (p - c).abs();
+    let r = if pa <= pb && pa <= pc {
+        a
+    } else if pb <= pc {
+        b
+    } else {
+        c
+    };
+    r as u8
+}
+
+/// Read three big-endian integer fields of variable byte width from a
+/// chunk of bytes. Sized like a u64 — XRef field widths are bounded
+/// at 8 bytes per §7.5.8.3.
+fn split_fields(chunk: &[u8], w1: usize, w2: usize, w3: usize) -> (u64, u64, u64) {
+    fn read_be(s: &[u8]) -> u64 {
+        let mut v: u64 = 0;
+        for &b in s {
+            v = (v << 8) | (b as u64);
+        }
+        v
+    }
+    let f1 = read_be(&chunk[..w1]);
+    let f2 = read_be(&chunk[w1..w1 + w2]);
+    let f3 = read_be(&chunk[w1 + w2..w1 + w2 + w3]);
+    (f1, f2, f3)
+}
+
+/// Strip stream-only keys from an XRef-stream dictionary so it's safe
+/// to treat as a trailer. The omitted keys are the ones that describe
+/// the stream payload itself, not document-level metadata.
+fn filter_trailer_dict(dict: &Dict) -> Dict {
+    let stream_only = [
+        "Type",
+        "Filter",
+        "DecodeParms",
+        "Length",
+        "F",
+        "FFilter",
+        "FDecodeParms",
+        "DL",
+        "W",
+        "Index",
+    ];
+    let mut out = Dict::new();
+    for (k, v) in dict.entries() {
+        if !stream_only.contains(&k.as_str()) {
+            out.set(k, v.clone());
+        }
+    }
+    out
 }
 
 #[cfg(test)]

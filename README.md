@@ -68,15 +68,47 @@ match oxideav_pdf::read_pdf_to_scene(&pdf) {
 Public-key handlers (`adbe.pkcs7.s3` / `s4` / `s5`) and per-stream
 crypt-filter overrides land in a follow-up round.
 
+## Encryption encode (writer side)
+
+The writer emits password-protected PDFs across the same revision range
+the reader handles. [`oxideav_pdf::write_pdf_from_scene_encrypted`]
+takes a [`Scene`] and an [`encrypt::EncryptionConfig`] and produces
+bytes that round-trip through `read_pdf_to_scene_with_password`:
+
+```rust
+use oxideav_pdf::encrypt::EncryptionConfig;
+
+let cfg = EncryptionConfig::aes_256_r6(b"hunter2", b"FILE-ID-16-BYTES");
+let pdf = oxideav_pdf::write_pdf_from_scene_encrypted(&scene, &cfg)?;
+# Ok::<(), oxideav_pdf::PdfError>(())
+```
+
+Writer-side coverage matches the reader: R=2 (RC4-40), R=3 (RC4-128),
+R=4 (AES-128 / RC4 via `CFM`), R=5 (Adobe ext L3), R=6 (ISO 2.0).
+`/O`, `/U`, `/OE`, `/UE`, and `/Perms` come from the canonical
+algorithms (3, 4, 5 for V≤4; 8, 9, 10 for V=5); per-object key
+derivation is Algorithm 1 (V≤4) or the file key directly (V=5).
+
+## Cross-reference streams
+
+The reader recognises both the plain `xref`-keyword cross-reference
+table (PDF 1.0..1.4) and the binary cross-reference *stream* form
+introduced in PDF 1.5 (ISO 32000-1 §7.5.8): a `/Type /XRef` stream
+object whose body packs each entry into `/W [w1 w2 w3]` big-endian
+fields, optionally Flate-compressed with `/Predictor 12` (PNG-Up).
+The XRef-stream writer side is deferred to a follow-up round (the
+plain `xref` form the writer emits remains the round-trip default).
+
 ## Deferred
 
 - Text (waiting on `Node::Text`; will use Type 0 fonts with a
   CIDFont built via `oxideav-ttf`/`oxideav-otf`).
 - JPEG passthrough on `ImageRef` (DCTDecode XObject).
-- Encryption *encode* (write side; the reader decrypts but the writer
-  doesn't yet emit `/Encrypt`).
 - Public-key security handlers (`adbe.pkcs7.*`).
-- Cross-reference streams (PDF 1.5+ `/Type /XRef`).
+- XRef-stream *encoder* (`/Type /XRef` write-side; reader decodes
+  them already).
+- Object streams (`/Type /ObjStm`) — XRef streams with `Compressed`
+  entries are recorded but not yet resolved.
 - Transparency groups beyond a per-`Group` `/ca`+`/CA` opacity.
 
 ## Usage

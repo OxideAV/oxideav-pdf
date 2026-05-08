@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round-6 writer: standard-security-handler **encryption** for the
+  full revision range — R=2 / R=3 / R=4 (RC4 + AES-128) / R=5 / R=6
+  (AES-256). New `encrypt::EncryptionConfig` builder + `encrypt::EncryptionState`
+  installed on `Document::encryption`; `write_pdf_from_scene_encrypted`
+  one-shot entry point. Implements Algorithms 3, 4, 5 (V≤4) plus
+  reuses 8, 9, 10 from `decrypt::r5_r6` (V=5). Round-trip tested across
+  all five revisions including full encode → decrypt → re-encode →
+  decrypt bounce, owner-password authentication, wrong-password
+  rejection, and content-stream encryption verification.
+- Round-6 reader: PDF 1.5+ cross-reference *streams* (`/Type /XRef`,
+  ISO 32000-1 §7.5.8). Binary `/W [w1 w2 w3]` field decoding, optional
+  `/Index` subsections, optional `/Filter /FlateDecode` body, full
+  PNG-Up `/Predictor 12` (and 10..15 fallback handling) reversal.
+  `XrefEntry::Compressed` variant added for type-2 entries (the
+  object-stream resolver itself is the next round).
+- Bug fix: `tests/external_validation.rs` `qpdf --check` test was
+  piping bytes through stdin, which qpdf ≥ 11 rejects (`-` is not
+  treated as stdin). Switched to a temp-file path so qpdf opens it
+  by name.
 - Round-4 reader: standard-security-handler decryption (ISO 32000-1
   §7.6) for revisions R=2 (RC4-40), R=3 (RC4-128), and R=4 (AES-128
   CBC or RC4-128 via `CFM`).

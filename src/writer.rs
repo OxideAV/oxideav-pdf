@@ -17,6 +17,7 @@
 use oxideav_core::vector::{FillRule, Group, ImageRef, Node, PathNode, VectorFrame};
 use oxideav_scene::Scene;
 
+use crate::encrypt::{EncryptionConfig, EncryptionState};
 use crate::error::PdfError;
 use crate::info::{build_info_dict, has_metadata};
 use crate::objects::{Document, Object};
@@ -117,6 +118,76 @@ pub fn write_pdf_from_scene(scene: &Scene) -> Result<Vec<u8>, PdfError> {
         let info_id = doc.add(Object::Dict(build_info_dict(&scene.metadata)));
         doc.info = Some(info_id);
     }
+
+    let mut out = Vec::with_capacity(4096);
+    doc.write_to(&mut out)?;
+    Ok(out)
+}
+
+/// Render a [`Scene`] in pages mode as a multi-page PDF document with
+/// the standard security handler applied. Identical to
+/// [`write_pdf_from_scene`] except every string + stream payload is
+/// encrypted under the supplied [`EncryptionConfig`] before the body
+/// is serialised, and the trailer carries `/Encrypt <ref>` + the
+/// matching `/ID` array.
+///
+/// Round-6 supports R=2 / R=3 / R=4 / R=5 / R=6 — see
+/// [`crate::encrypt`] for per-revision details. The reader's
+/// [`crate::read_pdf_to_scene_with_password`] decrypts the resulting
+/// bytes when given the supplied user (or owner) password.
+pub fn write_pdf_from_scene_encrypted(
+    scene: &Scene,
+    config: &EncryptionConfig,
+) -> Result<Vec<u8>, PdfError> {
+    let pages = scene
+        .pages
+        .as_ref()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            PdfError::other(
+                "write_pdf_from_scene_encrypted: scene is not in pages mode (scene.pages is None or empty)",
+            )
+        })?;
+
+    struct Rendered<'a> {
+        frame: &'a VectorFrame,
+        width: f32,
+        height: f32,
+        content_bytes: Vec<u8>,
+        resources: ResourceCollector,
+    }
+    let rendered: Vec<Rendered<'_>> = pages
+        .iter()
+        .map(|page| {
+            let (content_bytes, resources) = render_frame(&page.content);
+            Rendered {
+                frame: &page.content,
+                width: page.width,
+                height: page.height,
+                content_bytes,
+                resources,
+            }
+        })
+        .collect();
+
+    let inputs: Vec<PageInput<'_>> = rendered
+        .into_iter()
+        .map(|r| PageInput {
+            width: r.width,
+            height: r.height,
+            content_bytes: r.content_bytes,
+            resources: r.resources,
+            frame: r.frame,
+        })
+        .collect();
+
+    let mut doc = Document::new();
+    let _ = build_pages(&mut doc, inputs);
+    if has_metadata(&scene.metadata) {
+        let info_id = doc.add(Object::Dict(build_info_dict(&scene.metadata)));
+        doc.info = Some(info_id);
+    }
+    doc.encryption = Some(EncryptionState::build(config)?);
 
     let mut out = Vec::with_capacity(4096);
     doc.write_to(&mut out)?;

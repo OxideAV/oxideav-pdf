@@ -13,6 +13,22 @@ use oxideav_core::vector::{
     FillRule, Group, Node, Paint, Path, PathNode, Point, Rgba, VectorFrame,
 };
 
+/// Write `pdf` to a uniquely-named file under the system temp dir so
+/// validators that don't accept stdin (notably `qpdf` ≥ 11) can still
+/// read it. Returns the temp path; caller is responsible for cleanup
+/// (we don't bother since these tests run rarely).
+fn write_temp_pdf(pdf: &[u8], stem: &str) -> std::path::PathBuf {
+    let mut path = std::env::temp_dir();
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    path.push(format!("oxideav-pdf-{stem}-{pid}-{nanos}.pdf"));
+    std::fs::write(&path, pdf).expect("temp pdf write");
+    path
+}
+
 fn sample_pdf() -> Vec<u8> {
     let mut p = Path::new();
     p.move_to(Point::new(20.0, 20.0))
@@ -72,12 +88,20 @@ fn qpdf_check_accepts_round1_output() {
         return;
     }
     let pdf = sample_pdf();
-    // qpdf --check reads from stdin when given `-`. Some
-    // platforms' qpdf emits a `qpdf: warnings…` exit code
-    // (status 3) for non-fatal issues, but a clean PDF should
-    // exit with 0 — we only assert that the binary is willing
-    // to parse our envelope (success status).
-    let ok = pipe_to_tool("qpdf", &["--check", "-"], &pdf).unwrap_or(false);
+    // qpdf ≥ 11 doesn't accept `-` as a stdin substitute (every
+    // recent build resolves the literal filename `-` and reports
+    // "No such file or directory"). Write the PDF to a temp file
+    // and let qpdf open it by path.
+    let path = write_temp_pdf(&pdf, "qpdf-check");
+    let path_str = path.to_string_lossy().to_string();
+    let ok = Command::new("qpdf")
+        .args(["--check", &path_str])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let _ = std::fs::remove_file(&path);
     assert!(ok, "qpdf --check rejected the produced PDF");
 }
 
