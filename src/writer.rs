@@ -20,12 +20,13 @@ use oxideav_scene::Scene;
 use crate::encrypt::{EncryptionConfig, EncryptionState};
 use crate::error::PdfError;
 use crate::info::{build_info_dict, has_metadata};
-use crate::objects::{Document, Object};
+use crate::objects::{Dict, Document, Object, Stream};
 use crate::operators::{
     concat_matrix, emit_clip_marker, emit_path, paint, restore, save, set_ext_gstate,
     set_fill_paint, set_stroke_style, OpBuf, PaintMode,
 };
 use crate::page::{build_page, build_pages, PageInput};
+use crate::reader::xref::{find_startxref_offset, parse_xref};
 use crate::resources::ResourceCollector;
 
 /// Render a [`VectorFrame`] as a single-page PDF 1.4 document.
@@ -188,6 +189,285 @@ pub fn write_pdf_from_scene_xref_stream(scene: &Scene) -> Result<Vec<u8>, PdfErr
     doc.xref_stream = true;
 
     let mut out = Vec::with_capacity(4096);
+    doc.write_to(&mut out)?;
+    Ok(out)
+}
+
+/// Render a [`Scene`] in pages mode as a multi-page PDF document and
+/// emit a PDF 1.5+ cross-reference stream **plus** a `/Type /ObjStm`
+/// object-stream container (ISO 32000-1 §7.5.7) that holds every
+/// compressible indirect object (every dict that isn't a stream and
+/// isn't the document Catalog). Pairs with the round-7 reader's
+/// ObjStm resolver — bytes round-trip through
+/// [`crate::read_pdf_to_scene`].
+///
+/// ObjStm packing is the natural pair to the xref-stream encoder:
+/// real-world PDFs at 50+ pages need both at once or the file size
+/// quickly grows past what an `xref` table alone is good for. The
+/// trade-off versus [`write_pdf_from_scene_xref_stream`] is a
+/// modestly smaller file (the dict overhead on every Page,
+/// Resources, Pages-tree node disappears) at the cost of one extra
+/// indirect object (the ObjStm container) and a hard PDF 1.5+
+/// reader-version requirement.
+///
+/// Stream objects (content streams, image XObjects, the xref stream
+/// itself) cannot live inside an ObjStm per §7.5.7 — they remain at
+/// their own byte offsets.
+pub fn write_pdf_from_scene_object_stream(scene: &Scene) -> Result<Vec<u8>, PdfError> {
+    let pages = scene
+        .pages
+        .as_ref()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            PdfError::other(
+                "write_pdf_from_scene_object_stream: scene is not in pages mode (scene.pages is None or empty)",
+            )
+        })?;
+
+    struct Rendered<'a> {
+        frame: &'a VectorFrame,
+        width: f32,
+        height: f32,
+        content_bytes: Vec<u8>,
+        resources: ResourceCollector,
+    }
+    let rendered: Vec<Rendered<'_>> = pages
+        .iter()
+        .map(|page| {
+            let (content_bytes, resources) = render_frame(&page.content);
+            Rendered {
+                frame: &page.content,
+                width: page.width,
+                height: page.height,
+                content_bytes,
+                resources,
+            }
+        })
+        .collect();
+
+    let inputs: Vec<PageInput<'_>> = rendered
+        .into_iter()
+        .map(|r| PageInput {
+            width: r.width,
+            height: r.height,
+            content_bytes: r.content_bytes,
+            resources: r.resources,
+            frame: r.frame,
+        })
+        .collect();
+
+    let mut doc = Document::new();
+    let _ = build_pages(&mut doc, inputs);
+    if has_metadata(&scene.metadata) {
+        let info_id = doc.add(Object::Dict(build_info_dict(&scene.metadata)));
+        doc.info = Some(info_id);
+    }
+    doc.xref_stream = true;
+    doc.object_stream = true;
+
+    let mut out = Vec::with_capacity(4096);
+    doc.write_to(&mut out)?;
+    Ok(out)
+}
+
+/// Append an incremental update to a previously-written PDF
+/// (ISO 32000-1 §7.5.6). The new revision adds one or more pages
+/// (whichever pages aren't already in the original document) by
+/// emitting fresh indirect objects past the previous file's id
+/// range, a new cross-reference section that lists only the changed
+/// slots, and a trailer (or xref-stream dict) carrying
+/// `/Prev <prev_xref_off>` so the PDF reader can chain the two
+/// revisions.
+///
+/// The contract is:
+///
+/// 1. `prev_pdf` is a complete PDF previously emitted by
+///    [`write_pdf_from_scene`] (classical xref form). The function
+///    parses its trailer to recover the previous `/Size`, `/Root`,
+///    and existing object id range.
+/// 2. `additional_pages` are new pages to append; they get fresh
+///    object ids past the previous max. The catalog's `/Pages`
+///    tree is rewritten in the new revision (one indirect-object
+///    update at the existing pages-tree id) so the page list now
+///    includes both old and new kids.
+/// 3. The output is `prev_pdf || new-objects || new-xref || trailer
+///    || %%EOF` — readers that ignore `/Prev` (very few; none of
+///    the modern open-source ones) see the prior revision; readers
+///    that follow `/Prev` see the merged revision.
+///
+/// The new-revision payload is unencrypted regardless of the prior
+/// file's encryption state — round 8 doesn't yet rebuild the
+/// encryption handler from the trailer's `/Encrypt`. Pass
+/// unencrypted PDFs only.
+pub fn write_pdf_incremental_update(
+    prev_pdf: &[u8],
+    additional_pages: &[oxideav_scene::Page],
+) -> Result<Vec<u8>, PdfError> {
+    let prev_xref_off = find_startxref_offset(prev_pdf)?;
+    let prev_table = parse_xref(prev_pdf)?;
+    let prev_root = prev_table.root()?;
+
+    // Previous /Size — required so the new trailer's /Size is at
+    // least as large as the old (PDF readers require a monotonic
+    // /Size when chaining /Prev). Falls back to the maximum id
+    // observed in the entries when the trailer doesn't carry one.
+    let prev_size_from_trailer = prev_table
+        .trailer
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Size")
+        .and_then(|(_, v)| match v {
+            Object::Integer(n) if *n >= 0 => Some(*n as u32),
+            _ => None,
+        });
+    let prev_max_id = prev_table.entries.keys().copied().max().unwrap_or(0);
+    let prev_size = prev_size_from_trailer.unwrap_or(prev_max_id + 1);
+
+    // Find the catalog's /Pages reference + the existing /Pages
+    // dict so we can rewrite it with the new kids appended. We
+    // re-parse via a fresh DocumentReader so the existing pages
+    // tree comes back as `Object::Dict` we can mutate.
+    let mut reader = crate::reader::document::DocumentReader::open(prev_pdf)?;
+    let catalog = reader.resolve(prev_root)?;
+    let Object::Dict(catalog_dict) = catalog else {
+        return Err(PdfError::other(
+            "write_pdf_incremental_update: previous /Root is not a Dict",
+        ));
+    };
+    let pages_tree_id = match catalog_dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Pages")
+        .map(|(_, v)| v)
+    {
+        Some(Object::Reference(id)) => *id,
+        _ => {
+            return Err(PdfError::other(
+                "write_pdf_incremental_update: previous catalog missing /Pages reference",
+            ))
+        }
+    };
+    let pages_tree = reader.resolve(pages_tree_id)?;
+    let Object::Dict(pages_tree_dict) = pages_tree else {
+        return Err(PdfError::other(
+            "write_pdf_incremental_update: previous /Pages tree is not a Dict",
+        ));
+    };
+    let prev_kids: Vec<Object> = pages_tree_dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Kids")
+        .and_then(|(_, v)| match v {
+            Object::Array(items) => Some(items.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let prev_count = match pages_tree_dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Count")
+        .map(|(_, v)| v)
+    {
+        Some(Object::Integer(n)) => *n,
+        _ => prev_kids.len() as i64,
+    };
+
+    // Build the new-revision Document. ID allocation starts past the
+    // previous max; the existing `pages_tree_id` is reused (the new
+    // revision overwrites it).
+    let mut doc = Document::new();
+    doc.set_next_id(prev_max_id + 1);
+
+    // Render the new pages.
+    struct Rendered {
+        width: f32,
+        height: f32,
+        content_bytes: Vec<u8>,
+        resources: ResourceCollector,
+    }
+    let rendered: Vec<Rendered> = additional_pages
+        .iter()
+        .map(|page| {
+            let (content_bytes, resources) = render_frame(&page.content);
+            Rendered {
+                width: page.width,
+                height: page.height,
+                content_bytes,
+                resources,
+            }
+        })
+        .collect();
+
+    // Emit each new page: Page dict + Resources + Contents.
+    let mut new_kids = prev_kids.clone();
+    let mut changed_ids: Vec<u32> = Vec::new();
+    for r in rendered {
+        let page_id = doc.allocate_id();
+        let resources_id = doc.allocate_id();
+        let contents_id = doc.allocate_id();
+
+        let media_box = Object::Array(vec![
+            Object::Real(0.0),
+            Object::Real(0.0),
+            Object::Real(r.width as f64),
+            Object::Real(r.height as f64),
+        ]);
+
+        doc.add_object(
+            page_id,
+            Object::Dict(
+                Dict::new()
+                    .with("Type", Object::Name("Page".into()))
+                    .with("Parent", Object::Reference(pages_tree_id))
+                    .with("MediaBox", media_box)
+                    .with("Resources", Object::Reference(resources_id))
+                    .with("Contents", Object::Reference(contents_id)),
+            ),
+        );
+        let res_obj = r.resources.flatten_into_resources_dict(&mut doc);
+        doc.add_object(resources_id, res_obj);
+        doc.add_object(
+            contents_id,
+            Object::Stream(Stream::new(Dict::new(), r.content_bytes)),
+        );
+        new_kids.push(Object::Reference(page_id));
+        changed_ids.push(page_id.number);
+        changed_ids.push(resources_id.number);
+        changed_ids.push(contents_id.number);
+    }
+
+    // Rewrite the /Pages tree dict at the same id — that's what
+    // makes the new revision an *update* rather than an append: any
+    // reader that follows /Prev sees the new kids list, while one
+    // that ignores /Prev still resolves to the previous list.
+    doc.add_object(
+        pages_tree_id,
+        Object::Dict(
+            Dict::new()
+                .with("Type", Object::Name("Pages".into()))
+                .with("Kids", Object::Array(new_kids))
+                .with(
+                    "Count",
+                    Object::Integer(prev_count + additional_pages.len() as i64),
+                ),
+        ),
+    );
+    changed_ids.push(pages_tree_id.number);
+    doc.root = Some(prev_root);
+    doc.prev_xref_offset = Some(prev_xref_off);
+    doc.min_size = Some(prev_size);
+    let mut all_changed_ids = changed_ids.clone();
+    all_changed_ids.sort_unstable();
+    all_changed_ids.dedup();
+    doc.xref_only_ids = Some(all_changed_ids);
+
+    // Append to the previous bytes verbatim.
+    let mut out = prev_pdf.to_vec();
+    // Ensure the previous bytes ended on a line break — some viewers
+    // treat trailing-NL as required between revisions.
+    if !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
     doc.write_to(&mut out)?;
     Ok(out)
 }

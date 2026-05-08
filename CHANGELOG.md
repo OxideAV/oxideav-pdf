@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round-8 writer: **object-stream encoder** (`/Type /ObjStm`,
+  ISO 32000-1 §7.5.7). New `Document::object_stream` flag
+  (requires `xref_stream = true`) packs every compressible
+  indirect object — every dict that isn't a stream, the Catalog,
+  or the Encrypt object — into one ObjStm container per
+  revision. The xref stream's type-2 entries point at the
+  container; pairs with the round-7 reader-side resolver. New
+  one-shot entry point `write_pdf_from_scene_object_stream`.
+  Stream objects remain at byte offsets (§7.5.7 forbids
+  embedding them).
+- Round-8 writer: **incremental updates** (`/Prev`,
+  ISO 32000-1 §7.5.6). New `write_pdf_incremental_update(prev_pdf,
+  &new_pages)` appends a new revision to a previously-written
+  PDF: re-renders the new pages with fresh ids past the prior
+  maximum, rewrites the `/Pages` tree at its existing id
+  (so the new kids list overrides), emits a new xref subsection
+  listing only the changed slots, and writes a trailer with
+  `/Prev` pointing at the previous xref offset. Original bytes
+  are preserved verbatim — partial readers that ignore `/Prev`
+  see the original revision unchanged.
+- Round-8 reader: `parse_xref` now follows the trailer's `/Prev`
+  chain (up to 32 hops, cycle-detected) and merges older xref
+  sections beneath the newest. Newer revisions win on overlap.
+- Round-8 tests: 17 new integration tests across
+  `tests/object_stream_encode.rs` (6), `tests/incremental_update.rs`
+  (5), and `tests/encrypt_metadata_false.rs` (6) covering
+  encoder→reader round-trips, multi-page packing, two-level
+  `/Prev` chaining, original-bytes preservation, and the
+  `/EncryptMetadata false` end-to-end matrix (R=3 / R=4 / R=6).
+- `Document::set_next_id` + `Document::next_id` accessors so
+  the incremental-update writer can resume id allocation past
+  a previously-written revision's maximum.
+
 - Round-7 writer: cross-reference *stream* (`/Type /XRef`,
   ISO 32000-1 §7.5.8) emission. Mirror of the round-6 reader —
   `/W [1 4 2]` field widths, FlateDecode + PNG-Up `/Predictor 12`

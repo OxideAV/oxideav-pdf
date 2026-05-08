@@ -101,12 +101,33 @@ via [`oxideav_pdf::write_pdf_from_scene_xref_stream`].
 
 ## Object streams
 
-PDF 1.5+ object streams (`/Type /ObjStm`, ISO 32000-1 §7.5.7) are
-resolved by the reader: when a cross-reference entry is `Compressed`,
-the reader fetches the containing object stream, parses its
-`(obj_num offset)` header, and returns the body bytes from the
-matching slot. The writer doesn't yet emit object streams — that's
-the natural pair to the round-7 XRef-stream encoder.
+Both reader and writer support PDF 1.5+ object streams
+(`/Type /ObjStm`, ISO 32000-1 §7.5.7). The reader resolves
+`Compressed` xref entries by fetching the containing object stream,
+parsing its `(obj_num offset)` header, and returning the body bytes
+from the matching slot. The writer packs every compressible
+indirect object (every dict that isn't a stream and isn't the
+Catalog) into one ObjStm container — opt in via
+[`oxideav_pdf::write_pdf_from_scene_object_stream`]. Stream objects
+(content streams, image XObjects, the xref stream itself) cannot be
+compressed per §7.5.7 and remain at their own byte offsets.
+
+## Incremental updates
+
+[`oxideav_pdf::write_pdf_incremental_update`] appends new revisions
+to a previously-written PDF per ISO 32000-1 §7.5.6 — the new
+revision's body is appended verbatim, followed by a new xref
+subsection that lists only the changed slots, plus a trailer
+carrying `/Prev <prev_xref_off>` pointing back at the original
+revision. The reader follows the `/Prev` chain and merges entries:
+the newest revision wins on overlap.
+
+```rust,ignore
+let original = oxideav_pdf::write_pdf_from_scene(&scene_v1)?;
+// ... time passes; user adds two pages ...
+let updated = oxideav_pdf::write_pdf_incremental_update(&original, &new_pages)?;
+// `updated` starts with `original` byte-for-byte, then appends.
+```
 
 ## Per-stream `/Crypt /Identity` opt-out
 
@@ -125,7 +146,10 @@ remain searchable in encrypted PDFs.
 - JPEG passthrough on `ImageRef` (DCTDecode XObject) — needs core
   IR support for "raw codec bytes" alongside the decoded VideoFrame.
 - Public-key security handlers (`adbe.pkcs7.*`).
-- Object-stream *encoder* (writer-side `/Type /ObjStm`).
+- Linearization (§7.5.6 "Fast Web View" structural reorganisation).
+- Combined ObjStm + encryption (round 8 emits one or the other,
+  not both — the §7.6.1 + §7.5.7 unit-encryption interplay needs
+  careful handling).
 - Transparency groups beyond a per-`Group` `/ca`+`/CA` opacity.
 
 ## Usage

@@ -247,10 +247,87 @@ pub fn parse_xref_at(input: &[u8], xref_offset: u64) -> Result<XrefTable, PdfErr
     Ok(XrefTable { entries, trailer })
 }
 
-/// One-shot top-level: scan startxref offset → parse xref table.
+/// One-shot top-level: scan startxref offset → parse xref table,
+/// then walk the trailer's `/Prev` chain (incremental updates;
+/// ISO 32000-1 §7.5.6) merging older sections beneath. The newest
+/// revision wins on overlap — a slot rewritten in revision N hides
+/// the same slot from revision N-1.
+///
+/// The trailer dict returned belongs to the newest revision; the
+/// `entries` map carries the merged view across all revisions.
 pub fn parse_xref(input: &[u8]) -> Result<XrefTable, PdfError> {
-    let off = find_startxref_offset(input)?;
-    parse_xref_at(input, off)
+    let mut current_off = find_startxref_offset(input)?;
+    let mut newest = parse_xref_at(input, current_off)?;
+    // The newest revision's table is correct for the slots it owns;
+    // we only need to *fill in* slots that the newer revision didn't
+    // re-declare.
+    let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    visited.insert(current_off);
+    loop {
+        let prev_off = newest
+            .trailer
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Prev")
+            .and_then(|(_, v)| match v {
+                Object::Integer(n) if *n >= 0 => Some(*n as u64),
+                _ => None,
+            });
+        let Some(po) = prev_off else { break };
+        if !visited.insert(po) {
+            // Cycle in /Prev chain — refuse rather than loop forever.
+            return Err(PdfError::other(
+                "PDF reader: /Prev xref-section chain has a cycle",
+            ));
+        }
+        if visited.len() > 32 {
+            return Err(PdfError::other(
+                "PDF reader: /Prev xref-section chain exceeds 32 hops — refusing",
+            ));
+        }
+        let older = parse_xref_at(input, po)?;
+        // Merge older entries beneath — only fill slots the newer
+        // revision didn't declare. (HashMap::entry::or_insert
+        // semantics.)
+        for (id, entry) in older.entries {
+            newest.entries.entry(id).or_insert(entry);
+        }
+        // Move /Prev into the in-progress trailer so the next loop
+        // iteration sees the older section's /Prev (chains can be
+        // longer than one hop).
+        let mut next_trailer = older.trailer.clone();
+        // Strip /Prev so we don't re-walk indefinitely if the older
+        // section happened not to carry one. We keep the merged
+        // table's trailer pointed at the newest revision's dict
+        // values (above) — older.trailer is only used for its /Prev.
+        next_trailer.set("Prev", Object::Null);
+        // Record the older section's /Prev (if any) on the newest
+        // table so the next loop iteration walks one more step.
+        let older_prev = older
+            .trailer
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Prev")
+            .and_then(|(_, v)| match v {
+                Object::Integer(n) if *n >= 0 => Some(*n as u64),
+                _ => None,
+            });
+        // Replace newest.trailer's /Prev with whatever the older
+        // section pointed at (or remove it once chain ends).
+        let mut new_trailer = Dict::new();
+        for (k, v) in newest.trailer.entries() {
+            if k != "Prev" {
+                new_trailer.set(k, v.clone());
+            }
+        }
+        if let Some(op) = older_prev {
+            new_trailer.set("Prev", Object::Integer(op as i64));
+        }
+        newest.trailer = new_trailer;
+        current_off = po;
+    }
+    let _ = current_off;
+    Ok(newest)
 }
 
 fn skip_whitespace(input: &[u8], lex: &mut Lexer<'_>) {

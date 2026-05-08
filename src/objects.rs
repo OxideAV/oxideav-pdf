@@ -154,6 +154,43 @@ pub struct Document {
     /// flate-compressed with the PNG-Up `/Predictor 12` so the
     /// reader's predictor reversal is exercised end-to-end.
     pub xref_stream: bool,
+    /// When `true` (and [`Self::xref_stream`] is also `true`),
+    /// [`Self::write_to`] packs every compressible indirect object
+    /// (non-stream, non-Encrypt, non-Catalog-when-flagged) into one
+    /// `/Type /ObjStm` container per ISO 32000-1 §7.5.7. The xref
+    /// stream's type-2 entries point at the container; the round-7
+    /// reader's [`crate::reader::DocumentReader::resolve`] follows
+    /// them. Implies a PDF 1.5+ header (already implied by
+    /// [`Self::xref_stream`]).
+    ///
+    /// Stream objects (content streams, image XObjects, the xref
+    /// stream itself, the encryption-metadata stream, etc.) cannot
+    /// live inside an ObjStm (§7.5.7) and remain at their own byte
+    /// offsets. The Encrypt indirect object (when set) is excluded
+    /// because §7.6.1 forbids it from being compressed.
+    pub object_stream: bool,
+    /// Optional pointer at a previous cross-reference section's byte
+    /// offset. When `Some(off)`, the trailer dict (or, with
+    /// [`Self::xref_stream`], the xref-stream dict) carries
+    /// `/Prev <off>` per ISO 32000-1 §7.5.6 — the marker that lets a
+    /// reader walk a chain of incremental updates. Set by
+    /// [`crate::write_pdf_incremental_update`] on the new revision's
+    /// document; unused for one-shot writes.
+    pub prev_xref_offset: Option<u64>,
+    /// When emitting an incremental update, the reader's view of
+    /// `/Size` must be at least the original revision's `/Size` —
+    /// this honours that minimum even when the new revision adds
+    /// only one or two indirect objects past the old maximum.
+    pub min_size: Option<u32>,
+    /// When emitting an incremental update, the body section is
+    /// appended to a previous file's bytes. The xref subsection
+    /// header(s) the writer emits must list only the *changed* slots
+    /// and skip the unchanged ones. When set, the xref emitter (both
+    /// classical and stream forms) groups slots into contiguous
+    /// subsections covering only these ids (and id 0 for the
+    /// free-list head); when `None` the writer emits one subsection
+    /// covering `[0, max_id]`.
+    pub xref_only_ids: Option<Vec<u32>>,
 }
 
 impl Document {
@@ -165,7 +202,25 @@ impl Document {
             info: None,
             encryption: None,
             xref_stream: false,
+            object_stream: false,
+            prev_xref_offset: None,
+            min_size: None,
+            xref_only_ids: None,
         }
+    }
+
+    /// Pre-seed the next-id allocator past `max_id`. Used by the
+    /// incremental-update writer to make new objects pick up after
+    /// the previous revision's maximum id.
+    pub fn set_next_id(&mut self, next_id: u32) {
+        self.next_id = next_id;
+    }
+
+    /// The next id [`Self::allocate_id`] will hand out. Useful for
+    /// the incremental-update writer to know where the new revision's
+    /// id range starts.
+    pub fn next_id(&self) -> u32 {
+        self.next_id
     }
 
     /// Reserve a fresh id without committing the object body. Useful
@@ -202,32 +257,56 @@ impl Document {
         let root = self
             .root
             .ok_or_else(|| PdfError::other("Document::write_to: missing /Root reference"))?;
+        if self.object_stream && !self.xref_stream {
+            return Err(PdfError::other(
+                "Document::write_to: object_stream=true requires xref_stream=true (ObjStm \
+                 containers can only be referenced from a /Type /XRef stream — \
+                 ISO 32000-1 §7.5.7)",
+            ));
+        }
+        if self.object_stream && self.encryption.is_some() {
+            // §7.6.1 + §7.5.7 interplay is solvable (encrypt the
+            // ObjStm container as a unit, leave compressed bodies
+            // alone) but pulls the per-object key derivation out of
+            // the Algorithm 1 path — round 8 keeps the two features
+            // independent rather than shipping a half-tested combo.
+            return Err(PdfError::other(
+                "Document::write_to: object_stream=true with encryption=Some(_) is not yet \
+                 supported (round-8 emits ObjStm OR encryption, not both — \
+                 ISO 32000-1 §7.5.7 + §7.6.1)",
+            ));
+        }
 
         // ---- Header ---------------------------------------------------
         // PDF 1.4 magic + the four >0x80 bytes that mark the file as
         // binary so PDF readers don't treat it as ASCII (ISO 32000-1
         // §7.5.2). Any byte ≥0x80 satisfies the rule; we use 0xE2 0xE3
         // 0xCF 0xD3 — the canonical pdftk / Acrobat marker.
-        let header_version: &[u8] = if self
-            .encryption
-            .as_ref()
-            .map(|e| e.handler.revision >= 5)
-            .unwrap_or(false)
-        {
-            // V=5 was introduced in PDF 1.7 + ISO 32000-2 (2.0). Bump
-            // the magic so PDF 2.0 readers don't flag the file as
-            // pre-1.7-using-1.7-features.
-            b"%PDF-2.0\n"
-        } else if self.xref_stream {
-            // XRef streams require PDF 1.5+ readers (§7.5.8). Bump
-            // the header so older parsers refuse the file rather than
-            // silently misinterpreting the cross-reference section.
-            b"%PDF-1.5\n"
-        } else {
-            b"%PDF-1.4\n"
-        };
-        out.extend_from_slice(header_version);
-        out.extend_from_slice(b"%\xE2\xE3\xCF\xD3\n");
+        //
+        // Skip the header when we're appending an incremental update —
+        // the previous revision's bytes already carry one (§7.5.6).
+        if self.prev_xref_offset.is_none() {
+            let header_version: &[u8] = if self
+                .encryption
+                .as_ref()
+                .map(|e| e.handler.revision >= 5)
+                .unwrap_or(false)
+            {
+                // V=5 was introduced in PDF 1.7 + ISO 32000-2 (2.0). Bump
+                // the magic so PDF 2.0 readers don't flag the file as
+                // pre-1.7-using-1.7-features.
+                b"%PDF-2.0\n"
+            } else if self.xref_stream {
+                // XRef streams require PDF 1.5+ readers (§7.5.8). Bump
+                // the header so older parsers refuse the file rather than
+                // silently misinterpreting the cross-reference section.
+                b"%PDF-1.5\n"
+            } else {
+                b"%PDF-1.4\n"
+            };
+            out.extend_from_slice(header_version);
+            out.extend_from_slice(b"%\xE2\xE3\xCF\xD3\n");
+        }
 
         // If encrypted, allocate an Encrypt indirect object so its body
         // is interleaved with the rest. We do this on a clone so the
@@ -255,6 +334,120 @@ impl Document {
             None
         };
 
+        // ---- ObjStm packing -----------------------------------------
+        // When `object_stream` is set, partition `objects_to_emit` into
+        // a compressible group (regular dicts that aren't the Encrypt
+        // object and aren't already streams) and a non-compressible
+        // group (streams and the Encrypt object). The compressible
+        // group becomes the body of one ObjStm container; the xref
+        // stream gets `Compressed` entries for them.
+        //
+        // The Catalog is also pinned out of the ObjStm: §7.5.7 forbids
+        // the document Catalog from being compressed in ObjStm because
+        // the linearization hint (when present) and Adobe's reading
+        // logic both want to find the Catalog at a deterministic byte
+        // offset. We're not emitting linearized PDFs (deferred), but
+        // the Catalog pin keeps the output friendly to viewers that
+        // assume the historical layout.
+        let mut compressed_map: std::collections::HashMap<u32, (u32, u32)> =
+            std::collections::HashMap::new();
+        let objstm_id_opt: Option<ObjectId> = if self.object_stream {
+            let mut compressible: Vec<IndirectObject> = Vec::new();
+            let mut keep: Vec<IndirectObject> = Vec::new();
+            for ind in objects_to_emit.drain(..) {
+                let is_stream = matches!(ind.object, Object::Stream(_));
+                let is_encrypt = encrypt_id_opt == Some(ind.id);
+                let is_root = ind.id == root;
+                if !is_stream && !is_encrypt && !is_root {
+                    compressible.push(ind);
+                } else {
+                    keep.push(ind);
+                }
+            }
+            objects_to_emit = keep;
+
+            if compressible.is_empty() {
+                None
+            } else {
+                // Allocate a fresh id for the ObjStm container, past
+                // every existing object id (the kept set, the
+                // compressed set, and any Encrypt id). The drained
+                // `compressible` set still owns its original ids —
+                // they live inside the ObjStm via type-2 xref entries
+                // — so we have to count those too.
+                let max_kept = objects_to_emit
+                    .iter()
+                    .map(|o| o.id.number)
+                    .max()
+                    .unwrap_or(0);
+                let max_compressed = compressible.iter().map(|o| o.id.number).max().unwrap_or(0);
+                let next_id = max_kept
+                    .max(max_compressed)
+                    .max(self.next_id.saturating_sub(1))
+                    + 1;
+                let objstm_id = ObjectId::new(next_id);
+
+                // Build the ObjStm payload. §7.5.7: header is a
+                // whitespace-separated sequence of `obj_num offset`
+                // decimal pairs (offsets relative to /First, the start
+                // of the body region in the *decoded* stream); body
+                // is the concatenation of each compressed object's
+                // serialised form (no `n gen obj` / `endobj` wrapper).
+                let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(compressible.len());
+                for ind in &compressible {
+                    let mut b = Vec::new();
+                    write_object(&mut b, &ind.object).map_err(PdfError::Io)?;
+                    bodies.push(b);
+                }
+                let mut header = String::new();
+                let mut running = 0usize;
+                for (ind, body) in compressible.iter().zip(bodies.iter()) {
+                    if !header.is_empty() {
+                        header.push(' ');
+                    }
+                    header.push_str(&format!("{} {}", ind.id.number, running));
+                    running += body.len();
+                }
+                // Trailing space before the body — the §7.5.7
+                // header-token grammar requires whitespace between the
+                // last header integer and the first object body.
+                header.push(' ');
+
+                let header_bytes = header.into_bytes();
+                let first = header_bytes.len();
+                let n_compressed = compressible.len();
+
+                let mut payload =
+                    Vec::with_capacity(first + bodies.iter().map(|b| b.len()).sum::<usize>());
+                payload.extend_from_slice(&header_bytes);
+                for body in &bodies {
+                    payload.extend_from_slice(body);
+                }
+
+                let compressed = flate_compress(&payload);
+
+                let dict = Dict::new()
+                    .with("Type", Object::Name("ObjStm".into()))
+                    .with("N", Object::Integer(n_compressed as i64))
+                    .with("First", Object::Integer(first as i64))
+                    .with("Filter", Object::Name("FlateDecode".into()));
+
+                objects_to_emit.push(IndirectObject {
+                    id: objstm_id,
+                    object: Object::Stream(Stream::new(dict, compressed)),
+                });
+
+                // Record the type-2 mapping for each compressed id.
+                for (idx, ind) in compressible.into_iter().enumerate() {
+                    compressed_map.insert(ind.id.number, (objstm_id.number, idx as u32));
+                }
+
+                Some(objstm_id)
+            }
+        } else {
+            None
+        };
+
         // ---- XRef-stream branch: the cross-reference itself is an
         // indirect object so we have to allocate its id BEFORE we
         // emit the body (its offset depends on its position, but its
@@ -262,13 +455,26 @@ impl Document {
         // pre-allocate the id and add a placeholder Stream that the
         // post-body fix-up populates with the real binary table.
         let xref_stream_id_opt: Option<ObjectId> = if self.xref_stream {
-            let next_id = objects_to_emit
+            let mut max_existing = objects_to_emit
                 .iter()
                 .map(|o| o.id.number)
                 .max()
-                .unwrap_or(0)
-                + 1;
-            Some(ObjectId::new(next_id))
+                .unwrap_or(0);
+            // Account for any previously-allocated next_id (incremental
+            // updates) — the xref stream's id must not clash with an
+            // id that was reserved but not yet committed.
+            if self.next_id.saturating_sub(1) > max_existing {
+                max_existing = self.next_id - 1;
+            }
+            // Account for compressed-object ids (they're not in
+            // `objects_to_emit` after the ObjStm-packing drain, but
+            // they still occupy id slots in the cross-reference).
+            if let Some(top) = compressed_map.keys().max() {
+                if *top > max_existing {
+                    max_existing = *top;
+                }
+            }
+            Some(ObjectId::new(max_existing + 1))
         } else {
             None
         };
@@ -284,10 +490,22 @@ impl Document {
             .last()
             .map(|o| o.id.number as usize)
             .unwrap_or(0);
-        let max_id = match xref_stream_id_opt {
+        let mut max_id = match xref_stream_id_opt {
             Some(id) => id.number as usize,
             None => body_max_id,
         };
+        // Compressed-only ids might exceed body_max_id when the ObjStm
+        // container has fewer ids than the original objects.
+        if let Some(top) = compressed_map.keys().max() {
+            max_id = max_id.max(*top as usize);
+        }
+        // Honour the requested minimum (incremental updates: trailer
+        // /Size must be at least the previous revision's value).
+        if let Some(min) = self.min_size {
+            if (min as usize) > max_id + 1 {
+                max_id = (min as usize).saturating_sub(1);
+            }
+        }
         let mut offsets: Vec<u64> = vec![0; max_id + 1];
 
         for ind in &objects_to_emit {
@@ -298,23 +516,46 @@ impl Document {
 
         // ---- Cross-reference + trailer -------------------------------
         let xref_off = out.len() as u64;
+        // Build the subsection list — for a one-shot write, this is
+        // [(0, max_id+1)]; for an incremental update, only the changed
+        // ids land in subsections (plus id 0 if not already excluded).
+        let subsections: Vec<(u32, u32)> = match &self.xref_only_ids {
+            Some(ids) => Self::group_into_subsections(ids),
+            None => vec![(0, (max_id + 1) as u32)],
+        };
+
         if let Some(xref_stream_id) = xref_stream_id_opt {
             // Record the xref stream's own offset in the entry table.
             offsets[xref_stream_id.number as usize] = xref_off;
-            self.write_xref_stream(out, xref_stream_id, root, encrypt_id_opt, &offsets, max_id)?;
+            self.write_xref_stream(
+                out,
+                xref_stream_id,
+                root,
+                encrypt_id_opt,
+                objstm_id_opt,
+                &offsets,
+                &compressed_map,
+                max_id,
+                &subsections,
+            )?;
         } else {
             out.extend_from_slice(b"xref\n");
-            // Single subsection covering [0, max_id].
-            let header_line = format!("0 {}\n", max_id + 1);
-            out.extend_from_slice(header_line.as_bytes());
-            // Free-list head — slot 0 always 0000000000 65535 f.
-            out.extend_from_slice(b"0000000000 65535 f \n");
-            for offset in offsets.iter().skip(1) {
-                // 10-digit zero-padded byte offset, 5-digit zero-padded
-                // generation, 'n' (in-use) marker, exact two-character
-                // newline terminator (space + LF) per §7.5.4.
-                let line = format!("{:010} {:05} n \n", offset, 0);
-                out.extend_from_slice(line.as_bytes());
+            for (start, count) in &subsections {
+                let header_line = format!("{} {}\n", start, count);
+                out.extend_from_slice(header_line.as_bytes());
+                for id in *start..(*start + *count) {
+                    if id == 0 {
+                        // Free-list head — slot 0 always 0..f.
+                        out.extend_from_slice(b"0000000000 65535 f \n");
+                    } else {
+                        let off = offsets.get(id as usize).copied().unwrap_or(0);
+                        // 10-digit zero-padded byte offset, 5-digit
+                        // zero-padded generation, 'n' (in-use), exact
+                        // two-character newline terminator per §7.5.4.
+                        let line = format!("{:010} {:05} n \n", off, 0);
+                        out.extend_from_slice(line.as_bytes());
+                    }
+                }
             }
             out.extend_from_slice(b"trailer\n");
             let trailer_dict = self.build_trailer_dict(root, encrypt_id_opt, max_id);
@@ -329,9 +570,44 @@ impl Document {
         Ok(())
     }
 
+    /// Group a sorted list of ids into contiguous `(start, count)`
+    /// subsections. Used by the incremental-update path to emit only
+    /// the changed slots in the new xref section. Id 0 is always
+    /// included so the free-list head is rewritten on every revision.
+    fn group_into_subsections(ids: &[u32]) -> Vec<(u32, u32)> {
+        let mut all = Vec::with_capacity(ids.len() + 1);
+        all.push(0);
+        all.extend_from_slice(ids);
+        all.sort_unstable();
+        all.dedup();
+        let mut out: Vec<(u32, u32)> = Vec::new();
+        let mut iter = all.iter().copied();
+        let Some(mut start) = iter.next() else {
+            return out;
+        };
+        let mut prev = start;
+        let mut count: u32 = 1;
+        for v in iter {
+            if v == prev + 1 {
+                count += 1;
+            } else {
+                out.push((start, count));
+                start = v;
+                count = 1;
+            }
+            prev = v;
+        }
+        out.push((start, count));
+        out
+    }
+
     /// Build the trailer dict shared between the classical-xref and
     /// xref-stream emission paths. Carries `/Size`, `/Root`, optional
-    /// `/Info`, and (when encrypted) `/Encrypt` + `/ID`.
+    /// `/Info`, and (when encrypted) `/Encrypt` + `/ID`. When
+    /// `prev_xref_offset` is set (incremental update),
+    /// `/Prev <prev_off>` is emitted so a reader can chain back to
+    /// the previous revision's cross-reference section per
+    /// ISO 32000-1 §7.5.6.
     fn build_trailer_dict(
         &self,
         root: ObjectId,
@@ -343,6 +619,9 @@ impl Document {
             .with("Root", Object::Reference(root));
         if let Some(info_id) = self.info {
             trailer_dict.set("Info", Object::Reference(info_id));
+        }
+        if let Some(prev) = self.prev_xref_offset {
+            trailer_dict.set("Prev", Object::Integer(prev as i64));
         }
         if let (Some(eid), Some(state)) = (encrypt_id_opt, &self.encryption) {
             trailer_dict.set("Encrypt", Object::Reference(eid));
@@ -362,50 +641,68 @@ impl Document {
     /// Emit a PDF 1.5+ cross-reference stream (ISO 32000-1 §7.5.8).
     /// `offsets[i]` is the byte offset of the indirect object whose
     /// id is `i`; slot 0 is the free-list head and is encoded as
-    /// `(0, 0, 65535)` per §7.5.8.3 (Type 0 entry).
+    /// `(0, 0, 65535)` per §7.5.8.3 (Type 0 entry). Compressed-object
+    /// entries (type 2) come from `compressed_map[id] = (container,
+    /// index)` and override the type-1 default.
+    #[allow(clippy::too_many_arguments)]
     fn write_xref_stream(
         &self,
         out: &mut Vec<u8>,
         xref_id: ObjectId,
         root: ObjectId,
         encrypt_id_opt: Option<ObjectId>,
+        objstm_id_opt: Option<ObjectId>,
         offsets: &[u64],
+        compressed_map: &std::collections::HashMap<u32, (u32, u32)>,
         max_id: usize,
+        subsections: &[(u32, u32)],
     ) -> Result<(), PdfError> {
         // Field widths: type=1 byte, offset=4 bytes (handles ≤4 GiB),
         // generation=2 bytes. PDFs above 4 GiB would need w[1]=8; we
         // guard against the overflow rather than silently truncating.
         const W: [usize; 3] = [1, 4, 2];
         let entry_width = W[0] + W[1] + W[2];
-        let n = max_id + 1;
-        let mut raw_table = Vec::with_capacity(n * entry_width);
 
-        // Slot 0 — free-list head. Type 0, next=0, generation=65535.
-        raw_table.push(0);
-        raw_table.extend_from_slice(&0u32.to_be_bytes());
-        raw_table.extend_from_slice(&65535u16.to_be_bytes());
-
-        for (i, off) in offsets.iter().enumerate().skip(1) {
-            if *off > u32::MAX as u64 {
-                return Err(PdfError::other(format!(
-                    "Document::write_xref_stream: object {i} offset {off} exceeds 32-bit\
-                     limit — bump /W[1] to 8 bytes"
-                )));
+        // Collect every id we're emitting an entry for, in subsection
+        // order. The /Index array on the stream dict mirrors
+        // `subsections` exactly.
+        let mut emit_ids: Vec<u32> = Vec::new();
+        for (start, count) in subsections {
+            for id in *start..(*start + *count) {
+                emit_ids.push(id);
             }
-            // Slots above the body (for unallocated ids) and the slot
-            // for the in-use entries both go through this branch. The
-            // pre-fill of `offsets` with 0 means any never-written id
-            // would land here as type-1 with offset 0 — but in practice
-            // every id 1..=max_id has been written above (the xref
-            // stream's own slot was patched in by the caller).
-            raw_table.push(1);
-            raw_table.extend_from_slice(&(*off as u32).to_be_bytes());
-            raw_table.extend_from_slice(&0u16.to_be_bytes());
+        }
+        let n_entries = emit_ids.len();
+        let mut raw_table = Vec::with_capacity(n_entries * entry_width);
+
+        for id in &emit_ids {
+            if *id == 0 {
+                // Slot 0 — free-list head. Type 0, next=0, gen=65535.
+                raw_table.push(0);
+                raw_table.extend_from_slice(&0u32.to_be_bytes());
+                raw_table.extend_from_slice(&65535u16.to_be_bytes());
+            } else if let Some((container, idx)) = compressed_map.get(id).copied() {
+                // Type 2 — compressed inside an ObjStm container.
+                raw_table.push(2);
+                raw_table.extend_from_slice(&container.to_be_bytes());
+                raw_table.extend_from_slice(&(idx as u16).to_be_bytes());
+            } else {
+                let off = offsets.get(*id as usize).copied().unwrap_or(0);
+                if off > u32::MAX as u64 {
+                    return Err(PdfError::other(format!(
+                        "Document::write_xref_stream: object {id} offset {off} exceeds 32-bit\
+                         limit — bump /W[1] to 8 bytes"
+                    )));
+                }
+                raw_table.push(1);
+                raw_table.extend_from_slice(&(off as u32).to_be_bytes());
+                raw_table.extend_from_slice(&0u16.to_be_bytes());
+            }
         }
 
         // PNG-Up forward predictor (tag 2): each row is `entry[i] -
         // prev[i]` (mod 256). Match the round-6 reader's reversal.
-        let mut predicted = Vec::with_capacity(n * (entry_width + 1));
+        let mut predicted = Vec::with_capacity(n_entries * (entry_width + 1));
         let mut prev = vec![0u8; entry_width];
         for chunk in raw_table.chunks_exact(entry_width) {
             predicted.push(0x02); // PNG-Up tag.
@@ -420,6 +717,11 @@ impl Document {
 
         // Build the xref-stream dict — fold trailer entries in.
         let trailer_dict = self.build_trailer_dict(root, encrypt_id_opt, max_id);
+        let mut index_array: Vec<Object> = Vec::with_capacity(subsections.len() * 2);
+        for (start, count) in subsections {
+            index_array.push(Object::Integer(*start as i64));
+            index_array.push(Object::Integer(*count as i64));
+        }
         let mut stream_dict = Dict::new()
             .with("Type", Object::Name("XRef".into()))
             .with("Filter", Object::Name("FlateDecode".into()))
@@ -439,11 +741,8 @@ impl Document {
                     Object::Integer(W[2] as i64),
                 ]),
             )
-            .with(
-                "Index",
-                Object::Array(vec![Object::Integer(0), Object::Integer(n as i64)]),
-            );
-        // Copy trailer fields (Size, Root, Info, Encrypt, ID).
+            .with("Index", Object::Array(index_array));
+        // Copy trailer fields (Size, Root, Info, Prev, Encrypt, ID).
         for (k, v) in trailer_dict.entries() {
             stream_dict.set(k, v.clone());
         }
@@ -454,6 +753,11 @@ impl Document {
             object: Object::Stream(stream),
         };
         write_indirect(out, &indirect).map_err(PdfError::Io)?;
+        // Suppress unused-variable warning when `objstm_id_opt` is set
+        // but the caller doesn't need it here — kept on the signature
+        // so future revisions (per-stream encryption opt-out for the
+        // ObjStm container itself) can read it without re-threading.
+        let _ = objstm_id_opt;
         Ok(())
     }
 }
