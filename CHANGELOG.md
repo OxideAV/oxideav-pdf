@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round-11 writer: **public-key encryption encode** — the symmetric
+  encoder side of round 10. New top-level
+  `write_pdf_from_scene_pubsec_encrypted(scene, &PubSecEncoderConfig)`
+  emits PDFs whose `/Encrypt /Filter` is `/Adobe.PPKLite` and whose
+  `/Recipients` array carries one CMS `EnvelopedData` (RFC 5652 §6.1)
+  per access-permission set. `PubSecEncoderConfig` constructors:
+  `pkcs7_s4` (RC4-128 / SHA-1), `pkcs7_s5_v4_aes128` (AES-128 CBC /
+  SHA-1), `pkcs7_s5_v5_aes256` (AES-256 CBC / SHA-256). Each
+  recipient's content-encryption key is RSA-PKCS1-v1.5 wrapped to its
+  public key; the file encryption key is `SHA-1/SHA-256(seed ‖
+  envelope_blob [‖ 0xFFFFFFFF])` per ISO 32000-1 §7.6.4.3 / ISO
+  32000-2 §7.6.5.3. The `cms_build` module is promoted from `pub(crate)
+  test-only` to `pub` and gains a `build_envelope_rc4` helper +
+  `RecipientPlain::ias` / `::ski` constructors. `PubSecEncryptionState`
+  produces a `EncryptionState` shape so the writer reuses the
+  password-handler's per-object encryption walker without duplication.
+- Round-11: **`SubjectKeyIdentifier` recipient matching** (CMS v2 per
+  RFC 5652 §6.2.1). Previously the parser errored on the v=2 KTRI
+  variant; round 11 wires it through. `cms::RecipientId` becomes a
+  CHOICE-shaped enum with `IssuerAndSerial` and
+  `SubjectKeyIdentifier(Vec<u8>)` arms; `pubsec::open_with_certificate`
+  accepts either form, computing the cert's SKI as
+  `SHA-1(SubjectPublicKeyInfo BIT STRING contents)` (RFC 5280
+  §4.2.1.2 method 1). `x509::Certificate` extends with
+  `spki_pubkey_bits` + `subject_key_identifier()` accessor; the
+  X.509 parser now walks past `issuer` to `subjectPublicKeyInfo`
+  (best-effort — synthetic test certs that truncate after `issuer`
+  silently leave `spki_pubkey_bits = None`).
+- Round-11 writer: **linearization F.4.2 / F.4.3 / F.4.4 hint
+  tables** — shared-object (24-byte zero header), thumbnail (28-byte
+  zero header), outline (14-byte zero header). The hint stream's
+  dict gains `/S` (shared-object table offset), `/T` (thumbnail
+  table offset), `/O` (outline table offset). Entry sections stay
+  empty (we generate no shared objects / thumbnails / outlines), so
+  readers parsing these tables conclude there's nothing to consume —
+  but the structural completeness lets `qpdf --linearize-check` and
+  similar tools see a fully-formed hint stream.
+- Round-11 tests: 11 new tests — 4 lib unit tests for the
+  shared/thumbnail/outline hint table builders + the hint-stream
+  dict /S/T/O presence; 4 lib unit tests for the writer-side
+  encoder (s4 / s5-V4-AES128 / s5-V5-AES256 round-trip via
+  `open_with_certificate` + a SKI-form variant + an empty-recipients
+  rejection); 5 integration tests in `tests/pubsec.rs` exercising
+  the full writer→reader pipeline including a two-recipients-either
+  -opens scenario and an SKI-form round trip; 1 X.509 unit test for
+  the SPKI extractor / SHA-1 SKI computation.
+
 - Round-10 reader: **public-key encryption decode** for the
   `adbe.pkcs7.s3` / `s4` / `s5` SubFilters of the public-key
   security handler (ISO 32000-1 §7.6.4 + ISO 32000-2 §7.6.5).

@@ -57,15 +57,18 @@ pub mod resources;
 pub mod writer;
 
 pub use error::PdfError;
-pub use pubsec::{open_with_certificate, PubSecCredential, PubSecSubFilter};
+pub use pubsec::{
+    open_with_certificate, PubSecCredential, PubSecEncoderConfig, PubSecEncryptionState,
+    PubSecRecipient, PubSecSubFilter,
+};
 pub use reader::{
     read_pdf_to_scene, read_pdf_to_scene_with_certificate, read_pdf_to_scene_with_password,
 };
 pub use writer::{
     write_pdf, write_pdf_from_scene, write_pdf_from_scene_encrypted,
     write_pdf_from_scene_linearized, write_pdf_from_scene_object_stream,
-    write_pdf_from_scene_object_stream_encrypted, write_pdf_from_scene_xref_stream,
-    write_pdf_incremental_update,
+    write_pdf_from_scene_object_stream_encrypted, write_pdf_from_scene_pubsec_encrypted,
+    write_pdf_from_scene_xref_stream, write_pdf_incremental_update,
 };
 
 use oxideav_core::{

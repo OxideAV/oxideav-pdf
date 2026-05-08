@@ -454,7 +454,11 @@ fn build_pubsec_pdf(profile: Profile, title: &str) -> (Vec<u8>, PubSecCredential
     bytes.extend_from_slice(b">] >>\n");
     bytes.extend_from_slice(format!("startxref\n{}\n%%EOF\n", xref_off).as_bytes());
 
-    let cert = Certificate { issuer_der, serial };
+    let cert = Certificate {
+        issuer_der,
+        serial,
+        spki_pubkey_bits: None,
+    };
     let credential = PubSecCredential::from_parsed(cert, priv_key);
     (bytes, credential)
 }
@@ -497,6 +501,7 @@ fn wrong_certificate_serial_returns_error() {
         Certificate {
             issuer_der: der::write_sequence(b"O=OxideAV pubsec test"),
             serial: vec![0xFF, 0xFF, 0xFF],
+            spki_pubkey_bits: None,
         },
         priv_key,
     );
@@ -506,6 +511,200 @@ fn wrong_certificate_serial_returns_error() {
         msg.contains("certificate did not match"),
         "expected wrong-cert error, got: {msg}"
     );
+}
+
+// ───────── Round-11: writer-side public-key encryption ─────────
+
+/// Build a one-page Scene the writer entry point can serialise.
+fn one_page_scene(title: &str) -> oxideav_scene::Scene {
+    use oxideav_core::vector::{
+        FillRule, Group, Node, Paint, Path, PathCommand, PathNode, Point, Rgba, VectorFrame,
+    };
+    use oxideav_core::TimeBase;
+    use oxideav_scene::{Metadata, Page, Scene};
+    let mut p = Path::new();
+    p.commands.push(PathCommand::MoveTo(Point::new(10.0, 10.0)));
+    p.commands.push(PathCommand::LineTo(Point::new(60.0, 10.0)));
+    p.commands.push(PathCommand::LineTo(Point::new(60.0, 60.0)));
+    p.commands.push(PathCommand::LineTo(Point::new(10.0, 60.0)));
+    p.commands.push(PathCommand::Close);
+    let frame = VectorFrame {
+        width: 100.0,
+        height: 100.0,
+        view_box: None,
+        root: Group {
+            children: vec![Node::Path(PathNode {
+                path: p,
+                fill: Some(Paint::Solid(Rgba::opaque(0xFF, 0x00, 0x00))),
+                stroke: None,
+                fill_rule: FillRule::NonZero,
+            })],
+            ..Group::default()
+        },
+        pts: None,
+        time_base: TimeBase::new(1, 1),
+    };
+    let mut page = Page::new(100.0, 100.0);
+    page.content = frame;
+    Scene {
+        pages: Some(vec![page]),
+        metadata: Metadata {
+            title: Some(title.into()),
+            ..Metadata::default()
+        },
+        ..Scene::default()
+    }
+}
+
+fn writer_recipient_for_keypair(
+    issuer: &[u8],
+    serial: Vec<u8>,
+    pub_key: &rsa::RsaPublicKey,
+) -> oxideav_pdf::PubSecRecipient {
+    oxideav_pdf::PubSecRecipient::from_issuer_and_serial(
+        der::write_sequence(issuer),
+        serial,
+        pub_key.clone(),
+    )
+}
+
+#[test]
+fn writer_s4_then_reader_round_trip() {
+    let (priv_key, pub_key) = rsa_keypair();
+    let issuer = b"O=writer-s4";
+    let serial = vec![0x10];
+    let recipient = writer_recipient_for_keypair(issuer, serial.clone(), &pub_key);
+    let cfg = oxideav_pdf::PubSecEncoderConfig::pkcs7_s4(vec![recipient]);
+    let scene = one_page_scene("WriterS4");
+    let pdf = oxideav_pdf::write_pdf_from_scene_pubsec_encrypted(&scene, &cfg).expect("encode");
+    let cred = PubSecCredential::from_parsed(
+        Certificate {
+            issuer_der: der::write_sequence(issuer),
+            serial,
+            spki_pubkey_bits: None,
+        },
+        priv_key,
+    );
+    let decoded = read_pdf_to_scene_with_certificate(&pdf, &cred).expect("decode");
+    assert_eq!(decoded.metadata.title.as_deref(), Some("WriterS4"));
+    assert_eq!(decoded.pages.expect("pages").len(), 1);
+}
+
+#[test]
+fn writer_s5_v4_aes128_round_trip() {
+    let (priv_key, pub_key) = rsa_keypair();
+    let issuer = b"O=writer-s5-v4";
+    let serial = vec![0x20];
+    let recipient = writer_recipient_for_keypair(issuer, serial.clone(), &pub_key);
+    let cfg = oxideav_pdf::PubSecEncoderConfig::pkcs7_s5_v4_aes128(vec![recipient]);
+    let scene = one_page_scene("WriterS5V4-AES128");
+    let pdf = oxideav_pdf::write_pdf_from_scene_pubsec_encrypted(&scene, &cfg).expect("encode");
+    let cred = PubSecCredential::from_parsed(
+        Certificate {
+            issuer_der: der::write_sequence(issuer),
+            serial,
+            spki_pubkey_bits: None,
+        },
+        priv_key,
+    );
+    let decoded = read_pdf_to_scene_with_certificate(&pdf, &cred).expect("decode");
+    assert_eq!(decoded.metadata.title.as_deref(), Some("WriterS5V4-AES128"));
+}
+
+#[test]
+fn writer_s5_v5_aes256_round_trip() {
+    let (priv_key, pub_key) = rsa_keypair();
+    let issuer = b"O=writer-s5-v5";
+    let serial = vec![0x42, 0x01, 0x00];
+    let recipient = writer_recipient_for_keypair(issuer, serial.clone(), &pub_key);
+    let cfg = oxideav_pdf::PubSecEncoderConfig::pkcs7_s5_v5_aes256(vec![recipient]);
+    let scene = one_page_scene("WriterS5V5-AES256");
+    let pdf = oxideav_pdf::write_pdf_from_scene_pubsec_encrypted(&scene, &cfg).expect("encode");
+    let cred = PubSecCredential::from_parsed(
+        Certificate {
+            issuer_der: der::write_sequence(issuer),
+            serial,
+            spki_pubkey_bits: None,
+        },
+        priv_key,
+    );
+    let decoded = read_pdf_to_scene_with_certificate(&pdf, &cred).expect("decode");
+    assert_eq!(decoded.metadata.title.as_deref(), Some("WriterS5V5-AES256"));
+}
+
+#[test]
+fn writer_s5_v5_two_recipients_either_can_open() {
+    // Same envelope, two recipients — either user opens.
+    let (priv_a, pub_a) = rsa_keypair();
+    let (priv_b, pub_b) = rsa_keypair();
+    let issuer_a = b"O=writer-multi-A";
+    let issuer_b = b"O=writer-multi-B";
+    let recipients = vec![
+        writer_recipient_for_keypair(issuer_a, vec![0xAA], &pub_a),
+        writer_recipient_for_keypair(issuer_b, vec![0xBB], &pub_b),
+    ];
+    let cfg = oxideav_pdf::PubSecEncoderConfig::pkcs7_s5_v5_aes256(recipients);
+    let scene = one_page_scene("MultiRecipient");
+    let pdf = oxideav_pdf::write_pdf_from_scene_pubsec_encrypted(&scene, &cfg).expect("encode");
+    // Open with A.
+    let cred_a = PubSecCredential::from_parsed(
+        Certificate {
+            issuer_der: der::write_sequence(issuer_a),
+            serial: vec![0xAA],
+            spki_pubkey_bits: None,
+        },
+        priv_a,
+    );
+    assert_eq!(
+        read_pdf_to_scene_with_certificate(&pdf, &cred_a)
+            .expect("A decodes")
+            .metadata
+            .title
+            .as_deref(),
+        Some("MultiRecipient"),
+    );
+    // Open with B.
+    let cred_b = PubSecCredential::from_parsed(
+        Certificate {
+            issuer_der: der::write_sequence(issuer_b),
+            serial: vec![0xBB],
+            spki_pubkey_bits: None,
+        },
+        priv_b,
+    );
+    assert_eq!(
+        read_pdf_to_scene_with_certificate(&pdf, &cred_b)
+            .expect("B decodes")
+            .metadata
+            .title
+            .as_deref(),
+        Some("MultiRecipient"),
+    );
+}
+
+#[test]
+fn writer_s5_v5_ski_recipient_form_round_trip() {
+    // SKI = SHA-1 of pubkey BIT STRING contents (RFC 5280 §4.2.1.2).
+    // We cheat the synthetic form by hand-supplying the BIT STRING
+    // contents and computing its SHA-1 here.
+    let (priv_key, pub_key) = rsa_keypair();
+    let pubkey_bits = b"OXIDEAV-WRITER-PUBSEC-SKI-32BYTE".to_vec();
+    use sha1::Digest;
+    let ski = sha1::Sha1::digest(&pubkey_bits).to_vec();
+    let recipient = oxideav_pdf::PubSecRecipient::from_subject_key_identifier(ski, pub_key);
+    let cfg = oxideav_pdf::PubSecEncoderConfig::pkcs7_s5_v5_aes256(vec![recipient]);
+    let scene = one_page_scene("SKI-form");
+    let pdf = oxideav_pdf::write_pdf_from_scene_pubsec_encrypted(&scene, &cfg).expect("encode");
+    let cred = PubSecCredential::from_parsed(
+        Certificate {
+            issuer_der: vec![],
+            serial: vec![],
+            spki_pubkey_bits: Some(pubkey_bits),
+        },
+        priv_key,
+    );
+    let decoded = read_pdf_to_scene_with_certificate(&pdf, &cred).expect("decode");
+    assert_eq!(decoded.metadata.title.as_deref(), Some("SKI-form"));
 }
 
 #[test]
@@ -545,6 +744,7 @@ fn open_unencrypted_pdf_via_certificate_works() {
         Certificate {
             issuer_der: der::write_sequence(b"O=anything"),
             serial: vec![0x01],
+            spki_pubkey_bits: None,
         },
         priv_key,
     );

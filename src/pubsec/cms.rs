@@ -10,9 +10,12 @@
 //! * `RecipientInfo` of variant `KeyTransRecipientInfo` (no
 //!   key-agreement, no KEK, no password, no other) — the only one
 //!   the spec lets `adbe.pkcs7.s3`/`s4`/`s5` use in practice.
-//! * `RecipientIdentifier` of variant `IssuerAndSerialNumber` (the
-//!   `[0] SubjectKeyIdentifier` form is recognised but not yet used
-//!   for matching in round 10).
+//! * `RecipientIdentifier` of variant `IssuerAndSerialNumber` (CMS
+//!   v0) or `[0] SubjectKeyIdentifier` (CMS v2). Round 11 wires the
+//!   SKI variant through to the matcher (the pubsec module computes
+//!   the SHA-1 of the user cert's `SubjectPublicKeyInfo` BIT STRING
+//!   contents per RFC 5280 §4.2.1.2 and compares it to the recipient
+//!   slot's SKI octet string).
 //! * `EncryptedContentInfo` whose `contentType` is `id-data` and
 //!   whose `contentEncryptionAlgorithm` is one of the algorithm
 //!   identifiers the PDF spec allows (RC4 / AES-128-CBC /
@@ -78,6 +81,22 @@ pub struct IssuerAndSerial {
     pub serial: Vec<u8>,
 }
 
+/// CMS `RecipientIdentifier` (RFC 5652 §6.2.1) — the CHOICE that picks
+/// between `IssuerAndSerialNumber` (CMS v0) and `SubjectKeyIdentifier`
+/// (CMS v2). The SKI form carries the bare 20-byte SHA-1 of the
+/// recipient cert's `SubjectPublicKeyInfo` BIT STRING contents — see
+/// RFC 5280 §4.2.1.2 method 1.
+#[derive(Debug, Clone)]
+pub enum RecipientId {
+    /// `IssuerAndSerialNumber` (CMS v0). The matcher compares this to
+    /// the user cert's `(issuer_der, serial)` pair byte-for-byte.
+    IssuerAndSerial(IssuerAndSerial),
+    /// `[0] SubjectKeyIdentifier` (CMS v2). The matcher compares the
+    /// raw octet-string body to the SHA-1 of the user cert's
+    /// `SubjectPublicKeyInfo` BIT STRING contents.
+    SubjectKeyIdentifier(Vec<u8>),
+}
+
 /// `KeyTransRecipientInfo` (RFC 5652 §6.2.1) — the only RecipientInfo
 /// flavour the public-key handler ever uses in practice. RSAES-PKCS1
 /// v1.5 is the one key-encryption algorithm we accept (per the
@@ -85,8 +104,8 @@ pub struct IssuerAndSerial {
 /// recommendation).
 #[derive(Debug, Clone)]
 pub struct KeyTransRecipientInfo {
-    /// Issuer-and-serial-number identifier of the recipient cert.
-    pub rid: IssuerAndSerial,
+    /// Recipient identifier — IssuerAndSerial (v0) or SKI (v2).
+    pub rid: RecipientId,
     /// Algorithm identifier of the key-encryption algorithm. We only
     /// accept `OID_RSA_ENCRYPTION` here.
     pub key_encryption_oid: Vec<u64>,
@@ -255,17 +274,31 @@ fn parse_recipient_info(data: &[u8]) -> Result<(Option<KeyTransRecipientInfo>, &
         let issuer_der = ias_body[..issuer_total].to_vec();
         let (serial_body, _) = read_integer_bytes(ias_after_issuer)?;
         (
-            IssuerAndSerial {
+            RecipientId::IssuerAndSerial(IssuerAndSerial {
                 issuer_der,
                 serial: serial_body.to_vec(),
-            },
+            }),
             rest,
         )
     } else {
-        // [0] SubjectKeyIdentifier — not yet matched in round 10.
-        return Err(PdfError::other(
-            "CMS: KeyTransRecipientInfo[v=2] SubjectKeyIdentifier matching not yet supported",
-        ));
+        // [0] IMPLICIT OCTET STRING — context-specific primitive
+        // wrapping the recipient's SubjectKeyIdentifier (RFC 5652
+        // §6.2.1). The body bytes are the raw 20-byte SHA-1 of the
+        // recipient cert's `SubjectPublicKeyInfo` BIT STRING contents
+        // (RFC 5280 §4.2.1.2 method 1).
+        let (tlv, rest) = super::der::read_tlv(after_ver)?;
+        if tlv.class != Class::ContextSpecific || tlv.tag_number != 0 {
+            return Err(PdfError::other(format!(
+                "CMS: KeyTransRecipientInfo[v=2] expects [0] SubjectKeyIdentifier, got class={:?} tag={}",
+                tlv.class, tlv.tag_number
+            )));
+        }
+        if tlv.constructed {
+            return Err(PdfError::other(
+                "CMS: SubjectKeyIdentifier must be primitive [0] IMPLICIT OCTET STRING",
+            ));
+        }
+        (RecipientId::SubjectKeyIdentifier(tlv.body.to_vec()), rest)
     };
     // KeyEncryptionAlgorithm ::= AlgorithmIdentifier
     let (alg_seq, after_alg) = read_sequence(after_rid)?;
@@ -327,18 +360,20 @@ mod tests {
     fn parse_handcrafted_aes256_envelope() {
         // Build a minimal envelope with one synthetic recipient.
         let issuer_der = super::super::der::write_sequence(b"");
-        let recipient = RecipientPlain {
-            issuer_der: issuer_der.clone(),
-            serial: vec![0x01, 0x02, 0x03],
-            encrypted_key: vec![0xAA; 256],
-        };
+        let recipient =
+            RecipientPlain::ias(issuer_der.clone(), vec![0x01, 0x02, 0x03], vec![0xAA; 256]);
         let plaintext =
             b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E\x0F\x10\x11\x12\x13";
         let envelope = build_envelope_aes256(&[recipient], plaintext, &[0xBBu8; 32], &[0xCCu8; 16]);
         let parsed = parse_envelope(&envelope).expect("parse envelope");
         assert_eq!(parsed.recipients.len(), 1);
-        assert_eq!(parsed.recipients[0].rid.serial, vec![0x01, 0x02, 0x03]);
-        assert_eq!(parsed.recipients[0].rid.issuer_der, issuer_der);
+        match &parsed.recipients[0].rid {
+            super::RecipientId::IssuerAndSerial(ias) => {
+                assert_eq!(ias.serial, vec![0x01, 0x02, 0x03]);
+                assert_eq!(ias.issuer_der, issuer_der);
+            }
+            other => panic!("unexpected rid: {other:?}"),
+        }
         match parsed.content_encryption {
             ContentEncryption::Aes256Cbc { iv } => assert_eq!(iv, [0xCC; 16]),
             _ => panic!("expected AES256CBC"),

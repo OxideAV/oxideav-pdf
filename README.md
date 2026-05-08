@@ -67,11 +67,11 @@ match oxideav_pdf::read_pdf_to_scene(&pdf) {
 
 Per-stream crypt-filter overrides land in a follow-up round.
 
-## Public-key encryption decode
+## Public-key encryption (decode + encode)
 
-Round 10 unlocks **public-key-encrypted PDFs** under the
-`adbe.pkcs7.s3` / `s4` / `s5` SubFilters of the public-key security
-handler (ISO 32000-1 §7.6.4 + ISO 32000-2 §7.6.5):
+The reader and writer both handle **public-key-encrypted PDFs** under
+the `adbe.pkcs7.s3` / `s4` / `s5` SubFilters of the public-key
+security handler (ISO 32000-1 §7.6.4 + ISO 32000-2 §7.6.5):
 
 - **`adbe.pkcs7.s3`** — RC4-40, V=1, SHA-1 file-key derivation.
 - **`adbe.pkcs7.s4`** — RC4-128, V=2, SHA-1.
@@ -82,10 +82,11 @@ The trailer's `/Recipients` array (or `/CF /<StmF> /Recipients` for
 s5) carries one CMS `EnvelopedData` (RFC 5652 §6.1) per access-
 permission set; each envelope's `KeyTransRecipientInfo` SET wraps the
 content-encryption key with `RSAES-PKCS1-v1_5` to a recipient's RSA
-public key. The reader matches by `IssuerAndSerialNumber`,
-RSA-decrypts the wrapped CEK, decrypts the envelope contents (RC4 /
-AES-128 / AES-256 CBC), then derives the file encryption key per
-§7.6.4.3 / §7.6.5.3.
+public key. The reader matches by either `IssuerAndSerialNumber` (CMS
+v0) or `SubjectKeyIdentifier` (CMS v2 — RFC 5280 §4.2.1.2 method 1
+SHA-1 of the SPKI BIT STRING contents), RSA-decrypts the wrapped CEK,
+decrypts the envelope contents (RC4 / AES-128 / AES-256 CBC), then
+derives the file encryption key per §7.6.4.3 / §7.6.5.3.
 
 ```rust,ignore
 use oxideav_pdf::{read_pdf_to_scene_with_certificate, PubSecCredential};
@@ -97,9 +98,29 @@ let scene = read_pdf_to_scene_with_certificate(&pdf_bytes, &credential)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The encoder side (writer-emitted public-key PDFs), recipient
-identification by `SubjectKeyIdentifier`, and per-crypt-filter
-recipient lists are deferred.
+Round 11 lands the symmetric **encoder side**: the writer emits
+public-key-encrypted PDFs that round-trip through the reader.
+
+```rust,ignore
+use oxideav_pdf::{
+    write_pdf_from_scene_pubsec_encrypted, PubSecEncoderConfig, PubSecRecipient,
+};
+
+// One recipient — IssuerAndSerial form.
+let recipient = PubSecRecipient::from_issuer_and_serial(
+    issuer_der,           // recipient cert's `issuer` SEQUENCE bytes
+    serial_bytes,         // recipient cert's serial INTEGER body
+    rsa_public_key,
+);
+let cfg = PubSecEncoderConfig::pkcs7_s5_v5_aes256(vec![recipient]);
+let pdf = write_pdf_from_scene_pubsec_encrypted(&scene, &cfg)?;
+# Ok::<(), oxideav_pdf::PdfError>(())
+```
+
+`PubSecRecipient` also exposes `from_subject_key_identifier(ski, key)`
+for the CMS v2 form. Per-crypt-filter recipient lists (multiple
+permission sets per file) and `RC2 / 3DES / DES` envelope content
+algorithms are deferred.
 
 ## Encryption encode (writer side)
 
@@ -185,10 +206,14 @@ the first-page trailer's `/Prev` points at the main xref. The
 output is also a valid plain PDF — readers ignoring `/Linearized`
 walk the same Catalog + Pages tree + page content.
 
-The hint stream emits the mandatory page offset hint table only
-(Tables F.3 + F.4); shared-object / thumbnail / generic hints
-(F.4.2 / F.4.3 / F.4.4 / F.4.5 / F.4.6) are deferred and will
-land alongside outline / annotation support.
+The hint stream emits the page offset table (F.4.1) plus minimal
+shared-object (F.4.2), thumbnail (F.4.3), and outline (F.4.4) header
+sections — entry counts at zero so the structural shape is complete
+but no per-shared-object / per-thumbnail / per-outline bytes are
+generated. The hint dict carries `/S`, `/T`, `/O` offsets into the
+decoded hint stream so a reader walking the optional tables sees a
+fully-formed (if empty) layout. Generic (F.4.5) and named-destination
+(F.4.6) tables are still deferred.
 
 ## Deferred
 
@@ -196,13 +221,11 @@ land alongside outline / annotation support.
   CIDFont built via `oxideav-ttf`/`oxideav-otf`).
 - JPEG passthrough on `ImageRef` (DCTDecode XObject) — needs core
   IR support for "raw codec bytes" alongside the decoded VideoFrame.
-- Public-key security handler **encoder side** (writer emitting
-  `/Recipients` arrays — round 10 covers reader only).
-- Recipient identification by `SubjectKeyIdentifier` (only the
-  `IssuerAndSerialNumber` recipient ID form matches today).
-- Shared-object / thumbnail / outline / generic hint tables for
-  linearized output (only the mandatory page-offset hint table is
-  emitted).
+- Per-crypt-filter recipient lists for public-key encrypted PDFs
+  (multiple permission sets per file — round 11 wires the
+  document-level + single-StmF crypt-filter `Recipients` slots).
+- Generic / named-destination hint tables (F.4.5 / F.4.6) for
+  linearized output.
 - Transparency groups beyond a per-`Group` `/ca`+`/CA` opacity.
 
 ## Usage

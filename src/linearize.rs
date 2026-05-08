@@ -263,14 +263,34 @@ pub fn write_pdf_linearized(scene: &Scene) -> Result<Vec<u8>, PdfError> {
         None
     };
 
-    // Part 5: hint stream
+    // Part 5: hint stream — page-offset table (F.4.1) followed by
+    // empty-shape shared-object (F.4.2) + thumbnail (F.4.3) +
+    // outline (F.4.4) tables. Each follow-on table is its 22..32-byte
+    // header with all entry counts at zero, so the hint stream stays
+    // self-describing without any per-shared-object / per-thumbnail
+    // bytes (we generate none).
     let hint_stream_off = out.len() as u64;
-    let hint_data = build_page_offset_hint_table(n_pages);
+    let page_offset_table = build_page_offset_hint_table(n_pages);
+    let shared_object_table = build_shared_object_hint_table();
+    let thumbnail_table = build_thumbnail_hint_table();
+    let outline_table = build_outline_hint_table();
+    // Offsets within the decoded hint stream — these are what /S, /T
+    // and /O point at (Annex F.3.6 + F.4.x section headers).
+    let s_off = page_offset_table.len();
+    let t_off = s_off + shared_object_table.len();
+    let o_off = t_off + thumbnail_table.len();
+    let mut hint_data = Vec::with_capacity(o_off + outline_table.len());
+    hint_data.extend_from_slice(&page_offset_table);
+    hint_data.extend_from_slice(&shared_object_table);
+    hint_data.extend_from_slice(&thumbnail_table);
+    hint_data.extend_from_slice(&outline_table);
     let hint_dict = Dict::new()
-        // /S = byte offset of shared-object hint table inside the
-        // (decoded) hint stream. We don't emit a shared-object table;
-        // pointing past EOS is the conventional sentinel.
-        .with("S", Object::Integer(hint_data.len() as i64));
+        // /S = byte offset of shared-object hint table (F.4.2).
+        .with("S", Object::Integer(s_off as i64))
+        // /T = byte offset of thumbnail hint table (F.4.3).
+        .with("T", Object::Integer(t_off as i64))
+        // /O = byte offset of outline hint table (F.4.4).
+        .with("O", Object::Integer(o_off as i64));
     write_indirect(
         &mut out,
         &IndirectObject {
@@ -692,6 +712,83 @@ fn write_padded_at(out: &mut [u8], at: usize, value: u64) -> Result<(), PdfError
     Ok(())
 }
 
+/// Build the shared-object hint table per Table F.5 (Annex F.4.2).
+/// We emit the 24-byte header only; the entry section is empty
+/// because the Pages tree we generate has no shared objects (every
+/// page's resources / contents live in their own indirect objects,
+/// per the round-9 [`Page`] flatten). All fields are zero except
+/// "object number of first object in shared objects section" which
+/// is reported as zero too — the reader treats a zero
+/// "shared-object count" as "no shared objects to inspect."
+///
+/// Header field widths (bits): 32 + 32 + 32 + 32 + 16 + 32 + 16
+/// = 192 bits = 24 bytes.
+fn build_shared_object_hint_table() -> Vec<u8> {
+    let mut buf = Vec::with_capacity(24);
+    // Item 1 (32): object number of first object in shared section = 0
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    // Item 2 (32): location of first object in shared section = 0
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    // Item 3 (32): shared object entries for first page (incl. non-shared) = 0
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    // Item 4 (32): shared object entries for shared section = 0
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    // Item 5 (16): bits-needed for greatest number of objects per group = 0
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    // Item 6 (32): least length in bytes of any shared object group = 0
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    // Item 7 (16): bits-needed for greatest-vs-least group length = 0
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    debug_assert_eq!(buf.len(), 24);
+    buf
+}
+
+/// Build the thumbnail hint table per Table F.6 (Annex F.4.3). Same
+/// minimum-information shape as the shared-object header — we
+/// generate no thumbnails so the entry counts are all zero. Header
+/// field widths (bits): 32 + 32 + 16 + 32 + 16 + 32 + 16 + 32 + 16
+/// = 224 bits = 28 bytes.
+fn build_thumbnail_hint_table() -> Vec<u8> {
+    let mut buf = Vec::with_capacity(28);
+    // Item 1 (32): least-thumbnail object number = 0
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    // Item 2 (32): location of first thumbnail = 0
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    // Item 3 (16): bits-needed for thumbnail count delta = 0
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    // Item 4 (32): least thumbnail length in bytes = 0
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    // Item 5 (16): bits-needed for thumbnail length delta = 0
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    // Item 6 (32): least width of thumbnail in samples = 0
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    // Item 7 (16): bits-needed for thumbnail width delta = 0
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    // Item 8 (32): least height of thumbnail in samples = 0
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    // Item 9 (16): bits-needed for thumbnail height delta = 0
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    debug_assert_eq!(buf.len(), 28);
+    buf
+}
+
+/// Build the outline hint table per Table F.7 (Annex F.4.4). Same
+/// minimum-information shape — we generate no outlines. Header
+/// widths (bits): 32 + 32 + 32 + 16 = 112 bits = 14 bytes.
+fn build_outline_hint_table() -> Vec<u8> {
+    let mut buf = Vec::with_capacity(14);
+    // Item 1 (32): least outline object number = 0
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    // Item 2 (32): location of first outline = 0
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    // Item 3 (32): least number of outline items = 0
+    buf.extend_from_slice(&0u32.to_be_bytes());
+    // Item 4 (16): bits-needed for outline-count delta = 0
+    buf.extend_from_slice(&0u16.to_be_bytes());
+    debug_assert_eq!(buf.len(), 14);
+    buf
+}
+
 /// Build the page offset hint table per Tables F.3 + F.4.
 ///
 /// Round-9 emits the minimum-information form: every "bits-needed"
@@ -919,5 +1016,37 @@ mod tests {
         assert_eq!(table.len(), 36);
         assert_eq!(&table[0..4], &3u32.to_be_bytes());
         assert_eq!(&table[34..36], &4u16.to_be_bytes());
+    }
+
+    #[test]
+    fn shared_object_hint_table_is_24_bytes_zero() {
+        let table = build_shared_object_hint_table();
+        assert_eq!(table.len(), 24);
+        assert!(table.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn thumbnail_hint_table_is_28_bytes_zero() {
+        let table = build_thumbnail_hint_table();
+        assert_eq!(table.len(), 28);
+        assert!(table.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn outline_hint_table_is_14_bytes_zero() {
+        let table = build_outline_hint_table();
+        assert_eq!(table.len(), 14);
+        assert!(table.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn hint_stream_dict_carries_s_t_o_offsets() {
+        let pdf = write_pdf_linearized(&single_page_scene()).expect("linearize");
+        let s = pdf_lossy(&pdf);
+        // The hint stream's dict should now carry /S, /T, /O offsets
+        // pointing within the decoded hint stream.
+        assert!(s.contains("/S "), "hint dict must carry /S");
+        assert!(s.contains("/T "), "hint dict must carry /T (thumbnail)");
+        assert!(s.contains("/O "), "hint dict must carry /O (outline)");
     }
 }

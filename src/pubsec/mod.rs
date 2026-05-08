@@ -47,24 +47,33 @@
 //! §7.6.5; CMS DER from RFC 5652 §6; X.509 issuer/serial matching
 //! from RFC 5280 §4.1.2; RSA-PKCS1-v1.5 from RFC 8017 (PKCS#1).
 //!
-//! ## Round-10 deferrals
+//! ## Round-11 additions
 //!
-//! * Encoder side (writer-emitted public-key PDFs).
-//! * `SubjectKeyIdentifier`-form recipient identifiers (only
-//!   `IssuerAndSerialNumber` is used in matching).
+//! * **Writer / encoder side** — the writer can now emit
+//!   public-key-encrypted PDFs symmetric to the round-10 reader.
+//!   See [`PubSecEncoderConfig`] + [`PubSecRecipient`] +
+//!   [`crate::write_pdf_from_scene_pubsec_encrypted`].
+//! * **`SubjectKeyIdentifier` recipient matching** — CMS v2
+//!   RecipientIdentifier wired through the parser + matcher per
+//!   RFC 5652 §6.2.1 + RFC 5280 §4.2.1.2 method 1. Both forms
+//!   are supported on read; the writer emits IAS by default but
+//!   accepts SKI per-recipient.
+//!
+//! ## Remaining deferrals
+//!
 //! * `RC2 / 3DES / DES` envelope content algorithms (deprecated in
 //!   PDF 2.0; we accept RC4 / AES-128 / AES-256 only).
 //! * Recipient lists per *crypt filter* (the `Recipients` entry in
-//!   `/CF/<name>` for `s5`); only the document-level `Recipients`
-//!   array is wired through. Per-CF recipient lists land alongside
-//!   the encoder side in round 11.
+//!   `/CF/<name>` for `s5`) — only the document-level + the
+//!   single-StmF crypt-filter `Recipients` slot is wired.
 
 pub mod cms;
+pub mod cms_build;
 pub mod der;
+pub mod encode;
 pub mod x509;
 
-#[cfg(test)]
-pub(crate) mod cms_build;
+pub use encode::{PubSecEncoderConfig, PubSecEncryptionState, PubSecRecipient};
 
 use crate::decrypt::{CryptMethod, StandardHandler};
 use crate::error::PdfError;
@@ -378,29 +387,49 @@ fn key_length_bits(sub: PubSecSubFilter, encrypt: &Dict) -> Result<usize, PdfErr
     Ok(bits)
 }
 
-/// Find a recipient slot in `envelope` whose IssuerAndSerial matches
-/// `credential.cert`, then RSA-decrypt the wrapped CEK and use it to
-/// decrypt the envelope's encrypted content. Returns the plaintext
-/// (the seed + permissions blob), or `None` if no recipient matched.
+/// Find a recipient slot in `envelope` whose RecipientIdentifier
+/// matches `credential.cert`, then RSA-decrypt the wrapped CEK and use
+/// it to decrypt the envelope's encrypted content. Returns the
+/// plaintext (the seed + permissions blob), or `None` if no recipient
+/// matched.
+///
+/// Two RecipientIdentifier forms are matched (RFC 5652 §6.2.1 + RFC
+/// 5280 §4.2.1.2):
+/// 1. **IssuerAndSerialNumber (CMS v0)** — byte-compare the recipient
+///    slot's `(issuer_der, serial)` against the user cert's same pair.
+/// 2. **SubjectKeyIdentifier (CMS v2)** — byte-compare the recipient
+///    slot's SKI octet string against `SHA-1(SPKI BIT STRING contents)`
+///    of the user cert (RFC 5280 §4.2.1.2 method 1).
 fn try_unwrap(
     envelope: &cms::EnvelopedData,
     credential: &PubSecCredential,
 ) -> Result<Option<Vec<u8>>, PdfError> {
     let our_issuer = &credential.cert.issuer_der;
     let our_serial = &credential.cert.serial;
+    let our_ski = credential.cert.subject_key_identifier();
     for recipient in &envelope.recipients {
-        if &recipient.rid.issuer_der == our_issuer && &recipient.rid.serial == our_serial {
-            let cek = credential
-                .private_key
-                .decrypt(rsa::Pkcs1v15Encrypt, &recipient.encrypted_key)
-                .map_err(|e| PdfError::other(format!("PDF pubsec: RSA decrypt failed: {e}")))?;
-            let plaintext = decrypt_envelope_content(
-                &envelope.content_encryption,
-                &cek,
-                &envelope.encrypted_content,
-            )?;
-            return Ok(Some(plaintext));
+        let matched = match &recipient.rid {
+            cms::RecipientId::IssuerAndSerial(ias) => {
+                &ias.issuer_der == our_issuer && &ias.serial == our_serial
+            }
+            cms::RecipientId::SubjectKeyIdentifier(ski) => match &our_ski {
+                Some(our) => ski == our,
+                None => false,
+            },
+        };
+        if !matched {
+            continue;
         }
+        let cek = credential
+            .private_key
+            .decrypt(rsa::Pkcs1v15Encrypt, &recipient.encrypted_key)
+            .map_err(|e| PdfError::other(format!("PDF pubsec: RSA decrypt failed: {e}")))?;
+        let plaintext = decrypt_envelope_content(
+            &envelope.content_encryption,
+            &cek,
+            &envelope.encrypted_content,
+        )?;
+        return Ok(Some(plaintext));
     }
     Ok(None)
 }
@@ -494,7 +523,8 @@ fn derive_file_key(
 #[cfg(test)]
 mod tests {
     use super::cms_build::{
-        build_envelope_aes128, build_envelope_aes256, rsa_pkcs1_encrypt, RecipientPlain,
+        build_envelope_aes128, build_envelope_aes256, build_envelope_rc4, rsa_pkcs1_encrypt,
+        RecipientPlain,
     };
     use super::*;
     use crate::objects::Dict;
@@ -510,6 +540,7 @@ mod tests {
         super::x509::Certificate {
             issuer_der: issuer.to_vec(),
             serial: serial.to_vec(),
+            spki_pubkey_bits: None,
         }
     }
 
@@ -540,20 +571,16 @@ mod tests {
         let mut plaintext = vec![0u8; 24];
         plaintext[..20].copy_from_slice(&[0xAB; 20]);
         plaintext[20..24].copy_from_slice(&((-4i32) as u32).to_le_bytes());
-        // Encrypt the plaintext under RC4(cek).
-        let encrypted_content = crate::decrypt::rc4(&cek, &plaintext);
         let encrypted_key = rsa_pkcs1_encrypt(&pub_key, &cek).unwrap();
-        // Build the envelope manually because cms_build's RC4 helper
-        // isn't exposed — use the inner builder which assumes the
-        // caller pre-encrypted the content.
-        let envelope_der = {
-            let recipient = RecipientPlain {
-                issuer_der: issuer_der.clone(),
-                serial: serial.clone(),
+        let envelope_der = build_envelope_rc4(
+            &[RecipientPlain::ias(
+                issuer_der.clone(),
+                serial.clone(),
                 encrypted_key,
-            };
-            build_envelope_rc4(&[recipient], &encrypted_content)
-        };
+            )],
+            &plaintext,
+            &cek,
+        );
         let credential = PubSecCredential::from_parsed(fake_cert(&issuer_der, &serial), priv_key);
         let encrypt = make_encrypt_dict("adbe.pkcs7.s4", 2, &[envelope_der]);
         let handler = open_with_certificate(&encrypt, &credential)
@@ -562,73 +589,6 @@ mod tests {
         assert_eq!(handler.method, CryptMethod::Rc4);
         assert_eq!(handler.revision, 3);
         assert_eq!(handler.key.len(), 16);
-    }
-
-    /// Build an envelope with a pre-encrypted RC4 content. Used only
-    /// by the test above.
-    fn build_envelope_rc4(recipients: &[RecipientPlain], encrypted_content: &[u8]) -> Vec<u8> {
-        use super::cms::OID_RC4;
-        use super::der::{
-            write_context_constructed, write_context_primitive, write_integer_u64, write_oid,
-            write_sequence, write_set,
-        };
-        // RecipientInfos.
-        let ri_set = {
-            let mut body = Vec::new();
-            for r in recipients {
-                body.extend_from_slice(&build_ktri(r));
-            }
-            write_set(&body)
-        };
-        // EncryptedContentInfo with RC4 alg (no parameters or NULL).
-        let alg_id = {
-            let mut body = write_oid(&OID_RC4);
-            body.extend_from_slice(&super::der::write_null());
-            write_sequence(&body)
-        };
-        let eci = {
-            let mut body = write_oid(&super::cms::OID_DATA);
-            body.extend_from_slice(&alg_id);
-            body.extend_from_slice(&write_context_primitive(0, encrypted_content));
-            write_sequence(&body)
-        };
-        let enveloped = {
-            let mut body = write_integer_u64(0);
-            body.extend_from_slice(&ri_set);
-            body.extend_from_slice(&eci);
-            write_sequence(&body)
-        };
-        let outer_body = {
-            let mut b = write_oid(&super::cms::OID_ENVELOPED_DATA);
-            b.extend_from_slice(&write_context_constructed(0, &enveloped));
-            b
-        };
-        write_sequence(&outer_body)
-    }
-
-    fn build_ktri(r: &RecipientPlain) -> Vec<u8> {
-        use super::cms::OID_RSA_ENCRYPTION;
-        use super::der::{
-            write_integer_bytes, write_integer_u64, write_octet_string, write_oid, write_sequence,
-        };
-        let serial_int = write_integer_bytes(&r.serial);
-        let ias_body = {
-            let mut b = Vec::with_capacity(r.issuer_der.len() + serial_int.len());
-            b.extend_from_slice(&r.issuer_der);
-            b.extend_from_slice(&serial_int);
-            b
-        };
-        let ias = write_sequence(&ias_body);
-        let kea = {
-            let mut b = write_oid(&OID_RSA_ENCRYPTION);
-            b.extend_from_slice(&super::der::write_null());
-            write_sequence(&b)
-        };
-        let mut body = write_integer_u64(0);
-        body.extend_from_slice(&ias);
-        body.extend_from_slice(&kea);
-        body.extend_from_slice(&write_octet_string(&r.encrypted_key));
-        write_sequence(&body)
     }
 
     #[test]
@@ -645,11 +605,11 @@ mod tests {
         plaintext[20..24].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFC]);
         let encrypted_key = rsa_pkcs1_encrypt(&pub_key, &cek).unwrap();
         let envelope_der = build_envelope_aes256(
-            &[RecipientPlain {
-                issuer_der: issuer_der.clone(),
-                serial: serial.clone(),
+            &[RecipientPlain::ias(
+                issuer_der.clone(),
+                serial.clone(),
                 encrypted_key,
-            }],
+            )],
             &plaintext,
             &cek,
             &iv,
@@ -692,11 +652,11 @@ mod tests {
         let plaintext = vec![0xAA; 24];
         let encrypted_key = rsa_pkcs1_encrypt(&pub_key, &cek).unwrap();
         let envelope_der = build_envelope_aes256(
-            &[RecipientPlain {
-                issuer_der: issuer_der.clone(),
-                serial: vec![0x01],
+            &[RecipientPlain::ias(
+                issuer_der.clone(),
+                vec![0x01],
                 encrypted_key,
-            }],
+            )],
             &plaintext,
             &cek,
             &iv,
@@ -737,11 +697,11 @@ mod tests {
         let plaintext = vec![0u8; 24];
         let encrypted_key = rsa_pkcs1_encrypt(&pub_key, &cek).unwrap();
         let envelope_der = build_envelope_aes128(
-            &[RecipientPlain {
-                issuer_der: issuer_der.clone(),
-                serial: serial.clone(),
+            &[RecipientPlain::ias(
+                issuer_der.clone(),
+                serial.clone(),
                 encrypted_key,
-            }],
+            )],
             &plaintext,
             &cek,
             &iv,
