@@ -25,4 +25,4 @@ pub mod lex;
 pub mod parse;
 pub mod xref;
 
-pub use document::{read_pdf_to_scene, DocumentReader};
+pub use document::{read_pdf_to_scene, read_pdf_to_scene_with_password, DocumentReader};

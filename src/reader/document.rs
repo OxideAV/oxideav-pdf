@@ -30,8 +30,9 @@ use oxideav_core::vector::{
 use oxideav_core::TimeBase;
 use oxideav_scene::{Metadata, Page, Scene};
 
+use crate::decrypt::{open_with_password, StandardHandler};
 use crate::error::PdfError;
-use crate::objects::{Object, ObjectId, Stream};
+use crate::objects::{Dict, Object, ObjectId, Stream};
 use crate::reader::content::parse_content_stream;
 use crate::reader::parse::Parser;
 use crate::reader::xref::{parse_xref, XrefTable};
@@ -39,22 +40,43 @@ use crate::reader::xref::{parse_xref, XrefTable};
 /// A read-time view of the PDF document — owns the byte slice plus a
 /// resolved cross-reference table and a small object cache. Indirect
 /// objects are decoded lazily via [`Self::resolve`].
+///
+/// When the file's trailer carries an `/Encrypt` entry, the reader
+/// holds a [`StandardHandler`] derived from the supplied password.
+/// Every [`Self::resolve`] call decrypts string and stream payloads
+/// against that handler before caching them. PDFs without encryption
+/// leave `crypt = None` and the decrypt path is a no-op.
 pub struct DocumentReader<'a> {
     input: &'a [u8],
     xref: XrefTable,
     cache: HashMap<ObjectId, Object>,
+    crypt: Option<StandardHandler>,
 }
 
 impl<'a> DocumentReader<'a> {
-    /// Parse the cross-reference table + trailer for `input`. The
-    /// per-object body decoder is on-demand — call [`Self::resolve`]
-    /// for each indirect object you need.
+    /// Parse the cross-reference table + trailer for `input`. Equivalent
+    /// to [`Self::open_with_password`] with the empty password — works
+    /// for unencrypted PDFs and for PDFs whose user password is empty.
     pub fn open(input: &'a [u8]) -> Result<Self, PdfError> {
+        Self::open_with_password(input, b"")
+    }
+
+    /// Parse the cross-reference table + trailer for `input`. If the
+    /// trailer carries `/Encrypt`, derive a decryption handler from the
+    /// supplied password (tested first as the user password, then as
+    /// the owner password per ISO 32000-1 §7.6.3.1).
+    ///
+    /// Returns [`PdfError::Other`] when the file is encrypted but the
+    /// password fails to authenticate — the typical "wrong password"
+    /// error a PDF viewer surfaces.
+    pub fn open_with_password(input: &'a [u8], password: &[u8]) -> Result<Self, PdfError> {
         let xref = parse_xref(input)?;
+        let crypt = build_crypt(&xref, input, password)?;
         Ok(Self {
             input,
             xref,
             cache: HashMap::new(),
+            crypt,
         })
     }
 
@@ -63,8 +85,16 @@ impl<'a> DocumentReader<'a> {
         &self.xref
     }
 
+    /// `true` when the underlying PDF carried an `/Encrypt` entry that
+    /// the supplied password successfully authenticated against.
+    pub fn is_encrypted(&self) -> bool {
+        self.crypt.is_some()
+    }
+
     /// Decode the indirect object at `id`. Cached on first hit so a
-    /// second `resolve(id)` is O(1).
+    /// second `resolve(id)` is O(1). When the file is encrypted, the
+    /// per-object decryption is applied here so callers above this
+    /// layer see plaintext only.
     pub fn resolve(&mut self, id: ObjectId) -> Result<Object, PdfError> {
         if let Some(o) = self.cache.get(&id) {
             return Ok(o.clone());
@@ -75,11 +105,14 @@ impl<'a> DocumentReader<'a> {
             .ok_or_else(|| PdfError::other(format!("PDF reader: object {id:?} not in xref")))?;
         let mut p = Parser::new(self.input);
         p.lexer_mut().seek(off as usize);
-        let (parsed_id, body) = p.parse_indirect()?;
+        let (parsed_id, mut body) = p.parse_indirect()?;
         if parsed_id != id {
             return Err(PdfError::other(format!(
                 "PDF reader: xref points to wrong object — wanted {id:?}, got {parsed_id:?}"
             )));
+        }
+        if let Some(crypt) = &self.crypt {
+            decrypt_object_in_place(&mut body, id, crypt)?;
         }
         self.cache.insert(id, body.clone());
         Ok(body)
@@ -103,6 +136,137 @@ impl<'a> DocumentReader<'a> {
     }
 }
 
+/// Resolve the trailer's `/Encrypt` reference + `/ID[0]` and try the
+/// supplied password against the standard security handler. Returns
+/// `Ok(None)` when the trailer has no `/Encrypt`. Errors when present
+/// but malformed or when the password fails to authenticate.
+fn build_crypt(
+    xref: &XrefTable,
+    input: &[u8],
+    password: &[u8],
+) -> Result<Option<StandardHandler>, PdfError> {
+    let encrypt_ref = xref.trailer.entries().iter().find(|(k, _)| k == "Encrypt");
+    let Some((_, encrypt_obj)) = encrypt_ref else {
+        return Ok(None);
+    };
+
+    // /Encrypt may be inline or an indirect reference. Resolve as needed.
+    let encrypt_dict = match encrypt_obj {
+        Object::Dict(d) => d.clone(),
+        Object::Reference(id) => {
+            let off = xref
+                .offset_of(*id)
+                .ok_or_else(|| PdfError::other("PDF reader: /Encrypt refers to missing object"))?;
+            let mut p = Parser::new(input);
+            p.lexer_mut().seek(off as usize);
+            let (_, body) = p.parse_indirect()?;
+            match body {
+                Object::Dict(d) => d,
+                other => {
+                    return Err(PdfError::other(format!(
+                        "PDF reader: /Encrypt must resolve to a dict (got {other:?})"
+                    )))
+                }
+            }
+        }
+        other => {
+            return Err(PdfError::other(format!(
+                "PDF reader: /Encrypt must be a dict or reference (got {other:?})"
+            )))
+        }
+    };
+
+    // /ID is required for encrypted PDFs (Algorithm 2 step (e)). The
+    // first element is the document-permanent identifier.
+    let id_obj = xref
+        .trailer
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "ID")
+        .map(|(_, v)| v.clone())
+        .ok_or_else(|| PdfError::other("PDF reader: encrypted PDF missing /ID in trailer"))?;
+    let Object::Array(id_items) = id_obj else {
+        return Err(PdfError::other("PDF reader: /ID must be an array"));
+    };
+    if id_items.is_empty() {
+        return Err(PdfError::other("PDF reader: trailer /ID array is empty"));
+    }
+    let file_id = match &id_items[0] {
+        Object::LiteralString(s) | Object::HexString(s) => s.clone(),
+        other => {
+            return Err(PdfError::other(format!(
+                "PDF reader: /ID[0] must be a string (got {other:?})"
+            )))
+        }
+    };
+
+    let handler = open_with_password(&encrypt_dict, &file_id, password)?;
+    handler
+        .ok_or_else(|| {
+            PdfError::other("PDF reader: wrong password (or PDF requires owner password)")
+        })
+        .map(Some)
+}
+
+/// In-place decrypt: walk the parsed [`Object`] tree, decrypting every
+/// string and stream payload it contains. Encrypted PDFs only encrypt
+/// strings + streams — not numeric / boolean / name / array structure
+/// — so the recursion only mutates the leaf content of those two
+/// variants.
+fn decrypt_object_in_place(
+    obj: &mut Object,
+    id: ObjectId,
+    crypt: &StandardHandler,
+) -> Result<(), PdfError> {
+    match obj {
+        Object::LiteralString(s) | Object::HexString(s) => {
+            *s = crypt.decrypt_object(id, s)?;
+        }
+        Object::Array(items) => {
+            for item in items {
+                decrypt_object_in_place(item, id, crypt)?;
+            }
+        }
+        Object::Dict(d) => {
+            decrypt_dict_in_place(d, id, crypt)?;
+        }
+        Object::Stream(s) => {
+            // Stream body is decrypted; the `/Length` already reflects
+            // the encrypted length (which equals the cleartext length
+            // for RC4; for AES the cleartext is shorter by IV+padding).
+            // Recurse into the stream dict for any nested strings.
+            decrypt_dict_in_place(&mut s.dict, id, crypt)?;
+            // The stream's `/Filter` handling already decrypts before
+            // applying the filter — we decrypt the raw, still-filtered
+            // bytes here.
+            s.data = crypt.decrypt_object(id, &s.data)?;
+        }
+        // Numbers, booleans, names, null, references — not encrypted.
+        _ => {}
+    }
+    Ok(())
+}
+
+fn decrypt_dict_in_place(
+    d: &mut Dict,
+    id: ObjectId,
+    crypt: &StandardHandler,
+) -> Result<(), PdfError> {
+    // We can't borrow_mut + iterate; reconstruct entries with the
+    // mutated values.
+    let mut new_entries: Vec<(String, Object)> = Vec::with_capacity(d.entries().len());
+    for (k, v) in d.entries() {
+        let mut v = v.clone();
+        decrypt_object_in_place(&mut v, id, crypt)?;
+        new_entries.push((k.clone(), v));
+    }
+    *d = Dict::default();
+    for (k, v) in new_entries {
+        d.set(&k, v);
+    }
+    Ok(())
+}
+
 /// Convenience — open + read straight into a [`Scene`] in pages mode.
 /// Inverse of [`crate::write_pdf_from_scene`] for PDFs the writer
 /// would produce.
@@ -110,25 +274,22 @@ impl<'a> DocumentReader<'a> {
 /// Returns `Err` for:
 /// - Malformed xref / trailer (round-3 only handles plain xref tables;
 ///   PDF 1.5+ /XRef streams surface as parse errors).
-/// - Encrypted PDFs (the trailer's `/Encrypt` is rejected — round-4+).
+/// - Encrypted PDFs that aren't openable with the empty user password
+///   (use [`read_pdf_to_scene_with_password`] instead).
 /// - Documents that decode to zero pages (catalog → pages tree
 ///   walked but no Page leaves found).
 pub fn read_pdf_to_scene(input: &[u8]) -> Result<Scene, PdfError> {
-    let mut reader = DocumentReader::open(input)?;
+    read_pdf_to_scene_with_password(input, b"")
+}
 
-    // Encryption check — present an early, actionable error rather
-    // than emitting garbled paths.
-    if reader
-        .xref
-        .trailer
-        .entries()
-        .iter()
-        .any(|(k, _)| k == "Encrypt")
-    {
-        return Err(PdfError::other(
-            "PDF reader: encrypted PDFs are not supported — round-3 limitation",
-        ));
-    }
+/// Like [`read_pdf_to_scene`] but accepts a user / owner password
+/// for encrypted PDFs.
+///
+/// Round-4 supports the standard security handler (R=2, R=3, R=4
+/// — RC4-40, RC4-128, AES-128 CBC). R=5 / R=6 (AES-256) and
+/// public-key handlers are deferred.
+pub fn read_pdf_to_scene_with_password(input: &[u8], password: &[u8]) -> Result<Scene, PdfError> {
+    let mut reader = DocumentReader::open_with_password(input, password)?;
 
     // Catalog → /Pages reference.
     let root_id = reader.xref.root()?;

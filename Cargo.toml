@@ -26,3 +26,10 @@ oxideav-scene = { version = "0.1", default-features = false }
 # wrapper crate that ships pure-Rust miniz_oxide as its default backend
 # — see flate2's `rust_backend` feature, which is on by default).
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Pure-Rust AES (RustCrypto). Round-4 reader uses AES-128/256 in CBC
+# mode for ISO 32000-1 §7.6 standard-handler decryption (R=4 / R=5 /
+# R=6). The `aes` crate is a pure-Rust constant-time implementation
+# from the RustCrypto project — no `*-sys` wrapper, no external C.
+# The CBC mode wrapper is split into the companion `cbc` crate.
+aes = { version = "0.8", default-features = false }
+cbc = { version = "0.1", default-features = false, features = ["block-padding"] }

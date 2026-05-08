@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Round-4 reader: standard-security-handler decryption (ISO 32000-1
+  §7.6) for revisions R=2 (RC4-40), R=3 (RC4-128), and R=4 (AES-128
+  CBC or RC4-128 via `CFM`).
+- `read_pdf_to_scene_with_password()` and
+  `DocumentReader::open_with_password()` public APIs.
+- `decrypt` module exposing `StandardHandler`, `CryptMethod`, plus
+  hand-rolled `rc4()` / `md5()` (RFC 1321) and AES-128 CBC via the
+  `aes` + `cbc` RustCrypto crates.
+- 23 new tests: MD5 RFC 1321 §A.5 known-answers, RC4 RFC 6229 §2
+  known-answers, Algorithm 1/2 derivation vectors, AES-128 CBC
+  round-trip, and end-to-end fixture decode for R=2/R=3/R=4 with
+  user-password, owner-password (Algorithm 7), wrong-password, and
+  empty-default-password paths.
+
 ## [0.1.0](https://github.com/OxideAV/oxideav-pdf/compare/v0.0.2...v0.1.0) - 2026-05-04
 
 ### Other
