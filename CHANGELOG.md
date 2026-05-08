@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round-9 writer: **Linearization (Fast Web View)**, ISO 32000-1
+  §7.5.6 + Annex F. New `write_pdf_from_scene_linearized(scene)`
+  emits a PDF whose first 1024 bytes carry a complete linearization
+  parameter dictionary (`/Linearized 1` + `/L` + `/H` + `/O` +
+  `/E` + `/N` + `/T`); the layout follows Annex F.3.1 (header,
+  lin-dict, first-page xref, catalog, hint stream, first-page
+  section, remaining pages, main xref). `startxref` at EOF points
+  at the first-page xref (per F.3.11); the first-page trailer's
+  `/Prev` points at the main xref (per F.3.4). The output remains
+  a valid plain PDF — readers ignoring `/Linearized` still see
+  the same Catalog + Pages tree + page content. Hint stream emits
+  the mandatory page offset hint table only (Tables F.3 + F.4);
+  shared-object / thumbnail / generic hints (F.4.2 / F.4.3 /
+  F.4.4 / F.4.5 / F.4.6) are deferred. Two-pass emission:
+  placeholder values are written 10-digit zero-padded so the
+  patch step preserves byte alignment.
+- Round-9 writer: **ObjStm + encryption combined path**
+  (`write_pdf_from_scene_object_stream_encrypted`). Lifts the
+  round-8 "ObjStm OR encryption, not both" guard per the §7.5.7
+  carve-out: "In an encrypted file (i.e., entire object stream
+  is encrypted), strings occurring anywhere in an object stream
+  shall not be separately encrypted." The ObjStm container body
+  is encrypted as a unit using the container's own object id as
+  the per-object key seed; compressed bodies inside it are NOT
+  separately encrypted. Round-trips through the round-7 reader
+  with `read_pdf_to_scene_with_password`.
+- Round-9 tests: 23 new tests — 13 in `tests/linearization.rs`
+  covering the lin-dict-in-first-1024-bytes invariant, /L/N/O/E
+  consistency with actual file shape, startxref → first-page xref,
+  first-page trailer /Prev → main xref, single + multi-page
+  round-trips through the reader; 10 unit tests in `src/linearize.rs`
+  for the same; one new test in `tests/object_stream_encode.rs`
+  for the ObjStm + encryption combo round-trip.
+
 - Round-8 writer: **object-stream encoder** (`/Type /ObjStm`,
   ISO 32000-1 §7.5.7). New `Document::object_stream` flag
   (requires `xref_stream = true`) packs every compressible

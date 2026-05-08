@@ -473,6 +473,79 @@ pub fn write_pdf_incremental_update(
 }
 
 /// Render a [`Scene`] in pages mode as a multi-page PDF document with
+/// **both** ObjStm packing (§7.5.7) and the standard security handler
+/// (§7.6) active.
+///
+/// Round-9 lifts the round-8 "ObjStm OR encryption, not both" guard
+/// per the §7.5.7 carve-out: when a file is encrypted, the ObjStm
+/// container body is encrypted as a single unit (using the container's
+/// own object id as the per-object key seed); strings and stream
+/// bodies inside the compressed objects are NOT separately encrypted
+/// ("In an encrypted file (i.e., entire object stream is encrypted),
+/// strings occurring anywhere in an object stream shall not be
+/// separately encrypted." — ISO 32000-1 §7.5.7).
+pub fn write_pdf_from_scene_object_stream_encrypted(
+    scene: &Scene,
+    config: &EncryptionConfig,
+) -> Result<Vec<u8>, PdfError> {
+    let pages = scene
+        .pages
+        .as_ref()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            PdfError::other(
+                "write_pdf_from_scene_object_stream_encrypted: scene is not in pages mode (scene.pages is None or empty)",
+            )
+        })?;
+
+    struct Rendered<'a> {
+        frame: &'a VectorFrame,
+        width: f32,
+        height: f32,
+        content_bytes: Vec<u8>,
+        resources: ResourceCollector,
+    }
+    let rendered: Vec<Rendered<'_>> = pages
+        .iter()
+        .map(|page| {
+            let (content_bytes, resources) = render_frame(&page.content);
+            Rendered {
+                frame: &page.content,
+                width: page.width,
+                height: page.height,
+                content_bytes,
+                resources,
+            }
+        })
+        .collect();
+
+    let inputs: Vec<PageInput<'_>> = rendered
+        .into_iter()
+        .map(|r| PageInput {
+            width: r.width,
+            height: r.height,
+            content_bytes: r.content_bytes,
+            resources: r.resources,
+            frame: r.frame,
+        })
+        .collect();
+
+    let mut doc = Document::new();
+    let _ = build_pages(&mut doc, inputs);
+    if has_metadata(&scene.metadata) {
+        let info_id = doc.add(Object::Dict(build_info_dict(&scene.metadata)));
+        doc.info = Some(info_id);
+    }
+    doc.xref_stream = true;
+    doc.object_stream = true;
+    doc.encryption = Some(EncryptionState::build(config)?);
+
+    let mut out = Vec::with_capacity(4096);
+    doc.write_to(&mut out)?;
+    Ok(out)
+}
+
+/// Render a [`Scene`] in pages mode as a multi-page PDF document with
 /// the standard security handler applied. Identical to
 /// [`write_pdf_from_scene`] except every string + stream payload is
 /// encrypted under the supplied [`EncryptionConfig`] before the body
@@ -550,6 +623,21 @@ fn render_frame(frame: &VectorFrame) -> (Vec<u8>, ResourceCollector) {
     let mut resources = ResourceCollector::new();
     emit_group(&mut op, &frame.root, &mut resources);
     (op.into_bytes(), resources)
+}
+
+/// Crate-private re-export of [`render_frame`] for the linearize
+/// module. The walker is the same as the one
+/// [`write_pdf_from_scene`] uses; exposing it directly keeps the
+/// linearizer from having to re-implement the scene-graph walk.
+pub(crate) fn render_frame_for_linearize(frame: &VectorFrame) -> (Vec<u8>, ResourceCollector) {
+    render_frame(frame)
+}
+
+/// Render a [`Scene`] in pages mode as a Linearized PDF 1.5 document
+/// per ISO 32000-1 §7.5.6 + Annex F (Fast Web View). Thin wrapper
+/// around [`crate::linearize::write_pdf_linearized`].
+pub fn write_pdf_from_scene_linearized(scene: &Scene) -> Result<Vec<u8>, PdfError> {
+    crate::linearize::write_pdf_linearized(scene)
 }
 
 fn emit_group(op: &mut OpBuf, group: &Group, resources: &mut ResourceCollector) {

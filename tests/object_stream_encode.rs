@@ -155,20 +155,45 @@ fn objstm_writer_excludes_streams_from_container() {
 }
 
 #[test]
-fn objstm_writer_with_encryption_returns_error() {
+fn objstm_writer_with_encryption_now_supported() {
     use oxideav_pdf::encrypt::EncryptionConfig;
-    use oxideav_pdf::write_pdf_from_scene_encrypted;
-    // The combined ObjStm + encryption path is intentionally not
-    // supported in round 8 (§7.6.1 + §7.5.7 interplay needs
-    // careful unit-encryption handling for the container itself).
-    // We confirm here that the existing encrypted writer still
-    // works without ObjStm — and the validation lives on the
-    // Document layer.
+    use oxideav_pdf::{
+        read_pdf_to_scene_with_password, write_pdf_from_scene_encrypted,
+        write_pdf_from_scene_object_stream_encrypted,
+    };
+    // Round-9: the ObjStm + encryption combo path is now supported.
+    // §7.5.7: the ObjStm container body is encrypted as a unit
+    // (using the container's own object id as the per-object key
+    // seed); compressed bodies inside it are NOT separately
+    // encrypted. The existing non-ObjStm encrypted writer must
+    // still work on its own.
     let scene = red_rect_scene();
     let cfg = EncryptionConfig::aes_128(b"hunter2", b"FILE-ID-16-BYTES");
+
     let r = write_pdf_from_scene_encrypted(&scene, &cfg);
     assert!(
         r.is_ok(),
         "non-ObjStm encrypted writer must still work — ObjStm is opt-in"
+    );
+
+    // Combined ObjStm + encryption.
+    let pdf = write_pdf_from_scene_object_stream_encrypted(&scene, &cfg)
+        .expect("ObjStm + encryption combo must succeed in round 9");
+    assert!(pdf.starts_with(b"%PDF-1.5\n"));
+    assert!(pdf.ends_with(b"%%EOF\n"));
+    let s = String::from_utf8_lossy(&pdf);
+    assert!(s.contains("/Type /XRef"));
+    assert!(s.contains("/Encrypt"));
+    // /Type /ObjStm appears in the cleartext stream dict so the
+    // reader's ObjStm resolver can identify the container.
+    assert!(s.contains("/Type /ObjStm"));
+
+    // The combo must round-trip through the password-aware reader.
+    let scene2 = read_pdf_to_scene_with_password(&pdf, b"hunter2")
+        .expect("ObjStm + encryption combo reader round-trip");
+    assert_eq!(
+        scene2.pages.as_ref().map(|p| p.len()).unwrap_or(0),
+        1,
+        "round-trip must preserve page count"
     );
 }

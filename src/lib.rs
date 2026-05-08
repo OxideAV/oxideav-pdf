@@ -47,6 +47,7 @@ pub mod decrypt;
 pub mod encrypt;
 pub mod error;
 pub mod info;
+pub mod linearize;
 pub mod objects;
 pub mod operators;
 pub mod page;
@@ -58,7 +59,8 @@ pub use error::PdfError;
 pub use reader::{read_pdf_to_scene, read_pdf_to_scene_with_password};
 pub use writer::{
     write_pdf, write_pdf_from_scene, write_pdf_from_scene_encrypted,
-    write_pdf_from_scene_object_stream, write_pdf_from_scene_xref_stream,
+    write_pdf_from_scene_linearized, write_pdf_from_scene_object_stream,
+    write_pdf_from_scene_object_stream_encrypted, write_pdf_from_scene_xref_stream,
     write_pdf_incremental_update,
 };
 

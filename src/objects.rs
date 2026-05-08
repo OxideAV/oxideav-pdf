@@ -264,19 +264,6 @@ impl Document {
                  ISO 32000-1 §7.5.7)",
             ));
         }
-        if self.object_stream && self.encryption.is_some() {
-            // §7.6.1 + §7.5.7 interplay is solvable (encrypt the
-            // ObjStm container as a unit, leave compressed bodies
-            // alone) but pulls the per-object key derivation out of
-            // the Algorithm 1 path — round 8 keeps the two features
-            // independent rather than shipping a half-tested combo.
-            return Err(PdfError::other(
-                "Document::write_to: object_stream=true with encryption=Some(_) is not yet \
-                 supported (round-8 emits ObjStm OR encryption, not both — \
-                 ISO 32000-1 §7.5.7 + §7.6.1)",
-            ));
-        }
-
         // ---- Header ---------------------------------------------------
         // PDF 1.4 magic + the four >0x80 bytes that mark the file as
         // binary so PDF readers don't treat it as ASCII (ISO 32000-1
@@ -308,47 +295,18 @@ impl Document {
             out.extend_from_slice(b"%\xE2\xE3\xCF\xD3\n");
         }
 
-        // If encrypted, allocate an Encrypt indirect object so its body
-        // is interleaved with the rest. We do this on a clone so the
-        // public Document state stays unchanged. The Encrypt object
-        // itself is **not** encrypted (§7.6.1).
+        // ---- ObjStm packing happens BEFORE encryption ---------------
+        // §7.5.7 + §7.6.1 interaction: when an ObjStm container lives
+        // inside an encrypted file, the *container body* is encrypted
+        // as one unit (per the ObjStm container's own object id), but
+        // strings and stream bodies inside the compressed objects are
+        // NOT separately encrypted ("In an encrypted file (i.e., entire
+        // object stream is encrypted), strings occurring anywhere in
+        // an object stream shall not be separately encrypted." —
+        // §7.5.7). So the partition has to happen first, leaving the
+        // compressible bodies cleartext while the kept (non-objstm)
+        // objects still go through per-object encryption below.
         let mut objects_to_emit: Vec<IndirectObject> = self.objects.clone();
-        let encrypt_id_opt: Option<ObjectId> = if let Some(state) = &self.encryption {
-            let next_id = self.objects.iter().map(|o| o.id.number).max().unwrap_or(0) + 1;
-            let id = ObjectId::new(next_id);
-            // Apply per-object encryption to the cloned object list,
-            // mutating leaf strings and stream bodies in place. We do
-            // this BEFORE pushing the Encrypt indirect object so the
-            // Encrypt-object payload itself is left untouched (§7.6.1).
-            for ind in &mut objects_to_emit {
-                encrypt_object_in_place(&mut ind.object, ind.id, state)?;
-            }
-            // Push the /Encrypt indirect object now so it gets an
-            // xref slot.
-            objects_to_emit.push(IndirectObject {
-                id,
-                object: Object::Dict(state.encrypt_dict.clone()),
-            });
-            Some(id)
-        } else {
-            None
-        };
-
-        // ---- ObjStm packing -----------------------------------------
-        // When `object_stream` is set, partition `objects_to_emit` into
-        // a compressible group (regular dicts that aren't the Encrypt
-        // object and aren't already streams) and a non-compressible
-        // group (streams and the Encrypt object). The compressible
-        // group becomes the body of one ObjStm container; the xref
-        // stream gets `Compressed` entries for them.
-        //
-        // The Catalog is also pinned out of the ObjStm: §7.5.7 forbids
-        // the document Catalog from being compressed in ObjStm because
-        // the linearization hint (when present) and Adobe's reading
-        // logic both want to find the Catalog at a deterministic byte
-        // offset. We're not emitting linearized PDFs (deferred), but
-        // the Catalog pin keeps the output friendly to viewers that
-        // assume the historical layout.
         let mut compressed_map: std::collections::HashMap<u32, (u32, u32)> =
             std::collections::HashMap::new();
         let objstm_id_opt: Option<ObjectId> = if self.object_stream {
@@ -356,9 +314,8 @@ impl Document {
             let mut keep: Vec<IndirectObject> = Vec::new();
             for ind in objects_to_emit.drain(..) {
                 let is_stream = matches!(ind.object, Object::Stream(_));
-                let is_encrypt = encrypt_id_opt == Some(ind.id);
                 let is_root = ind.id == root;
-                if !is_stream && !is_encrypt && !is_root {
+                if !is_stream && !is_root {
                     compressible.push(ind);
                 } else {
                     keep.push(ind);
@@ -369,30 +326,35 @@ impl Document {
             if compressible.is_empty() {
                 None
             } else {
-                // Allocate a fresh id for the ObjStm container, past
-                // every existing object id (the kept set, the
-                // compressed set, and any Encrypt id). The drained
-                // `compressible` set still owns its original ids —
-                // they live inside the ObjStm via type-2 xref entries
-                // — so we have to count those too.
+                // Allocate a fresh id for the ObjStm container past
+                // every existing object id.
                 let max_kept = objects_to_emit
                     .iter()
                     .map(|o| o.id.number)
                     .max()
                     .unwrap_or(0);
                 let max_compressed = compressible.iter().map(|o| o.id.number).max().unwrap_or(0);
-                let next_id = max_kept
+                // Reserve room for an Encrypt id past max_kept too,
+                // because encryption assigns the Encrypt id from
+                // `objects_to_emit.iter().map(id).max() + 1` after we
+                // return — bump by 2 here so the ObjStm id and any
+                // future Encrypt id can both be placed without clash.
+                let mut next_id = max_kept
                     .max(max_compressed)
                     .max(self.next_id.saturating_sub(1))
                     + 1;
+                if self.encryption.is_some() {
+                    // Leave one id slot for the /Encrypt indirect
+                    // object that gets allocated below.
+                    next_id += 1;
+                }
                 let objstm_id = ObjectId::new(next_id);
 
-                // Build the ObjStm payload. §7.5.7: header is a
-                // whitespace-separated sequence of `obj_num offset`
-                // decimal pairs (offsets relative to /First, the start
-                // of the body region in the *decoded* stream); body
-                // is the concatenation of each compressed object's
-                // serialised form (no `n gen obj` / `endobj` wrapper).
+                // §7.5.7: header is a whitespace-separated sequence of
+                // `obj_num offset` decimal pairs (offsets relative to
+                // /First, the start of the body region in the *decoded*
+                // stream); body is the concatenation of each compressed
+                // object's serialised form (no wrappers).
                 let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(compressible.len());
                 for ind in &compressible {
                     let mut b = Vec::new();
@@ -408,9 +370,6 @@ impl Document {
                     header.push_str(&format!("{} {}", ind.id.number, running));
                     running += body.len();
                 }
-                // Trailing space before the body — the §7.5.7
-                // header-token grammar requires whitespace between the
-                // last header integer and the first object body.
                 header.push(' ');
 
                 let header_bytes = header.into_bytes();
@@ -437,13 +396,37 @@ impl Document {
                     object: Object::Stream(Stream::new(dict, compressed)),
                 });
 
-                // Record the type-2 mapping for each compressed id.
                 for (idx, ind) in compressible.into_iter().enumerate() {
                     compressed_map.insert(ind.id.number, (objstm_id.number, idx as u32));
                 }
 
                 Some(objstm_id)
             }
+        } else {
+            None
+        };
+
+        // ---- Encryption -------------------------------------------------
+        // Per-object encryption now runs on the kept set only (the
+        // ObjStm container Stream is in `objects_to_emit` and gets its
+        // body encrypted as a unit; the compressed bodies inside it are
+        // NOT separately encrypted — §7.5.7). The Encrypt indirect
+        // object itself is NOT encrypted (§7.6.1).
+        let encrypt_id_opt: Option<ObjectId> = if let Some(state) = &self.encryption {
+            let max_id_now = objects_to_emit
+                .iter()
+                .map(|o| o.id.number)
+                .max()
+                .unwrap_or(0);
+            let id = ObjectId::new(max_id_now + 1);
+            for ind in &mut objects_to_emit {
+                encrypt_object_in_place(&mut ind.object, ind.id, state)?;
+            }
+            objects_to_emit.push(IndirectObject {
+                id,
+                object: Object::Dict(state.encrypt_dict.clone()),
+            });
+            Some(id)
         } else {
             None
         };
@@ -885,6 +868,25 @@ fn encrypt_dict_in_place(
         d.set(&k, v);
     }
     Ok(())
+}
+
+/// Crate-private re-export of [`write_object`] for the linearize
+/// module — it serialises one [`Object`] body into a byte buffer using
+/// exactly the same shape as [`Document::write_to`] does internally
+/// (so /Length on streams gets auto-patched, etc.). Kept private to
+/// the crate so external callers don't depend on the writer's
+/// internals.
+pub(crate) fn write_object_to(out: &mut Vec<u8>, obj: &Object) -> io::Result<()> {
+    write_object(out, obj)
+}
+
+/// Drain every [`IndirectObject`] from `doc` into a fresh `Vec`,
+/// in insertion order. Used by the linearize module to capture the
+/// gradient / image sub-objects allocated by
+/// [`crate::resources::ResourceCollector::flatten_into_resources_dict`]
+/// without having to re-implement that walker.
+pub(crate) fn take_objects(doc: &mut Document) -> Vec<IndirectObject> {
+    std::mem::take(&mut doc.objects)
 }
 
 fn write_indirect(out: &mut Vec<u8>, ind: &IndirectObject) -> io::Result<()> {

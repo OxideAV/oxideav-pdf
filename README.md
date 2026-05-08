@@ -139,6 +139,24 @@ encrypting the rest of the file; the reader applies the same rule
 on input. The classic consumer is XMP metadata streams that need to
 remain searchable in encrypted PDFs.
 
+## Linearization (Fast Web View)
+
+Round 9 emits **Linearized PDF** per ISO 32000-1 §7.5.6 + Annex F.
+[`write_pdf_from_scene_linearized`] produces a PDF whose first 1024
+bytes carry a complete linearization parameter dictionary
+(`/Linearized 1` + `/L` + `/H` + `/O` + `/E` + `/N` + `/T`); the
+on-wire layout follows F.3.1 (header → lin-dict → first-page xref →
+catalog → hint stream → first-page section → remaining pages →
+main xref). `startxref` at EOF points at the first-page xref;
+the first-page trailer's `/Prev` points at the main xref. The
+output is also a valid plain PDF — readers ignoring `/Linearized`
+walk the same Catalog + Pages tree + page content.
+
+The hint stream emits the mandatory page offset hint table only
+(Tables F.3 + F.4); shared-object / thumbnail / generic hints
+(F.4.2 / F.4.3 / F.4.4 / F.4.5 / F.4.6) are deferred and will
+land alongside outline / annotation support.
+
 ## Deferred
 
 - Text (waiting on `Node::Text`; will use Type 0 fonts with a
@@ -146,10 +164,9 @@ remain searchable in encrypted PDFs.
 - JPEG passthrough on `ImageRef` (DCTDecode XObject) — needs core
   IR support for "raw codec bytes" alongside the decoded VideoFrame.
 - Public-key security handlers (`adbe.pkcs7.*`).
-- Linearization (§7.5.6 "Fast Web View" structural reorganisation).
-- Combined ObjStm + encryption (round 8 emits one or the other,
-  not both — the §7.6.1 + §7.5.7 unit-encryption interplay needs
-  careful handling).
+- Shared-object / thumbnail / outline / generic hint tables for
+  linearized output (only the mandatory page-offset hint table is
+  emitted).
 - Transparency groups beyond a per-`Group` `/ca`+`/CA` opacity.
 
 ## Usage
