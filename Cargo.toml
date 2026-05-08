@@ -33,3 +33,11 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # The CBC mode wrapper is split into the companion `cbc` crate.
 aes = { version = "0.8", default-features = false }
 cbc = { version = "0.1", default-features = false, features = ["block-padding"] }
+# Pure-Rust SHA-256 / SHA-384 / SHA-512 (RustCrypto). Round-5 reader
+# uses SHA-256 for R=5 password derivation (Adobe extension level 3)
+# and the full SHA-256/384/512 set for R=6 Algorithm 2.B (ISO
+# 32000-2:2020 §7.6.4.4.3) — the hash chain alternates between the
+# three depending on a running modulus byte. The `sha2` crate is
+# pure-Rust + constant-time; it shares the `digest` trait surface
+# already pulled in transitively by the AES cipher dep.
+sha2 = { version = "0.10", default-features = false }

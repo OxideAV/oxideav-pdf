@@ -1,9 +1,9 @@
-//! PDF *decryption* support — ISO 32000-1 §7.6 Standard Security Handler.
+//! PDF *decryption* support — ISO 32000-1 §7.6 / ISO 32000-2 §7.6
+//! Standard Security Handler.
 //!
-//! Round-4 reader gains the ability to open password-protected PDFs.
-//! The standard security handler is the only handler this module
-//! implements; public-key (`adbe.pkcs7.s3` / `s4` / `s5`) handlers
-//! are out of scope.
+//! The reader can open password-protected PDFs across the full
+//! revision spectrum the Standard handler defines. Public-key
+//! (`adbe.pkcs7.s3` / `s4` / `s5`) handlers are out of scope.
 //!
 //! Coverage:
 //!
@@ -11,28 +11,41 @@
 //! * **R=3**: RC4-128 (V=2, Length up to 128).
 //! * **R=4**: AES-128 CBC or RC4-128 selected by the crypt-filter
 //!   `CFM` entry (`AESV2` vs `V2`).
+//! * **R=5**: AES-256 CBC, V=5, `CFM=AESV3`. Adobe extension level 3
+//!   (PDF 1.7) — simpler password derivation than R=6 (no Algorithm
+//!   2.B hash chain — just plain SHA-256 over the password and the
+//!   appropriate salt).
+//! * **R=6**: AES-256 CBC, V=5, `CFM=AESV3`. ISO 32000-2:2020
+//!   (PDF 2.0) — the iterated SHA-256/384/512 chain of Algorithm 2.B
+//!   plus the Perms-block validation of Algorithm 13.
 //!
-//! R=5 and R=6 (PDF 1.7 Adobe-extension AES-256, PDF 2.0 ISO AES-256)
-//! land in a follow-up round — the password derivation is materially
-//! different (SHA-256-based, no MD5 fan-out, validation salt + key
-//! salt) and worth its own sweep.
+//! # Algorithms used (numbered per ISO 32000)
 //!
-//! # Algorithms used (all numbered per §7.6.2 / §7.6.3)
-//!
-//! * **Algorithm 1** — per-object encryption key: extend file key
-//!   with `objnum` LE3 + `gennum` LE2 (+ `"sAlT"` for AES), MD5,
+//! * **Algorithm 1** — per-object encryption key for V≤4: extend file
+//!   key with `objnum` LE3 + `gennum` LE2 (+ `"sAlT"` for AES), MD5,
 //!   take first `n+5` ≤ 16 bytes.
-//! * **Algorithm 2** — encryption key: pad password to 32 bytes with
-//!   the canonical pad string, MD5(pad ‖ O ‖ P ‖ ID[0] ‖ optional
-//!   `0xFFFFFFFF` for R≥4 with `EncryptMetadata=false`); for R≥3,
-//!   loop 50× MD5 of the first `n` bytes; final key is first `n`
+//! * **Algorithm 2** (V≤4) — encryption key: pad password to 32 bytes
+//!   with the canonical pad string, MD5(pad ‖ O ‖ P ‖ ID[0] ‖ optional
+//!   `0xFFFFFFFF`); for R≥3, loop 50× MD5; final key is first `n`
 //!   bytes.
-//! * **Algorithm 4** (R=2) and **Algorithm 5** (R≥3) — derive the
-//!   `/U` value the writer would have stored. `/U` matches → user
-//!   password is correct. Algorithm 6 just inverts Algo 4/5.
-//! * **Algorithm 7** — owner-password authentication: undo the
-//!   RC4 ladder on `/O` to recover what the user-password padding
-//!   string would have been, then run Algorithm 6 on that.
+//! * **Algorithm 2.A** — open-with-password orchestration for V=5
+//!   (R=5 / R=6). Combines Algorithms 11 + 12 + 13 with the right
+//!   per-revision derivation of the *file* encryption key.
+//! * **Algorithm 2.B** — the iterated SHA-{256/384/512} hash function
+//!   used by R=6 to derive intermediate keys; R=5 falls back to plain
+//!   SHA-256.
+//! * **Algorithms 4 / 5 / 6 / 7** — RC4 / AES-128 password
+//!   authentication and recovery (see ISO 32000-1 §7.6.3.4).
+//! * **Algorithms 8 / 9 / 10** — V=5 *writer* paths: compute O, U,
+//!   and the encrypted Perms blob from a password + file key.
+//! * **Algorithm 11** — V=5 user-password authentication. SHA-256 over
+//!   `password ‖ U[32..40]` (validation salt) → compare to `U[..32]`.
+//! * **Algorithm 12** — V=5 owner-password authentication. SHA-256
+//!   over `password ‖ O[32..40] ‖ U[..48]` → compare to `O[..32]`.
+//! * **Algorithm 13** — V=5 permissions-block decryption: AES-256 ECB
+//!   on `Perms` with the file key; bytes 0..3 reproduce P (LE), bytes
+//!   8..12 are `T` or `F` for `EncryptMetadata`, bytes 9..11 are
+//!   `"adb"`.
 //!
 //! Strings + streams in the encryption dictionary are NOT decrypted
 //! (per §7.6.1). Strings inside the trailer's `/ID` array are also
@@ -42,12 +55,14 @@
 //!
 //! Implemented from the spec PDFs only:
 //! `docs/document/pdf/PDF32000_2008.pdf` §7.6 (Tables 20–22, Algorithms
-//! 1–7). RC4 and MD5 are hand-rolled per RSA's published RC4 description
-//! (the spec calls out "RC4" by name and references RSA Security; the
-//! algorithm itself is well-documented in RFC 6229 test vectors and
-//! has been public-domain for decades). MD5 follows RFC 1321 verbatim.
-//! AES-128 CBC is from the `aes` + `cbc` RustCrypto crates — pure-Rust,
-//! constant-time, no `*-sys` wrappers.
+//! 1–7) plus `docs/document/pdf/PDF32000_2020.pdf` §7.6.4.4 (Algorithms
+//! 2.A / 2.B / 8 / 9 / 10 / 11 / 12 / 13). RC4 and MD5 are hand-rolled
+//! per RSA's RC4 / RFC 1321 references; SHA-256/384/512 come from the
+//! pure-Rust `sha2` crate (RustCrypto). AES-128/256 CBC come from the
+//! `aes` + `cbc` RustCrypto crates — pure-Rust, constant-time, no
+//! `*-sys` wrappers.
+
+pub mod r5_r6;
 
 use crate::error::PdfError;
 use crate::objects::{Object, ObjectId};
@@ -73,6 +88,12 @@ pub enum CryptMethod {
     Rc4,
     /// Algorithm 1 + AES-128 CBC. Used when V=4 with `CFM=AESV2`.
     Aes128,
+    /// AES-256 CBC. Used when V=5 (R=5 / R=6) with `CFM=AESV3`. Per
+    /// ISO 32000-2:2020 §7.6.3.1 the per-object key derivation
+    /// (Algorithm 1) is **not** applied — the file encryption key is
+    /// fed to AES-256 directly. The IV is still the leading 16 bytes
+    /// of the ciphertext as for AESV2.
+    Aes256,
 }
 
 /// File-level encryption parameters resolved from the trailer's
@@ -92,18 +113,31 @@ impl StandardHandler {
     /// Decrypt the data of an indirect object whose id is `id` and
     /// whose payload is `data` (a string body or stream body, after
     /// any `/Filter` decoding). Returns the cleartext bytes.
+    ///
+    /// AESV3 (R=5 / R=6) intentionally ignores `id`: ISO 32000-2:2020
+    /// §7.6.3.1 specifies that for V=5 the file encryption key is fed
+    /// to AES-256 directly, with no per-object derivation.
     pub fn decrypt_object(&self, id: ObjectId, data: &[u8]) -> Result<Vec<u8>, PdfError> {
-        let obj_key = self.object_key(id);
         match self.method {
-            CryptMethod::Rc4 => Ok(rc4(&obj_key, data)),
-            CryptMethod::Aes128 => aes128_cbc_decrypt(&obj_key, data),
+            CryptMethod::Rc4 => {
+                let obj_key = self.object_key(id);
+                Ok(rc4(&obj_key, data))
+            }
+            CryptMethod::Aes128 => {
+                let obj_key = self.object_key(id);
+                aes128_cbc_decrypt(&obj_key, data)
+            }
+            CryptMethod::Aes256 => aes256_cbc_decrypt(&self.key, data),
         }
     }
 
-    /// Algorithm 1: derive the per-object encryption key.
+    /// Algorithm 1: derive the per-object encryption key for V≤4.
     ///
     /// `extended = key ‖ obj_num_le3 ‖ gen_le2 [‖ "sAlT" if AES]` →
     /// MD5 → take first `n+5` (capped at 16) bytes.
+    ///
+    /// Not used for AESV3 — the V=5 spec disables per-object derivation
+    /// entirely (the AES-256 key is the file key itself).
     fn object_key(&self, id: ObjectId) -> Vec<u8> {
         let n = self.key.len();
         let extra = if self.method == CryptMethod::Aes128 {
@@ -141,6 +175,13 @@ pub fn open_with_password(
 ) -> Result<Option<StandardHandler>, PdfError> {
     let params = parse_encrypt_dict(encrypt)?;
 
+    // V=5 (R=5 / R=6) is its own module — the password derivation is
+    // SHA-256-based with validation/key salts, with no overlap to the
+    // MD5+RC4 ladder of R≤4.
+    if params.revision == 5 || params.revision == 6 {
+        return r5_r6::open_with_password(&params, password);
+    }
+
     // Try as user password first (Algorithm 6).
     if let Some(handler) = try_user_password(&params, file_id, password) {
         return Ok(Some(handler));
@@ -152,23 +193,32 @@ pub fn open_with_password(
     Ok(None)
 }
 
+/// Parsed-but-not-yet-validated `/Encrypt` parameters. Non-V5
+/// entries (`o`, `u`) are 32 bytes; V5 entries are 48 bytes (the
+/// extra 16 bytes split into validation salt + key salt). The new
+/// `oe` / `ue` / `perms` slots are V5-only (zero-length on V≤4).
 #[derive(Debug, Clone)]
-struct EncryptParams {
-    revision: u8,
+pub(crate) struct EncryptParams {
+    pub(crate) revision: u8,
     /// Length in bits.
-    length_bits: usize,
-    /// 32-byte O entry.
-    o: Vec<u8>,
-    /// 32-byte U entry.
-    u: Vec<u8>,
+    pub(crate) length_bits: usize,
+    /// `/O` entry — 32 bytes (R≤4) or 48 bytes (R=5 / R=6).
+    pub(crate) o: Vec<u8>,
+    /// `/U` entry — 32 bytes (R≤4) or 48 bytes (R=5 / R=6).
+    pub(crate) u: Vec<u8>,
+    /// `/OE` entry — 32 bytes, V5-only (Algorithm 8 output).
+    pub(crate) oe: Vec<u8>,
+    /// `/UE` entry — 32 bytes, V5-only (Algorithm 9 output).
+    pub(crate) ue: Vec<u8>,
+    /// `/Perms` entry — 16 bytes, V5-only (Algorithm 10 output).
+    pub(crate) perms: Vec<u8>,
     /// P (signed 32-bit). Stored as i32 → reinterpreted as little-endian
-    /// bytes when fed into Algorithm 2 step (d).
-    p: i32,
+    /// bytes when fed into Algorithm 2 step (d) and Algorithm 10.
+    pub(crate) p: i32,
     /// EncryptMetadata flag. R≥4, default true; round-4 honours it.
-    encrypt_metadata: bool,
-    /// Per-stream / per-string crypt method for V=4. None for V<4
-    /// (then the method is RC4 by definition of V=1 / V=2 paths).
-    cfm: CryptMethod,
+    pub(crate) encrypt_metadata: bool,
+    /// Per-stream / per-string crypt method for V=4 / V=5.
+    pub(crate) cfm: CryptMethod,
 }
 
 fn parse_encrypt_dict(d: &crate::objects::Dict) -> Result<EncryptParams, PdfError> {
@@ -195,19 +245,26 @@ fn parse_encrypt_dict(d: &crate::objects::Dict) -> Result<EncryptParams, PdfErro
         Some(Object::Integer(n)) => *n,
         _ => return Err(PdfError::other("PDF decrypt: /Encrypt missing /R")),
     };
-    if !(2..=4).contains(&r) {
+    if !(2..=6).contains(&r) {
         return Err(PdfError::other(format!(
-            "PDF decrypt: revision R={r} not supported in this round (R∈[2,4])"
+            "PDF decrypt: revision R={r} not supported (R∈[2,6])"
         )));
     }
 
+    // Length defaults: 40 bits for V≤2, 256 bits for V=5 (Table 21).
+    let length_bits_default = if v >= 5 { 256 } else { 40 };
     let length_bits = match lookup(d, "Length") {
         Some(Object::Integer(n)) => *n as usize,
-        _ => 40, // default per Table 20
+        _ => length_bits_default,
     };
-    if !(40..=128).contains(&length_bits) || length_bits % 8 != 0 {
+    let length_ok = if v >= 5 {
+        length_bits == 256
+    } else {
+        (40..=128).contains(&length_bits) && length_bits % 8 == 0
+    };
+    if !length_ok {
         return Err(PdfError::other(format!(
-            "PDF decrypt: /Length {length_bits} bits is out of range (40..=128, multiple of 8)"
+            "PDF decrypt: /Length {length_bits} bits invalid for V={v} (V≤2: 40..=128 multiple of 8; V=5: must be 256)"
         )));
     }
 
@@ -219,15 +276,17 @@ fn parse_encrypt_dict(d: &crate::objects::Dict) -> Result<EncryptParams, PdfErro
         Some(Object::LiteralString(s)) | Some(Object::HexString(s)) => s.clone(),
         _ => return Err(PdfError::other("PDF decrypt: /Encrypt missing /U")),
     };
-    if o.len() != 32 {
+    let o_expected = if r >= 5 { 48 } else { 32 };
+    let u_expected = if r >= 5 { 48 } else { 32 };
+    if o.len() != o_expected {
         return Err(PdfError::other(format!(
-            "PDF decrypt: /O must be 32 bytes (got {})",
+            "PDF decrypt: /O must be {o_expected} bytes for R={r} (got {})",
             o.len()
         )));
     }
-    if u.len() != 32 {
+    if u.len() != u_expected {
         return Err(PdfError::other(format!(
-            "PDF decrypt: /U must be 32 bytes (got {})",
+            "PDF decrypt: /U must be {u_expected} bytes for R={r} (got {})",
             u.len()
         )));
     }
@@ -241,23 +300,63 @@ fn parse_encrypt_dict(d: &crate::objects::Dict) -> Result<EncryptParams, PdfErro
         _ => true,
     };
 
+    // V=5 — pull /OE, /UE, /Perms (all required per ISO 32000-2 Table 21).
+    let (oe, ue, perms) = if r >= 5 {
+        let oe = match lookup(d, "OE") {
+            Some(Object::LiteralString(s)) | Some(Object::HexString(s)) => s.clone(),
+            _ => return Err(PdfError::other("PDF decrypt: V=5 /Encrypt missing /OE")),
+        };
+        let ue = match lookup(d, "UE") {
+            Some(Object::LiteralString(s)) | Some(Object::HexString(s)) => s.clone(),
+            _ => return Err(PdfError::other("PDF decrypt: V=5 /Encrypt missing /UE")),
+        };
+        let perms = match lookup(d, "Perms") {
+            Some(Object::LiteralString(s)) | Some(Object::HexString(s)) => s.clone(),
+            _ => return Err(PdfError::other("PDF decrypt: V=5 /Encrypt missing /Perms")),
+        };
+        if oe.len() != 32 {
+            return Err(PdfError::other(format!(
+                "PDF decrypt: /OE must be 32 bytes (got {})",
+                oe.len()
+            )));
+        }
+        if ue.len() != 32 {
+            return Err(PdfError::other(format!(
+                "PDF decrypt: /UE must be 32 bytes (got {})",
+                ue.len()
+            )));
+        }
+        if perms.len() != 16 {
+            return Err(PdfError::other(format!(
+                "PDF decrypt: /Perms must be 16 bytes (got {})",
+                perms.len()
+            )));
+        }
+        (oe, ue, perms)
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
+
     // Pick the crypt method.
     let cfm = match (v, r) {
         (1, _) | (2, _) | (_, 2) | (_, 3) => CryptMethod::Rc4,
-        (4, _) => {
-            // V=4, R=4 — look up StmF → CF[StmF].CFM.
+        (4, _) | (5, _) => {
             let stmf = match lookup(d, "StmF") {
                 Some(Object::Name(s)) => s.as_str(),
                 _ => "Identity",
             };
             if stmf == "Identity" {
-                // No stream encryption — degrade to no-op. We still
-                // need a method for strings; round-4 picks RC4 since
-                // V=4 default for legacy PDF was V2.
-                CryptMethod::Rc4
+                // No stream encryption — degrade to a default suited
+                // for the version. V=4 historical default is RC4
+                // (CFM=V2); V=5 only ever pairs with AESV3.
+                if v >= 5 {
+                    CryptMethod::Aes256
+                } else {
+                    CryptMethod::Rc4
+                }
             } else {
                 let cf = lookup(d, "CF").ok_or_else(|| {
-                    PdfError::other("PDF decrypt: V=4 /Encrypt missing /CF dictionary")
+                    PdfError::other("PDF decrypt: V=4/V=5 /Encrypt missing /CF dictionary")
                 })?;
                 let Object::Dict(cf_dict) = cf else {
                     return Err(PdfError::other("PDF decrypt: /CF must be a dictionary"));
@@ -273,11 +372,7 @@ fn parse_encrypt_dict(d: &crate::objects::Dict) -> Result<EncryptParams, PdfErro
                 match lookup(filter_dict, "CFM") {
                     Some(Object::Name(s)) if s == "V2" => CryptMethod::Rc4,
                     Some(Object::Name(s)) if s == "AESV2" => CryptMethod::Aes128,
-                    Some(Object::Name(s)) if s == "AESV3" => {
-                        return Err(PdfError::other(
-                            "PDF decrypt: AESV3 (R=5 / R=6) not yet supported",
-                        ))
-                    }
+                    Some(Object::Name(s)) if s == "AESV3" => CryptMethod::Aes256,
                     Some(Object::Name(s)) if s == "None" => {
                         return Err(PdfError::other(
                             "PDF decrypt: CFM=None requires a custom security handler",
@@ -288,13 +383,19 @@ fn parse_encrypt_dict(d: &crate::objects::Dict) -> Result<EncryptParams, PdfErro
                             "PDF decrypt: unsupported CFM={other:?}"
                         )))
                     }
-                    None => CryptMethod::Rc4,
+                    None => {
+                        if v >= 5 {
+                            CryptMethod::Aes256
+                        } else {
+                            CryptMethod::Rc4
+                        }
+                    }
                 }
             }
         }
         _ => {
             return Err(PdfError::other(format!(
-                "PDF decrypt: V={v} not supported (this round handles V∈[1,2,4])"
+                "PDF decrypt: V={v} not supported (handler accepts V∈[1,2,4,5])"
             )))
         }
     };
@@ -304,6 +405,9 @@ fn parse_encrypt_dict(d: &crate::objects::Dict) -> Result<EncryptParams, PdfErro
         length_bits,
         o,
         u,
+        oe,
+        ue,
+        perms,
         p,
         encrypt_metadata,
         cfm,
@@ -466,7 +570,7 @@ fn strip_pad(padded: &[u8]) -> Vec<u8> {
     padded.to_vec()
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -511,6 +615,61 @@ pub fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
 }
 
 // ───────────────────────── AES-128 CBC ─────────────────────────
+
+/// AES-256 CBC ECB-mode primitive (single 16-byte block, no IV)
+/// used by Algorithms 8 / 9 / 10 / 13 of ISO 32000-2 §7.6.4.4. The
+/// spec calls this "AES-256, no padding, with an IV of zero" — which
+/// is the ECB mode of AES-256 over a single block. Used to undo the
+/// Algorithm 8/9 wrap of the file key, and the Algorithm 10 Perms
+/// block.
+pub(crate) fn aes256_ecb_decrypt_block(key: &[u8], block: &[u8; 16]) -> Result<[u8; 16], PdfError> {
+    use aes::cipher::{BlockDecrypt, KeyInit};
+    if key.len() != 32 {
+        return Err(PdfError::other(format!(
+            "PDF decrypt: AES-256 requires a 32-byte key (got {} bytes)",
+            key.len()
+        )));
+    }
+    let cipher = aes::Aes256::new(key.into());
+    let mut buf = aes::cipher::generic_array::GenericArray::clone_from_slice(block);
+    cipher.decrypt_block(&mut buf);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&buf);
+    Ok(out)
+}
+
+/// Decrypt an AES-256-CBC blob with the first 16 bytes being the IV
+/// (per ISO 32000-2 §7.6.3.1 — V=5 uses the same IV-prepended layout
+/// as AESV2). Removes PKCS#7 padding.
+fn aes256_cbc_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, PdfError> {
+    use aes::cipher::{BlockDecryptMut, KeyIvInit};
+    type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
+    if data.len() < 16 {
+        return Err(PdfError::other(
+            "PDF decrypt: AES-256 ciphertext shorter than IV",
+        ));
+    }
+    if (data.len() - 16) % 16 != 0 {
+        return Err(PdfError::other(format!(
+            "PDF decrypt: AES-256 ciphertext length {} not aligned to 16-byte blocks (after IV)",
+            data.len() - 16
+        )));
+    }
+    if key.len() != 32 {
+        return Err(PdfError::other(format!(
+            "PDF decrypt: AES-256 expects a 32-byte key (got {} bytes)",
+            key.len()
+        )));
+    }
+    let iv = &data[..16];
+    let ct = &data[16..];
+    let dec = Aes256CbcDec::new(key.into(), iv.into());
+    let mut buf = ct.to_vec();
+    let pt = dec
+        .decrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(&mut buf)
+        .map_err(|e| PdfError::other(format!("PDF decrypt: AES-256 padding error: {e:?}")))?;
+    Ok(pt.to_vec())
+}
 
 /// Decrypt an AES-128-CBC blob whose first 16 bytes are the IV
 /// (per §7.6.2 Algorithm 1, AES-only paragraph). Removes PKCS#7
@@ -773,6 +932,9 @@ mod tests {
             length_bits: 128,
             o: vec![0xAA; 32],
             u: vec![0; 32],
+            oe: Vec::new(),
+            ue: Vec::new(),
+            perms: Vec::new(),
             p: -4,
             encrypt_metadata: true,
             cfm: CryptMethod::Rc4,

@@ -12,16 +12,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Round-4 reader: standard-security-handler decryption (ISO 32000-1
   §7.6) for revisions R=2 (RC4-40), R=3 (RC4-128), and R=4 (AES-128
   CBC or RC4-128 via `CFM`).
+- Round-5 reader: AES-256 standard-handler decryption for **R=5**
+  (PDF 1.7 Adobe extension level 3) and **R=6** (ISO 32000-2:2020
+  PDF 2.0). Implements Algorithms 2.A, 2.B, 8, 9, 10, 11, 12 and 13
+  from ISO 32000-2 §7.6.4.4 — full coverage of the AESV3 era.
+- `decrypt::r5_r6` module exposing `algorithm_8` / `algorithm_9` /
+  `algorithm_10` for fixture builders, plus the SHA-256/384/512
+  iterated hash chain of Algorithm 2.B.
+- `CryptMethod::Aes256` variant (V=5 file-key direct AES-256 CBC,
+  no per-object Algorithm 1 derivation).
+- `EncryptParams` is extended with `oe`, `ue`, `perms` slots that
+  the reader populates for V=5 PDFs (32 / 32 / 16 bytes).
 - `read_pdf_to_scene_with_password()` and
   `DocumentReader::open_with_password()` public APIs.
 - `decrypt` module exposing `StandardHandler`, `CryptMethod`, plus
   hand-rolled `rc4()` / `md5()` (RFC 1321) and AES-128 CBC via the
   `aes` + `cbc` RustCrypto crates.
-- 23 new tests: MD5 RFC 1321 §A.5 known-answers, RC4 RFC 6229 §2
-  known-answers, Algorithm 1/2 derivation vectors, AES-128 CBC
-  round-trip, and end-to-end fixture decode for R=2/R=3/R=4 with
-  user-password, owner-password (Algorithm 7), wrong-password, and
-  empty-default-password paths.
+- New `sha2` (RustCrypto) dep for SHA-256/384/512 — pure-Rust, no
+  `*-sys`. Used only by the V=5 password derivation path.
+- ~32 new tests: SHA-256/384/512 FIPS 180-4 known-answers,
+  Algorithm 9 → 11 user-auth round-trip (R=5 + R=6), Algorithm 10
+  → 13 Perms round-trip, Algorithm 2.B determinism, file-key
+  wrap/unwrap, and end-to-end fixture decode for R=5 + R=6 covering
+  user / owner / wrong / empty / Unicode / >127-byte passwords.
 
 ## [0.1.0](https://github.com/OxideAV/oxideav-pdf/compare/v0.0.2...v0.1.0) - 2026-05-04
 
