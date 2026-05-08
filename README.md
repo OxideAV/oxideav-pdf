@@ -91,24 +91,41 @@ derivation is Algorithm 1 (V≤4) or the file key directly (V=5).
 
 ## Cross-reference streams
 
-The reader recognises both the plain `xref`-keyword cross-reference
-table (PDF 1.0..1.4) and the binary cross-reference *stream* form
-introduced in PDF 1.5 (ISO 32000-1 §7.5.8): a `/Type /XRef` stream
-object whose body packs each entry into `/W [w1 w2 w3]` big-endian
-fields, optionally Flate-compressed with `/Predictor 12` (PNG-Up).
-The XRef-stream writer side is deferred to a follow-up round (the
-plain `xref` form the writer emits remains the round-trip default).
+Both reader and writer support the binary cross-reference *stream*
+form introduced in PDF 1.5 (ISO 32000-1 §7.5.8): a `/Type /XRef`
+stream object whose body packs each entry into `/W [w1 w2 w3]`
+big-endian fields, Flate-compressed with `/Predictor 12` (PNG-Up).
+The classical `xref`-keyword form (PDF 1.0..1.4) is also accepted
+on input and remains the writer's default; opt into the stream form
+via [`oxideav_pdf::write_pdf_from_scene_xref_stream`].
+
+## Object streams
+
+PDF 1.5+ object streams (`/Type /ObjStm`, ISO 32000-1 §7.5.7) are
+resolved by the reader: when a cross-reference entry is `Compressed`,
+the reader fetches the containing object stream, parses its
+`(obj_num offset)` header, and returns the body bytes from the
+matching slot. The writer doesn't yet emit object streams — that's
+the natural pair to the round-7 XRef-stream encoder.
+
+## Per-stream `/Crypt /Identity` opt-out
+
+ISO 32000-1 §7.6.5 lets a single stream opt out of per-object
+encryption by listing `/Crypt` as its first `/Filter` with
+`/DecodeParms /Name /Identity` (or no `/Name` — the default per
+§7.4.10 Table 24). The writer leaves such streams untouched while
+encrypting the rest of the file; the reader applies the same rule
+on input. The classic consumer is XMP metadata streams that need to
+remain searchable in encrypted PDFs.
 
 ## Deferred
 
 - Text (waiting on `Node::Text`; will use Type 0 fonts with a
   CIDFont built via `oxideav-ttf`/`oxideav-otf`).
-- JPEG passthrough on `ImageRef` (DCTDecode XObject).
+- JPEG passthrough on `ImageRef` (DCTDecode XObject) — needs core
+  IR support for "raw codec bytes" alongside the decoded VideoFrame.
 - Public-key security handlers (`adbe.pkcs7.*`).
-- XRef-stream *encoder* (`/Type /XRef` write-side; reader decodes
-  them already).
-- Object streams (`/Type /ObjStm`) — XRef streams with `Compressed`
-  entries are recorded but not yet resolved.
+- Object-stream *encoder* (writer-side `/Type /ObjStm`).
 - Transparency groups beyond a per-`Group` `/ca`+`/CA` opacity.
 
 ## Usage

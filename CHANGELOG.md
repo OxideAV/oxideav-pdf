@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round-7 writer: cross-reference *stream* (`/Type /XRef`,
+  ISO 32000-1 §7.5.8) emission. Mirror of the round-6 reader —
+  `/W [1 4 2]` field widths, FlateDecode + PNG-Up `/Predictor 12`
+  body, trailer dict folded into the stream's own dictionary. New
+  `Document::xref_stream` flag + `write_pdf_from_scene_xref_stream`
+  one-shot entry point. Header bumped to PDF 1.5 when active.
+- Round-7 reader: PDF 1.5+ **object-stream resolver**
+  (`/Type /ObjStm`, ISO 32000-1 §7.5.7). `DocumentReader::resolve`
+  now walks `XrefEntry::Compressed` slots — fetches the containing
+  ObjStm, parses its `(obj_num offset)` header, and slices out the
+  matching body. Header object-number mismatches surface as parse
+  errors. Pairs naturally with the round-7 xref-stream encoder.
+- Round-7 reader+writer: per-stream `/Filter /Crypt` `/Identity`
+  opt-out (ISO 32000-1 §7.6.5 + §7.4.10). Streams whose first filter
+  is `/Crypt` and whose `/DecodeParms /Name` is `/Identity` (or
+  absent — Table 24 default) bypass per-object encryption on both
+  encode and decode paths. The classic consumer is XMP metadata
+  that needs to remain searchable in encrypted PDFs.
+
 - Round-6 writer: standard-security-handler **encryption** for the
   full revision range — R=2 / R=3 / R=4 (RC4 + AES-128) / R=5 / R=6
   (AES-256). New `encrypt::EncryptionConfig` builder + `encrypt::EncryptionState`

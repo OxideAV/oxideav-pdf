@@ -56,7 +56,10 @@ pub mod writer;
 
 pub use error::PdfError;
 pub use reader::{read_pdf_to_scene, read_pdf_to_scene_with_password};
-pub use writer::{write_pdf, write_pdf_from_scene, write_pdf_from_scene_encrypted};
+pub use writer::{
+    write_pdf, write_pdf_from_scene, write_pdf_from_scene_encrypted,
+    write_pdf_from_scene_xref_stream,
+};
 
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, ContainerRegistry,

@@ -35,7 +35,7 @@ use crate::error::PdfError;
 use crate::objects::{Dict, Object, ObjectId, Stream};
 use crate::reader::content::parse_content_stream;
 use crate::reader::parse::Parser;
-use crate::reader::xref::{parse_xref, XrefTable};
+use crate::reader::xref::{parse_xref, XrefEntry, XrefTable};
 
 /// A read-time view of the PDF document — owns the byte slice plus a
 /// resolved cross-reference table and a small object cache. Indirect
@@ -95,9 +95,30 @@ impl<'a> DocumentReader<'a> {
     /// second `resolve(id)` is O(1). When the file is encrypted, the
     /// per-object decryption is applied here so callers above this
     /// layer see plaintext only.
+    ///
+    /// Compressed objects (xref entry type 2 — PDF 1.5+ object
+    /// streams, ISO 32000-1 §7.5.7) are resolved by fetching their
+    /// containing object stream, slicing the matching body out of the
+    /// concatenated payload, and re-parsing it with the standard
+    /// object parser.
     pub fn resolve(&mut self, id: ObjectId) -> Result<Object, PdfError> {
         if let Some(o) = self.cache.get(&id) {
             return Ok(o.clone());
+        }
+        // Compressed entries take a different path — they live inside
+        // an object stream (`/Type /ObjStm`) rather than at a byte
+        // offset. The container itself is encrypted (when the file is
+        // encrypted); the per-stored-object payload is **not**
+        // re-encrypted (§7.6.1, "object streams are encrypted as a
+        // unit").
+        if let Some(XrefEntry::Compressed {
+            obj_stream_id,
+            index_within_stream,
+        }) = self.xref.entries.get(&id.number).copied()
+        {
+            let body = self.resolve_compressed(id, obj_stream_id, index_within_stream)?;
+            self.cache.insert(id, body.clone());
+            return Ok(body);
         }
         let off = self
             .xref
@@ -115,6 +136,120 @@ impl<'a> DocumentReader<'a> {
             decrypt_object_in_place(&mut body, id, crypt)?;
         }
         self.cache.insert(id, body.clone());
+        Ok(body)
+    }
+
+    /// Resolve a compressed object — fetch + decode the containing
+    /// object stream (PDF 1.5+ `/Type /ObjStm`), slice the body whose
+    /// header matches `wanted.number`, and parse it with the standard
+    /// object parser.
+    fn resolve_compressed(
+        &mut self,
+        wanted: ObjectId,
+        obj_stream_num: u32,
+        index_within_stream: u32,
+    ) -> Result<Object, PdfError> {
+        let container_id = ObjectId::new(obj_stream_num);
+        let container = self.resolve(container_id)?;
+        let Object::Stream(s) = container else {
+            return Err(PdfError::other(format!(
+                "PDF reader: object {wanted:?} expected its container {container_id:?} to be a Stream"
+            )));
+        };
+        // /Type must be /ObjStm.
+        let dict = &s.dict;
+        let lookup = |k: &str| {
+            dict.entries()
+                .iter()
+                .find(|(kk, _)| kk == k)
+                .map(|(_, v)| v.clone())
+        };
+        if !matches!(lookup("Type"), Some(Object::Name(ref n)) if n == "ObjStm") {
+            return Err(PdfError::other(format!(
+                "PDF reader: container {container_id:?} is not /Type /ObjStm"
+            )));
+        }
+        let n = match lookup("N") {
+            Some(Object::Integer(v)) if v >= 0 => v as u32,
+            other => {
+                return Err(PdfError::other(format!(
+                    "PDF reader: ObjStm /N must be a non-negative integer (got {other:?})"
+                )))
+            }
+        };
+        let first = match lookup("First") {
+            Some(Object::Integer(v)) if v >= 0 => v as usize,
+            other => {
+                return Err(PdfError::other(format!(
+                    "PDF reader: ObjStm /First must be a non-negative integer (got {other:?})"
+                )))
+            }
+        };
+        if index_within_stream >= n {
+            return Err(PdfError::other(format!(
+                "PDF reader: ObjStm index {index_within_stream} out of range (N={n})"
+            )));
+        }
+        let payload = decode_stream(&s)?;
+        if first > payload.len() {
+            return Err(PdfError::other(format!(
+                "PDF reader: ObjStm /First {first} exceeds payload length {}",
+                payload.len()
+            )));
+        }
+        let header_bytes = &payload[..first];
+        // Header is `obj_num_1 off_1 obj_num_2 off_2 ...` with
+        // whitespace separators per §7.5.7. Re-use the standard
+        // parser's integer machinery rather than re-implementing it.
+        let mut hp = Parser::new(header_bytes);
+        let mut pairs: Vec<(u32, usize)> = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let on = hp.parse_object()?.ok_or_else(|| {
+                PdfError::other(format!(
+                    "PDF reader: ObjStm header truncated at pair {i} (obj_num)"
+                ))
+            })?;
+            let off = hp.parse_object()?.ok_or_else(|| {
+                PdfError::other(format!(
+                    "PDF reader: ObjStm header truncated at pair {i} (offset)"
+                ))
+            })?;
+            let (Object::Integer(num), Object::Integer(o)) = (on, off) else {
+                return Err(PdfError::other(format!(
+                    "PDF reader: ObjStm header pair {i} must be two integers"
+                )));
+            };
+            if num < 1 || o < 0 {
+                return Err(PdfError::other(format!(
+                    "PDF reader: ObjStm header pair {i} out of range ({num}, {o})"
+                )));
+            }
+            pairs.push((num as u32, o as usize));
+        }
+        let (header_num, body_off) = pairs[index_within_stream as usize];
+        if header_num != wanted.number {
+            return Err(PdfError::other(format!(
+                "PDF reader: ObjStm slot {index_within_stream} declares object {header_num},\
+                 but xref expected {}",
+                wanted.number
+            )));
+        }
+        let abs_off = first
+            .checked_add(body_off)
+            .ok_or_else(|| PdfError::other("PDF reader: ObjStm offset overflow"))?;
+        if abs_off > payload.len() {
+            return Err(PdfError::other(format!(
+                "PDF reader: ObjStm body offset {abs_off} past payload length {}",
+                payload.len()
+            )));
+        }
+        // Compressed objects in an ObjStm cannot themselves be
+        // streams (§7.5.7), and have no `n gen obj` wrapper — we
+        // parse a single object starting at `abs_off`.
+        let mut bp = Parser::new(&payload[abs_off..]);
+        let body = bp
+            .parse_object()?
+            .ok_or_else(|| PdfError::other("PDF reader: ObjStm body parse returned EOF"))?;
         Ok(body)
     }
 
@@ -213,6 +348,14 @@ fn build_crypt(
 /// strings + streams — not numeric / boolean / name / array structure
 /// — so the recursion only mutates the leaf content of those two
 /// variants.
+///
+/// Per ISO 32000-1 §7.4.10 + §7.6.5, a stream's first `/Filter` may be
+/// `/Crypt` with `/DecodeParms /Name /Identity` to opt out of the
+/// per-object decryption — the bytes are then treated as cleartext.
+/// This is the standard "this stream is intentionally NOT encrypted
+/// even though the rest of the file is" override (used e.g. for
+/// document-level XMP metadata streams when `/EncryptMetadata false`
+/// can't be applied uniformly).
 fn decrypt_object_in_place(
     obj: &mut Object,
     id: ObjectId,
@@ -236,6 +379,10 @@ fn decrypt_object_in_place(
             // for RC4; for AES the cleartext is shorter by IV+padding).
             // Recurse into the stream dict for any nested strings.
             decrypt_dict_in_place(&mut s.dict, id, crypt)?;
+            // Per-stream /Crypt /Identity override: skip decryption.
+            if has_identity_crypt_filter(&s.dict) {
+                return Ok(());
+            }
             // The stream's `/Filter` handling already decrypts before
             // applying the filter — we decrypt the raw, still-filtered
             // bytes here.
@@ -245,6 +392,63 @@ fn decrypt_object_in_place(
         _ => {}
     }
     Ok(())
+}
+
+/// Detect a per-stream `/Filter [/Crypt …] /DecodeParms [<<…>>]` shape
+/// where the crypt-filter parms specify `/Name /Identity` — the ISO
+/// 32000-1 §7.6.5 opt-out for "this stream is NOT encrypted".
+///
+/// Accepts both the `/Filter /Crypt` (single name) and `/Filter
+/// [/Crypt …]` (array) forms; the matching `/DecodeParms` may be a
+/// single dict or an array of dicts (parallel to `/Filter`).
+fn has_identity_crypt_filter(dict: &Dict) -> bool {
+    let filter = dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Filter")
+        .map(|(_, v)| v);
+    let parms = dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "DecodeParms")
+        .map(|(_, v)| v);
+
+    let crypt_pos: Option<usize> = match filter {
+        Some(Object::Name(s)) if s == "Crypt" => Some(0),
+        Some(Object::Array(items)) => items
+            .iter()
+            .position(|f| matches!(f, Object::Name(n) if n == "Crypt")),
+        _ => None,
+    };
+    let Some(idx) = crypt_pos else {
+        return false;
+    };
+
+    // The matching DecodeParms slot.
+    let parms_dict = match parms {
+        Some(Object::Dict(d)) if idx == 0 => Some(d.clone()),
+        Some(Object::Array(items)) => match items.get(idx) {
+            Some(Object::Dict(d)) => Some(d.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(d) = parms_dict else {
+        // No parms → default Crypt filter. Default crypt filter
+        // /Name is /Identity per §7.4.10 (Table 24).
+        return true;
+    };
+    match d
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Name")
+        .map(|(_, v)| v)
+    {
+        Some(Object::Name(s)) => s == "Identity",
+        // Missing /Name defaults to /Identity (Table 24).
+        None => true,
+        _ => false,
+    }
 }
 
 fn decrypt_dict_in_place(

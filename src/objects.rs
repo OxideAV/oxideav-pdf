@@ -142,6 +142,18 @@ pub struct Document {
     /// itself (the Encrypt object) is **not** encrypted — see
     /// ISO 32000-1 §7.6.1.
     pub encryption: Option<EncryptionState>,
+    /// When `true`, [`Self::write_to`] emits a PDF 1.5+ cross-reference
+    /// *stream* (`/Type /XRef`, ISO 32000-1 §7.5.8) instead of the
+    /// classical `xref`-keyword table. The trailer dict is folded into
+    /// the stream's own dictionary (per §7.5.8.2), so the file no
+    /// longer carries a separate `trailer << ... >>` block.
+    ///
+    /// The xref stream uses `/W [1 4 2]` — one byte for the entry
+    /// type, four bytes for the offset (or compressed-stream id), two
+    /// bytes for the generation (or in-stream index). The body is
+    /// flate-compressed with the PNG-Up `/Predictor 12` so the
+    /// reader's predictor reversal is exercised end-to-end.
+    pub xref_stream: bool,
 }
 
 impl Document {
@@ -152,6 +164,7 @@ impl Document {
             root: None,
             info: None,
             encryption: None,
+            xref_stream: false,
         }
     }
 
@@ -205,6 +218,11 @@ impl Document {
             // the magic so PDF 2.0 readers don't flag the file as
             // pre-1.7-using-1.7-features.
             b"%PDF-2.0\n"
+        } else if self.xref_stream {
+            // XRef streams require PDF 1.5+ readers (§7.5.8). Bump
+            // the header so older parsers refuse the file rather than
+            // silently misinterpreting the cross-reference section.
+            b"%PDF-1.5\n"
         } else {
             b"%PDF-1.4\n"
         };
@@ -237,41 +255,89 @@ impl Document {
             None
         };
 
+        // ---- XRef-stream branch: the cross-reference itself is an
+        // indirect object so we have to allocate its id BEFORE we
+        // emit the body (its offset depends on its position, but its
+        // own xref entry has to know its id to record itself). We
+        // pre-allocate the id and add a placeholder Stream that the
+        // post-body fix-up populates with the real binary table.
+        let xref_stream_id_opt: Option<ObjectId> = if self.xref_stream {
+            let next_id = objects_to_emit
+                .iter()
+                .map(|o| o.id.number)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            Some(ObjectId::new(next_id))
+        } else {
+            None
+        };
+
         // ---- Body -----------------------------------------------------
         // Sort by id so the xref subsection slot table lines up neatly.
         objects_to_emit.sort_by_key(|o| o.id.number);
-        let sorted: Vec<&IndirectObject> = objects_to_emit.iter().collect();
 
         // Offsets[i] = byte offset of the indirect object whose id is
         // (i+1). Slot 0 of the xref is reserved for the head of the
         // free list (always entry `0000000000 65535 f`).
-        let max_id = sorted.last().map(|o| o.id.number as usize).unwrap_or(0);
+        let body_max_id = objects_to_emit
+            .last()
+            .map(|o| o.id.number as usize)
+            .unwrap_or(0);
+        let max_id = match xref_stream_id_opt {
+            Some(id) => id.number as usize,
+            None => body_max_id,
+        };
         let mut offsets: Vec<u64> = vec![0; max_id + 1];
 
-        for ind in &sorted {
+        for ind in &objects_to_emit {
             let off = out.len() as u64;
             offsets[ind.id.number as usize] = off;
             write_indirect(out, ind).map_err(PdfError::Io)?;
         }
 
-        // ---- Cross-reference table -----------------------------------
+        // ---- Cross-reference + trailer -------------------------------
         let xref_off = out.len() as u64;
-        out.extend_from_slice(b"xref\n");
-        // Single subsection covering [0, max_id].
-        let header_line = format!("0 {}\n", max_id + 1);
-        out.extend_from_slice(header_line.as_bytes());
-        // Free-list head — slot 0 always 0000000000 65535 f.
-        out.extend_from_slice(b"0000000000 65535 f \n");
-        for offset in offsets.iter().skip(1) {
-            // 10-digit zero-padded byte offset, 5-digit zero-padded
-            // generation, 'n' (in-use) marker, exact two-character
-            // newline terminator (space + LF) per §7.5.4.
-            let line = format!("{:010} {:05} n \n", offset, 0);
-            out.extend_from_slice(line.as_bytes());
+        if let Some(xref_stream_id) = xref_stream_id_opt {
+            // Record the xref stream's own offset in the entry table.
+            offsets[xref_stream_id.number as usize] = xref_off;
+            self.write_xref_stream(out, xref_stream_id, root, encrypt_id_opt, &offsets, max_id)?;
+        } else {
+            out.extend_from_slice(b"xref\n");
+            // Single subsection covering [0, max_id].
+            let header_line = format!("0 {}\n", max_id + 1);
+            out.extend_from_slice(header_line.as_bytes());
+            // Free-list head — slot 0 always 0000000000 65535 f.
+            out.extend_from_slice(b"0000000000 65535 f \n");
+            for offset in offsets.iter().skip(1) {
+                // 10-digit zero-padded byte offset, 5-digit zero-padded
+                // generation, 'n' (in-use) marker, exact two-character
+                // newline terminator (space + LF) per §7.5.4.
+                let line = format!("{:010} {:05} n \n", offset, 0);
+                out.extend_from_slice(line.as_bytes());
+            }
+            out.extend_from_slice(b"trailer\n");
+            let trailer_dict = self.build_trailer_dict(root, encrypt_id_opt, max_id);
+            let trailer = Object::Dict(trailer_dict);
+            write_object(out, &trailer).map_err(PdfError::Io)?;
+            out.extend_from_slice(b"\n");
         }
+        out.extend_from_slice(b"startxref\n");
+        out.extend_from_slice(format!("{}\n", xref_off).as_bytes());
+        out.extend_from_slice(b"%%EOF\n");
 
-        // ---- Trailer + startxref + EOF -------------------------------
-        out.extend_from_slice(b"trailer\n");
+        Ok(())
+    }
+
+    /// Build the trailer dict shared between the classical-xref and
+    /// xref-stream emission paths. Carries `/Size`, `/Root`, optional
+    /// `/Info`, and (when encrypted) `/Encrypt` + `/ID`.
+    fn build_trailer_dict(
+        &self,
+        root: ObjectId,
+        encrypt_id_opt: Option<ObjectId>,
+        max_id: usize,
+    ) -> Dict {
         let mut trailer_dict = Dict::new()
             .with("Size", Object::Integer((max_id + 1) as i64))
             .with("Root", Object::Reference(root));
@@ -280,23 +346,128 @@ impl Document {
         }
         if let (Some(eid), Some(state)) = (encrypt_id_opt, &self.encryption) {
             trailer_dict.set("Encrypt", Object::Reference(eid));
-            // /ID is required when /Encrypt is present (§7.5.5 + §7.6.3.3).
-            // We emit ID[0] == ID[1] (no incremental updates → both
-            // halves point to the same permanent identifier).
+            // /ID is required when /Encrypt is present (§7.5.5 +
+            // §7.6.3.3). We emit ID[0] == ID[1] (no incremental
+            // updates → both halves point to the same permanent
+            // identifier).
             let id_array = Object::Array(vec![
                 Object::LiteralString(state.file_id.clone()),
                 Object::LiteralString(state.file_id.clone()),
             ]);
             trailer_dict.set("ID", id_array);
         }
-        let trailer = Object::Dict(trailer_dict);
-        write_object(out, &trailer).map_err(PdfError::Io)?;
-        out.extend_from_slice(b"\nstartxref\n");
-        out.extend_from_slice(format!("{}\n", xref_off).as_bytes());
-        out.extend_from_slice(b"%%EOF\n");
+        trailer_dict
+    }
 
+    /// Emit a PDF 1.5+ cross-reference stream (ISO 32000-1 §7.5.8).
+    /// `offsets[i]` is the byte offset of the indirect object whose
+    /// id is `i`; slot 0 is the free-list head and is encoded as
+    /// `(0, 0, 65535)` per §7.5.8.3 (Type 0 entry).
+    fn write_xref_stream(
+        &self,
+        out: &mut Vec<u8>,
+        xref_id: ObjectId,
+        root: ObjectId,
+        encrypt_id_opt: Option<ObjectId>,
+        offsets: &[u64],
+        max_id: usize,
+    ) -> Result<(), PdfError> {
+        // Field widths: type=1 byte, offset=4 bytes (handles ≤4 GiB),
+        // generation=2 bytes. PDFs above 4 GiB would need w[1]=8; we
+        // guard against the overflow rather than silently truncating.
+        const W: [usize; 3] = [1, 4, 2];
+        let entry_width = W[0] + W[1] + W[2];
+        let n = max_id + 1;
+        let mut raw_table = Vec::with_capacity(n * entry_width);
+
+        // Slot 0 — free-list head. Type 0, next=0, generation=65535.
+        raw_table.push(0);
+        raw_table.extend_from_slice(&0u32.to_be_bytes());
+        raw_table.extend_from_slice(&65535u16.to_be_bytes());
+
+        for (i, off) in offsets.iter().enumerate().skip(1) {
+            if *off > u32::MAX as u64 {
+                return Err(PdfError::other(format!(
+                    "Document::write_xref_stream: object {i} offset {off} exceeds 32-bit\
+                     limit — bump /W[1] to 8 bytes"
+                )));
+            }
+            // Slots above the body (for unallocated ids) and the slot
+            // for the in-use entries both go through this branch. The
+            // pre-fill of `offsets` with 0 means any never-written id
+            // would land here as type-1 with offset 0 — but in practice
+            // every id 1..=max_id has been written above (the xref
+            // stream's own slot was patched in by the caller).
+            raw_table.push(1);
+            raw_table.extend_from_slice(&(*off as u32).to_be_bytes());
+            raw_table.extend_from_slice(&0u16.to_be_bytes());
+        }
+
+        // PNG-Up forward predictor (tag 2): each row is `entry[i] -
+        // prev[i]` (mod 256). Match the round-6 reader's reversal.
+        let mut predicted = Vec::with_capacity(n * (entry_width + 1));
+        let mut prev = vec![0u8; entry_width];
+        for chunk in raw_table.chunks_exact(entry_width) {
+            predicted.push(0x02); // PNG-Up tag.
+            for i in 0..entry_width {
+                predicted.push(chunk[i].wrapping_sub(prev[i]));
+            }
+            prev.copy_from_slice(chunk);
+        }
+
+        // FlateDecode the predicted bytes.
+        let compressed = flate_compress(&predicted);
+
+        // Build the xref-stream dict — fold trailer entries in.
+        let trailer_dict = self.build_trailer_dict(root, encrypt_id_opt, max_id);
+        let mut stream_dict = Dict::new()
+            .with("Type", Object::Name("XRef".into()))
+            .with("Filter", Object::Name("FlateDecode".into()))
+            .with(
+                "DecodeParms",
+                Object::Dict(
+                    Dict::new()
+                        .with("Predictor", Object::Integer(12))
+                        .with("Columns", Object::Integer(entry_width as i64)),
+                ),
+            )
+            .with(
+                "W",
+                Object::Array(vec![
+                    Object::Integer(W[0] as i64),
+                    Object::Integer(W[1] as i64),
+                    Object::Integer(W[2] as i64),
+                ]),
+            )
+            .with(
+                "Index",
+                Object::Array(vec![Object::Integer(0), Object::Integer(n as i64)]),
+            );
+        // Copy trailer fields (Size, Root, Info, Encrypt, ID).
+        for (k, v) in trailer_dict.entries() {
+            stream_dict.set(k, v.clone());
+        }
+
+        let stream = Stream::new(stream_dict, compressed);
+        let indirect = IndirectObject {
+            id: xref_id,
+            object: Object::Stream(stream),
+        };
+        write_indirect(out, &indirect).map_err(PdfError::Io)?;
         Ok(())
     }
+}
+
+/// FlateDecode helper shared between the xref-stream encoder and any
+/// future stream-compression call sites in this module. Keeping it
+/// inline avoids a circular import on `resources::flate_compress`.
+fn flate_compress(input: &[u8]) -> Vec<u8> {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(input)
+        .expect("zlib compression cannot fail on Vec");
+    enc.finish().expect("zlib finish cannot fail on Vec")
 }
 
 /// Recursively encrypt every literal/hex string and stream payload in
@@ -304,6 +475,12 @@ impl Document {
 /// `id`. Numeric / boolean / name / reference values pass through
 /// unchanged. Nested dicts and arrays are walked recursively so nested
 /// strings (e.g. `/Title (...)` inside an /Info dict) are encrypted.
+///
+/// Streams whose first `/Filter` is `/Crypt` with a `/Name /Identity`
+/// crypt-filter parm (or a missing parm — the default Name is
+/// `/Identity` per §7.4.10 Table 24) are explicitly NOT encrypted —
+/// this is the §7.6.5 opt-out for "this stream is intentionally
+/// cleartext even though the rest of the file is encrypted".
 fn encrypt_object_in_place(
     obj: &mut Object,
     id: ObjectId,
@@ -324,6 +501,11 @@ fn encrypt_object_in_place(
         Object::Stream(s) => {
             // Recurse into the dict for any nested string values.
             encrypt_dict_in_place(&mut s.dict, id, state)?;
+            // §7.6.5 opt-out: /Filter /Crypt + /DecodeParms /Name
+            // /Identity → leave the body untouched.
+            if has_identity_crypt_filter(&s.dict) {
+                return Ok(());
+            }
             // Encrypt the stream body. Note: per §7.6.1, the
             // body-already-Filter-encoded layer is what gets encrypted —
             // FlateDecode etc. are applied first, then the bytes are
@@ -333,6 +515,54 @@ fn encrypt_object_in_place(
         _ => {}
     }
     Ok(())
+}
+
+/// Match a stream-dict shape that opts out of per-stream encryption
+/// per ISO 32000-1 §7.6.5. Mirror of the reader-side detector in
+/// [`crate::reader::document`]; kept private here so the encoder
+/// doesn't need to round-trip through the reader.
+fn has_identity_crypt_filter(dict: &Dict) -> bool {
+    let filter = dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Filter")
+        .map(|(_, v)| v);
+    let parms = dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "DecodeParms")
+        .map(|(_, v)| v);
+    let crypt_pos: Option<usize> = match filter {
+        Some(Object::Name(s)) if s == "Crypt" => Some(0),
+        Some(Object::Array(items)) => items
+            .iter()
+            .position(|f| matches!(f, Object::Name(n) if n == "Crypt")),
+        _ => None,
+    };
+    let Some(idx) = crypt_pos else {
+        return false;
+    };
+    let parms_dict = match parms {
+        Some(Object::Dict(d)) if idx == 0 => Some(d.clone()),
+        Some(Object::Array(items)) => match items.get(idx) {
+            Some(Object::Dict(d)) => Some(d.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(d) = parms_dict else {
+        return true;
+    };
+    match d
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Name")
+        .map(|(_, v)| v)
+    {
+        Some(Object::Name(s)) => s == "Identity",
+        None => true,
+        _ => false,
+    }
 }
 
 fn encrypt_dict_in_place(
