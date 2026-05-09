@@ -57,3 +57,22 @@ sha1 = { version = "0.10", default-features = false }
 # `std` is needed for `OsRng` (used by tests + by the encoder side
 # in round 11) and for the `pkcs8` feature's PKCS#8 PEM/DER reader.
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
+# Pure-Rust NIST P-256 (secp256r1) curve (RustCrypto). Round-14 KARI
+# unwrap uses ECDH key agreement on P-256 — the most common curve in
+# Adobe + standard-PDF tools' enveloped data. The `ecdh` feature
+# enables the diffie_hellman primitive that produces the shared
+# secret `Z`. The crate is constant-time pure-Rust on top of
+# `elliptic-curve`; no `*-sys`. P-384 / P-521 / X25519 stay deferred.
+p256 = { version = "0.13", default-features = false, features = [
+    "ecdh",
+    "std",
+] }
+# Pure-Rust AES Key Wrap (RustCrypto). Round-14 KARI unwrap uses
+# RFC 3394 AES-KW (AES-128 / AES-192 / AES-256) to unwrap the CEK
+# from the bytes the KDF-derived KEK + the wrapped octets in the
+# recipient slot. See `dhSinglePass-stdDH-sha*kdf-scheme` (RFC 5753
+# §7.1) — its `parameters` is the AlgorithmIdentifier of the wrap.
+# `alloc` enables the `wrap_vec` / `unwrap_vec` Vec-returning helpers
+# (the lower-level `wrap` / `unwrap` API requires a pre-sized output
+# buffer; the Vec helpers are simpler at the call site).
+aes-kw = { version = "0.2", features = ["alloc"] }

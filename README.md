@@ -122,10 +122,15 @@ for the CMS v2 form. Round 12 adds **per-crypt-filter recipient
 lists** — `write_pdf_from_scene_pubsec_multi_cf` + `PubSecMultiCfConfig`
 + `PubSecCfGroup` emit a doc with multiple permission sets (each its
 own envelope), and `open_with_certificate_with_permissions` surfaces
-the matched recipient's permission mask. Round 12 also lands the
-**CMS KARI decoder** (RFC 5652 §6.2.2) — KeyAgree (ECDH/DH) recipients
-parse structurally; unwrap stays deferred. `RC2 / 3DES / DES` envelope
-content algorithms remain out of scope.
+the matched recipient's permission mask. Round 12 lands the **CMS KARI
+decoder** (RFC 5652 §6.2.2) — KeyAgree (ECDH/DH) recipients parse
+structurally. **Round 14 closes the unwrap**: P-256 ECDH + RFC 5753
+§7.1.2 X9.63-SHA-256 KDF + RFC 3394 AES Key Wrap (128/192/256-bit) for
+the `dhSinglePass-stdDH-sha256kdf-scheme` KEA OID. Pass an EC scalar
+via `PubSecCredential::from_parsed_ec_p256(cert, ec_scalar)` and the
+KARI envelope opens through the same `read_pdf_to_scene_with_certificate`
+entry point as KTRI. P-384 / P-521 / X25519 stay deferred. `RC2 /
+3DES / DES` envelope content algorithms remain out of scope.
 
 ## Encryption encode (writer side)
 
@@ -234,8 +239,10 @@ embedded files.
   hint tables (F.4.6) for linearized output — we generate no
   interactive forms / structure trees / embedded files, so the
   per-table content would be empty anyway.
-- CMS KARI *unwrap* (DH/ECDH key agreement + RFC 5753 KDFs) — round
-  12 surfaces the KARI structure but doesn't unwrap.
+- CMS KARI for non-P-256 curves (P-384 / P-521 / X25519) — round 14
+  unwraps the most common case (`dhSinglePass-stdDH-sha256kdf-scheme`
+  on P-256 with AES-KW); the structural parser already accepts every
+  curve so a future round extends the matcher.
 - Transparency groups beyond a per-`Group` `/ca`+`/CA` opacity.
 
 ## Usage

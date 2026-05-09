@@ -82,16 +82,29 @@
 //!   scope here. Mixed-recipient envelopes (KTRI + KARI) decode
 //!   correctly via the KTRI side.
 //!
+//! ## Round-14 additions
+//!
+//! * **KARI unwrap** (RFC 5753 §7.1 + RFC 3394) — closes the round-12
+//!   deferral. P-256 ECDH + X9.63-SHA-256 KDF + AES Key Wrap (128 /
+//!   192 / 256 bit). Surfaces as the `OID_DH_SINGLE_PASS_STDDH_SHA256_KDF`
+//!   KEA OID; non-P-256 / non-SHA-256 KDF combinations are still
+//!   silently skipped (a future round adds P-384 + P-521 + X25519).
+//! * **`PubSecCredential::from_parsed_ec_p256`** + `with_ec_p256_scalar`
+//!   constructors — populate the EC private scalar slot so a
+//!   credential can open both KTRI (RSA) and KARI (ECDH) envelopes.
+//!
 //! ## Remaining deferrals
 //!
 //! * `RC2 / 3DES / DES` envelope content algorithms (deprecated in
 //!   PDF 2.0; we accept RC4 / AES-128 / AES-256 only).
-//! * KARI *unwrap* — DH/ECDH key agreement + RFC 5753 KDFs.
+//! * P-384 / P-521 / X25519 KARI variants (only P-256 +
+//!   `dhSinglePass-stdDH-sha256kdf-scheme` lands in round 14).
 
 pub mod cms;
 pub mod cms_build;
 pub mod der;
 pub mod encode;
+pub mod kari;
 pub mod x509;
 
 pub use encode::{
@@ -204,13 +217,22 @@ fn stmf_cfm(d: &Dict) -> Option<String> {
 }
 
 /// User-supplied credential — an X.509 certificate (DER-encoded) and
-/// the matching RSA private key. The certificate identifier
-/// (`IssuerAndSerialNumber` from RFC 5280) is extracted from the
-/// certificate's DER body; the RSA private key is the one used to
-/// unwrap the recipient's encrypted content-encryption key.
+/// the matching private key (RSA for KTRI envelopes, EC for round-14
+/// KARI envelopes). The certificate identifier (`IssuerAndSerialNumber`
+/// from RFC 5280) is extracted from the certificate's DER body.
+///
+/// Round 14 adds the optional `ec_private_scalar` slot — the
+/// recipient's raw P-256 SEC1 scalar (32 bytes). When present, KARI
+/// envelopes matching the same certificate can also be unwrapped (RFC
+/// 5753 §7.1 + RFC 3394). When absent, KARI envelopes are skipped
+/// (the original round-12 behaviour).
 pub struct PubSecCredential {
     pub(crate) cert: x509::Certificate,
-    pub(crate) private_key: rsa::RsaPrivateKey,
+    pub(crate) private_key: Option<rsa::RsaPrivateKey>,
+    /// Optional P-256 SEC1 raw private scalar (32 bytes) — populates
+    /// the round-14 KARI-unwrap path. When `None`, KARI recipient
+    /// slots that match this certificate's RID are silently skipped.
+    pub(crate) ec_private_scalar: Option<Vec<u8>>,
 }
 
 impl PubSecCredential {
@@ -222,7 +244,11 @@ impl PubSecCredential {
         let cert = x509::Certificate::parse(cert_der)?;
         let private_key = rsa::RsaPrivateKey::from_pkcs8_der(pkcs8_der)
             .map_err(|e| PdfError::other(format!("PDF pubsec: RSA private key parse: {e}")))?;
-        Ok(Self { cert, private_key })
+        Ok(Self {
+            cert,
+            private_key: Some(private_key),
+            ec_private_scalar: None,
+        })
     }
 
     /// Build directly from a parsed certificate + RSA key — used by
@@ -230,7 +256,37 @@ impl PubSecCredential {
     /// in `tests/pubsec.rs`).
     #[doc(hidden)]
     pub fn from_parsed(cert: x509::Certificate, private_key: rsa::RsaPrivateKey) -> Self {
-        Self { cert, private_key }
+        Self {
+            cert,
+            private_key: Some(private_key),
+            ec_private_scalar: None,
+        }
+    }
+
+    /// Round-14: build a credential from a parsed certificate + a
+    /// P-256 SEC1 raw private scalar (32 bytes). Used to open a
+    /// KARI-encrypted PDF whose recipient slot matches this certificate.
+    ///
+    /// The `cert.spki_pubkey_bits` slot — when populated — is used to
+    /// match the recipient's `RecipientKeyIdentifier(SKI)` form. For
+    /// an EC certificate, `spki_pubkey_bits` is the SEC1-encoded
+    /// public point.
+    pub fn from_parsed_ec_p256(cert: x509::Certificate, ec_private_scalar: Vec<u8>) -> Self {
+        Self {
+            cert,
+            private_key: None,
+            ec_private_scalar: Some(ec_private_scalar),
+        }
+    }
+
+    /// Round-14: extend an existing credential with a P-256 EC private
+    /// scalar. Allows a single credential to unwrap both KTRI (RSA)
+    /// and KARI (ECDH) envelopes — typical for a recipient who carries
+    /// both a long-term RSA cert and a separate EC cert under the same
+    /// identity.
+    pub fn with_ec_p256_scalar(mut self, ec_private_scalar: Vec<u8>) -> Self {
+        self.ec_private_scalar = Some(ec_private_scalar);
+        self
     }
 }
 
@@ -541,10 +597,10 @@ fn recipients_to_blobs(array: &Object) -> Result<Vec<Vec<u8>>, PdfError> {
 }
 
 /// Find a recipient slot in `envelope` whose RecipientIdentifier
-/// matches `credential.cert`, then RSA-decrypt the wrapped CEK and use
-/// it to decrypt the envelope's encrypted content. Returns the
-/// plaintext (the seed + permissions blob), or `None` if no recipient
-/// matched.
+/// matches `credential.cert`, derive the CEK (KTRI: RSA decrypt;
+/// KARI: ECDH + KDF + AES Key Wrap unwrap), and use it to decrypt the
+/// envelope's encrypted content. Returns the plaintext (the seed +
+/// permissions blob), or `None` if no recipient matched.
 ///
 /// Two RecipientIdentifier forms are matched (RFC 5652 §6.2.1 + RFC
 /// 5280 §4.2.1.2):
@@ -553,6 +609,13 @@ fn recipients_to_blobs(array: &Object) -> Result<Vec<Vec<u8>>, PdfError> {
 /// 2. **SubjectKeyIdentifier (CMS v2)** — byte-compare the recipient
 ///    slot's SKI octet string against `SHA-1(SPKI BIT STRING contents)`
 ///    of the user cert (RFC 5280 §4.2.1.2 method 1).
+///
+/// Round 14: KARI variants (RFC 5652 §6.2.2 + RFC 5753 §7.1) are
+/// unwrapped when the credential carries an EC private scalar (see
+/// [`PubSecCredential::from_parsed_ec_p256`]). KARI envelopes whose
+/// scheme isn't `dhSinglePass-stdDH-sha256kdf-scheme` (P-256 +
+/// X9.63-SHA-256 KDF + AES-KW) are skipped silently — a future round
+/// extends this matcher with P-384 / P-521 / X25519.
 fn try_unwrap(
     envelope: &cms::EnvelopedData,
     credential: &PubSecCredential,
@@ -560,29 +623,67 @@ fn try_unwrap(
     let our_issuer = &credential.cert.issuer_der;
     let our_serial = &credential.cert.serial;
     let our_ski = credential.cert.subject_key_identifier();
-    for recipient in &envelope.recipients {
-        let matched = match &recipient.rid {
-            cms::RecipientId::IssuerAndSerial(ias) => {
-                &ias.issuer_der == our_issuer && &ias.serial == our_serial
+
+    // Walk every RecipientInfo in declaration order — KTRI + KARI.
+    for variant in &envelope.all_recipients {
+        match variant {
+            cms::RecipientInfoVariant::KeyTrans(recipient) => {
+                let matched = match &recipient.rid {
+                    cms::RecipientId::IssuerAndSerial(ias) => {
+                        &ias.issuer_der == our_issuer && &ias.serial == our_serial
+                    }
+                    cms::RecipientId::SubjectKeyIdentifier(ski) => match &our_ski {
+                        Some(our) => ski == our,
+                        None => false,
+                    },
+                };
+                if !matched {
+                    continue;
+                }
+                let Some(rsa_key) = credential.private_key.as_ref() else {
+                    // No RSA key on this credential — can't open KTRI.
+                    continue;
+                };
+                let cek = rsa_key
+                    .decrypt(rsa::Pkcs1v15Encrypt, &recipient.encrypted_key)
+                    .map_err(|e| PdfError::other(format!("PDF pubsec: RSA decrypt failed: {e}")))?;
+                let plaintext = decrypt_envelope_content(
+                    &envelope.content_encryption,
+                    &cek,
+                    &envelope.encrypted_content,
+                )?;
+                return Ok(Some(plaintext));
             }
-            cms::RecipientId::SubjectKeyIdentifier(ski) => match &our_ski {
-                Some(our) => ski == our,
-                None => false,
-            },
-        };
-        if !matched {
-            continue;
+            cms::RecipientInfoVariant::KeyAgree(kari) => {
+                // Only the round-14 P-256 path is implemented. Other
+                // schemes are silently skipped.
+                let Some(ec_scalar) = credential.ec_private_scalar.as_ref() else {
+                    continue;
+                };
+                if kari.key_encryption_oid != kari::OID_DH_SINGLE_PASS_STDDH_SHA256_KDF {
+                    continue;
+                }
+                let Some(slot) = kari::match_kari_slot(
+                    kari,
+                    our_issuer,
+                    our_serial,
+                    credential.cert.spki_pubkey_bits.as_deref(),
+                ) else {
+                    continue;
+                };
+                let recipient = kari::EcRecipient {
+                    private_scalar: ec_scalar.clone(),
+                    public_point_sec1: credential.cert.spki_pubkey_bits.clone().unwrap_or_default(),
+                };
+                let cek = kari::unwrap_kari_p256(kari, slot, &recipient)?;
+                let plaintext = decrypt_envelope_content(
+                    &envelope.content_encryption,
+                    &cek,
+                    &envelope.encrypted_content,
+                )?;
+                return Ok(Some(plaintext));
+            }
         }
-        let cek = credential
-            .private_key
-            .decrypt(rsa::Pkcs1v15Encrypt, &recipient.encrypted_key)
-            .map_err(|e| PdfError::other(format!("PDF pubsec: RSA decrypt failed: {e}")))?;
-        let plaintext = decrypt_envelope_content(
-            &envelope.content_encryption,
-            &cek,
-            &envelope.encrypted_content,
-        )?;
-        return Ok(Some(plaintext));
     }
     Ok(None)
 }

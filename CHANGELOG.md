@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round-14: **KARI unwrap** (RFC 5753 §7.1 + RFC 3394) — closes the
+  round-12 deferral. P-256 ECDH key agreement + RFC 5753 §7.1.2 X9.63
+  KDF with SHA-256 + RFC 3394 AES Key Wrap (128 / 192 / 256 bit) for
+  the `dhSinglePass-stdDH-sha256kdf-scheme` KEA OID
+  (`1.3.132.1.11.1`). New `pubsec::kari` module:
+  `unwrap_kari_p256(kari, slot, &EcRecipient)` performs the full
+  ECDH + KDF + AES-KW recovery; `x963_kdf_sha256` + `build_ecc_cms_shared_info`
+  are the public KDF-input helpers. New
+  `PubSecCredential::from_parsed_ec_p256(cert, ec_scalar)` +
+  `with_ec_p256_scalar(scalar)` constructors plumb a P-256 SEC1 raw
+  private scalar into the credential. The reader's `try_unwrap` now
+  walks `all_recipients` (KTRI + KARI) — KARI slots whose
+  `keyEncryptionAlgorithm` matches `dhSinglePass-stdDH-sha256kdf-scheme`
+  and whose RID matches the credential's cert are unwrapped via P-256;
+  unsupported KEA OIDs / mismatched RIDs are skipped silently so a
+  mixed-recipient envelope (KTRI + KARI) opens via either side. New
+  deps: `p256` 0.13 (with `ecdh` + `std` features) + `aes-kw` 0.2
+  (with `alloc` feature). Provenance: RFC 5753 §3.1 / §7.1 / §7.2 +
+  RFC 3394 §2.2.2 + RFC 5652 §6.2.2 + NIST SP 800-56A only. Decoder
+  side; encoder-side `wrap_cek_for_p256_recipient` is a `#[doc(hidden)]`
+  fixture helper used by the round-14 integration tests. P-384 / P-521
+  / X25519 stay deferred (the structural parser already accepts every
+  curve via `OriginatorPublicKey.algorithm`).
+- Round-14 tests: 11 new tests — 8 `pubsec::kari` unit tests
+  (X9.63-SHA-256 KDF one-block + truncated-multi-block, ECC-CMS-SharedInfo
+  builder with + without UKM, wrap-OID round trip, P-256 + AES-128 KW
+  round trip, P-256 + AES-256 KW round trip, unsupported-KEA-OID
+  error path) + 3 integration tests in `tests/pubsec_round14_kari.rs`
+  (`adbe.pkcs7.s5` V=5 KARI-encrypted PDF round-trip via
+  `read_pdf_to_scene_with_certificate` — IAS form, SKI form, wrong
+  EC key error path).
+
 - Round-12: **per-crypt-filter recipient lists** — multiple named
   crypt filters under `/CF`, each with its own permission mask, all
   sharing one `/Recipients` array of multi-envelope PKCS#7 blobs (one
