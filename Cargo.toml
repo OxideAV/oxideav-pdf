@@ -75,6 +75,21 @@ p384 = { version = "0.13", default-features = false, features = [
     "ecdh",
     "std",
 ] }
+# Pure-Rust NIST P-521 (secp521r1) curve (RustCrypto). Round-16 closes
+# the NIST KARI curve coverage by binding P-521 ECDH to the X9.63
+# SHA-512 KDF per RFC 5753 §7.1.4 (`dhSinglePass-stdDH-sha512kdf-scheme`,
+# OID 1.3.132.1.11.3). Same family + API as `p256` / `p384`.
+p521 = { version = "0.13", default-features = false, features = [
+    "ecdh",
+    "std",
+] }
+# Pure-Rust HKDF (RustCrypto). Round-16 wires the RFC 8418 §2.2 HKDF
+# binding for X25519 — `dhSinglePass-stdDH-hkdf-sha256/384/512-scheme`
+# (smime-alg 19 / 20 / 21, OIDs 1.2.840.113549.1.9.16.3.{19,20,21}).
+# HKDF replaces X9.63 as the modern KDF for the same KEK derivation
+# slot: salt = ukm (or empty), IKM = ECDH shared secret, info = DER
+# ECC-CMS-SharedInfo, output truncated to the wrap KEK length.
+hkdf = { version = "0.12", default-features = false }
 # Pure-Rust X25519 ECDH (dalek-cryptography). Round-15 adds the X25519
 # KARI variant per RFC 8418 §2.1 (CMS uses ANSI-X9.63 KDF over X25519
 # with the secg-scheme OIDs in the same `1.3.132.1.11.x` family that

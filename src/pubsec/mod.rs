@@ -109,13 +109,26 @@
 //!   the curve + cert; the writer derives the ephemeral keypair, runs
 //!   the right ECDH primitive, KDFs the KEK, and AES-KWs the CEK.
 //!
+//! ## Round-16 additions
+//!
+//! * **P-521 KARI** (RFC 5753 §7.1.4) — `dhSinglePass-stdDH-sha512kdf-scheme`,
+//!   OID 1.3.132.1.11.3. Closes the NIST KARI curve coverage; same
+//!   builder + reader path as P-256 / P-384 with X9.63-SHA-512 KDF +
+//!   AES-128/192/256-WRAP.
+//! * **RFC 8418 §2.2 HKDF binding for X25519** —
+//!   `dhSinglePass-stdDH-hkdf-sha256/384/512-scheme`, OIDs
+//!   `1.2.840.113549.1.9.16.3.{19,20,21}`. The X25519
+//!   `KariRecipient::x25519_hkdf_*` constructors switch the KDF on the
+//!   writer side; the reader auto-routes by parsing the KEA OID into a
+//!   [`kari::KariKdf`].
+//!
 //! ## Remaining deferrals
 //!
 //! * `RC2 / 3DES / DES` envelope content algorithms (deprecated in
 //!   PDF 2.0; we accept RC4 / AES-128 / AES-256 only).
-//! * P-521 KARI (`dhSinglePass-stdDH-sha512kdf-scheme`).
-//! * RFC 8418 §2.2 HKDF binding for X25519 / X448 (`smime-alg 19/20/21`
-//!   OIDs) and X448.
+//! * X448 KARI (no vetted pure-Rust implementation in the workspace
+//!   yet — RFC 8418 §2 + RFC 7748 spec is wired through, the
+//!   `KariCurve` enum just needs an `X448` variant once a crate lands).
 //! * Long-term-cert originator path (`OriginatorId::IssuerAndSerial` /
 //!   `SubjectKeyIdentifier`) — current path requires the
 //!   `OriginatorPublicKey` in-band form.
@@ -699,13 +712,17 @@ fn try_unwrap(
                 return Ok(Some(plaintext));
             }
             cms::RecipientInfoVariant::KeyAgree(kari) => {
-                // KARI: round-14 P-256 + round-15 P-384 / X25519 paths.
-                // Skip envelopes whose KEA OID doesn't bind to the
-                // credential's EC scalar (different curve / KDF).
+                // KARI: round-14 P-256 + round-15 P-384 / X25519 +
+                // round-16 P-521 + RFC 8418 §2.2 HKDF-X25519 paths.
+                // Skip envelopes whose KEA OID names an unsupported
+                // KDF, or one not paired with the credential's curve.
                 let Some((curve, ec_scalar)) = credential.ec_private.as_ref() else {
                     continue;
                 };
-                if kari.key_encryption_oid != curve.kea_oid() {
+                let Some(kdf) = kari::KariKdf::from_kea_oid(&kari.key_encryption_oid) else {
+                    continue;
+                };
+                if !kdf.is_valid_for(*curve) {
                     continue;
                 }
                 let Some(slot) = kari::match_kari_slot(

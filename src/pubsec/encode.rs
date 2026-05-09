@@ -742,7 +742,7 @@ fn build_encrypt_dict(
 /// identified by their X.509 certificate (issuer + serial — KARI
 /// `RecipientEncryptedKey` IAS form), and `recipient_pub_bytes` carries
 /// their public key in the curve's encoded form (SEC1 uncompressed for
-/// P-256 / P-384, raw 32-byte u-coordinate for X25519).
+/// P-256 / P-384 / P-521, raw 32-byte u-coordinate for X25519).
 #[derive(Debug, Clone)]
 pub struct KariRecipient {
     /// Recipient certificate's issuer DER (a SEQUENCE — same shape as
@@ -750,9 +750,17 @@ pub struct KariRecipient {
     pub issuer_der: Vec<u8>,
     /// Recipient cert's serial number INTEGER body bytes.
     pub serial: Vec<u8>,
-    /// Curve the recipient's keypair lives on. Determines the KEA OID
-    /// + KDF hash + ephemeral keypair shape the writer will emit.
+    /// Curve the recipient's keypair lives on. Determines the ECDH
+    /// primitive + ephemeral keypair shape the writer will emit.
     pub curve: super::kari::KariCurve,
+    /// KDF binding the writer will encode in
+    /// `KeyAgreeRecipientInfo.keyEncryptionAlgorithm`. Defaults via the
+    /// per-curve constructors to [`super::kari::KariCurve::default_kdf`]:
+    /// RFC 5753 §7.1.4 X9.63 with the matching hash for NIST curves;
+    /// RFC 8418 §2.1 X9.63-SHA-256 for X25519. Use the
+    /// `x25519_hkdf_*` constructors to switch X25519 to the modern RFC
+    /// 8418 §2.2 HKDF binding.
+    pub kdf: super::kari::KariKdf,
     /// Recipient's encoded public key. SEC1 uncompressed point for
     /// NIST curves; raw 32-byte u-coordinate for X25519.
     pub recipient_pub_bytes: Vec<u8>,
@@ -766,7 +774,7 @@ pub struct KariRecipient {
 }
 
 impl KariRecipient {
-    /// Build a P-256 recipient.
+    /// Build a P-256 recipient (X9.63-SHA-256 KDF per RFC 5753 §7.1.4).
     pub fn p256(
         issuer_der: Vec<u8>,
         serial: Vec<u8>,
@@ -777,12 +785,13 @@ impl KariRecipient {
             issuer_der,
             serial,
             curve: super::kari::KariCurve::P256,
+            kdf: super::kari::KariKdf::X963Sha256,
             recipient_pub_bytes: recipient_pub_sec1,
             ephemeral_scalar,
         }
     }
 
-    /// Build a P-384 recipient.
+    /// Build a P-384 recipient (X9.63-SHA-384 KDF per RFC 5753 §7.1.4).
     pub fn p384(
         issuer_der: Vec<u8>,
         serial: Vec<u8>,
@@ -793,12 +802,33 @@ impl KariRecipient {
             issuer_der,
             serial,
             curve: super::kari::KariCurve::P384,
+            kdf: super::kari::KariKdf::X963Sha384,
             recipient_pub_bytes: recipient_pub_sec1,
             ephemeral_scalar,
         }
     }
 
-    /// Build an X25519 recipient.
+    /// Round-16: build a P-521 recipient (X9.63-SHA-512 KDF per RFC
+    /// 5753 §7.1.4 — `dhSinglePass-stdDH-sha512kdf-scheme`,
+    /// OID 1.3.132.1.11.3).
+    pub fn p521(
+        issuer_der: Vec<u8>,
+        serial: Vec<u8>,
+        recipient_pub_sec1: Vec<u8>,
+        ephemeral_scalar: Vec<u8>,
+    ) -> Self {
+        Self {
+            issuer_der,
+            serial,
+            curve: super::kari::KariCurve::P521,
+            kdf: super::kari::KariKdf::X963Sha512,
+            recipient_pub_bytes: recipient_pub_sec1,
+            ephemeral_scalar,
+        }
+    }
+
+    /// Build an X25519 recipient with the legacy X9.63-SHA-256 KDF
+    /// binding (RFC 8418 §2.1).
     pub fn x25519(
         issuer_der: Vec<u8>,
         serial: Vec<u8>,
@@ -809,6 +839,62 @@ impl KariRecipient {
             issuer_der,
             serial,
             curve: super::kari::KariCurve::X25519,
+            kdf: super::kari::KariKdf::X963Sha256,
+            recipient_pub_bytes: recipient_pub_x25519,
+            ephemeral_scalar,
+        }
+    }
+
+    /// Round-16: build an X25519 recipient with the modern HKDF-SHA-256
+    /// KDF binding (RFC 8418 §2.2 — `dhSinglePass-stdDH-hkdf-sha256-scheme`,
+    /// smime-alg 19).
+    pub fn x25519_hkdf_sha256(
+        issuer_der: Vec<u8>,
+        serial: Vec<u8>,
+        recipient_pub_x25519: Vec<u8>,
+        ephemeral_scalar: Vec<u8>,
+    ) -> Self {
+        Self {
+            issuer_der,
+            serial,
+            curve: super::kari::KariCurve::X25519,
+            kdf: super::kari::KariKdf::HkdfSha256,
+            recipient_pub_bytes: recipient_pub_x25519,
+            ephemeral_scalar,
+        }
+    }
+
+    /// Round-16: build an X25519 recipient with HKDF-SHA-384 (RFC 8418
+    /// §2.2 — `dhSinglePass-stdDH-hkdf-sha384-scheme`, smime-alg 20).
+    pub fn x25519_hkdf_sha384(
+        issuer_der: Vec<u8>,
+        serial: Vec<u8>,
+        recipient_pub_x25519: Vec<u8>,
+        ephemeral_scalar: Vec<u8>,
+    ) -> Self {
+        Self {
+            issuer_der,
+            serial,
+            curve: super::kari::KariCurve::X25519,
+            kdf: super::kari::KariKdf::HkdfSha384,
+            recipient_pub_bytes: recipient_pub_x25519,
+            ephemeral_scalar,
+        }
+    }
+
+    /// Round-16: build an X25519 recipient with HKDF-SHA-512 (RFC 8418
+    /// §2.2 — `dhSinglePass-stdDH-hkdf-sha512-scheme`, smime-alg 21).
+    pub fn x25519_hkdf_sha512(
+        issuer_der: Vec<u8>,
+        serial: Vec<u8>,
+        recipient_pub_x25519: Vec<u8>,
+        ephemeral_scalar: Vec<u8>,
+    ) -> Self {
+        Self {
+            issuer_der,
+            serial,
+            curve: super::kari::KariCurve::X25519,
+            kdf: super::kari::KariKdf::HkdfSha512,
             recipient_pub_bytes: recipient_pub_x25519,
             ephemeral_scalar,
         }
@@ -904,8 +990,9 @@ impl PubSecEncryptionState {
                     r.curve
                 )));
             }
-            let (originator_pub, wrapped) = super::kari::wrap_cek_for_recipient(
+            let (originator_pub, wrapped) = super::kari::wrap_cek_for_recipient_with_kdf(
                 r.curve,
+                r.kdf,
                 &r.ephemeral_scalar,
                 &r.recipient_pub_bytes,
                 config.ukm.as_deref(),
@@ -929,11 +1016,13 @@ impl PubSecEncryptionState {
             // We build ONE envelope per KARI with the same CEK + IV
             // for the content; the per-recipient envelope's CMS layout
             // carries just that recipient's KARI. Then we splice all
-            // KARIs into the one outer EnvelopedData below.
+            // KARIs into the one outer EnvelopedData below. The KEA
+            // OID is the recipient's KDF OID (so the same envelope can
+            // mix X9.63 + HKDF X25519 recipients).
             let envelope = super::cms_build::build_envelope_kari_aes256(
                 &originator,
                 config.ukm.as_deref(),
-                r.curve.kea_oid(),
+                r.kdf.kea_oid(),
                 &kea_params,
                 &[recipient_slot],
                 &plaintext,

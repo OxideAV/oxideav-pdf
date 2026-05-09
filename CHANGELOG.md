@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round-16: **P-521 KARI + RFC 8418 §2.2 HKDF binding for X25519**.
+  Closes the NIST KARI curve coverage and adds the modern HKDF KDF
+  family for X25519. New `pubsec::kari::KariCurve::P521` variant +
+  `EcRecipient::p521` constructor + `KariRecipient::p521` writer
+  constructor — bound to `dhSinglePass-stdDH-sha512kdf-scheme`
+  (OID `1.3.132.1.11.3`) + X9.63-SHA-512 KDF per RFC 5753 §7.1.4.
+  New `KariKdf` enum with `X963Sha256/384/512` + `HkdfSha256/384/512`
+  arms (and `KariKdf::from_kea_oid` / `is_valid_for(curve)` helpers
+  enforcing the RFC 5753 / RFC 8418 pairing matrix). New writer
+  constructors `KariRecipient::x25519_hkdf_sha256/384/512` switch the
+  X25519 binding from the legacy X9.63-SHA-256 (RFC 8418 §2.1) to the
+  modern HKDF family — `dhSinglePass-stdDH-hkdf-sha256/384/512-scheme`
+  OIDs `1.2.840.113549.1.9.16.3.{19,20,21}` per RFC 8418 §2.2. Per
+  RFC 8418 §2.2: HKDF-Extract uses `salt = ukm` (or absent when UKM
+  is missing) and `IKM = ECDH shared secret`; HKDF-Expand consumes
+  the same DER `ECC-CMS-SharedInfo` structure as the X9.63 path.
+  Reader auto-routes by parsing the KEA OID into `KariKdf` (no
+  caller-side opt-in needed). New helpers `derive_kek` (KDF dispatch)
+  + `hkdf_kdf_sha256/384/512` (RFC 5869 wrappers). The round-15
+  `wrap_cek_for_recipient` keeps its signature; new
+  `wrap_cek_for_recipient_with_kdf` accepts an explicit `KariKdf`
+  override. Provenance: RFC 5753 §7.1.4 + RFC 5869 + RFC 8418 §2.2 +
+  NIST FIPS 186-4 (P-521 curve) + NIST SP 800-56C only. New deps:
+  `p521` 0.13 (`ecdh` + `std`) + `hkdf` 0.12.
+- Round-16 tests: 11 new tests — 5 `pubsec::kari` unit tests (P-521 +
+  AES-256 KW round-trip, X25519 + HKDF-SHA-256/384/512 + AES-128/256
+  KW round-trips, KDF/curve pairing matrix coverage, HKDF dispatch
+  byte-equivalence with `hkdf` crate primitive, X9.63-SHA-512 KDF
+  one-block, build-time KDF/curve mismatch rejection) + 6 integration
+  tests in `tests/pubsec_round16_kari.rs` (P-521 writer→reader
+  round-trip, X25519 HKDF-SHA-256/384/512 writer→reader round-trips
+  with UKM-present/absent variants, P-256-credential-against-P-521
+  negative, wrong-X25519-scalar-against-HKDF negative).
+
 - Round-15: **KARI multi-curve + writer-side encode**. Extends the
   round-14 KARI unwrap path to **P-384** (`dhSinglePass-stdDH-sha384kdf-scheme`,
   OID `1.3.132.1.11.2`, X9.63-SHA-384 KDF) and **X25519** (RFC 8418

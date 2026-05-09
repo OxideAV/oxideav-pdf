@@ -1,22 +1,32 @@
-//! Round-14 / round-15: KARI unwrap — RFC 5753 / RFC 8418 ECDH key
-//! agreement + RFC 3394 AES Key Wrap. Round 14 closed the round-12
-//! deferral by surfacing the wrapped CEK on P-256; round 15 extends
-//! coverage to P-384 (NIST FIPS 186-4) and X25519 (RFC 7748 / RFC
-//! 8418), and adds the symmetric writer-side helper
-//! [`wrap_cek_for_recipient`] used by `write_pdf_from_scene_pubsec_kari`.
+//! Round-14 / round-15 / round-16: KARI unwrap — RFC 5753 / RFC 8418
+//! ECDH key agreement + RFC 3394 AES Key Wrap. Round 14 closed the
+//! round-12 deferral by surfacing the wrapped CEK on P-256; round 15
+//! extended coverage to P-384 (NIST FIPS 186-4) and X25519 (RFC 7748
+//! / RFC 8418 §2.1) and added the symmetric writer-side helper
+//! [`wrap_cek_for_recipient`] used by `write_pdf_from_scene_pubsec_kari`;
+//! round 16 closes both the curve coverage (P-521 — NIST FIPS 186-4
+//! `secp521r1` + X9.63-SHA-512 KDF) and the modern KDF binding (RFC
+//! 8418 §2.2 HKDF for X25519 — `dhSinglePass-stdDH-hkdf-sha256/384/512-scheme`,
+//! smime-alg 19 / 20 / 21).
 //!
 //! ## Coverage
 //!
-//! | Curve  | KDF                | Wrap                 | OID for KEA scheme              |
-//! |--------|--------------------|----------------------|---------------------------------|
-//! | P-256  | X9.63 + SHA-256    | AES-128/192/256-WRAP | 1.3.132.1.11.1 (`stdDH-sha256`) |
-//! | P-384  | X9.63 + SHA-384    | AES-128/192/256-WRAP | 1.3.132.1.11.2 (`stdDH-sha384`) |
-//! | X25519 | X9.63 + SHA-256    | AES-128/192/256-WRAP | 1.3.132.1.11.1 (`stdDH-sha256`) |
+//! | Curve  | KDF                  | Wrap                 | OID for KEA scheme                       |
+//! |--------|----------------------|----------------------|------------------------------------------|
+//! | P-256  | X9.63 + SHA-256      | AES-128/192/256-WRAP | 1.3.132.1.11.1 (`stdDH-sha256kdf`)       |
+//! | P-384  | X9.63 + SHA-384      | AES-128/192/256-WRAP | 1.3.132.1.11.2 (`stdDH-sha384kdf`)       |
+//! | P-521  | X9.63 + SHA-512      | AES-128/192/256-WRAP | 1.3.132.1.11.3 (`stdDH-sha512kdf`)       |
+//! | X25519 | X9.63 + SHA-256      | AES-128/192/256-WRAP | 1.3.132.1.11.1 (`stdDH-sha256kdf`)       |
+//! | X25519 | HKDF-SHA-256         | AES-128/192/256-WRAP | 1.2.840.113549.1.9.16.3.19 (`hkdf-sha256`) |
+//! | X25519 | HKDF-SHA-384         | AES-128/192/256-WRAP | 1.2.840.113549.1.9.16.3.20 (`hkdf-sha384`) |
+//! | X25519 | HKDF-SHA-512         | AES-128/192/256-WRAP | 1.2.840.113549.1.9.16.3.21 (`hkdf-sha512`) |
 //!
-//! For X25519 we follow RFC 8418 §2.1: the secg-scheme `1.3.132.1.11.x`
-//! KDF binding combined with the `id-X25519` OID `1.3.101.110` in the
-//! `OriginatorPublicKey.algorithm` slot. The HKDF binding from RFC
-//! 8418 §2.2 (`smime-alg 19/20/21`) and P-521 are deferred.
+//! For X25519 we follow RFC 8418 §2.1 (X9.63 binding, secg-scheme OID
+//! family) AND RFC 8418 §2.2 (HKDF binding, smime-alg OID family). The
+//! per-recipient choice is carried in [`KariKdf`]; the writer's
+//! [`KariRecipient`] carries it explicitly while the reader infers
+//! the KDF from the parsed `KeyAgreeRecipientInfo.keyEncryptionAlgorithm`
+//! OID. X448 is deferred until a vetted pure-Rust crate appears.
 //!
 //! ## Algorithm summary (RFC 5753 §3.1 + §7.1, RFC 3394 §2.2.2)
 //!
@@ -56,6 +66,12 @@ pub const OID_SECP256R1: [u64; 7] = [1, 2, 840, 10045, 3, 1, 7];
 /// `ecPublicKey` AlgorithmIdentifier's `parameters`.
 pub const OID_SECP384R1: [u64; 5] = [1, 3, 132, 0, 34];
 
+/// OID `1.3.132.0.35` — secp521r1 / NIST P-521 (RFC 5480 §2.1.1.1 +
+/// SECG SEC 2). Round-16: same encoding shape as P-256 / P-384 — a
+/// named-curve OID inside the `ecPublicKey` AlgorithmIdentifier's
+/// `parameters`.
+pub const OID_SECP521R1: [u64; 5] = [1, 3, 132, 0, 35];
+
 /// OID `1.3.101.110` — `id-X25519` (RFC 8410 §3 — the curve identifier
 /// used by both X.509 SPKIs and CMS KARI's `OriginatorPublicKey`). RFC
 /// 8418 §2 mandates an absent `parameters` field (no OID nor NULL) for
@@ -71,6 +87,31 @@ pub const OID_DH_SINGLE_PASS_STDDH_SHA256_KDF: [u64; 6] = [1, 3, 132, 1, 11, 1];
 /// 5753 §7.1.4). Combined ECDH + X9.63-SHA-384 KDF identifier. Round-15
 /// dispatch binds this to P-384.
 pub const OID_DH_SINGLE_PASS_STDDH_SHA384_KDF: [u64; 6] = [1, 3, 132, 1, 11, 2];
+
+/// OID `1.3.132.1.11.3` — `dhSinglePass-stdDH-sha512kdf-scheme` (RFC
+/// 5753 §7.1.4). Combined ECDH + X9.63-SHA-512 KDF identifier.
+/// Round-16 dispatch binds this to P-521.
+pub const OID_DH_SINGLE_PASS_STDDH_SHA512_KDF: [u64; 6] = [1, 3, 132, 1, 11, 3];
+
+/// OID `1.2.840.113549.1.9.16.3.19` — `dhSinglePass-stdDH-hkdf-sha256-scheme`
+/// (RFC 8418 §2.2, smime-alg 19). Combined ECDH + HKDF-SHA-256 KDF
+/// identifier. Round-16 dispatch routes X25519 (and any other DH/ECDH
+/// curve) to HKDF-SHA-256 when the `keyEncryptionAlgorithm` carries
+/// this OID instead of the X9.63 family.
+pub const OID_DH_SINGLE_PASS_STDDH_HKDF_SHA256_SCHEME: [u64; 9] =
+    [1, 2, 840, 113549, 1, 9, 16, 3, 19];
+
+/// OID `1.2.840.113549.1.9.16.3.20` — `dhSinglePass-stdDH-hkdf-sha384-scheme`
+/// (RFC 8418 §2.2, smime-alg 20). Combined ECDH + HKDF-SHA-384 KDF
+/// identifier.
+pub const OID_DH_SINGLE_PASS_STDDH_HKDF_SHA384_SCHEME: [u64; 9] =
+    [1, 2, 840, 113549, 1, 9, 16, 3, 20];
+
+/// OID `1.2.840.113549.1.9.16.3.21` — `dhSinglePass-stdDH-hkdf-sha512-scheme`
+/// (RFC 8418 §2.2, smime-alg 21). Combined ECDH + HKDF-SHA-512 KDF
+/// identifier.
+pub const OID_DH_SINGLE_PASS_STDDH_HKDF_SHA512_SCHEME: [u64; 9] =
+    [1, 2, 840, 113549, 1, 9, 16, 3, 21];
 
 /// OID `2.16.840.1.101.3.4.1.5` — `id-aes128-wrap` (RFC 5649 §3 / RFC
 /// 3394 §3 OID list).
@@ -130,10 +171,11 @@ impl WrapAlgorithm {
     }
 }
 
-/// Curves the round-15 dispatch can route to. Selects both the ECDH
-/// primitive (P-256 / P-384 / X25519) and the X9.63 KDF hash that
-/// pairs with the curve per RFC 5753 §7.1.4 / RFC 8418 §2.1 — P-256
-/// and X25519 use SHA-256, P-384 uses SHA-384.
+/// Curves the round-16 dispatch can route to. Selects the ECDH
+/// primitive (P-256 / P-384 / P-521 / X25519). The KDF binding is
+/// curve-fixed for the NIST curves per RFC 5753 §7.1.4 (P-256 →
+/// SHA-256, P-384 → SHA-384, P-521 → SHA-512) and configurable via
+/// [`KariKdf`] for X25519 per RFC 8418 §2.1 + §2.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KariCurve {
     /// NIST P-256 (`secp256r1`) + X9.63-SHA-256 KDF. KEA OID is
@@ -142,9 +184,14 @@ pub enum KariCurve {
     /// NIST P-384 (`secp384r1`) + X9.63-SHA-384 KDF. KEA OID is
     /// [`OID_DH_SINGLE_PASS_STDDH_SHA384_KDF`].
     P384,
-    /// X25519 (`id-X25519`, RFC 7748 / RFC 8410) + X9.63-SHA-256 KDF.
-    /// KEA OID is [`OID_DH_SINGLE_PASS_STDDH_SHA256_KDF`] per RFC 8418
-    /// §2.1.
+    /// NIST P-521 (`secp521r1`) + X9.63-SHA-512 KDF. KEA OID is
+    /// [`OID_DH_SINGLE_PASS_STDDH_SHA512_KDF`].
+    P521,
+    /// X25519 (`id-X25519`, RFC 7748 / RFC 8410). KDF defaults to the
+    /// X9.63-SHA-256 binding (RFC 8418 §2.1, KEA OID
+    /// [`OID_DH_SINGLE_PASS_STDDH_SHA256_KDF`]); the modern HKDF
+    /// binding (RFC 8418 §2.2) is selectable on the writer side via
+    /// [`KariKdf::HkdfSha256`] / `HkdfSha384` / `HkdfSha512`.
     X25519,
 }
 
@@ -154,7 +201,7 @@ impl KariCurve {
     /// named-curve param; for X25519 it's `id-X25519` directly.
     pub fn algorithm_oid(self) -> &'static [u64] {
         match self {
-            Self::P256 | Self::P384 => &OID_EC_PUBLIC_KEY,
+            Self::P256 | Self::P384 | Self::P521 => &OID_EC_PUBLIC_KEY,
             Self::X25519 => &OID_X25519,
         }
     }
@@ -166,17 +213,32 @@ impl KariCurve {
         match self {
             Self::P256 => write_oid(&OID_SECP256R1),
             Self::P384 => write_oid(&OID_SECP384R1),
+            Self::P521 => write_oid(&OID_SECP521R1),
             Self::X25519 => Vec::new(),
         }
     }
 
-    /// KEA OID the writer puts in `KeyAgreeRecipientInfo.keyEncryptionAlgorithm`.
-    /// Encodes the (curve → KDF) binding: P-256/X25519 → SHA-256;
-    /// P-384 → SHA-384.
+    /// Default KEA OID the writer puts in
+    /// `KeyAgreeRecipientInfo.keyEncryptionAlgorithm` for this curve
+    /// when no explicit [`KariKdf`] override is supplied. Encodes the
+    /// (curve → X9.63 KDF) binding from RFC 5753 §7.1.4 / RFC 8418
+    /// §2.1: P-256/X25519 → SHA-256; P-384 → SHA-384; P-521 → SHA-512.
     pub fn kea_oid(self) -> &'static [u64] {
         match self {
             Self::P256 | Self::X25519 => &OID_DH_SINGLE_PASS_STDDH_SHA256_KDF,
             Self::P384 => &OID_DH_SINGLE_PASS_STDDH_SHA384_KDF,
+            Self::P521 => &OID_DH_SINGLE_PASS_STDDH_SHA512_KDF,
+        }
+    }
+
+    /// Default KDF for this curve. NIST curves are pinned by RFC 5753
+    /// §7.1.4; X25519 defaults to X9.63-SHA-256 per RFC 8418 §2.1
+    /// (the HKDF variants are explicit-opt-in on the writer side).
+    pub fn default_kdf(self) -> KariKdf {
+        match self {
+            Self::P256 | Self::X25519 => KariKdf::X963Sha256,
+            Self::P384 => KariKdf::X963Sha384,
+            Self::P521 => KariKdf::X963Sha512,
         }
     }
 
@@ -187,8 +249,99 @@ impl KariCurve {
             // SEC1 uncompressed: 1 + 2*field_bytes.
             Self::P256 => 65,
             Self::P384 => 97,
+            // P-521 field is 521 bits → 66-byte coordinates → 1 + 132 = 133.
+            Self::P521 => 133,
             // X25519 raw u-coordinate (RFC 7748 §5).
             Self::X25519 => 32,
+        }
+    }
+}
+
+/// KDF flavour used to derive the KEK from the ECDH shared secret.
+///
+/// * **X9.63 family** — RFC 5753 §7.1.2 / NIST SP 800-56A §5.6.2.1.
+///   Mandated for the NIST curves (P-256 → SHA-256, P-384 → SHA-384,
+///   P-521 → SHA-512); also one of the two valid X25519 bindings (RFC
+///   8418 §2.1 — uses [`OID_DH_SINGLE_PASS_STDDH_SHA256_KDF`] in the
+///   secg-scheme arc).
+/// * **HKDF family** — RFC 5869 + RFC 8418 §2.2. The modern X25519
+///   binding: `salt = ukm` (or absent), `IKM = ECDH shared secret`,
+///   `info = DER(ECC-CMS-SharedInfo)`, output truncated to the wrap
+///   KEK length. KEA OIDs sit in the smime-alg arc
+///   `1.2.840.113549.1.9.16.3.{19,20,21}` (HKDF-SHA-256 / 384 / 512).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KariKdf {
+    /// X9.63 KDF with SHA-256 (RFC 5753 §7.1.2 + §7.1.4 secg-scheme).
+    /// Default for P-256 + X25519.
+    X963Sha256,
+    /// X9.63 KDF with SHA-384 (RFC 5753 §7.1.4 secg-scheme). Default
+    /// for P-384.
+    X963Sha384,
+    /// X9.63 KDF with SHA-512 (RFC 5753 §7.1.4 secg-scheme). Default
+    /// for P-521.
+    X963Sha512,
+    /// HKDF-SHA-256 (RFC 5869 + RFC 8418 §2.2 — smime-alg 19,
+    /// `dhSinglePass-stdDH-hkdf-sha256-scheme`).
+    HkdfSha256,
+    /// HKDF-SHA-384 (RFC 5869 + RFC 8418 §2.2 — smime-alg 20,
+    /// `dhSinglePass-stdDH-hkdf-sha384-scheme`).
+    HkdfSha384,
+    /// HKDF-SHA-512 (RFC 5869 + RFC 8418 §2.2 — smime-alg 21,
+    /// `dhSinglePass-stdDH-hkdf-sha512-scheme`).
+    HkdfSha512,
+}
+
+impl KariKdf {
+    /// KEA OID the writer puts in
+    /// `KeyAgreeRecipientInfo.keyEncryptionAlgorithm` for this KDF.
+    /// The wrap algorithm OID lives separately in the KEA's
+    /// `parameters` field (RFC 5753 §7.1.4 / RFC 8418 §2.2).
+    pub fn kea_oid(self) -> &'static [u64] {
+        match self {
+            Self::X963Sha256 => &OID_DH_SINGLE_PASS_STDDH_SHA256_KDF,
+            Self::X963Sha384 => &OID_DH_SINGLE_PASS_STDDH_SHA384_KDF,
+            Self::X963Sha512 => &OID_DH_SINGLE_PASS_STDDH_SHA512_KDF,
+            Self::HkdfSha256 => &OID_DH_SINGLE_PASS_STDDH_HKDF_SHA256_SCHEME,
+            Self::HkdfSha384 => &OID_DH_SINGLE_PASS_STDDH_HKDF_SHA384_SCHEME,
+            Self::HkdfSha512 => &OID_DH_SINGLE_PASS_STDDH_HKDF_SHA512_SCHEME,
+        }
+    }
+
+    /// Resolve the KDF from a parsed KEA OID. Returns `None` for any
+    /// OID that doesn't name one of the six supported KDF schemes.
+    pub fn from_kea_oid(oid: &[u64]) -> Option<Self> {
+        if oid == OID_DH_SINGLE_PASS_STDDH_SHA256_KDF {
+            Some(Self::X963Sha256)
+        } else if oid == OID_DH_SINGLE_PASS_STDDH_SHA384_KDF {
+            Some(Self::X963Sha384)
+        } else if oid == OID_DH_SINGLE_PASS_STDDH_SHA512_KDF {
+            Some(Self::X963Sha512)
+        } else if oid == OID_DH_SINGLE_PASS_STDDH_HKDF_SHA256_SCHEME {
+            Some(Self::HkdfSha256)
+        } else if oid == OID_DH_SINGLE_PASS_STDDH_HKDF_SHA384_SCHEME {
+            Some(Self::HkdfSha384)
+        } else if oid == OID_DH_SINGLE_PASS_STDDH_HKDF_SHA512_SCHEME {
+            Some(Self::HkdfSha512)
+        } else {
+            None
+        }
+    }
+
+    /// Validate the KDF / curve pairing per the RFCs:
+    /// * NIST curves (P-256/P-384/P-521) MUST use X9.63 with the
+    ///   matching SHA hash (RFC 5753 §7.1.4).
+    /// * X25519 MAY use any of the X9.63-SHA-256 (RFC 8418 §2.1) or
+    ///   HKDF-SHA-256/384/512 (RFC 8418 §2.2) schemes; SHA-384 and
+    ///   SHA-512 X9.63 bindings are NOT defined for X25519.
+    pub fn is_valid_for(self, curve: KariCurve) -> bool {
+        match curve {
+            KariCurve::P256 => self == Self::X963Sha256,
+            KariCurve::P384 => self == Self::X963Sha384,
+            KariCurve::P521 => self == Self::X963Sha512,
+            KariCurve::X25519 => matches!(
+                self,
+                Self::X963Sha256 | Self::HkdfSha256 | Self::HkdfSha384 | Self::HkdfSha512
+            ),
         }
     }
 }
@@ -226,6 +379,62 @@ pub fn x963_kdf<H: sha2::Digest>(z: &[u8], shared_info: &[u8], keydatalen: usize
 /// hot path. Round-15 callers use the generic [`x963_kdf`] directly.
 pub fn x963_kdf_sha256(z: &[u8], shared_info: &[u8], keydatalen: usize) -> Vec<u8> {
     x963_kdf::<sha2::Sha256>(z, shared_info, keydatalen)
+}
+
+/// HKDF-SHA-256 KEK derivation per RFC 5869 + RFC 8418 §2.2.
+/// `salt` is the UKM (or an empty slice when UKM is absent), `ikm` is
+/// the ECDH shared secret `Z`, `info` is the DER `ECC-CMS-SharedInfo`,
+/// and the output is `keydatalen` bytes. Computes
+/// `HKDF-Extract(salt, ikm)` followed by `HKDF-Expand(prk, info, keydatalen)`.
+pub fn hkdf_kdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], keydatalen: usize) -> Vec<u8> {
+    let salt_opt = if salt.is_empty() { None } else { Some(salt) };
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(salt_opt, ikm);
+    let mut okm = vec![0u8; keydatalen];
+    hk.expand(info, &mut okm)
+        .expect("HKDF-SHA-256 keydatalen within 255 * HashLen");
+    okm
+}
+
+/// HKDF-SHA-384 KEK derivation per RFC 5869 + RFC 8418 §2.2.
+pub fn hkdf_kdf_sha384(salt: &[u8], ikm: &[u8], info: &[u8], keydatalen: usize) -> Vec<u8> {
+    let salt_opt = if salt.is_empty() { None } else { Some(salt) };
+    let hk = hkdf::Hkdf::<sha2::Sha384>::new(salt_opt, ikm);
+    let mut okm = vec![0u8; keydatalen];
+    hk.expand(info, &mut okm)
+        .expect("HKDF-SHA-384 keydatalen within 255 * HashLen");
+    okm
+}
+
+/// HKDF-SHA-512 KEK derivation per RFC 5869 + RFC 8418 §2.2.
+pub fn hkdf_kdf_sha512(salt: &[u8], ikm: &[u8], info: &[u8], keydatalen: usize) -> Vec<u8> {
+    let salt_opt = if salt.is_empty() { None } else { Some(salt) };
+    let hk = hkdf::Hkdf::<sha2::Sha512>::new(salt_opt, ikm);
+    let mut okm = vec![0u8; keydatalen];
+    hk.expand(info, &mut okm)
+        .expect("HKDF-SHA-512 keydatalen within 255 * HashLen");
+    okm
+}
+
+/// Dispatch helper: derive the KEK for the supplied [`KariKdf`] using
+/// the right primitive. For X9.63 the `ukm` parameter is folded into
+/// `shared_info` by the caller (it's already in the
+/// `ECC-CMS-SharedInfo`); for HKDF the UKM is the salt per RFC 8418
+/// §2.2 and is supplied separately.
+pub fn derive_kek(
+    kdf: KariKdf,
+    z: &[u8],
+    ukm: Option<&[u8]>,
+    shared_info: &[u8],
+    keydatalen: usize,
+) -> Vec<u8> {
+    match kdf {
+        KariKdf::X963Sha256 => x963_kdf::<sha2::Sha256>(z, shared_info, keydatalen),
+        KariKdf::X963Sha384 => x963_kdf::<sha2::Sha384>(z, shared_info, keydatalen),
+        KariKdf::X963Sha512 => x963_kdf::<sha2::Sha512>(z, shared_info, keydatalen),
+        KariKdf::HkdfSha256 => hkdf_kdf_sha256(ukm.unwrap_or(&[]), z, shared_info, keydatalen),
+        KariKdf::HkdfSha384 => hkdf_kdf_sha384(ukm.unwrap_or(&[]), z, shared_info, keydatalen),
+        KariKdf::HkdfSha512 => hkdf_kdf_sha512(ukm.unwrap_or(&[]), z, shared_info, keydatalen),
+    }
 }
 
 /// Build the `ECC-CMS-SharedInfo` DER structure (RFC 5753 §7.2). Used
@@ -308,6 +517,17 @@ impl EcRecipient {
         }
     }
 
+    /// Build a P-521 recipient. `private_scalar` is the 66-byte SEC1
+    /// scalar + `public_point_sec1` is the 133-byte SEC1 uncompressed
+    /// point.
+    pub fn p521(private_scalar: Vec<u8>, public_point_sec1: Vec<u8>) -> Self {
+        Self {
+            curve: KariCurve::P521,
+            private_scalar,
+            public_point_sec1,
+        }
+    }
+
     /// Build an X25519 recipient. `private_scalar` is the 32-byte
     /// secret + `public_point_sec1` is the 32-byte raw u-coordinate
     /// (RFC 7748 §5).
@@ -343,23 +563,29 @@ pub fn unwrap_kari_p256(
     unwrap_kari(kari, recipient_slot, recipient)
 }
 
-/// Unified KARI unwrap dispatch (round 15). Pulls the wrap algorithm
-/// and UKM out of the KARI envelope, validates that the originator's
-/// curve matches the recipient's expected curve, runs the right ECDH
-/// primitive, derives the KEK with the curve-bound X9.63 KDF, and
-/// AES-KW unwraps the CEK.
+/// Unified KARI unwrap dispatch (round 15 / round 16). Pulls the KDF
+/// and wrap algorithm and UKM out of the KARI envelope, validates that
+/// the parsed KDF is one the recipient's curve permits per RFC 5753 /
+/// RFC 8418, runs the right ECDH primitive, derives the KEK with the
+/// chosen KDF (X9.63 or HKDF), and AES-KW unwraps the CEK.
 pub fn unwrap_kari(
     kari: &KeyAgreeRecipientInfo,
     recipient_slot: &RecipientEncryptedKey,
     recipient: &EcRecipient,
 ) -> Result<Vec<u8>, PdfError> {
-    // 1. Validate KEA OID matches the curve's expected KDF binding.
-    if kari.key_encryption_oid != recipient.curve.kea_oid() {
+    // 1. Resolve the KDF from the KEA OID + cross-check it's a binding
+    //    the recipient's curve permits (RFC 5753 §7.1.4 / RFC 8418).
+    let kdf = KariKdf::from_kea_oid(&kari.key_encryption_oid).ok_or_else(|| {
+        PdfError::other(format!(
+            "PDF pubsec KARI: unsupported KEA OID {:?} (no matching KDF scheme)",
+            kari.key_encryption_oid
+        ))
+    })?;
+    if !kdf.is_valid_for(recipient.curve) {
         return Err(PdfError::other(format!(
-            "PDF pubsec KARI: KEA OID {:?} does not match curve {:?} (expected {:?})",
-            kari.key_encryption_oid,
-            recipient.curve,
-            recipient.curve.kea_oid()
+            "PDF pubsec KARI: KDF {:?} is not a valid binding for curve {:?} \
+             (RFC 5753 §7.1.4 / RFC 8418 §2)",
+            kdf, recipient.curve,
         )));
     }
     // 2. Pull the wrap AlgorithmIdentifier out of the KEA params.
@@ -393,19 +619,18 @@ pub fn unwrap_kari(
         &originator_point,
     )?;
     // 5. Build ECC-CMS-SharedInfo using the wrap OID + UKM.
+    //    RFC 8418 §2.2 spells out that the HKDF binding still consumes
+    //    the SAME `ECC-CMS-SharedInfo` value as `info` — only the salt
+    //    handling differs (UKM → salt for HKDF; UKM goes inside
+    //    sharedInfo for X9.63).
     let ukm = if kari.ukm.is_empty() {
         None
     } else {
         Some(kari.ukm.as_slice())
     };
     let shared_info = build_ecc_cms_shared_info(wrap.oid(), ukm, (wrap.kek_len() * 8) as u32);
-    // 6. KDF → KEK (the curve picks the hash).
-    let kek = match recipient.curve {
-        KariCurve::P256 | KariCurve::X25519 => {
-            x963_kdf::<sha2::Sha256>(&z, &shared_info, wrap.kek_len())
-        }
-        KariCurve::P384 => x963_kdf::<sha2::Sha384>(&z, &shared_info, wrap.kek_len()),
-    };
+    // 6. KDF → KEK (X9.63 or HKDF, per the parsed KEA OID).
+    let kek = derive_kek(kdf, &z, ukm, &shared_info, wrap.kek_len());
     // 7. AES Key Wrap unwrap (RFC 3394).
     aes_kw_unwrap(wrap, &kek, &recipient_slot.encrypted_key)
 }
@@ -440,6 +665,21 @@ fn ecdh_z(curve: KariCurve, scalar: &[u8], originator_point: &[u8]) -> Result<Ve
             let originator = PublicKey::from_sec1_bytes(originator_point).map_err(|e| {
                 PdfError::other(format!(
                     "PDF pubsec KARI: invalid P-384 originator SEC1 point: {e}"
+                ))
+            })?;
+            let shared = diffie_hellman(secret.to_nonzero_scalar(), originator.as_affine());
+            Ok(shared.raw_secret_bytes().to_vec())
+        }
+        KariCurve::P521 => {
+            use p521::{ecdh::diffie_hellman, PublicKey, SecretKey};
+            let secret = SecretKey::from_slice(scalar).map_err(|e| {
+                PdfError::other(format!(
+                    "PDF pubsec KARI: invalid P-521 private scalar: {e}"
+                ))
+            })?;
+            let originator = PublicKey::from_sec1_bytes(originator_point).map_err(|e| {
+                PdfError::other(format!(
+                    "PDF pubsec KARI: invalid P-521 originator SEC1 point: {e}"
                 ))
             })?;
             let shared = diffie_hellman(secret.to_nonzero_scalar(), originator.as_affine());
@@ -551,7 +791,7 @@ fn extract_originator_point(
     expected: KariCurve,
 ) -> Result<Vec<u8>, PdfError> {
     match expected {
-        KariCurve::P256 | KariCurve::P384 => {
+        KariCurve::P256 | KariCurve::P384 | KariCurve::P521 => {
             if opk.algorithm_oid != OID_EC_PUBLIC_KEY {
                 return Err(PdfError::other(format!(
                     "PDF pubsec KARI: originator algorithm OID {:?} is not ecPublicKey",
@@ -559,10 +799,11 @@ fn extract_originator_point(
                 )));
             }
             let (curve_oid, _rest) = read_oid(&opk.algorithm_params)?;
-            let want = if expected == KariCurve::P256 {
-                OID_SECP256R1.as_slice()
-            } else {
-                OID_SECP384R1.as_slice()
+            let want: &[u64] = match expected {
+                KariCurve::P256 => &OID_SECP256R1,
+                KariCurve::P384 => &OID_SECP384R1,
+                KariCurve::P521 => &OID_SECP521R1,
+                KariCurve::X25519 => unreachable!(),
             };
             if curve_oid != want {
                 return Err(PdfError::other(format!(
@@ -653,17 +894,23 @@ pub fn wrap_cek_for_p256_recipient(
     )
 }
 
-/// Round-15: wrap a CEK for one ECDH recipient on the supplied curve.
-/// Returns `(originator_public_bytes, wrapped_cek)` where
-/// `originator_public_bytes` is the SEC1 uncompressed point for NIST
-/// curves or the raw 32-byte u-coordinate for X25519. The bytes are
-/// directly suitable for plugging into the
+/// Round-15 / round-16: wrap a CEK for one ECDH recipient on the
+/// supplied curve. Returns `(originator_public_bytes, wrapped_cek)`
+/// where `originator_public_bytes` is the SEC1 uncompressed point for
+/// NIST curves or the raw 32-byte u-coordinate for X25519. The bytes
+/// are directly suitable for plugging into the
 /// `cms_build::build_envelope_kari_aes256` fixture builder's
 /// `OriginatorIdRef::OriginatorKey.public_key` field.
 ///
 /// `ephemeral_scalar` is the ephemeral private key bytes (32 for P-256
-/// / X25519, 48 for P-384). `recipient_pub_bytes` is the recipient's
-/// public point in the curve's encoded form.
+/// / X25519, 48 for P-384, 66 for P-521). `recipient_pub_bytes` is the
+/// recipient's public point in the curve's encoded form.
+///
+/// The KDF is the curve's [`default_kdf`](KariCurve::default_kdf) —
+/// X9.63 + the canonical hash for that curve (NIST → matching SHA;
+/// X25519 → SHA-256 per RFC 8418 §2.1). Use
+/// [`wrap_cek_for_recipient_with_kdf`] to override (e.g. to bind X25519
+/// to HKDF-SHA-256 / 384 / 512 per RFC 8418 §2.2).
 pub fn wrap_cek_for_recipient(
     curve: KariCurve,
     ephemeral_scalar: &[u8],
@@ -672,6 +919,37 @@ pub fn wrap_cek_for_recipient(
     cek: &[u8],
     wrap: WrapAlgorithm,
 ) -> Result<(Vec<u8>, Vec<u8>), PdfError> {
+    wrap_cek_for_recipient_with_kdf(
+        curve,
+        curve.default_kdf(),
+        ephemeral_scalar,
+        recipient_pub_bytes,
+        ukm,
+        cek,
+        wrap,
+    )
+}
+
+/// Round-16: wrap a CEK with an explicit [`KariKdf`] override. Same
+/// dispatch as [`wrap_cek_for_recipient`] except the KDF is supplied
+/// directly; the (curve, KDF) pair must be permitted by RFC 5753 /
+/// RFC 8418 (see [`KariKdf::is_valid_for`]).
+#[allow(clippy::too_many_arguments)]
+pub fn wrap_cek_for_recipient_with_kdf(
+    curve: KariCurve,
+    kdf: KariKdf,
+    ephemeral_scalar: &[u8],
+    recipient_pub_bytes: &[u8],
+    ukm: Option<&[u8]>,
+    cek: &[u8],
+    wrap: WrapAlgorithm,
+) -> Result<(Vec<u8>, Vec<u8>), PdfError> {
+    if !kdf.is_valid_for(curve) {
+        return Err(PdfError::other(format!(
+            "PDF pubsec KARI build: KDF {kdf:?} is not a valid binding \
+             for curve {curve:?} (RFC 5753 §7.1.4 / RFC 8418 §2)"
+        )));
+    }
     let (originator_pub, z) = match curve {
         KariCurve::P256 => {
             use p256::elliptic_curve::sec1::ToEncodedPoint;
@@ -713,6 +991,26 @@ pub fn wrap_cek_for_recipient(
             let shared = diffie_hellman(secret.to_nonzero_scalar(), recipient_public.as_affine());
             (originator_point, shared.raw_secret_bytes().to_vec())
         }
+        KariCurve::P521 => {
+            use p521::elliptic_curve::sec1::ToEncodedPoint;
+            use p521::{ecdh::diffie_hellman, PublicKey, SecretKey};
+            let secret = SecretKey::from_slice(ephemeral_scalar).map_err(|e| {
+                PdfError::other(format!("PDF pubsec KARI build: bad P-521 ephemeral: {e}"))
+            })?;
+            let originator_point = secret
+                .public_key()
+                .to_encoded_point(false)
+                .as_bytes()
+                .to_vec();
+            let recipient_public =
+                PublicKey::from_sec1_bytes(recipient_pub_bytes).map_err(|e| {
+                    PdfError::other(format!(
+                        "PDF pubsec KARI build: bad P-521 recipient SEC1 point: {e}"
+                    ))
+                })?;
+            let shared = diffie_hellman(secret.to_nonzero_scalar(), recipient_public.as_affine());
+            (originator_point, shared.raw_secret_bytes().to_vec())
+        }
         KariCurve::X25519 => {
             use x25519_dalek::{PublicKey, StaticSecret};
             if ephemeral_scalar.len() != 32 {
@@ -745,12 +1043,7 @@ pub fn wrap_cek_for_recipient(
         }
     };
     let shared_info = build_ecc_cms_shared_info(wrap.oid(), ukm, (wrap.kek_len() * 8) as u32);
-    let kek = match curve {
-        KariCurve::P256 | KariCurve::X25519 => {
-            x963_kdf::<sha2::Sha256>(&z, &shared_info, wrap.kek_len())
-        }
-        KariCurve::P384 => x963_kdf::<sha2::Sha384>(&z, &shared_info, wrap.kek_len()),
-    };
+    let kek = derive_kek(kdf, &z, ukm, &shared_info, wrap.kek_len());
     let wrapped = aes_kw_wrap(wrap, &kek, cek)?;
     Ok((originator_pub, wrapped))
 }
@@ -978,7 +1271,9 @@ mod tests {
             unwrap_kari_p256(&kari, &kari.recipient_encrypted_keys[0], &recipient).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("does not match curve") || msg.contains("KEA OID"),
+            msg.contains("does not match curve")
+                || msg.contains("KEA OID")
+                || msg.contains("not a valid binding"),
             "unexpected error: {msg}"
         );
     }
@@ -1107,11 +1402,301 @@ mod tests {
             &OID_DH_SINGLE_PASS_STDDH_SHA384_KDF
         );
         assert_eq!(
+            KariCurve::P521.kea_oid(),
+            &OID_DH_SINGLE_PASS_STDDH_SHA512_KDF
+        );
+        assert_eq!(
             KariCurve::X25519.kea_oid(),
             &OID_DH_SINGLE_PASS_STDDH_SHA256_KDF
         );
         assert_eq!(KariCurve::P256.algorithm_oid(), &OID_EC_PUBLIC_KEY);
         assert_eq!(KariCurve::P384.algorithm_oid(), &OID_EC_PUBLIC_KEY);
+        assert_eq!(KariCurve::P521.algorithm_oid(), &OID_EC_PUBLIC_KEY);
         assert_eq!(KariCurve::X25519.algorithm_oid(), &OID_X25519);
+        // Default KDF mapping per RFC 5753 §7.1.4 / RFC 8418 §2.1.
+        assert_eq!(KariCurve::P256.default_kdf(), KariKdf::X963Sha256);
+        assert_eq!(KariCurve::P384.default_kdf(), KariKdf::X963Sha384);
+        assert_eq!(KariCurve::P521.default_kdf(), KariKdf::X963Sha512);
+        assert_eq!(KariCurve::X25519.default_kdf(), KariKdf::X963Sha256);
+    }
+
+    /// X9.63 KDF SHA-512 vector check — single block emits
+    /// `SHA-512(z || 0x00000001 || sharedInfo)`.
+    #[test]
+    fn x963_kdf_sha512_one_block() {
+        let z = [0x42u8; 66];
+        let shared_info = [0x99u8; 8];
+        let out = x963_kdf::<sha2::Sha512>(&z, &shared_info, 64);
+        use sha2::Digest;
+        let mut h = sha2::Sha512::new();
+        h.update(z);
+        h.update(1u32.to_be_bytes());
+        h.update(shared_info);
+        let want = h.finalize().to_vec();
+        assert_eq!(out, want);
+    }
+
+    /// HKDF dispatch round-trip: `derive_kek` + RFC 5869's primitives
+    /// agree byte-for-byte. Sanity-checks the salt-from-UKM wiring.
+    #[test]
+    fn hkdf_kek_matches_rfc5869() {
+        let z = [0x10u8; 32];
+        let ukm = b"OXIDEAV-UKM-RFC8418";
+        let info = build_ecc_cms_shared_info(&OID_AES256_WRAP, Some(ukm), 256);
+        // derive_kek path.
+        let got = derive_kek(KariKdf::HkdfSha256, &z, Some(ukm), &info, 32);
+        // Direct hkdf primitive call — same inputs.
+        let want = {
+            let hk = hkdf::Hkdf::<sha2::Sha256>::new(Some(ukm), &z);
+            let mut okm = [0u8; 32];
+            hk.expand(&info, &mut okm).unwrap();
+            okm.to_vec()
+        };
+        assert_eq!(got, want);
+        // Sanity: empty UKM ⇒ salt absent (None), not Some(empty).
+        let got_no_salt = derive_kek(KariKdf::HkdfSha256, &z, None, &info, 32);
+        let want_no_salt = {
+            let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, &z);
+            let mut okm = [0u8; 32];
+            hk.expand(&info, &mut okm).unwrap();
+            okm.to_vec()
+        };
+        assert_eq!(got_no_salt, want_no_salt);
+    }
+
+    /// `KariKdf::is_valid_for` enforces the RFC 5753 / RFC 8418 pairing
+    /// matrix: NIST curves are pinned to one X9.63 SHA hash; X25519
+    /// accepts X9.63-SHA-256 + every HKDF flavour, and rejects the
+    /// SHA-384 / SHA-512 X9.63 bindings (those are NIST-only).
+    #[test]
+    fn kdf_curve_pairing_matrix() {
+        // P-256 — only X9.63-SHA-256.
+        assert!(KariKdf::X963Sha256.is_valid_for(KariCurve::P256));
+        assert!(!KariKdf::X963Sha384.is_valid_for(KariCurve::P256));
+        assert!(!KariKdf::X963Sha512.is_valid_for(KariCurve::P256));
+        assert!(!KariKdf::HkdfSha256.is_valid_for(KariCurve::P256));
+        // P-384 — only X9.63-SHA-384.
+        assert!(KariKdf::X963Sha384.is_valid_for(KariCurve::P384));
+        assert!(!KariKdf::X963Sha256.is_valid_for(KariCurve::P384));
+        assert!(!KariKdf::HkdfSha384.is_valid_for(KariCurve::P384));
+        // P-521 — only X9.63-SHA-512.
+        assert!(KariKdf::X963Sha512.is_valid_for(KariCurve::P521));
+        assert!(!KariKdf::X963Sha384.is_valid_for(KariCurve::P521));
+        assert!(!KariKdf::HkdfSha512.is_valid_for(KariCurve::P521));
+        // X25519 — X9.63-SHA-256 + every HKDF flavour.
+        assert!(KariKdf::X963Sha256.is_valid_for(KariCurve::X25519));
+        assert!(KariKdf::HkdfSha256.is_valid_for(KariCurve::X25519));
+        assert!(KariKdf::HkdfSha384.is_valid_for(KariCurve::X25519));
+        assert!(KariKdf::HkdfSha512.is_valid_for(KariCurve::X25519));
+        // X9.63 SHA-384 / 512 are NOT defined for X25519 in the RFCs.
+        assert!(!KariKdf::X963Sha384.is_valid_for(KariCurve::X25519));
+        assert!(!KariKdf::X963Sha512.is_valid_for(KariCurve::X25519));
+    }
+
+    /// Round-16: P-521 ECDH + X9.63-SHA-512 KDF + AES-256 KW unwrap
+    /// round trip.
+    #[test]
+    fn p521_aes256_wrap_unwrap_round_trip() {
+        use p521::elliptic_curve::sec1::ToEncodedPoint;
+        use p521::SecretKey;
+        // 66-byte deterministic scalars for P-521. The first byte
+        // carries only 1 bit of the 521-bit field, so we lead with
+        // 0x00 to keep the scalar comfortably below the curve order n
+        // (≈ 2^521). The remaining 65 bytes are an arbitrary pattern.
+        let mut ephemeral_scalar = [0x42u8; 66];
+        ephemeral_scalar[0] = 0x00;
+        let mut recipient_scalar = [0x77u8; 66];
+        recipient_scalar[0] = 0x00;
+        let recipient_secret = SecretKey::from_slice(&recipient_scalar).unwrap();
+        let recipient_pub = recipient_secret
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        let cek = vec![0x9Au8; 32];
+        let ukm = b"OXIDEAV-UKM-P521";
+        let (originator_pub, wrapped) = wrap_cek_for_recipient(
+            KariCurve::P521,
+            &ephemeral_scalar,
+            &recipient_pub,
+            Some(ukm),
+            &cek,
+            WrapAlgorithm::Aes256,
+        )
+        .expect("wrap P-521");
+        // P-521 SEC1 uncompressed point = 1 + 2*66 = 133 bytes.
+        assert_eq!(originator_pub.len(), 133);
+        let kari = KeyAgreeRecipientInfo {
+            originator: OriginatorId::OriginatorKey(OriginatorPublicKey {
+                algorithm_oid: OID_EC_PUBLIC_KEY.to_vec(),
+                algorithm_params: write_oid(&OID_SECP521R1),
+                public_key: originator_pub,
+            }),
+            ukm: ukm.to_vec(),
+            key_encryption_oid: OID_DH_SINGLE_PASS_STDDH_SHA512_KDF.to_vec(),
+            key_encryption_params: write_sequence(&write_oid(&OID_AES256_WRAP)),
+            recipient_encrypted_keys: vec![RecipientEncryptedKey {
+                rid: KeyAgreeRecipientId::RecipientKeyIdentifier {
+                    ski: vec![0x33u8; 20],
+                },
+                encrypted_key: wrapped,
+            }],
+        };
+        let recipient = EcRecipient::p521(recipient_scalar.to_vec(), recipient_pub);
+        let unwrapped =
+            unwrap_kari(&kari, &kari.recipient_encrypted_keys[0], &recipient).expect("unwrap");
+        assert_eq!(unwrapped, cek);
+    }
+
+    /// Round-16: X25519 ECDH + HKDF-SHA-256 KDF + AES-128 KW round trip
+    /// (RFC 8418 §2.2 — `dhSinglePass-stdDH-hkdf-sha256-scheme`).
+    #[test]
+    fn x25519_hkdf_sha256_aes128_wrap_unwrap_round_trip() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+        let recipient_scalar_arr = [0x44u8; 32];
+        let secret = StaticSecret::from(recipient_scalar_arr);
+        let recipient_pub = PublicKey::from(&secret).as_bytes().to_vec();
+        let ephemeral_scalar = [0x66u8; 32];
+        let cek = vec![0xC1u8; 16];
+        let ukm = b"OXIDEAV-UKM-RFC8418-22";
+        let (originator_pub, wrapped) = wrap_cek_for_recipient_with_kdf(
+            KariCurve::X25519,
+            KariKdf::HkdfSha256,
+            &ephemeral_scalar,
+            &recipient_pub,
+            Some(ukm),
+            &cek,
+            WrapAlgorithm::Aes128,
+        )
+        .expect("wrap X25519 HKDF");
+        let kari = KeyAgreeRecipientInfo {
+            originator: OriginatorId::OriginatorKey(OriginatorPublicKey {
+                algorithm_oid: OID_X25519.to_vec(),
+                algorithm_params: Vec::new(),
+                public_key: originator_pub,
+            }),
+            ukm: ukm.to_vec(),
+            key_encryption_oid: OID_DH_SINGLE_PASS_STDDH_HKDF_SHA256_SCHEME.to_vec(),
+            key_encryption_params: write_sequence(&write_oid(&OID_AES128_WRAP)),
+            recipient_encrypted_keys: vec![RecipientEncryptedKey {
+                rid: KeyAgreeRecipientId::RecipientKeyIdentifier {
+                    ski: vec![0xABu8; 20],
+                },
+                encrypted_key: wrapped,
+            }],
+        };
+        let recipient = EcRecipient::x25519(recipient_scalar_arr.to_vec(), recipient_pub);
+        let unwrapped =
+            unwrap_kari(&kari, &kari.recipient_encrypted_keys[0], &recipient).expect("unwrap");
+        assert_eq!(unwrapped, cek);
+    }
+
+    /// Round-16: X25519 ECDH + HKDF-SHA-384 KDF + AES-256 KW round trip
+    /// (RFC 8418 §2.2 — `dhSinglePass-stdDH-hkdf-sha384-scheme`).
+    /// Exercises the absent-UKM (salt = None) path.
+    #[test]
+    fn x25519_hkdf_sha384_aes256_no_ukm_round_trip() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+        let recipient_scalar_arr = [0x55u8; 32];
+        let secret = StaticSecret::from(recipient_scalar_arr);
+        let recipient_pub = PublicKey::from(&secret).as_bytes().to_vec();
+        let ephemeral_scalar = [0xA6u8; 32];
+        let cek = vec![0xD2u8; 32];
+        let (originator_pub, wrapped) = wrap_cek_for_recipient_with_kdf(
+            KariCurve::X25519,
+            KariKdf::HkdfSha384,
+            &ephemeral_scalar,
+            &recipient_pub,
+            None,
+            &cek,
+            WrapAlgorithm::Aes256,
+        )
+        .expect("wrap X25519 HKDF-384");
+        let kari = KeyAgreeRecipientInfo {
+            originator: OriginatorId::OriginatorKey(OriginatorPublicKey {
+                algorithm_oid: OID_X25519.to_vec(),
+                algorithm_params: Vec::new(),
+                public_key: originator_pub,
+            }),
+            ukm: Vec::new(),
+            key_encryption_oid: OID_DH_SINGLE_PASS_STDDH_HKDF_SHA384_SCHEME.to_vec(),
+            key_encryption_params: write_sequence(&write_oid(&OID_AES256_WRAP)),
+            recipient_encrypted_keys: vec![RecipientEncryptedKey {
+                rid: KeyAgreeRecipientId::RecipientKeyIdentifier {
+                    ski: vec![0xCDu8; 20],
+                },
+                encrypted_key: wrapped,
+            }],
+        };
+        let recipient = EcRecipient::x25519(recipient_scalar_arr.to_vec(), recipient_pub);
+        let unwrapped =
+            unwrap_kari(&kari, &kari.recipient_encrypted_keys[0], &recipient).expect("unwrap");
+        assert_eq!(unwrapped, cek);
+    }
+
+    /// Round-16: X25519 ECDH + HKDF-SHA-512 KDF + AES-256 KW round trip
+    /// (RFC 8418 §2.2 — `dhSinglePass-stdDH-hkdf-sha512-scheme`).
+    #[test]
+    fn x25519_hkdf_sha512_aes256_wrap_unwrap_round_trip() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+        let recipient_scalar_arr = [0x77u8; 32];
+        let secret = StaticSecret::from(recipient_scalar_arr);
+        let recipient_pub = PublicKey::from(&secret).as_bytes().to_vec();
+        let ephemeral_scalar = [0xE3u8; 32];
+        let cek = vec![0xF1u8; 32];
+        let ukm = b"UKM-512";
+        let (originator_pub, wrapped) = wrap_cek_for_recipient_with_kdf(
+            KariCurve::X25519,
+            KariKdf::HkdfSha512,
+            &ephemeral_scalar,
+            &recipient_pub,
+            Some(ukm),
+            &cek,
+            WrapAlgorithm::Aes256,
+        )
+        .expect("wrap X25519 HKDF-512");
+        let kari = KeyAgreeRecipientInfo {
+            originator: OriginatorId::OriginatorKey(OriginatorPublicKey {
+                algorithm_oid: OID_X25519.to_vec(),
+                algorithm_params: Vec::new(),
+                public_key: originator_pub,
+            }),
+            ukm: ukm.to_vec(),
+            key_encryption_oid: OID_DH_SINGLE_PASS_STDDH_HKDF_SHA512_SCHEME.to_vec(),
+            key_encryption_params: write_sequence(&write_oid(&OID_AES256_WRAP)),
+            recipient_encrypted_keys: vec![RecipientEncryptedKey {
+                rid: KeyAgreeRecipientId::RecipientKeyIdentifier {
+                    ski: vec![0xEFu8; 20],
+                },
+                encrypted_key: wrapped,
+            }],
+        };
+        let recipient = EcRecipient::x25519(recipient_scalar_arr.to_vec(), recipient_pub);
+        let unwrapped =
+            unwrap_kari(&kari, &kari.recipient_encrypted_keys[0], &recipient).expect("unwrap");
+        assert_eq!(unwrapped, cek);
+    }
+
+    /// `wrap_cek_for_recipient_with_kdf` rejects an X9.63-SHA-512 KDF
+    /// against an X25519 curve at build time (the pairing is illegal
+    /// per RFC 8418 §2 — only X9.63-SHA-256 + HKDF flavours are
+    /// permitted).
+    #[test]
+    fn invalid_kdf_curve_pairing_rejected_at_build() {
+        let err = wrap_cek_for_recipient_with_kdf(
+            KariCurve::X25519,
+            KariKdf::X963Sha512,
+            &[0u8; 32],
+            &[0u8; 32],
+            None,
+            &[0u8; 32],
+            WrapAlgorithm::Aes256,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not a valid binding"),
+            "unexpected error: {msg}"
+        );
     }
 }
