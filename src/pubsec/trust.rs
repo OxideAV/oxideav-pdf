@@ -197,7 +197,7 @@ mod tests {
             issuer_der: issuer.to_vec(),
             serial: serial.to_vec(),
             spki_pubkey_bits: spki,
-            validity: None,
+            ..Default::default()
         }
     }
 
@@ -282,6 +282,7 @@ mod tests {
             serial: serial.to_vec(),
             spki_pubkey_bits: Some(spki),
             validity: Some((not_before.to_vec(), not_after.to_vec())),
+            ..Default::default()
         }
     }
 
@@ -345,7 +346,7 @@ mod tests {
             issuer_der: b"O=No window".to_vec(),
             serial: vec![0xAA],
             spki_pubkey_bits: Some(pubkey.clone()),
-            validity: None,
+            ..Default::default()
         };
         let cert_with_window = synth_cert_with_validity(
             b"O=With window",

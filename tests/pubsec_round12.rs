@@ -116,6 +116,7 @@ fn multi_cf_two_groups_two_permission_sets() {
             serial: serial_a,
             spki_pubkey_bits: None,
             validity: None,
+            ..Default::default()
         },
         priv_a,
     );
@@ -129,6 +130,7 @@ fn multi_cf_two_groups_two_permission_sets() {
             serial: serial_b,
             spki_pubkey_bits: None,
             validity: None,
+            ..Default::default()
         },
         priv_b,
     );
@@ -199,6 +201,7 @@ fn multi_cf_surfaces_distinct_permissions_per_recipient() {
             serial: vec![0x01],
             spki_pubkey_bits: None,
             validity: None,
+            ..Default::default()
         },
         priv_a,
     );
@@ -215,6 +218,7 @@ fn multi_cf_surfaces_distinct_permissions_per_recipient() {
             serial: vec![0x02],
             spki_pubkey_bits: None,
             validity: None,
+            ..Default::default()
         },
         priv_b,
     );
@@ -267,6 +271,7 @@ fn multi_cf_recipient_in_neither_group_returns_none() {
             serial: vec![0xFF],
             spki_pubkey_bits: None,
             validity: None,
+            ..Default::default()
         },
         priv_s,
     );

@@ -170,9 +170,26 @@ that carry one. **CMS `SignedData` parser scaffolding** (RFC 5652 §5
 `id-signedData` blobs into typed `SignedData { digest_algorithms,
 encap_content, certs, crls, signer_infos }` + `SignerInfo` (sid,
 digest / signature OIDs, signed / unsigned attribute lists with
-raw-DER values, raw `signature` octets). Signature **verification**
-(hash-then-verify dispatch) is a round-20 deferral; today's surface
-covers every byte the verifier will need.
+raw-DER values, raw `signature` octets).
+
+**Round 20** closes the round-19 verification deferral. New
+`pubsec::verify::verify_signature(signer, certs, content)` resolves the
+signer's certificate from a pool by `IssuerAndSerial` or
+`SubjectKeyIdentifier`, hashes the canonical (universal-SET-tag)
+re-encoding of `signedAttrs` per `digestAlgorithm`, and verifies the
+hash against `signature` per `signatureAlgorithm` (RFC 5652 §5.4 +
+§11.2). Hash side: SHA-1 / SHA-256 / SHA-384 / SHA-512. Signature
+side: RSA-PKCS#1 v1.5 (the `rsaEncryption` + four `sha*WithRSA` OIDs
+all map here), RSA-PSS (`id-RSASSA-PSS`), and ECDSA on P-256 / P-384
+/ P-521 (curve dispatch by the cert SPKI's named-curve OID per RFC
+5480 §2.1.1.1). When `signedAttrs` is present, the verifier also
+cross-checks the `messageDigest` attribute against the eContent hash
+(RFC 5652 §11.2) — so a tampered eContent fails even when the outer
+signature still verifies. Detached signatures (PAdES — eContent absent)
+feed the document bytes through `AttachedContent::External(&[u8])`.
+Round-20 also extends `x509::Certificate` to capture
+`spki_algorithm_oid` + `spki_algorithm_params` so the verifier can
+route ECDSA on the named-curve OID without re-parsing the certificate.
 
 ## Encryption encode (writer side)
 

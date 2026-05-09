@@ -181,12 +181,14 @@ fn temporal_lookup_picks_cert_active_at_envelope_date() {
         serial: vec![0x01],
         spki_pubkey_bits: Some(shared_pubkey.clone()),
         validity: Some((b"20240101000000Z".to_vec(), b"20241231235959Z".to_vec())),
+        ..Default::default()
     };
     let cert_2025 = Certificate {
         issuer_der: der::write_sequence(b"O=Recipient 2025"),
         serial: vec![0x02],
         spki_pubkey_bits: Some(shared_pubkey.clone()),
         validity: Some((b"20250101000000Z".to_vec(), b"20251231235959Z".to_vec())),
+        ..Default::default()
     };
     // Sanity: both certs derive the same SKI from the shared SPKI bits.
     let ski = cert_2024.subject_key_identifier().expect("SKI");
@@ -239,6 +241,7 @@ fn temporal_lookup_returns_none_when_no_cert_window_contains_instant() {
         serial: vec![0x42],
         spki_pubkey_bits: Some(shared_pubkey.clone()),
         validity: Some((b"20200101000000Z".to_vec(), b"20201231235959Z".to_vec())),
+        ..Default::default()
     };
     let ski = cert.subject_key_identifier().expect("SKI");
     let mut store = TrustStore::new();
@@ -256,6 +259,7 @@ fn temporal_lookup_falls_back_to_lookup_when_instant_is_none() {
         serial: vec![0xAA],
         spki_pubkey_bits: Some(shared_pubkey.clone()),
         validity: Some((b"20240101000000Z".to_vec(), b"20241231235959Z".to_vec())),
+        ..Default::default()
     };
     let ski = cert.subject_key_identifier().expect("SKI");
     let mut store = TrustStore::new();

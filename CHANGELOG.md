@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round-20: **CMS `SignedData` signature verification** (RFC 5652 §5.4 +
+  §11.2 + RFC 8017 + RFC 5754 + RFC 5758). Closes the round-19 deferral
+  that surfaced parsed `SignerInfo` bytes without a verifier. New
+  `pubsec::verify::verify_signature(signer, certs, content) -> Result<bool>`
+  resolves the signer's certificate from a pool by `IssuerAndSerial` or
+  `SubjectKeyIdentifier`, hashes the canonical (universal-SET-tag)
+  re-encoding of `signedAttrs` (or the raw eContent when `signedAttrs`
+  is absent) per `digestAlgorithm`, and verifies the resulting hash
+  against `signature` per `signatureAlgorithm`. Hash side: SHA-1 /
+  SHA-256 / SHA-384 / SHA-512 via the existing `sha1` + `sha2` deps.
+  Signature side: RSA-PKCS#1 v1.5 (the `rsaEncryption` + four
+  `sha*WithRSA` OIDs all map here), RSA-PSS (`id-RSASSA-PSS`), and
+  ECDSA on P-256 / P-384 / P-521 (curve dispatch by the cert SPKI's
+  named-curve OID per RFC 5480 §2.1.1.1). When `signedAttrs` is
+  present, the verifier also cross-checks the `messageDigest`
+  attribute against the eContent hash per RFC 5652 §11.2 — so a
+  tampered eContent still fails even when the outer signature
+  verifies against intact attrs. Detached signatures (PAdES — eContent
+  absent) feed the document bytes through a new
+  `AttachedContent::External(&[u8])` parameter. New helpers
+  `signed_attrs_to_be_signed`, `build_message_digest_attribute_der`,
+  `pack_signed_attrs_implicit`, `implicit_signed_attrs_tlv`,
+  `rsa_pubkey_to_pkcs1_der` for fixture builders. New OID constants
+  `OID_SHA1` / `OID_SHA256` / `OID_SHA384` / `OID_SHA512` /
+  `OID_RSA_ENCRYPTION` / `OID_SHA{1,256,384,512}_WITH_RSA` /
+  `OID_RSA_PSS` / `OID_EC_PUBLIC_KEY` /
+  `OID_ECDSA_WITH_SHA{1,256,384,512}` /
+  `OID_NAMED_CURVE_P{256,384,521}` / `OID_ATTR_MESSAGE_DIGEST`.
+- Round-20: **`x509::Certificate.spki_algorithm_oid` +
+  `spki_algorithm_params`** — the SPKI's `AlgorithmIdentifier` is now
+  captured (in addition to the BIT STRING contents already extracted
+  in round 11) so the verifier can route ECDSA on the named-curve OID
+  without re-parsing the certificate. `Certificate` now derives
+  `Default`, so test fixtures can use `..Default::default()` for the
+  optional fields.
+- Round-20 tests: 20 new tests — 13 `pubsec::verify` unit tests
+  (hash-OID dispatch, signed_attrs SET re-tag, RSA-PKCS1v15 with
+  signedAttrs, RSA-PKCS1v15 without signedAttrs, content-tamper via
+  messageDigest mismatch, single-bit signature flip rejection,
+  cert-not-in-pool error, RSA-PSS, ECDSA-P256/384/521, ECDSA-P256
+  signature-tamper rejection, SKI signer resolution) + 7
+  `tests/pubsec_round20_signed_data_verify.rs` end-to-end integration
+  tests (full SignedData ContentInfo → parse → verify, four algorithm
+  combinations from the round dispatch sheet, both tamper paths,
+  cert-not-in-pool, OID re-export visibility).
+
 - Round-19: **Document-level XMP `/Metadata` stream end-to-end**
   (ISO 32000-1 §14.3.2 + Adobe XMP Spec 2012). Closes the round-17
   `EncryptMetadata=false` carve-out by giving the PDF a place to put

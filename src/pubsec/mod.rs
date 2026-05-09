@@ -160,6 +160,28 @@
 //!   pivot) so envelope `GeneralizedTime` instants byte-compare
 //!   directly. New helper [`x509::time_within`].
 //!
+//! ## Round-20 additions
+//!
+//! * **`SignedData` signature verification** (RFC 5652 §5.4 + §11.2 +
+//!   RFC 5754 + RFC 5758 + RFC 8017) — closes the round-19 deferral.
+//!   New [`verify::verify_signature`] entry point dispatches on the
+//!   per-`SignerInfo` `(digestAlgorithm, signatureAlgorithm)` OID pair:
+//!   * Hash side — SHA-1 / SHA-256 / SHA-384 / SHA-512.
+//!   * Signature side — RSA-PKCS#1 v1.5, RSA-PSS, and ECDSA on the
+//!     P-256 / P-384 / P-521 curves (curve dispatch by the cert SPKI's
+//!     named-curve OID, RFC 5480 §2.1.1.1).
+//!   * Re-encodes the `[0] IMPLICIT signedAttrs` body with the
+//!     universal SET tag before hashing, per RFC 5652 §5.4.
+//!   * Cross-checks the `messageDigest` signed attribute against the
+//!     hash of the encapsulated content (RFC 5652 §11.2), so a
+//!     tampered eContent fails even when the outer signature hashes
+//!     intact attrs.
+//! * **`x509::Certificate.spki_algorithm_oid` + `spki_algorithm_params`** —
+//!   the SPKI's `AlgorithmIdentifier` is now captured (in addition to
+//!   the BIT STRING contents already extracted in round 11) so the
+//!   verifier can route ECDSA on the named-curve OID without re-parsing
+//!   the certificate.
+//!
 //! ## Remaining deferrals
 //!
 //! * X448 KARI (no vetted pure-Rust implementation in the workspace
@@ -172,13 +194,14 @@
 //!   entries — round 18 surfaces them as opaque DER; future work could
 //!   tag-dispatch each entry into X.509 v3 / extended-cert /
 //!   attribute-cert / other-cert variants per RFC 5652 §10.2.2.
-//! * **Round-19 deferral** — `SignedData` signature verification
-//!   (hash-then-verify dispatch per `digestAlgorithm` +
-//!   `signatureAlgorithm`). The parser surfaces every byte the verifier
-//!   needs (signed_attrs_der, signature, OIDs); a follow-up round
-//!   needs to wire SHA-1 / SHA-256 / SHA-384 / SHA-512 into the
-//!   digest path and RSA-PKCS1v15 / RSA-PSS / ECDSA into the verify
-//!   path with a per-algorithm dispatch table.
+//! * **Round-20 follow-ups** — PDF `/Sig` annotation reader/writer (the
+//!   container PDF object that points at a SignedData blob via
+//!   `/Contents` + `/ByteRange`); Ed25519 / Ed448 signature dispatch in
+//!   the verifier (no Ed25519/Ed448 dep yet); full
+//!   `id-RSASSA-PSS` parameter parsing (round-20 accepts the OID with
+//!   default SHA-1 / SHA-256 / SHA-384 / SHA-512 via `digestAlgorithm`
+//!   but doesn't yet honour explicit MGF1 hash / salt-length parameters
+//!   if they differ from the digest hash).
 
 pub mod cms;
 pub mod cms_build;
@@ -187,6 +210,7 @@ pub mod encode;
 pub mod kari;
 pub mod signed_data;
 pub mod trust;
+pub mod verify;
 pub mod x509;
 
 pub use encode::{
@@ -1042,6 +1066,8 @@ mod tests {
             serial: serial.to_vec(),
             spki_pubkey_bits: None,
             validity: None,
+            spki_algorithm_oid: None,
+            spki_algorithm_params: None,
         }
     }
 

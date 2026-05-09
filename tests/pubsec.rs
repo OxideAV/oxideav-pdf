@@ -459,6 +459,7 @@ fn build_pubsec_pdf(profile: Profile, title: &str) -> (Vec<u8>, PubSecCredential
         serial,
         spki_pubkey_bits: None,
         validity: None,
+        ..Default::default()
     };
     let credential = PubSecCredential::from_parsed(cert, priv_key);
     (bytes, credential)
@@ -504,6 +505,7 @@ fn wrong_certificate_serial_returns_error() {
             serial: vec![0xFF, 0xFF, 0xFF],
             spki_pubkey_bits: None,
             validity: None,
+            ..Default::default()
         },
         priv_key,
     );
@@ -585,6 +587,7 @@ fn writer_s4_then_reader_round_trip() {
             serial,
             spki_pubkey_bits: None,
             validity: None,
+            ..Default::default()
         },
         priv_key,
     );
@@ -608,6 +611,7 @@ fn writer_s5_v4_aes128_round_trip() {
             serial,
             spki_pubkey_bits: None,
             validity: None,
+            ..Default::default()
         },
         priv_key,
     );
@@ -630,6 +634,7 @@ fn writer_s5_v5_aes256_round_trip() {
             serial,
             spki_pubkey_bits: None,
             validity: None,
+            ..Default::default()
         },
         priv_key,
     );
@@ -658,6 +663,7 @@ fn writer_s5_v5_two_recipients_either_can_open() {
             serial: vec![0xAA],
             spki_pubkey_bits: None,
             validity: None,
+            ..Default::default()
         },
         priv_a,
     );
@@ -676,6 +682,7 @@ fn writer_s5_v5_two_recipients_either_can_open() {
             serial: vec![0xBB],
             spki_pubkey_bits: None,
             validity: None,
+            ..Default::default()
         },
         priv_b,
     );
@@ -708,6 +715,7 @@ fn writer_s5_v5_ski_recipient_form_round_trip() {
             serial: vec![],
             spki_pubkey_bits: Some(pubkey_bits),
             validity: None,
+            ..Default::default()
         },
         priv_key,
     );
@@ -754,6 +762,7 @@ fn open_unencrypted_pdf_via_certificate_works() {
             serial: vec![0x01],
             spki_pubkey_bits: None,
             validity: None,
+            ..Default::default()
         },
         priv_key,
     );

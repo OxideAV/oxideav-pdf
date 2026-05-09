@@ -108,6 +108,7 @@ fn build_kari_pubsec_pdf_long_term_originator(
         serial: recipient_serial.clone(),
         spki_pubkey_bits: Some(recipient_pub_sec1.clone()),
         validity: None,
+        ..Default::default()
     };
 
     // Originator long-term cert. Stored in the trust store under both
@@ -120,6 +121,7 @@ fn build_kari_pubsec_pdf_long_term_originator(
         serial: originator_serial.clone(),
         spki_pubkey_bits: Some(originator_pub_sec1.clone()),
         validity: None,
+        ..Default::default()
     };
     let originator_ski = originator_cert.subject_key_identifier().expect("SKI");
 
@@ -308,6 +310,7 @@ fn missing_originator_cert_in_trust_store_fails_cleanly() {
             serial: vec![0xFF, 0xEE],
             spki_pubkey_bits: Some(vec![0x04; 65]),
             validity: None,
+            ..Default::default()
         },
     );
     let err = read_pdf_to_scene_with_certificate_and_trust_store(&pdf, &cred, &store).unwrap_err();

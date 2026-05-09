@@ -52,7 +52,7 @@ use super::der::{maybe_read_context, read_integer_bytes, read_sequence, read_tlv
 /// see [`Self::validity`]). The slot lets [`super::TrustStore::find_with_temporal_validity`]
 /// pick a cert whose validity window contains an envelope-supplied
 /// instant (the round-18 RKID `date` field, RFC 5652 §6.2.2).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Certificate {
     /// Raw DER of the issuer `Name` (a SEQUENCE).
     pub issuer_der: Vec<u8>,
@@ -68,6 +68,18 @@ pub struct Certificate {
     /// `None` when the validity SEQUENCE was unreachable or unparseable
     /// (matches the round-10 best-effort SPKI behaviour).
     pub validity: Option<(Vec<u8>, Vec<u8>)>,
+    /// Round-20: `subjectPublicKeyInfo.algorithm.algorithm` OID arcs.
+    /// Lets the SignedData verifier dispatch the public-key shape
+    /// (`rsaEncryption` 1.2.840.113549.1.1.1, `id-ecPublicKey`
+    /// 1.2.840.10045.2.1, `id-Ed25519` 1.3.101.112, ...). `None` when
+    /// the SPKI couldn't be located.
+    pub spki_algorithm_oid: Option<Vec<u64>>,
+    /// Round-20: `subjectPublicKeyInfo.algorithm.parameters` raw DER
+    /// bytes (or empty when absent). For `id-ecPublicKey` this carries
+    /// the named-curve OID (e.g. `secp256r1` 1.2.840.10045.3.1.7) which
+    /// the verifier needs to pick the right curve. `None` when the SPKI
+    /// couldn't be located.
+    pub spki_algorithm_params: Option<Vec<u8>>,
 }
 
 impl Certificate {
@@ -105,8 +117,12 @@ impl Certificate {
         // to tolerate a parse failure here. validity SEQUENCE, subject
         // Name SEQUENCE, then subjectPublicKeyInfo SEQUENCE.
         // Round 18 also captures `validity = (not_before, not_after)`
-        // when the SEQUENCE is parseable.
+        // when the SEQUENCE is parseable. Round 20 also captures the
+        // SPKI algorithm OID + parameters so the SignedData verifier
+        // can dispatch the public-key shape.
         let mut validity_out: Option<(Vec<u8>, Vec<u8>)> = None;
+        let mut spki_alg_oid_out: Option<Vec<u64>> = None;
+        let mut spki_alg_params_out: Option<Vec<u8>> = None;
         let spki_pubkey_bits = (|| -> Option<Vec<u8>> {
             let (validity_body, after_validity) = match read_sequence(after_issuer) {
                 Ok(parts) => parts,
@@ -132,8 +148,14 @@ impl Certificate {
             };
             // subjectPublicKeyInfo SEQUENCE.
             let (spki_body, _) = read_sequence(after_subject).ok()?;
-            // skip algorithm SEQUENCE
-            let (_, after_alg) = read_sequence(spki_body).ok()?;
+            // algorithm SEQUENCE — capture the AlgorithmIdentifier
+            // contents (OID + parameters) before stepping into the
+            // BIT STRING.
+            let (alg_body, after_alg) = read_sequence(spki_body).ok()?;
+            if let Ok((alg_oid, alg_params)) = super::der::read_oid(alg_body) {
+                spki_alg_oid_out = Some(alg_oid);
+                spki_alg_params_out = Some(alg_params.to_vec());
+            }
             // BIT STRING — body has a leading unused-bits byte we drop.
             let (bs, _) = read_tlv(after_alg).ok()?;
             if bs.class != Class::Universal || bs.tag_number != tag::BIT_STRING {
@@ -152,6 +174,8 @@ impl Certificate {
             serial: serial_body.to_vec(),
             spki_pubkey_bits,
             validity: validity_out,
+            spki_algorithm_oid: spki_alg_oid_out,
+            spki_algorithm_params: spki_alg_params_out,
         })
     }
 

@@ -40,7 +40,7 @@ cbc = { version = "0.1", default-features = false, features = ["block-padding"] 
 # three depending on a running modulus byte. The `sha2` crate is
 # pure-Rust + constant-time; it shares the `digest` trait surface
 # already pulled in transitively by the AES cipher dep.
-sha2 = { version = "0.10", default-features = false }
+sha2 = { version = "0.10", default-features = false, features = ["oid"] }
 # Pure-Rust SHA-1 (RustCrypto). Round-10 public-key handler uses
 # SHA-1 over `seed ‖ recipient_blobs [‖ 0xFFFFFFFF]` for
 # `adbe.pkcs7.s3` and `adbe.pkcs7.s4` (ISO 32000-1 §7.6.4.3) — and
@@ -48,7 +48,7 @@ sha2 = { version = "0.10", default-features = false }
 # in `adbe.pkcs7.s5`. SHA-1 is broken for collision attacks but
 # the spec mandates it for these subfilters; SHA-256 is only used
 # for the ISO 32000-2 AES-256 path.
-sha1 = { version = "0.10", default-features = false }
+sha1 = { version = "0.10", default-features = false, features = ["oid"] }
 # Pure-Rust RSA (RustCrypto). Round-10 public-key handler unwraps
 # the CMS RecipientInfo encrypted content-encryption key using
 # RSAES-PKCS1-v1_5 (the only key-encryption algorithm OID we need
@@ -65,6 +65,7 @@ rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
 # `elliptic-curve`; no `*-sys`.
 p256 = { version = "0.13", default-features = false, features = [
     "ecdh",
+    "ecdsa",
     "std",
 ] }
 # Pure-Rust NIST P-384 (secp384r1) curve (RustCrypto). Round-15
@@ -73,6 +74,7 @@ p256 = { version = "0.13", default-features = false, features = [
 # OID 1.3.132.1.11.2). Same family + API as `p256`.
 p384 = { version = "0.13", default-features = false, features = [
     "ecdh",
+    "ecdsa",
     "std",
 ] }
 # Pure-Rust NIST P-521 (secp521r1) curve (RustCrypto). Round-16 closes
@@ -81,6 +83,8 @@ p384 = { version = "0.13", default-features = false, features = [
 # OID 1.3.132.1.11.3). Same family + API as `p256` / `p384`.
 p521 = { version = "0.13", default-features = false, features = [
     "ecdh",
+    "ecdsa",
+    "getrandom",
     "std",
 ] }
 # Pure-Rust HKDF (RustCrypto). Round-16 wires the RFC 8418 §2.2 HKDF

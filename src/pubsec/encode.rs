@@ -1104,8 +1104,7 @@ mod tests {
         Certificate {
             issuer_der,
             serial,
-            spki_pubkey_bits: None,
-            validity: None,
+            ..Default::default()
         }
     }
 
@@ -1189,10 +1188,8 @@ mod tests {
         // open_with_certificate computes SHA-1 internally.
         let cred = PubSecCredential::from_parsed(
             Certificate {
-                issuer_der: vec![],
-                serial: vec![],
                 spki_pubkey_bits: Some(pubkey_bits),
-                validity: None,
+                ..Default::default()
             },
             priv_key,
         );

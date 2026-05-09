@@ -105,6 +105,7 @@ fn p521_kari_writer_then_reader_round_trip() {
         serial,
         spki_pubkey_bits: Some(recipient_pub),
         validity: None,
+        ..Default::default()
     };
     let cred = PubSecCredential::from_parsed_ec(cert, KariCurve::P521, recipient_scalar);
     let opened =
@@ -143,6 +144,7 @@ fn x25519_hkdf_sha256_kari_writer_then_reader_round_trip() {
         serial,
         spki_pubkey_bits: Some(recipient_pub),
         validity: None,
+        ..Default::default()
     };
     let cred = PubSecCredential::from_parsed_ec(cert, KariCurve::X25519, recipient_scalar);
     let opened = read_pdf_to_scene_with_certificate(&pdf, &cred)
@@ -180,6 +182,7 @@ fn x25519_hkdf_sha384_kari_writer_then_reader_round_trip() {
         serial,
         spki_pubkey_bits: Some(recipient_pub),
         validity: None,
+        ..Default::default()
     };
     let cred = PubSecCredential::from_parsed_ec(cert, KariCurve::X25519, recipient_scalar);
     let opened = read_pdf_to_scene_with_certificate(&pdf, &cred)
@@ -212,6 +215,7 @@ fn x25519_hkdf_sha512_kari_writer_then_reader_round_trip() {
         serial,
         spki_pubkey_bits: Some(recipient_pub),
         validity: None,
+        ..Default::default()
     };
     let cred = PubSecCredential::from_parsed_ec(cert, KariCurve::X25519, recipient_scalar);
     let opened = read_pdf_to_scene_with_certificate(&pdf, &cred)
@@ -247,6 +251,7 @@ fn p256_credential_does_not_open_p521_kari() {
         serial: vec![0xEE],
         spki_pubkey_bits: Some(vec![0x04; 65]),
         validity: None,
+        ..Default::default()
     };
     let bad_cred = PubSecCredential::from_parsed_ec(bad_cert, KariCurve::P256, bad_scalar.to_vec());
     let err = read_pdf_to_scene_with_certificate(&pdf, &bad_cred).unwrap_err();
@@ -287,6 +292,7 @@ fn wrong_x25519_scalar_fails_hkdf_decrypt() {
         serial,
         spki_pubkey_bits: Some(rogue_pub),
         validity: None,
+        ..Default::default()
     };
     let bad_cred = PubSecCredential::from_parsed_ec(bad_cert, KariCurve::X25519, rogue_scalar);
     let err = read_pdf_to_scene_with_certificate(&pdf, &bad_cred).unwrap_err();
