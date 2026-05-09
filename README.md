@@ -211,14 +211,18 @@ the first-page trailer's `/Prev` points at the main xref. The
 output is also a valid plain PDF — readers ignoring `/Linearized`
 walk the same Catalog + Pages tree + page content.
 
-The hint stream emits the page offset table (F.4.1) plus minimal
-shared-object (F.4.2), thumbnail (F.4.3), and outline (F.4.4) header
-sections — entry counts at zero so the structural shape is complete
-but no per-shared-object / per-thumbnail / per-outline bytes are
-generated. The hint dict carries `/S`, `/T`, `/O` offsets into the
-decoded hint stream so a reader walking the optional tables sees a
-fully-formed (if empty) layout. Generic (F.4.5) and named-destination
-(F.4.6) tables are still deferred.
+The hint stream emits the page offset table (F.4.1) with full
+per-page entries (round 13: items 1, 2, 6, 7 — object count, page
+length, content stream offset relative to page start, content stream
+length) at fixed 32-bit width, plus minimal shared-object (F.4.2),
+thumbnail (F.4.3), and outline (F.4.4) header sections. Entry counts
+for the latter three are zero so no per-shared-object / per-thumbnail
+/ per-outline bytes are generated. The hint dict carries `/S`, `/T`,
+`/O` offsets into the decoded hint stream so a reader walking the
+optional tables sees a fully-formed (if empty) layout. Extended
+generic (F.4.5) and embedded-file-stream (F.4.6) tables are still
+deferred — we generate no interactive forms / structure trees /
+embedded files.
 
 ## Deferred
 
@@ -226,8 +230,10 @@ fully-formed (if empty) layout. Generic (F.4.5) and named-destination
   CIDFont built via `oxideav-ttf`/`oxideav-otf`).
 - JPEG passthrough on `ImageRef` (DCTDecode XObject) — needs core
   IR support for "raw codec bytes" alongside the decoded VideoFrame.
-- Generic / named-destination hint tables (F.4.5 / F.4.6) for
-  linearized output.
+- Extended generic hint tables (F.4.5) and embedded-file-stream
+  hint tables (F.4.6) for linearized output — we generate no
+  interactive forms / structure trees / embedded files, so the
+  per-table content would be empty anyway.
 - CMS KARI *unwrap* (DH/ECDH key agreement + RFC 5753 KDFs) — round
   12 surfaces the KARI structure but doesn't unwrap.
 - Transparency groups beyond a per-`Group` `/ca`+`/CA` opacity.
