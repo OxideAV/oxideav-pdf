@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round-18: **CMS `OriginatorInfo` `certs[]` / `crls[]` surface**. The
+  `EnvelopedData.originatorInfo` field (RFC 5652 §10.2.1 — `[0] IMPLICIT
+  OriginatorInfo OPTIONAL`) was previously parsed-and-discarded. New
+  `pubsec::cms::OriginatorInfo { certs: Vec<Vec<u8>>, crls: Vec<Vec<u8>> }`
+  carries each `CertificateChoices` / `RevocationInfoChoices` entry as
+  raw DER (preserving the outer tag + length, so callers can re-parse
+  without reconstruction). New accessor
+  `EnvelopedData::originator_info() -> Option<&OriginatorInfo>` returns
+  `Some` only when the envelope carried a non-empty `OriginatorInfo`.
+  Test fixture `pubsec::cms_build::build_envelope_aes256_with_originator_info`
+  emits the bundled-cert form for the round-trip integration test.
+- Round-18: **`RecipientKeyIdentifier { date, other }` parse + temporal
+  trust-store lookup**. Per RFC 5652 §6.2.2 the RKID SEQUENCE may carry
+  OPTIONAL `date GeneralizedTime` + `other OtherKeyAttribute` fields;
+  round 17 ignored both. Round 18 captures them on the parser side
+  (new `pubsec::cms::OtherKeyAttribute { key_attr_id: Vec<u64>, key_attr:
+  Vec<u8> }`; the `KeyAgreeRecipientId::RecipientKeyIdentifier` arm
+  gains `date: Option<Vec<u8>>` + `other: Option<OtherKeyAttribute>`
+  fields), AND the encode-side fixture (`KariRecipientIdRef::RecipientKeyIdentifier`
+  in `cms_build`) emits both OPTIONAL fields when populated.
+  New `TrustStore::find_with_temporal_validity(ski, instant: Option<&[u8]>)`
+  picks among multiple certs sharing an SKI the one whose validity
+  window contains the supplied instant — useful for long-lived archives
+  where the same recipient identity has been re-certified multiple
+  times (yearly cert rotation preserving the SubjectKey). The
+  `Certificate` parser now also extracts the `(not_before, not_after)`
+  validity window, normalising `UTCTime` to `GeneralizedTime` per RFC
+  5280 §4.1.2.5.1's 1950..2049 pivot so envelope `GeneralizedTime`
+  bytes byte-compare directly against the cert's window. New helper
+  `pubsec::x509::time_within(instant, not_before, not_after) -> bool`.
+- Round-18 tests: 14 new tests — 3 `pubsec::trust` unit tests (temporal
+  pick / temporal-skip-without-window / x509 validity round-trip) +
+  4 `tests/pubsec_round18_originator_info.rs` (round-trip with both
+  certs+crls, envelope-without-OI surfaces None, certs-only without
+  CRLs, default-empty) + 7 `tests/pubsec_round18_rkid_temporal.rs`
+  (RKID round-trip with date+other / date-only / other-only / neither,
+  temporal lookup picks active generation, returns None outside any
+  window, falls back to single-entry lookup when instant is None).
 - Round-17: **Long-term originator cert via TrustStore**. Closes the
   RFC 5652 §6.2.2 `OriginatorIdentifierOrKey` `IssuerAndSerial` /
   `SubjectKeyIdentifier` decoder gap — when a KARI envelope identifies

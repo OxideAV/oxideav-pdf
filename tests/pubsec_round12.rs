@@ -115,6 +115,7 @@ fn multi_cf_two_groups_two_permission_sets() {
             issuer_der: issuer_a,
             serial: serial_a,
             spki_pubkey_bits: None,
+            validity: None,
         },
         priv_a,
     );
@@ -127,6 +128,7 @@ fn multi_cf_two_groups_two_permission_sets() {
             issuer_der: issuer_b,
             serial: serial_b,
             spki_pubkey_bits: None,
+            validity: None,
         },
         priv_b,
     );
@@ -196,6 +198,7 @@ fn multi_cf_surfaces_distinct_permissions_per_recipient() {
             issuer_der: issuer_a,
             serial: vec![0x01],
             spki_pubkey_bits: None,
+            validity: None,
         },
         priv_a,
     );
@@ -211,6 +214,7 @@ fn multi_cf_surfaces_distinct_permissions_per_recipient() {
             issuer_der: issuer_b,
             serial: vec![0x02],
             spki_pubkey_bits: None,
+            validity: None,
         },
         priv_b,
     );
@@ -262,6 +266,7 @@ fn multi_cf_recipient_in_neither_group_returns_none() {
             issuer_der: der::write_sequence(b"O=Stranger"),
             serial: vec![0xFF],
             spki_pubkey_bits: None,
+            validity: None,
         },
         priv_s,
     );
@@ -336,6 +341,8 @@ fn kari_only_envelope_parses_structurally() {
         &[KariRecipientPlain {
             rid: KariRecipientIdRef::RecipientKeyIdentifier {
                 ski: recipient_ski.clone(),
+                date: None,
+                other: None,
             },
             encrypted_key: vec![0xDEu8; 40],
         }],
@@ -351,7 +358,10 @@ fn kari_only_envelope_parses_structurally() {
             assert_eq!(kari.ukm, b"OXIDEAV-UKM-1234");
             assert_eq!(kari.recipient_encrypted_keys.len(), 1);
             match &kari.recipient_encrypted_keys[0].rid {
-                oxideav_pdf::pubsec::cms::KeyAgreeRecipientId::RecipientKeyIdentifier { ski } => {
+                oxideav_pdf::pubsec::cms::KeyAgreeRecipientId::RecipientKeyIdentifier {
+                    ski,
+                    ..
+                } => {
                     assert_eq!(ski, &recipient_ski);
                 }
                 _ => panic!("expected RKID"),

@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use super::x509::Certificate;
+use super::x509::{time_within, Certificate};
 
 /// CHOICE tag for one entry in a [`TrustStore`]. Mirrors the two
 /// long-term-cert forms of `OriginatorIdentifierOrKey`'s CHOICE
@@ -65,6 +65,14 @@ pub enum CertRef {
 pub struct TrustStore {
     by_ias: HashMap<(Vec<u8>, Vec<u8>), Certificate>,
     by_ski: HashMap<Vec<u8>, Certificate>,
+    /// Round-18: multi-entry SKI index — every cert ever inserted via
+    /// [`Self::insert_certificate`] is appended here (along with its
+    /// SKI) so [`Self::find_with_temporal_validity`] can pick among
+    /// multiple certs that share an SKI but have different validity
+    /// windows. The single-entry [`Self::by_ski`] is kept as the fast
+    /// path for callers that don't care about temporal selection — it
+    /// holds the LAST cert inserted under each SKI (last-writer-wins).
+    by_ski_multi: Vec<(Vec<u8>, Certificate)>,
 }
 
 impl TrustStore {
@@ -77,12 +85,16 @@ impl TrustStore {
     /// Insert a certificate under one explicit [`CertRef`] form. Use
     /// [`Self::insert_certificate`] to index a cert under both forms
     /// automatically.
+    ///
+    /// Round 18: SKI inserts also land in the multi-entry SKI index
+    /// consulted by [`Self::find_with_temporal_validity`].
     pub fn insert(&mut self, key: CertRef, cert: Certificate) {
         match key {
             CertRef::IssuerAndSerial { issuer_der, serial } => {
                 self.by_ias.insert((issuer_der, serial), cert);
             }
             CertRef::SubjectKeyIdentifier(ski) => {
+                self.by_ski_multi.push((ski.clone(), cert.clone()));
                 self.by_ski.insert(ski, cert);
             }
         }
@@ -93,9 +105,15 @@ impl TrustStore {
     /// derivable from the cert's SPKI). The two index entries point at
     /// independent clones of the same struct — modifying one after
     /// insertion does not affect the other.
+    ///
+    /// Round 18: also appended to the multi-entry SKI index so multiple
+    /// certs with the same SKI but different validity windows survive
+    /// (the single-entry [`Self::by_ski`] still keeps last-writer-wins
+    /// semantics for the [`Self::lookup`] fast path).
     pub fn insert_certificate(&mut self, cert: Certificate) {
         let ias_key = (cert.issuer_der.clone(), cert.serial.clone());
         if let Some(ski) = cert.subject_key_identifier() {
+            self.by_ski_multi.push((ski.clone(), cert.clone()));
             self.by_ski.insert(ski, cert.clone());
         }
         self.by_ias.insert(ias_key, cert);
@@ -109,6 +127,51 @@ impl TrustStore {
                 self.by_ias.get(&(issuer_der.clone(), serial.clone()))
             }
             CertRef::SubjectKeyIdentifier(ski) => self.by_ski.get(ski),
+        }
+    }
+
+    /// Round-18: pick among multiple certs sharing the same
+    /// `SubjectKeyIdentifier` the one whose validity window contains
+    /// the supplied `instant` (a `GeneralizedTime` ASCII byte string,
+    /// `b"YYYYMMDDHHMMSSZ"` — see [`super::x509::time_within`]). When
+    /// `instant` is `None` (i.e. the envelope's `RecipientKeyIdentifier`
+    /// omitted the OPTIONAL `date` field), this falls back to the
+    /// last-inserted cert under the SKI — equivalent to [`Self::lookup`].
+    ///
+    /// When `instant` is `Some(_)`, every cert sharing the SKI is
+    /// scanned in insertion order; the FIRST one whose validity window
+    /// contains `instant` wins. Certs without a parsed validity window
+    /// are skipped during the temporal scan (so a tester would wind up
+    /// using the [`Self::lookup`] fall-through instead).
+    ///
+    /// Use case: long-lived archives where the same recipient SKI has
+    /// been re-certified multiple times (e.g. yearly cert rotation
+    /// preserving the SubjectKey across roll-overs); the envelope's
+    /// `RecipientKeyIdentifier.date` pins the cert generation that was
+    /// active at envelope-creation time. RFC 5652 §6.2.2.
+    pub fn find_with_temporal_validity(
+        &self,
+        ski: &[u8],
+        instant: Option<&[u8]>,
+    ) -> Option<&Certificate> {
+        match instant {
+            Some(inst) => {
+                for (entry_ski, cert) in &self.by_ski_multi {
+                    if entry_ski.as_slice() != ski {
+                        continue;
+                    }
+                    if let Some((nb, na)) = cert.validity() {
+                        if time_within(inst, nb, na) {
+                            return Some(cert);
+                        }
+                    }
+                }
+                // No cert under this SKI had a window containing the
+                // instant. Don't fall through — the caller specifically
+                // asked for temporal validity.
+                None
+            }
+            None => self.by_ski.get(ski),
         }
     }
 
@@ -134,6 +197,7 @@ mod tests {
             issuer_der: issuer.to_vec(),
             serial: serial.to_vec(),
             spki_pubkey_bits: spki,
+            validity: None,
         }
     }
 
@@ -201,5 +265,102 @@ mod tests {
             })
             .is_some());
         assert_eq!(store.len(), 1);
+    }
+
+    /// Round-18: build two certs with the same SKI but disjoint
+    /// validity windows; verify [`TrustStore::find_with_temporal_validity`]
+    /// picks the cert whose window contains the instant.
+    fn synth_cert_with_validity(
+        issuer: &[u8],
+        serial: &[u8],
+        spki: Vec<u8>,
+        not_before: &[u8],
+        not_after: &[u8],
+    ) -> Certificate {
+        Certificate {
+            issuer_der: issuer.to_vec(),
+            serial: serial.to_vec(),
+            spki_pubkey_bits: Some(spki),
+            validity: Some((not_before.to_vec(), not_after.to_vec())),
+        }
+    }
+
+    #[test]
+    fn find_with_temporal_validity_picks_active_generation() {
+        let mut store = TrustStore::new();
+        // Two certs share the same SPKI bits => same SKI. cert_a is
+        // valid 2024-01-01 .. 2024-12-31; cert_b is valid 2025-01-01 ..
+        // 2025-12-31.
+        let pubkey = b"shared-spki-bits-32-bytes-ZZZZ!!".to_vec();
+        let cert_a = synth_cert_with_validity(
+            b"O=A 2024",
+            &[0x01],
+            pubkey.clone(),
+            b"20240101000000Z",
+            b"20241231235959Z",
+        );
+        let cert_b = synth_cert_with_validity(
+            b"O=B 2025",
+            &[0x02],
+            pubkey.clone(),
+            b"20250101000000Z",
+            b"20251231235959Z",
+        );
+        store.insert_certificate(cert_a.clone());
+        store.insert_certificate(cert_b.clone());
+        let ski = cert_a.subject_key_identifier().expect("SKI");
+
+        // Instant in 2024 → cert_a.
+        let hit_a = store
+            .find_with_temporal_validity(&ski, Some(b"20240601000000Z"))
+            .expect("temporal-A");
+        assert_eq!(hit_a.serial, vec![0x01]);
+
+        // Instant in 2025 → cert_b.
+        let hit_b = store
+            .find_with_temporal_validity(&ski, Some(b"20250601000000Z"))
+            .expect("temporal-B");
+        assert_eq!(hit_b.serial, vec![0x02]);
+
+        // Instant in 2026 (outside both windows) → None.
+        assert!(store
+            .find_with_temporal_validity(&ski, Some(b"20260601000000Z"))
+            .is_none());
+
+        // No instant → fall-through to lookup (last-writer-wins =
+        // cert_b for the single-entry by_ski path).
+        let fallback = store
+            .find_with_temporal_validity(&ski, None)
+            .expect("fallback");
+        assert_eq!(fallback.serial, vec![0x02]);
+    }
+
+    #[test]
+    fn find_with_temporal_validity_skips_certs_without_window() {
+        let mut store = TrustStore::new();
+        let pubkey = b"some-spki-bits-32-bytes-padding!".to_vec();
+        // cert_no_window has SPKI but no validity bytes — temporal
+        // scan must skip it.
+        let cert_no_window = Certificate {
+            issuer_der: b"O=No window".to_vec(),
+            serial: vec![0xAA],
+            spki_pubkey_bits: Some(pubkey.clone()),
+            validity: None,
+        };
+        let cert_with_window = synth_cert_with_validity(
+            b"O=With window",
+            &[0xBB],
+            pubkey.clone(),
+            b"20260101000000Z",
+            b"20261231235959Z",
+        );
+        store.insert_certificate(cert_no_window);
+        store.insert_certificate(cert_with_window.clone());
+        let ski = cert_with_window.subject_key_identifier().expect("SKI");
+
+        let hit = store
+            .find_with_temporal_validity(&ski, Some(b"20260601000000Z"))
+            .expect("temporal-with-window");
+        assert_eq!(hit.serial, vec![0xBB]);
     }
 }

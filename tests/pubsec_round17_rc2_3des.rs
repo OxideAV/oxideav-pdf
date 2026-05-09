@@ -99,6 +99,7 @@ fn rc2_cbc_envelope_decrypts_round_trip() {
             issuer_der,
             serial,
             spki_pubkey_bits: None,
+            validity: None,
         },
         priv_key,
     );
@@ -161,6 +162,7 @@ fn rc2_with_eff_key_64_bits_decrypts() {
             issuer_der,
             serial,
             spki_pubkey_bits: None,
+            validity: None,
         },
         priv_key,
     );
@@ -233,6 +235,7 @@ fn des_ede3_cbc_envelope_decrypts_round_trip() {
             issuer_der,
             serial,
             spki_pubkey_bits: None,
+            validity: None,
         },
         priv_key,
     );

@@ -929,7 +929,7 @@ pub fn match_kari_slot<'a>(
                     return Some(slot);
                 }
             }
-            KeyAgreeRecipientId::RecipientKeyIdentifier { ski } => {
+            KeyAgreeRecipientId::RecipientKeyIdentifier { ski, .. } => {
                 if let Some(our) = our_ski.as_ref() {
                     if ski == our {
                         return Some(slot);
@@ -1269,6 +1269,8 @@ mod tests {
             recipient_encrypted_keys: vec![RecipientEncryptedKey {
                 rid: KeyAgreeRecipientId::RecipientKeyIdentifier {
                     ski: vec![0xCDu8; 20],
+                    date: None,
+                    other: None,
                 },
                 encrypted_key: wrapped,
             }],
@@ -1313,6 +1315,8 @@ mod tests {
             recipient_encrypted_keys: vec![RecipientEncryptedKey {
                 rid: KeyAgreeRecipientId::RecipientKeyIdentifier {
                     ski: vec![0xEEu8; 20],
+                    date: None,
+                    other: None,
                 },
                 encrypted_key: wrapped,
             }],
@@ -1338,6 +1342,8 @@ mod tests {
             recipient_encrypted_keys: vec![RecipientEncryptedKey {
                 rid: KeyAgreeRecipientId::RecipientKeyIdentifier {
                     ski: vec![0xCD; 20],
+                    date: None,
+                    other: None,
                 },
                 encrypted_key: vec![0; 40],
             }],
@@ -1394,6 +1400,8 @@ mod tests {
             recipient_encrypted_keys: vec![RecipientEncryptedKey {
                 rid: KeyAgreeRecipientId::RecipientKeyIdentifier {
                     ski: vec![0x33u8; 20],
+                    date: None,
+                    other: None,
                 },
                 encrypted_key: wrapped,
             }],
@@ -1438,6 +1446,8 @@ mod tests {
             recipient_encrypted_keys: vec![RecipientEncryptedKey {
                 rid: KeyAgreeRecipientId::RecipientKeyIdentifier {
                     ski: vec![0xABu8; 20],
+                    date: None,
+                    other: None,
                 },
                 encrypted_key: wrapped,
             }],
@@ -1614,6 +1624,8 @@ mod tests {
             recipient_encrypted_keys: vec![RecipientEncryptedKey {
                 rid: KeyAgreeRecipientId::RecipientKeyIdentifier {
                     ski: vec![0x33u8; 20],
+                    date: None,
+                    other: None,
                 },
                 encrypted_key: wrapped,
             }],
@@ -1657,6 +1669,8 @@ mod tests {
             recipient_encrypted_keys: vec![RecipientEncryptedKey {
                 rid: KeyAgreeRecipientId::RecipientKeyIdentifier {
                     ski: vec![0xABu8; 20],
+                    date: None,
+                    other: None,
                 },
                 encrypted_key: wrapped,
             }],
@@ -1700,6 +1714,8 @@ mod tests {
             recipient_encrypted_keys: vec![RecipientEncryptedKey {
                 rid: KeyAgreeRecipientId::RecipientKeyIdentifier {
                     ski: vec![0xCDu8; 20],
+                    date: None,
+                    other: None,
                 },
                 encrypted_key: wrapped,
             }],
@@ -1743,6 +1759,8 @@ mod tests {
             recipient_encrypted_keys: vec![RecipientEncryptedKey {
                 rid: KeyAgreeRecipientId::RecipientKeyIdentifier {
                     ski: vec![0xEFu8; 20],
+                    date: None,
+                    other: None,
                 },
                 encrypted_key: wrapped,
             }],

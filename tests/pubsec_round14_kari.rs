@@ -239,6 +239,7 @@ fn build_kari_pubsec_pdf(title: &str) -> (Vec<u8>, PubSecCredential) {
         issuer_der,
         serial,
         spki_pubkey_bits: Some(recipient_pub_sec1),
+        validity: None,
     };
     let credential = PubSecCredential::from_parsed_ec_p256(cert, recipient_scalar);
     (bytes, credential)
@@ -293,6 +294,8 @@ fn kari_p256_ski_form_decodes_with_certificate() {
     let recipient_slot = KariRecipientPlain {
         rid: KariRecipientIdRef::RecipientKeyIdentifier {
             ski: recipient_ski.clone(),
+            date: None,
+            other: None,
         },
         encrypted_key: wrapped_cek,
     };
@@ -383,6 +386,7 @@ fn kari_p256_ski_form_decodes_with_certificate() {
         issuer_der: der::write_sequence(b"O=Other"),
         serial: vec![0xFF],
         spki_pubkey_bits: Some(recipient_pub_sec1),
+        validity: None,
     };
     let credential = PubSecCredential::from_parsed_ec_p256(cert, recipient_scalar);
 
@@ -408,6 +412,7 @@ fn kari_wrong_ec_key_does_not_decrypt() {
         issuer_der: der::write_sequence(b"O=Rogue"),
         serial: vec![0xEE],
         spki_pubkey_bits: Some(rogue_pub),
+        validity: None,
     };
     let bad_cred = PubSecCredential::from_parsed_ec_p256(cert, rogue_scalar);
     let err = read_pdf_to_scene_with_certificate(&pdf, &bad_cred).unwrap_err();

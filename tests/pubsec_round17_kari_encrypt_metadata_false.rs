@@ -98,6 +98,7 @@ fn p256_kari_with_encrypt_metadata_false_round_trips() {
         issuer_der,
         serial,
         spki_pubkey_bits: Some(recipient_pub),
+        validity: None,
     };
     let cred = PubSecCredential::from_parsed_ec(cert, KariCurve::P256, recipient_scalar);
     let opened =
@@ -138,6 +139,7 @@ fn p256_kari_default_encrypt_metadata_true_does_not_emit_flag() {
         issuer_der,
         serial,
         spki_pubkey_bits: Some(recipient_pub),
+        validity: None,
     };
     let cred = PubSecCredential::from_parsed_ec(cert, KariCurve::P256, recipient_scalar);
     let opened =
@@ -176,6 +178,7 @@ fn x25519_kari_with_encrypt_metadata_false_round_trips() {
         issuer_der,
         serial,
         spki_pubkey_bits: Some(recipient_pub),
+        validity: None,
     };
     let cred = PubSecCredential::from_parsed_ec(cert, KariCurve::X25519, scalar_arr.to_vec());
     let opened = read_pdf_to_scene_with_certificate(&pdf, &cred)

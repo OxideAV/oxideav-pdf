@@ -89,7 +89,77 @@ pub fn build_envelope_aes128(
     iv: &[u8; 16],
 ) -> Vec<u8> {
     let encrypted = aes128_cbc_encrypt_padded(cek, iv, plaintext);
-    build_envelope_inner(recipients, &OID_AES128_CBC, Some(iv), &encrypted)
+    build_envelope_inner(recipients, &OID_AES128_CBC, Some(iv), &encrypted, None)
+}
+
+/// **Round-18 test fixture** — build an `EnvelopedData` ContentInfo for
+/// AES-256-CBC, ALSO carrying an `[0] IMPLICIT OriginatorInfo` field
+/// per RFC 5652 §10.2.1. `originator_certs` becomes the `certs[]` SET
+/// (each entry is one CertificateChoices alternative — typically a
+/// raw X.509 v3 SEQUENCE DER); `originator_crls` becomes `crls[]`.
+/// Pass empty slices to omit either field; passing both empty omits
+/// the wrapper entirely (no `[0]` tag emitted).
+///
+/// Used by the round-18 OriginatorInfo round-trip test.
+pub fn build_envelope_aes256_with_originator_info(
+    recipients: &[RecipientPlain],
+    plaintext: &[u8],
+    cek: &[u8; 32],
+    iv: &[u8; 16],
+    originator_certs: &[Vec<u8>],
+    originator_crls: &[Vec<u8>],
+) -> Vec<u8> {
+    let encrypted = aes256_cbc_encrypt_padded(cek, iv, plaintext);
+    let oi = if originator_certs.is_empty() && originator_crls.is_empty() {
+        None
+    } else {
+        Some(build_originator_info(originator_certs, originator_crls))
+    };
+    build_envelope_inner(
+        recipients,
+        &OID_AES256_CBC,
+        Some(iv),
+        &encrypted,
+        oi.as_deref(),
+    )
+}
+
+/// Round-18 helper: encode an `OriginatorInfo` body (the bytes that
+/// land inside the `[0] IMPLICIT` wrapper of `EnvelopedData`).
+///
+/// Per RFC 5652 §10.2.1 the SEQUENCE itself takes the IMPLICIT [0]
+/// tag, so the bytes returned here are the SEQUENCE contents (no outer
+/// SEQUENCE tag). `certs[0] IMPLICIT CertificateSet OPTIONAL` and
+/// `crls[1] IMPLICIT RevocationInfoChoices OPTIONAL` are themselves
+/// IMPLICIT-tagged SETs, so we emit `[0]` / `[1]` constructed
+/// wrappers around the raw entries.
+fn build_originator_info(certs: &[Vec<u8>], crls: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    if !certs.is_empty() {
+        let mut certs_body = Vec::new();
+        for c in certs {
+            certs_body.extend_from_slice(c);
+        }
+        out.extend_from_slice(&super::der::write_tlv(
+            super::der::Class::ContextSpecific,
+            true,
+            0,
+            &certs_body,
+        ));
+    }
+    if !crls.is_empty() {
+        let mut crls_body = Vec::new();
+        for c in crls {
+            crls_body.extend_from_slice(c);
+        }
+        out.extend_from_slice(&super::der::write_tlv(
+            super::der::Class::ContextSpecific,
+            true,
+            1,
+            &crls_body,
+        ));
+    }
+    out
 }
 
 /// Build an `EnvelopedData` ContentInfo for AES-256-CBC.
@@ -100,7 +170,7 @@ pub fn build_envelope_aes256(
     iv: &[u8; 16],
 ) -> Vec<u8> {
     let encrypted = aes256_cbc_encrypt_padded(cek, iv, plaintext);
-    build_envelope_inner(recipients, &OID_AES256_CBC, Some(iv), &encrypted)
+    build_envelope_inner(recipients, &OID_AES256_CBC, Some(iv), &encrypted, None)
 }
 
 /// Build an `EnvelopedData` ContentInfo whose content-encryption
@@ -108,7 +178,7 @@ pub fn build_envelope_aes256(
 /// RC4 key — RFC 5652 §6.3 with the RC4 OID 1.2.840.113549.3.4.
 pub fn build_envelope_rc4(recipients: &[RecipientPlain], plaintext: &[u8], cek: &[u8]) -> Vec<u8> {
     let encrypted = crate::decrypt::rc4(cek, plaintext);
-    build_envelope_inner(recipients, &OID_RC4, None, &encrypted)
+    build_envelope_inner(recipients, &OID_RC4, None, &encrypted, None)
 }
 
 /// **Round-17 read-only test fixture** — build an `EnvelopedData`
@@ -172,6 +242,7 @@ fn build_envelope_inner(
     content_alg_oid: &[u64],
     iv: Option<&[u8; 16]>,
     encrypted_content: &[u8],
+    originator_info_body: Option<&[u8]>,
 ) -> Vec<u8> {
     // RFC 5652 §10.2.1: EnvelopedData version is 2 if any recipient
     // uses the SubjectKeyIdentifier (CHOICE) form, else 0.
@@ -209,9 +280,19 @@ fn build_envelope_inner(
         write_sequence(&body)
     };
 
-    // 3) EnvelopedData = SEQUENCE { version, recipients, eci }.
+    // 3) EnvelopedData = SEQUENCE { version, originatorInfo?, recipients, eci }.
+    // Round-18: emit the optional `[0] IMPLICIT OriginatorInfo` between
+    // version and recipients per RFC 5652 §6.1.
     let enveloped_body = {
         let mut b = write_integer_u64(envelope_version);
+        if let Some(oi_body) = originator_info_body {
+            b.extend_from_slice(&super::der::write_tlv(
+                super::der::Class::ContextSpecific,
+                true,
+                0,
+                oi_body,
+            ));
+        }
         b.extend_from_slice(&ri_set);
         b.extend_from_slice(&eci);
         b
@@ -426,6 +507,12 @@ pub enum OriginatorIdRef {
 
 /// Recipient identifier shape inside one `RecipientEncryptedKey` slot
 /// of a KARI envelope (RFC 5652 §6.2.2 — `KeyAgreeRecipientIdentifier`).
+///
+/// Round 18 surfaces the OPTIONAL `date` (`GeneralizedTime`) + `other`
+/// (`OtherKeyAttribute`) RKID fields on the encode side too — the
+/// `RecipientKeyIdentifier` arm now carries `date` + `other` slots that
+/// emit when populated. Pass `date = None, other = None` for the
+/// round-12 / round-17 behaviour.
 #[derive(Debug, Clone)]
 pub enum KariRecipientIdRef {
     /// Legacy `IssuerAndSerialNumber` form.
@@ -433,10 +520,25 @@ pub enum KariRecipientIdRef {
         issuer_der: Vec<u8>,
         serial: Vec<u8>,
     },
-    /// `[0] IMPLICIT RecipientKeyIdentifier` carrying just the SKI
-    /// (no `date` / `other` attributes — those are OPTIONAL and the
-    /// decoder ignores them anyway).
-    RecipientKeyIdentifier { ski: Vec<u8> },
+    /// `[0] IMPLICIT RecipientKeyIdentifier` (RFC 5652 §6.2.2). The
+    /// `ski` field is mandatory; the `date` (`GeneralizedTime` ASCII
+    /// bytes per RFC 5280 §4.1.2.5.2 — e.g. `b"20260510120000Z"`) and
+    /// `other` (`OtherKeyAttribute` SEQUENCE = OID + optional ANY)
+    /// are emitted only when populated.
+    RecipientKeyIdentifier {
+        /// 20-byte SHA-1 of the recipient cert's SPKI BIT STRING contents
+        /// (RFC 5280 §4.2.1.2 method 1).
+        ski: Vec<u8>,
+        /// Optional `date` field as raw `GeneralizedTime` ASCII bytes
+        /// (e.g. `b"20260510120000Z"` per RFC 5280 §4.1.2.5.2).
+        /// `None` to omit. Round 18.
+        date: Option<Vec<u8>>,
+        /// Optional `other` field — `(OID arcs, raw key_attr bytes)`.
+        /// `None` to omit. The `key_attr` bytes are emitted verbatim
+        /// after the OID (the caller pre-DER-encodes any ANY value).
+        /// Round 18.
+        other: Option<(Vec<u64>, Vec<u8>)>,
+    },
 }
 
 /// One recipient slot inside a KARI envelope. `encrypted_key` is the
@@ -629,11 +731,31 @@ fn build_kari(
                 ias_body.extend_from_slice(&serial_int);
                 write_sequence(&ias_body)
             }
-            KariRecipientIdRef::RecipientKeyIdentifier { ski } => {
+            KariRecipientIdRef::RecipientKeyIdentifier { ski, date, other } => {
                 // [0] IMPLICIT RecipientKeyIdentifier — body is the
-                // RKID's SEQUENCE contents (one OCTET STRING for the
-                // SKI; no date / other).
-                let inner = write_octet_string(ski);
+                // RKID's SEQUENCE contents:
+                //   subjectKeyIdentifier OCTET STRING
+                //   date GeneralizedTime OPTIONAL  (universal tag 24)
+                //   other OtherKeyAttribute OPTIONAL  (SEQUENCE)
+                // Round 18 emits both OPTIONAL fields when populated.
+                let mut inner = write_octet_string(ski);
+                if let Some(date_bytes) = date {
+                    // GeneralizedTime is universal tag 24, primitive
+                    // ASCII-encoded `YYYYMMDDHHMMSSZ` per RFC 5280
+                    // §4.1.2.5.2.
+                    inner.extend_from_slice(&super::der::write_tlv(
+                        super::der::Class::Universal,
+                        false,
+                        24,
+                        date_bytes,
+                    ));
+                }
+                if let Some((oid_arcs, key_attr)) = other {
+                    // OtherKeyAttribute = SEQUENCE { OID, ANY OPTIONAL }.
+                    let mut oka_body = write_oid(oid_arcs);
+                    oka_body.extend_from_slice(key_attr);
+                    inner.extend_from_slice(&write_sequence(&oka_body));
+                }
                 super::der::write_tlv(super::der::Class::ContextSpecific, true, 0, &inner)
             }
         };
@@ -676,6 +798,8 @@ mod tests {
         let rek = KariRecipientPlain {
             rid: KariRecipientIdRef::RecipientKeyIdentifier {
                 ski: recipient_ski.clone(),
+                date: None,
+                other: None,
             },
             encrypted_key: wrapped_cek.clone(),
         };
@@ -701,8 +825,14 @@ mod tests {
                 assert_eq!(kari.ukm, ukm);
                 assert_eq!(kari.recipient_encrypted_keys.len(), 1);
                 match &kari.recipient_encrypted_keys[0].rid {
-                    crate::pubsec::cms::KeyAgreeRecipientId::RecipientKeyIdentifier { ski } => {
+                    crate::pubsec::cms::KeyAgreeRecipientId::RecipientKeyIdentifier {
+                        ski,
+                        date,
+                        other,
+                    } => {
                         assert_eq!(ski, &recipient_ski);
+                        assert!(date.is_none());
+                        assert!(other.is_none());
                     }
                     other => panic!("expected RKID got {other:?}"),
                 }

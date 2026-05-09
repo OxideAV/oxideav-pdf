@@ -1105,6 +1105,7 @@ mod tests {
             issuer_der,
             serial,
             spki_pubkey_bits: None,
+            validity: None,
         }
     }
 
@@ -1191,6 +1192,7 @@ mod tests {
                 issuer_der: vec![],
                 serial: vec![],
                 spki_pubkey_bits: Some(pubkey_bits),
+                validity: None,
             },
             priv_key,
         );

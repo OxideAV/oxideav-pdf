@@ -108,6 +108,7 @@ fn p256_kari_writer_then_reader_round_trip() {
         issuer_der,
         serial,
         spki_pubkey_bits: Some(recipient_pub),
+        validity: None,
     };
     let cred = PubSecCredential::from_parsed_ec(cert, KariCurve::P256, recipient_scalar);
     let opened =
@@ -142,6 +143,7 @@ fn p384_kari_writer_then_reader_round_trip() {
         issuer_der,
         serial,
         spki_pubkey_bits: Some(recipient_pub),
+        validity: None,
     };
     let cred = PubSecCredential::from_parsed_ec(cert, KariCurve::P384, recipient_scalar);
     let opened =
@@ -175,6 +177,7 @@ fn x25519_kari_writer_then_reader_round_trip() {
         issuer_der,
         serial,
         spki_pubkey_bits: Some(recipient_pub),
+        validity: None,
     };
     let cred = PubSecCredential::from_parsed_ec(cert, KariCurve::X25519, recipient_scalar);
     let opened =
@@ -211,6 +214,7 @@ fn wrong_curve_key_does_not_decrypt_writer_kari() {
         issuer_der: der::write_sequence(b"O=Rogue"),
         serial: vec![0xEE],
         spki_pubkey_bits: Some(rogue_pub),
+        validity: None,
     };
     let bad_cred = PubSecCredential::from_parsed_ec(cert, KariCurve::P256, rogue_scalar);
     let err = read_pdf_to_scene_with_certificate(&pdf, &bad_cred).unwrap_err();

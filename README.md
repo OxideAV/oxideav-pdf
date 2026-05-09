@@ -147,6 +147,18 @@ pass it via `read_pdf_to_scene_with_certificate_and_trust_store(pdf,
 RC2-CBC (RFC 2268 + RFC 3217) and DES-EDE3-CBC (3DES, RFC 3370 §5.2)
 envelope content algorithms so PDF 2.0-deprecated archives still open;
 no encode-side support — the writer always uses AES.
+**Round 18** surfaces previously-discarded CMS metadata: the envelope's
+`OriginatorInfo` (RFC 5652 §10.2.1 — `certs[]` / `crls[]`) is now
+exposed via `EnvelopedData::originator_info()`, and the `RecipientKeyIdentifier`'s
+OPTIONAL `date` (`GeneralizedTime`) + `other` (`OtherKeyAttribute`)
+fields are captured by the parser. New
+`TrustStore::find_with_temporal_validity(ski, instant)` uses the RKID
+`date` to pick the cert generation that was active when the envelope
+was authored — useful for long-lived archives where multiple cert
+generations exist for the same SKI. The `Certificate` parser now also
+extracts the `validity` window (notBefore / notAfter), normalising
+`UTCTime` to `GeneralizedTime` per RFC 5280 §4.1.2.5.1's 1950..2049
+pivot for direct byte-comparison.
 
 ## Encryption encode (writer side)
 

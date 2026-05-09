@@ -458,6 +458,7 @@ fn build_pubsec_pdf(profile: Profile, title: &str) -> (Vec<u8>, PubSecCredential
         issuer_der,
         serial,
         spki_pubkey_bits: None,
+        validity: None,
     };
     let credential = PubSecCredential::from_parsed(cert, priv_key);
     (bytes, credential)
@@ -502,6 +503,7 @@ fn wrong_certificate_serial_returns_error() {
             issuer_der: der::write_sequence(b"O=OxideAV pubsec test"),
             serial: vec![0xFF, 0xFF, 0xFF],
             spki_pubkey_bits: None,
+            validity: None,
         },
         priv_key,
     );
@@ -582,6 +584,7 @@ fn writer_s4_then_reader_round_trip() {
             issuer_der: der::write_sequence(issuer),
             serial,
             spki_pubkey_bits: None,
+            validity: None,
         },
         priv_key,
     );
@@ -604,6 +607,7 @@ fn writer_s5_v4_aes128_round_trip() {
             issuer_der: der::write_sequence(issuer),
             serial,
             spki_pubkey_bits: None,
+            validity: None,
         },
         priv_key,
     );
@@ -625,6 +629,7 @@ fn writer_s5_v5_aes256_round_trip() {
             issuer_der: der::write_sequence(issuer),
             serial,
             spki_pubkey_bits: None,
+            validity: None,
         },
         priv_key,
     );
@@ -652,6 +657,7 @@ fn writer_s5_v5_two_recipients_either_can_open() {
             issuer_der: der::write_sequence(issuer_a),
             serial: vec![0xAA],
             spki_pubkey_bits: None,
+            validity: None,
         },
         priv_a,
     );
@@ -669,6 +675,7 @@ fn writer_s5_v5_two_recipients_either_can_open() {
             issuer_der: der::write_sequence(issuer_b),
             serial: vec![0xBB],
             spki_pubkey_bits: None,
+            validity: None,
         },
         priv_b,
     );
@@ -700,6 +707,7 @@ fn writer_s5_v5_ski_recipient_form_round_trip() {
             issuer_der: vec![],
             serial: vec![],
             spki_pubkey_bits: Some(pubkey_bits),
+            validity: None,
         },
         priv_key,
     );
@@ -745,6 +753,7 @@ fn open_unencrypted_pdf_via_certificate_works() {
             issuer_der: der::write_sequence(b"O=anything"),
             serial: vec![0x01],
             spki_pubkey_bits: None,
+            validity: None,
         },
         priv_key,
     );

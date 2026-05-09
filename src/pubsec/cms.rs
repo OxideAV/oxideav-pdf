@@ -197,18 +197,62 @@ pub enum OriginatorId {
     OriginatorKey(OriginatorPublicKey),
 }
 
+/// `OtherKeyAttribute` (RFC 5652 §10.2.7) — opaque application-defined
+/// recipient-key attribute carried inside a `RecipientKeyIdentifier`.
+///
+/// ```asn.1
+/// OtherKeyAttribute ::= SEQUENCE {
+///   keyAttrId    OBJECT IDENTIFIER,
+///   keyAttr      ANY DEFINED BY keyAttrId OPTIONAL
+/// }
+/// ```
+///
+/// We surface the raw bytes (both the OID arc list and the unparsed
+/// attribute body) so callers can interpret application-specific
+/// attributes per their own conventions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OtherKeyAttribute {
+    /// `keyAttrId` OID arcs.
+    pub key_attr_id: Vec<u64>,
+    /// Raw bytes of the optional `keyAttr` ANY value (DER-encoded — the
+    /// caller is expected to parse it per the OID's contract). Empty
+    /// when absent.
+    pub key_attr: Vec<u8>,
+}
+
 /// `KeyAgreeRecipientIdentifier` (RFC 5652 §6.2.2) — identifies one
 /// recipient inside a KARI's `recipientEncryptedKeys` SEQUENCE. Either
 /// the legacy `IssuerAndSerial` form or a `RecipientKeyIdentifier` —
 /// which carries an SKI plus optional `date` + `other` attributes.
+///
+/// Round 18: the OPTIONAL `date` (`GeneralizedTime`) and `other`
+/// (`OtherKeyAttribute`) fields of `RecipientKeyIdentifier` are now
+/// captured rather than silently discarded. The `date` field lets the
+/// originator pin "this envelope is valid for the recipient cert that
+/// was active at this instant" — useful for long-lived archives where
+/// multiple cert generations exist for the same SKI. See
+/// [`super::TrustStore::find_with_temporal_validity`].
 #[derive(Debug, Clone)]
 pub enum KeyAgreeRecipientId {
     /// Legacy `IssuerAndSerialNumber` — same shape as KTRI v0.
     IssuerAndSerial(IssuerAndSerial),
-    /// `[0] IMPLICIT RecipientKeyIdentifier`. We surface the SKI body
-    /// only; the OPTIONAL `date` and `other` fields are skipped (the
-    /// PDF public-key handler doesn't consume them).
-    RecipientKeyIdentifier { ski: Vec<u8> },
+    /// `[0] IMPLICIT RecipientKeyIdentifier` (RFC 5652 §6.2.2). The
+    /// `ski` is the recipient cert's SubjectKeyIdentifier; the OPTIONAL
+    /// `date` (RFC 5280 §4.1.2.5.2 `GeneralizedTime` — `YYYYMMDDHHMMSSZ`)
+    /// and `other` (`OtherKeyAttribute`) fields are surfaced as raw
+    /// bytes / structured arms when present.
+    RecipientKeyIdentifier {
+        /// 20-byte SHA-1 of the recipient cert's SPKI BIT STRING
+        /// contents (RFC 5280 §4.2.1.2 method 1).
+        ski: Vec<u8>,
+        /// OPTIONAL `date` field — raw `GeneralizedTime` ASCII bytes
+        /// per RFC 5280 §4.1.2.5.2 (e.g. `b"20260510120000Z"`). `None`
+        /// when the field was absent. Round 18.
+        date: Option<Vec<u8>>,
+        /// OPTIONAL `other` field — the parsed `OtherKeyAttribute`
+        /// SEQUENCE. `None` when absent. Round 18.
+        other: Option<OtherKeyAttribute>,
+    },
 }
 
 /// `RecipientEncryptedKey` (RFC 5652 §6.2.2) — one wrapped CEK inside
@@ -260,6 +304,53 @@ pub enum RecipientInfoVariant {
     KeyAgree(KeyAgreeRecipientInfo),
 }
 
+/// `OriginatorInfo` (RFC 5652 §10.2.1) — the optional `[0] IMPLICIT`
+/// originator-side certificate + revocation chain that an envelope MAY
+/// carry alongside the recipient-info SET.
+///
+/// ```asn.1
+/// OriginatorInfo ::= SEQUENCE {
+///   certs [0] IMPLICIT CertificateSet OPTIONAL,
+///   crls  [1] IMPLICIT RevocationInfoChoices OPTIONAL
+/// }
+/// ```
+///
+/// Round 18 surfaces this structurally-parsed-but-previously-discarded
+/// chain so callers (e.g. validation pipelines) can inspect the
+/// originator's transmitted certificate / CRL bundle. Each `certs[]`
+/// element is the raw DER bytes of one CertificateChoices alternative —
+/// typically an X.509 v3 `Certificate` SEQUENCE; we surface every
+/// alternative shape as opaque DER so the caller can dispatch on the
+/// outer tag (`SEQUENCE` for the X.509 v3 / v1 form vs context-specific
+/// `[0]..[3]` for the extended-cert / attribute-cert / other-cert
+/// alternatives of RFC 5652 §10.2.2). Each `crls[]` element is the raw
+/// DER of one RevocationInfoChoices alternative — typically an X.509
+/// `CertificateList` SEQUENCE.
+///
+/// The bytes captured for each entry include the outer tag and length —
+/// they are byte-identical to what would be written back by a
+/// re-encoder, so a caller can re-parse the inner X.509 / CRL via the
+/// crate's [`super::x509::Certificate::parse`] helper without
+/// reconstruction.
+#[derive(Debug, Clone, Default)]
+pub struct OriginatorInfo {
+    /// Raw DER bytes of each entry in the OPTIONAL `certs[0]` set.
+    /// Empty when the field was absent.
+    pub certs: Vec<Vec<u8>>,
+    /// Raw DER bytes of each entry in the OPTIONAL `crls[1]` set.
+    /// Empty when the field was absent.
+    pub crls: Vec<Vec<u8>>,
+}
+
+impl OriginatorInfo {
+    /// `true` when both `certs[]` and `crls[]` are empty (i.e. the
+    /// envelope omitted `OriginatorInfo` or carried it as an empty
+    /// SEQUENCE).
+    pub fn is_empty(&self) -> bool {
+        self.certs.is_empty() && self.crls.is_empty()
+    }
+}
+
 /// Parsed CMS `EnvelopedData` reduced to the fields the PDF public-key
 /// handler consumes. Recipients of unsupported variants (`kekri`,
 /// `pwri`, `ori`) are skipped over silently so a pre-existing PDF
@@ -280,6 +371,23 @@ pub struct EnvelopedData {
     /// The encrypted enveloped data (the bytes that decrypt to the
     /// 20-byte seed + 4-byte permissions blob).
     pub encrypted_content: Vec<u8>,
+    /// Round-18: the OPTIONAL originator-side cert / CRL chain
+    /// (RFC 5652 §10.2.1 `OriginatorInfo`). Empty when the envelope
+    /// omitted the field.
+    pub originator_info: OriginatorInfo,
+}
+
+impl EnvelopedData {
+    /// Round-18: surface the originator-side cert + CRL chain when the
+    /// envelope carried `[0] IMPLICIT OriginatorInfo`. Returns `None`
+    /// when the field was absent or both `certs[]`/`crls[]` were empty.
+    pub fn originator_info(&self) -> Option<&OriginatorInfo> {
+        if self.originator_info.is_empty() {
+            None
+        } else {
+            Some(&self.originator_info)
+        }
+    }
 }
 
 /// Parse the `ContentInfo` envelope wrapping an `EnvelopedData` blob,
@@ -328,9 +436,20 @@ pub fn parse_enveloped_data(data: &[u8]) -> Result<EnvelopedData, PdfError> {
             "CMS: unsupported EnvelopedData version {version}"
         )));
     }
-    // `[0] IMPLICIT OriginatorInfo OPTIONAL` — skip if present (we
-    // don't need any of its fields).
-    let (_orig, body) = maybe_read_context(body, 0)?;
+    // `[0] IMPLICIT OriginatorInfo OPTIONAL` — round 18 captures it.
+    // Body shape per RFC 5652 §10.2.1 / §10.2.2:
+    //   OriginatorInfo ::= SEQUENCE {
+    //     certs [0] IMPLICIT CertificateSet OPTIONAL,
+    //     crls  [1] IMPLICIT RevocationInfoChoices OPTIONAL
+    //   }
+    // The `[0] IMPLICIT OriginatorInfo` outer wrapper means the body
+    // bytes are themselves the SEQUENCE contents (the IMPLICIT tag
+    // replaces the SEQUENCE's universal tag).
+    let (orig_opt, body) = maybe_read_context(body, 0)?;
+    let originator_info = match orig_opt {
+        Some(b) => parse_originator_info(b)?,
+        None => OriginatorInfo::default(),
+    };
 
     // RecipientInfos
     let (ri_set, body) = read_set(body)?;
@@ -385,7 +504,61 @@ pub fn parse_enveloped_data(data: &[u8]) -> Result<EnvelopedData, PdfError> {
         all_recipients,
         content_encryption,
         encrypted_content,
+        originator_info,
     })
+}
+
+/// Round-18: parse an `OriginatorInfo` body (the bytes inside the
+/// `[0] IMPLICIT` wrapper of `EnvelopedData`). Both the `certs[0]` and
+/// `crls[1]` fields are OPTIONAL `IMPLICIT` SETs of `CertificateChoices` /
+/// `RevocationInfoChoices`. We capture every entry's raw DER bytes
+/// (including the outer tag/length) so callers can re-parse them
+/// without reconstructing the encoding.
+fn parse_originator_info(body: &[u8]) -> Result<OriginatorInfo, PdfError> {
+    let mut cursor = body;
+    let mut info = OriginatorInfo::default();
+    // `[0] IMPLICIT CertificateSet` — an IMPLICIT SET, so its tag is
+    // `[0]` constructed (the SET's universal tag is replaced).
+    if !cursor.is_empty() {
+        let (peek, _) = super::der::read_tlv(cursor)?;
+        if peek.class == Class::ContextSpecific && peek.tag_number == 0 {
+            let (set_body, after) = super::der::read_tlv(cursor)?;
+            info.certs = split_set_into_raw_entries(set_body.body)?;
+            cursor = after;
+        }
+    }
+    // `[1] IMPLICIT RevocationInfoChoices` — same wrapping.
+    if !cursor.is_empty() {
+        let (peek, _) = super::der::read_tlv(cursor)?;
+        if peek.class == Class::ContextSpecific && peek.tag_number == 1 {
+            let (set_body, after) = super::der::read_tlv(cursor)?;
+            info.crls = split_set_into_raw_entries(set_body.body)?;
+            cursor = after;
+        }
+    }
+    if !cursor.is_empty() {
+        return Err(PdfError::other(
+            "CMS: trailing bytes after OriginatorInfo SEQUENCE body",
+        ));
+    }
+    Ok(info)
+}
+
+/// Split a SET body (or any concatenation of TLVs) into a Vec where
+/// each entry is the raw DER bytes (tag + length + body) of one TLV.
+/// Used by [`parse_originator_info`] to surface `certs[]` / `crls[]`
+/// alternatives without dispatching on the inner CHOICE.
+fn split_set_into_raw_entries(set_body: &[u8]) -> Result<Vec<Vec<u8>>, PdfError> {
+    let mut out = Vec::new();
+    let mut cursor = set_body;
+    while !cursor.is_empty() {
+        let before_len = cursor.len();
+        let (_tlv, after) = super::der::read_tlv(cursor)?;
+        let consumed = before_len - after.len();
+        out.push(cursor[..consumed].to_vec());
+        cursor = after;
+    }
+    Ok(out)
 }
 
 /// Parse a single `RecipientInfo` element from the SET body. Returns
@@ -670,13 +843,66 @@ fn parse_recipient_encrypted_key(data: &[u8]) -> Result<(RecipientEncryptedKey, 
     let (rid, after_rid) = if peek.class == Class::ContextSpecific && peek.tag_number == 0 {
         // [0] IMPLICIT RecipientKeyIdentifier — body is the RKID's
         // SEQUENCE contents. Consume the [0] TLV from the parent
-        // body to compute `after`, then peel its body for the SKI.
+        // body to compute `after`, then peel its body for the SKI +
+        // the round-18 OPTIONAL `date` and `other` fields.
+        //
+        //   RecipientKeyIdentifier ::= SEQUENCE {
+        //     subjectKeyIdentifier SubjectKeyIdentifier,  -- OCTET STRING
+        //     date GeneralizedTime OPTIONAL,
+        //     other OtherKeyAttribute OPTIONAL
+        //   }
         let (rkid_tlv, after) = super::der::read_tlv(rek_body)?;
-        let (ski, _ignored) = read_octet_string(rkid_tlv.body)?;
-        // The rest of the RKID body (date / other) is skipped — the
-        // PDF public-key handler doesn't consume it.
+        let (ski, after_ski) = read_octet_string(rkid_tlv.body)?;
+        let mut cursor = after_ski;
+        let mut date: Option<Vec<u8>> = None;
+        // GeneralizedTime is universal tag 24 (RFC 5280 §4.1.2.5.2).
+        const TAG_GENERALIZED_TIME: u32 = 24;
+        if !cursor.is_empty() {
+            let (peek_dt, _) = super::der::read_tlv(cursor)?;
+            if peek_dt.class == Class::Universal && peek_dt.tag_number == TAG_GENERALIZED_TIME {
+                let (dt_tlv, after_dt) = super::der::read_tlv(cursor)?;
+                date = Some(dt_tlv.body.to_vec());
+                cursor = after_dt;
+            }
+        }
+        let mut other: Option<OtherKeyAttribute> = None;
+        if !cursor.is_empty() {
+            // Either the next TLV is the `other` SEQUENCE, or there is
+            // trailing junk we should reject. RFC 5652 §6.2.2 marks
+            // `other` as a SEQUENCE with `keyAttrId` OID + optional
+            // `keyAttr` ANY.
+            let (peek_other, _) = super::der::read_tlv(cursor)?;
+            if peek_other.class == Class::Universal
+                && peek_other.tag_number == super::der::tag::SEQUENCE
+            {
+                let (oka_body, after_oka) = read_sequence(cursor)?;
+                let (oid_arcs, after_oid) = read_oid(oka_body)?;
+                let key_attr = after_oid.to_vec();
+                other = Some(OtherKeyAttribute {
+                    key_attr_id: oid_arcs,
+                    key_attr,
+                });
+                cursor = after_oka;
+            } else {
+                return Err(PdfError::other(format!(
+                    "CMS: RecipientKeyIdentifier trailing TLV class={:?} tag={} \
+                     is neither GeneralizedTime nor OtherKeyAttribute SEQUENCE",
+                    peek_other.class, peek_other.tag_number,
+                )));
+            }
+        }
+        if !cursor.is_empty() {
+            return Err(PdfError::other(
+                "CMS: RecipientKeyIdentifier has trailing bytes after \
+                 (subjectKeyIdentifier, date?, other?)",
+            ));
+        }
         (
-            KeyAgreeRecipientId::RecipientKeyIdentifier { ski: ski.to_vec() },
+            KeyAgreeRecipientId::RecipientKeyIdentifier {
+                ski: ski.to_vec(),
+                date,
+                other,
+            },
             after,
         )
     } else {

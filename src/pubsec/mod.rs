@@ -993,6 +993,7 @@ mod tests {
             issuer_der: issuer.to_vec(),
             serial: serial.to_vec(),
             spki_pubkey_bits: None,
+            validity: None,
         }
     }
 
