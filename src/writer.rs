@@ -761,6 +761,81 @@ pub fn write_pdf_from_scene_pubsec_multi_cf(
     Ok(out)
 }
 
+/// Render a [`Scene`] in pages mode as a multi-page public-key /
+/// **KARI** (key agreement) encrypted PDF — round 15 (symmetric to
+/// the round-14 reader path
+/// [`crate::read_pdf_to_scene_with_certificate`] for envelopes whose
+/// `RecipientInfos` SET carries `KeyAgreeRecipientInfo` slots).
+///
+/// Each [`crate::PubSecKariConfig::recipients`] entry contributes one
+/// CMS `EnvelopedData` to the `/Recipients` array, with its own
+/// `KeyAgreeRecipientInfo` (curve + ephemeral keypair + KDF + AES-KW
+/// wrap of the shared CEK). All envelopes wrap the SAME content
+/// encryption key, so any matching recipient recovers the same
+/// AES-256 file key derived from `SHA-256(seed ‖ all envelope blobs)`
+/// per ISO 32000-2 §7.6.5.3.
+///
+/// Provenance: ISO 32000-1 §7.6.4 + ISO 32000-2 §7.6.5 + RFC 5652
+/// §6.2.2 + RFC 5753 §7.1 + RFC 8418 §2 + RFC 3394.
+pub fn write_pdf_from_scene_pubsec_kari(
+    scene: &Scene,
+    config: &crate::pubsec::PubSecKariConfig,
+) -> Result<Vec<u8>, PdfError> {
+    let pages = scene
+        .pages
+        .as_ref()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            PdfError::other(
+                "write_pdf_from_scene_pubsec_kari: scene is not in pages mode (scene.pages is None or empty)",
+            )
+        })?;
+
+    struct Rendered<'a> {
+        frame: &'a VectorFrame,
+        width: f32,
+        height: f32,
+        content_bytes: Vec<u8>,
+        resources: ResourceCollector,
+    }
+    let rendered: Vec<Rendered<'_>> = pages
+        .iter()
+        .map(|page| {
+            let (content_bytes, resources) = render_frame(&page.content);
+            Rendered {
+                frame: &page.content,
+                width: page.width,
+                height: page.height,
+                content_bytes,
+                resources,
+            }
+        })
+        .collect();
+    let inputs: Vec<PageInput<'_>> = rendered
+        .into_iter()
+        .map(|r| PageInput {
+            width: r.width,
+            height: r.height,
+            content_bytes: r.content_bytes,
+            resources: r.resources,
+            frame: r.frame,
+        })
+        .collect();
+
+    let mut doc = Document::new();
+    let _ = build_pages(&mut doc, inputs);
+    if has_metadata(&scene.metadata) {
+        let info_id = doc.add(Object::Dict(build_info_dict(&scene.metadata)));
+        doc.info = Some(info_id);
+    }
+    let pubsec_state = crate::pubsec::PubSecEncryptionState::build_kari(config)?;
+    doc.encryption = Some(pubsec_state.into_encryption_state());
+
+    let mut out = Vec::with_capacity(4096);
+    doc.write_to(&mut out)?;
+    Ok(out)
+}
+
 /// Walk a single [`VectorFrame`] into a content stream + the per-page
 /// [`ResourceCollector`]. Shared by [`write_pdf`] and
 /// [`write_pdf_from_scene`].

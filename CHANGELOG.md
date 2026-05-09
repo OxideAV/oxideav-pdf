@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round-15: **KARI multi-curve + writer-side encode**. Extends the
+  round-14 KARI unwrap path to **P-384** (`dhSinglePass-stdDH-sha384kdf-scheme`,
+  OID `1.3.132.1.11.2`, X9.63-SHA-384 KDF) and **X25519** (RFC 8418
+  §2.1 — secg-scheme `1.3.132.1.11.1` X9.63-SHA-256 binding +
+  `id-X25519` `1.3.101.110` curve OID). New `pubsec::kari::KariCurve`
+  enum + `EcRecipient::p256/p384/x25519` constructors + generic
+  `x963_kdf::<H: sha2::Digest>` (the SHA-256 wrapper
+  `x963_kdf_sha256` is kept). Single dispatcher `unwrap_kari` routes
+  on the recipient's curve; the round-14 `unwrap_kari_p256` entry
+  point still works. New `PubSecCredential::from_parsed_ec(cert,
+  curve, scalar)` + `with_ec_scalar(curve, scalar)` (round-14
+  `_p256` variants forward here). Provenance: RFC 5753 §7.1.4 + RFC
+  8418 §2.1 + RFC 8410 §3 + RFC 7748 §5 only. New deps: `p384` 0.13
+  (`ecdh` + `std`) + `x25519-dalek` 2 (`static_secrets`).
+- Round-15 writer: **`write_pdf_from_scene_pubsec_kari(scene, &PubSecKariConfig)`**.
+  Symmetric to the round-11 `write_pdf_from_scene_pubsec_encrypted`
+  KTRI path. Each `KariRecipient { curve, issuer/serial, recipient_pub_bytes,
+  ephemeral_scalar }` becomes one CMS `EnvelopedData` carrying its
+  own `KeyAgreeRecipientInfo` (one per recipient because the KEA
+  pinpoints one curve per KARI); all envelopes wrap the same shared
+  CEK with AES-256-WRAP and decrypt to the same AES-256 file content.
+  New public types: `PubSecKariConfig::aes256(recipients)` +
+  `KariRecipient::p256/p384/x25519` + `PubSecEncryptionState::build_kari`.
+  The round-15 `wrap_cek_for_recipient(curve, ephemeral_scalar,
+  recipient_pub_bytes, ukm, cek, wrap)` is the public dispatch
+  helper used by `build_kari` (the round-14 P-256-only
+  `wrap_cek_for_p256_recipient` forwards here).
+- Round-15 tests: 8 new tests — 4 `pubsec::kari` unit tests
+  (P-384 + AES-256 KW round trip, X25519 + AES-128 KW round trip,
+  X9.63-SHA-384 KDF one-block, curve dispatch consistency) + 4
+  integration tests in `tests/pubsec_round15_kari.rs` (P-256 / P-384 /
+  X25519 writer→reader round-trips through the new
+  `write_pdf_from_scene_pubsec_kari`, plus a wrong-key negative path).
+
 - Round-14: **KARI unwrap** (RFC 5753 §7.1 + RFC 3394) — closes the
   round-12 deferral. P-256 ECDH key agreement + RFC 5753 §7.1.2 X9.63
   KDF with SHA-256 + RFC 3394 AES Key Wrap (128 / 192 / 256 bit) for

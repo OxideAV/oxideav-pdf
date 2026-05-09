@@ -62,10 +62,28 @@ rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
 # Adobe + standard-PDF tools' enveloped data. The `ecdh` feature
 # enables the diffie_hellman primitive that produces the shared
 # secret `Z`. The crate is constant-time pure-Rust on top of
-# `elliptic-curve`; no `*-sys`. P-384 / P-521 / X25519 stay deferred.
+# `elliptic-curve`; no `*-sys`.
 p256 = { version = "0.13", default-features = false, features = [
     "ecdh",
     "std",
+] }
+# Pure-Rust NIST P-384 (secp384r1) curve (RustCrypto). Round-15
+# extends KARI unwrap + write to P-384 ECDH bound to the X9.63
+# SHA-384 KDF per RFC 5753 §7.1.4 (`dhSinglePass-stdDH-sha384kdf-scheme`,
+# OID 1.3.132.1.11.2). Same family + API as `p256`.
+p384 = { version = "0.13", default-features = false, features = [
+    "ecdh",
+    "std",
+] }
+# Pure-Rust X25519 ECDH (dalek-cryptography). Round-15 adds the X25519
+# KARI variant per RFC 8418 §2.1 (CMS uses ANSI-X9.63 KDF over X25519
+# with the secg-scheme OIDs in the same `1.3.132.1.11.x` family that
+# RFC 5753 defines for the NIST curves; the `id-X25519` OID 1.3.101.110
+# names the curve inside the OriginatorPublicKey AlgorithmIdentifier).
+# `static_secrets` enables `StaticSecret::from([u8; 32])` used by both
+# the unwrap and the writer-side ephemeral derivation paths.
+x25519-dalek = { version = "2", default-features = false, features = [
+    "static_secrets",
 ] }
 # Pure-Rust AES Key Wrap (RustCrypto). Round-14 KARI unwrap uses
 # RFC 3394 AES-KW (AES-128 / AES-192 / AES-256) to unwrap the CEK

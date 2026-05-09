@@ -58,9 +58,9 @@ pub mod writer;
 
 pub use error::PdfError;
 pub use pubsec::{
-    open_with_certificate, open_with_certificate_with_permissions, PubSecCfGroup, PubSecCredential,
-    PubSecEncoderConfig, PubSecEncryptionState, PubSecMatch, PubSecMultiCfConfig, PubSecRecipient,
-    PubSecSubFilter,
+    open_with_certificate, open_with_certificate_with_permissions, KariRecipient, PubSecCfGroup,
+    PubSecCredential, PubSecEncoderConfig, PubSecEncryptionState, PubSecKariConfig, PubSecMatch,
+    PubSecMultiCfConfig, PubSecRecipient, PubSecSubFilter,
 };
 pub use reader::{
     read_pdf_to_scene, read_pdf_to_scene_with_certificate, read_pdf_to_scene_with_password,
@@ -69,8 +69,8 @@ pub use writer::{
     write_pdf, write_pdf_from_scene, write_pdf_from_scene_encrypted,
     write_pdf_from_scene_linearized, write_pdf_from_scene_object_stream,
     write_pdf_from_scene_object_stream_encrypted, write_pdf_from_scene_pubsec_encrypted,
-    write_pdf_from_scene_pubsec_multi_cf, write_pdf_from_scene_xref_stream,
-    write_pdf_incremental_update,
+    write_pdf_from_scene_pubsec_kari, write_pdf_from_scene_pubsec_multi_cf,
+    write_pdf_from_scene_xref_stream, write_pdf_incremental_update,
 };
 
 use oxideav_core::{

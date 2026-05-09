@@ -736,6 +736,267 @@ fn build_encrypt_dict(
     Ok(dict)
 }
 
+// ───────── Round-15: writer-side KARI envelope ─────────
+
+/// One KARI recipient slot the writer will emit. The recipient is
+/// identified by their X.509 certificate (issuer + serial — KARI
+/// `RecipientEncryptedKey` IAS form), and `recipient_pub_bytes` carries
+/// their public key in the curve's encoded form (SEC1 uncompressed for
+/// P-256 / P-384, raw 32-byte u-coordinate for X25519).
+#[derive(Debug, Clone)]
+pub struct KariRecipient {
+    /// Recipient certificate's issuer DER (a SEQUENCE — same shape as
+    /// [`super::cms_build::RecipientIdRef::IssuerAndSerial::issuer_der`]).
+    pub issuer_der: Vec<u8>,
+    /// Recipient cert's serial number INTEGER body bytes.
+    pub serial: Vec<u8>,
+    /// Curve the recipient's keypair lives on. Determines the KEA OID
+    /// + KDF hash + ephemeral keypair shape the writer will emit.
+    pub curve: super::kari::KariCurve,
+    /// Recipient's encoded public key. SEC1 uncompressed point for
+    /// NIST curves; raw 32-byte u-coordinate for X25519.
+    pub recipient_pub_bytes: Vec<u8>,
+    /// Ephemeral private scalar used for THIS recipient's wrap. Each
+    /// recipient gets its own ephemeral keypair so the writer can mix
+    /// curves across recipients in a single envelope (one KARI per
+    /// curve / ephemeral). Tests pin to a deterministic value;
+    /// production callers should use a fresh random scalar per
+    /// recipient.
+    pub ephemeral_scalar: Vec<u8>,
+}
+
+impl KariRecipient {
+    /// Build a P-256 recipient.
+    pub fn p256(
+        issuer_der: Vec<u8>,
+        serial: Vec<u8>,
+        recipient_pub_sec1: Vec<u8>,
+        ephemeral_scalar: Vec<u8>,
+    ) -> Self {
+        Self {
+            issuer_der,
+            serial,
+            curve: super::kari::KariCurve::P256,
+            recipient_pub_bytes: recipient_pub_sec1,
+            ephemeral_scalar,
+        }
+    }
+
+    /// Build a P-384 recipient.
+    pub fn p384(
+        issuer_der: Vec<u8>,
+        serial: Vec<u8>,
+        recipient_pub_sec1: Vec<u8>,
+        ephemeral_scalar: Vec<u8>,
+    ) -> Self {
+        Self {
+            issuer_der,
+            serial,
+            curve: super::kari::KariCurve::P384,
+            recipient_pub_bytes: recipient_pub_sec1,
+            ephemeral_scalar,
+        }
+    }
+
+    /// Build an X25519 recipient.
+    pub fn x25519(
+        issuer_der: Vec<u8>,
+        serial: Vec<u8>,
+        recipient_pub_x25519: Vec<u8>,
+        ephemeral_scalar: Vec<u8>,
+    ) -> Self {
+        Self {
+            issuer_der,
+            serial,
+            curve: super::kari::KariCurve::X25519,
+            recipient_pub_bytes: recipient_pub_x25519,
+            ephemeral_scalar,
+        }
+    }
+}
+
+/// Configuration for a writer-side KARI public-key envelope. AES-256
+/// content + AES-256-WRAP (the round-15 baseline; AES-128 / AES-192
+/// wrap variants are reachable through [`super::kari::wrap_cek_for_recipient`]
+/// directly if a caller needs them).
+///
+/// Each recipient gets its own KARI in the RecipientInfos SET — that's
+/// the only way to mix curves cleanly because a single KARI's
+/// `keyEncryptionAlgorithm` binds one (curve, KDF) pair (RFC 5652
+/// §6.2.2 + RFC 5753 §3.1). All KARIs wrap the same CEK so any
+/// matching recipient recovers the same AES-256 file content.
+#[derive(Debug, Clone)]
+pub struct PubSecKariConfig {
+    /// 32-bit signed permissions value (§7.6.3.2 Table 22).
+    pub p: i32,
+    /// Whether the document metadata stream is encrypted. Plumbed into
+    /// both the `/EncryptMetadata` dict entry and the `0xFFFFFFFF`
+    /// opt-in tail of the SHA-256 file-key derivation when false.
+    pub encrypt_metadata: bool,
+    /// One [`KariRecipient`] per recipient certificate.
+    pub recipients: Vec<KariRecipient>,
+    /// Optional UKM (UserKeyingMaterial) mixed into the X9.63 KDF on
+    /// both sides. Same UKM is used for every recipient's wrap (RFC
+    /// 5753 §7.2 — the UKM is per-KARI). `None` for "absent".
+    pub ukm: Option<Vec<u8>>,
+    /// 20-byte seed prefixed to the envelope plaintext. Tests pin for
+    /// determinism.
+    pub seed: [u8; 20],
+    /// 32-byte content-encryption key. AES-256.
+    pub cek: [u8; 32],
+    /// AES-256-CBC envelope IV.
+    pub envelope_iv: [u8; 16],
+    /// Per-object AES IV.
+    pub aes_iv: [u8; 16],
+}
+
+impl PubSecKariConfig {
+    /// Default config for AES-256 KARI with deterministic test
+    /// constants. Production callers should override `seed`, `cek`,
+    /// `envelope_iv`, `aes_iv`, and each recipient's `ephemeral_scalar`
+    /// with fresh random bytes.
+    pub fn aes256(recipients: Vec<KariRecipient>) -> Self {
+        Self {
+            p: -4,
+            encrypt_metadata: true,
+            recipients,
+            ukm: None,
+            seed: [0x6Au8; 20],
+            cek: [0x9Cu8; 32],
+            envelope_iv: [0x77; 16],
+            aes_iv: [0; 16],
+        }
+    }
+}
+
+impl PubSecEncryptionState {
+    /// Round-15: build the writer-side state for a KARI-encrypted PDF.
+    /// Emits one CMS `EnvelopedData` containing one
+    /// `KeyAgreeRecipientInfo` per recipient (each one sized to its own
+    /// curve), all wrapping the same shared CEK with AES-256-WRAP.
+    /// Symmetric to the round-14 reader path: the resulting
+    /// `/Encrypt` dict opens via [`super::open_with_certificate`] when
+    /// the recipient passes a [`PubSecCredential`] carrying their EC
+    /// scalar.
+    pub fn build_kari(config: &PubSecKariConfig) -> Result<Self, PdfError> {
+        if config.recipients.is_empty() {
+            return Err(PdfError::other(
+                "PDF pubsec KARI encode: at least one recipient is required",
+            ));
+        }
+        // Plaintext: 20-byte seed + 4-byte permissions (V=5 / AES-256
+        // takes MSB-first per ISO 32000-2 §7.6.5.3).
+        let mut plaintext = Vec::with_capacity(24);
+        plaintext.extend_from_slice(&config.seed);
+        plaintext.extend_from_slice(&(config.p as u32).to_be_bytes());
+
+        // Build each recipient's KARI: ephemeral keypair, ECDH against
+        // recipient pub, KDF, AES-KW. Each KARI carries one
+        // RecipientEncryptedKey because the KEA pinpoints one curve.
+        let wrap = super::kari::WrapAlgorithm::Aes256;
+        let mut karis: Vec<Vec<u8>> = Vec::with_capacity(config.recipients.len());
+        for r in &config.recipients {
+            if r.recipient_pub_bytes.len() != r.curve.pub_point_len() {
+                return Err(PdfError::other(format!(
+                    "PDF pubsec KARI encode: recipient pub_bytes {} != expected {} for {:?}",
+                    r.recipient_pub_bytes.len(),
+                    r.curve.pub_point_len(),
+                    r.curve
+                )));
+            }
+            let (originator_pub, wrapped) = super::kari::wrap_cek_for_recipient(
+                r.curve,
+                &r.ephemeral_scalar,
+                &r.recipient_pub_bytes,
+                config.ukm.as_deref(),
+                &config.cek,
+                wrap,
+            )?;
+            // KEA params = AlgorithmIdentifier of the wrap.
+            let kea_params = super::der::write_sequence(&super::der::write_oid(wrap.oid()));
+            let originator = super::cms_build::OriginatorIdRef::OriginatorKey {
+                algorithm_oid: r.curve.algorithm_oid().to_vec(),
+                algorithm_params: r.curve.algorithm_params(),
+                public_key: originator_pub,
+            };
+            let recipient_slot = super::cms_build::KariRecipientPlain {
+                rid: super::cms_build::KariRecipientIdRef::IssuerAndSerial {
+                    issuer_der: r.issuer_der.clone(),
+                    serial: r.serial.clone(),
+                },
+                encrypted_key: wrapped,
+            };
+            // We build ONE envelope per KARI with the same CEK + IV
+            // for the content; the per-recipient envelope's CMS layout
+            // carries just that recipient's KARI. Then we splice all
+            // KARIs into the one outer EnvelopedData below.
+            let envelope = super::cms_build::build_envelope_kari_aes256(
+                &originator,
+                config.ukm.as_deref(),
+                r.curve.kea_oid(),
+                &kea_params,
+                &[recipient_slot],
+                &plaintext,
+                &config.cek,
+                &config.envelope_iv,
+            );
+            karis.push(envelope);
+        }
+        // The /Recipients array carries one envelope blob per
+        // recipient — every reader hashes over the entire ordered set
+        // to derive the file key, so all recipients converge on the
+        // same AES-256 file key (the seed is identical across
+        // envelopes via the shared `config.seed`).
+        let key_length_bits = 256usize;
+        let file_key = derive_file_key(
+            PubSecSubFilter::Pkcs7S5V5,
+            &config.seed,
+            &karis,
+            config.encrypt_metadata,
+            key_length_bits,
+        );
+        let handler = StandardHandler {
+            key: file_key,
+            method: CryptMethod::Aes256,
+            revision: 6,
+        };
+        // /Encrypt dict — same shape as the round-11/12 KTRI s5/V=5
+        // path, just with the KARI envelopes in /Recipients.
+        let recipients_arr = Object::Array(
+            karis
+                .iter()
+                .map(|e| Object::LiteralString(e.clone()))
+                .collect(),
+        );
+        let std_cf = Dict::new()
+            .with("Type", Object::Name("CryptFilter".into()))
+            .with("CFM", Object::Name("AESV3".into()))
+            .with("Length", Object::Integer(32))
+            .with("Recipients", recipients_arr.clone());
+        let cf = Dict::new().with("DefaultCryptFilter", Object::Dict(std_cf));
+        let mut dict = Dict::new()
+            .with("Filter", Object::Name("Adobe.PPKLite".into()))
+            .with("SubFilter", Object::Name("adbe.pkcs7.s5".into()))
+            .with("V", Object::Integer(5))
+            .with("R", Object::Integer(6))
+            .with("Length", Object::Integer(256))
+            .with("P", Object::Integer(config.p as i64))
+            .with("CF", Object::Dict(cf))
+            .with("StmF", Object::Name("DefaultCryptFilter".into()))
+            .with("StrF", Object::Name("DefaultCryptFilter".into()))
+            .with("Recipients", recipients_arr);
+        if !config.encrypt_metadata {
+            dict.set("EncryptMetadata", Object::Bool(false));
+        }
+        Ok(PubSecEncryptionState {
+            handler,
+            encrypt_dict: dict,
+            aes_iv: config.aes_iv,
+            file_id: b"OXIDEAV-PUBSEC-KARI-ID-12345!XYZ".to_vec(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::open_with_certificate;

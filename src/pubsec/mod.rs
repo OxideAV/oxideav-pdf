@@ -87,18 +87,38 @@
 //! * **KARI unwrap** (RFC 5753 §7.1 + RFC 3394) — closes the round-12
 //!   deferral. P-256 ECDH + X9.63-SHA-256 KDF + AES Key Wrap (128 /
 //!   192 / 256 bit). Surfaces as the `OID_DH_SINGLE_PASS_STDDH_SHA256_KDF`
-//!   KEA OID; non-P-256 / non-SHA-256 KDF combinations are still
-//!   silently skipped (a future round adds P-384 + P-521 + X25519).
+//!   KEA OID.
 //! * **`PubSecCredential::from_parsed_ec_p256`** + `with_ec_p256_scalar`
 //!   constructors — populate the EC private scalar slot so a
 //!   credential can open both KTRI (RSA) and KARI (ECDH) envelopes.
+//!
+//! ## Round-15 additions
+//!
+//! * **P-384 + X25519 KARI variants** (RFC 5753 §7.1.4 +
+//!   RFC 8418 §2.1) — `dhSinglePass-stdDH-sha384kdf-scheme` (P-384) +
+//!   X25519 with the secg-scheme `dhSinglePass-stdDH-sha256kdf-scheme`
+//!   binding. Generic [`kari::x963_kdf`] + curve-tagged
+//!   [`kari::EcRecipient`]; the legacy P-256 entry point
+//!   [`kari::unwrap_kari_p256`] still works.
+//! * **`PubSecCredential::from_parsed_ec`** + `with_ec_scalar` —
+//!   populate the EC slot for any supported curve via
+//!   [`kari::KariCurve`]. The round-14 `_p256` variants forward here.
+//! * **Writer-side `crate::write_pdf_from_scene_pubsec_kari`** — the
+//!   symmetric encode-side helper for KARI envelopes (the round-11/12
+//!   pubsec writer was KTRI-only). Each [`crate::KariRecipient`] picks
+//!   the curve + cert; the writer derives the ephemeral keypair, runs
+//!   the right ECDH primitive, KDFs the KEK, and AES-KWs the CEK.
 //!
 //! ## Remaining deferrals
 //!
 //! * `RC2 / 3DES / DES` envelope content algorithms (deprecated in
 //!   PDF 2.0; we accept RC4 / AES-128 / AES-256 only).
-//! * P-384 / P-521 / X25519 KARI variants (only P-256 +
-//!   `dhSinglePass-stdDH-sha256kdf-scheme` lands in round 14).
+//! * P-521 KARI (`dhSinglePass-stdDH-sha512kdf-scheme`).
+//! * RFC 8418 §2.2 HKDF binding for X25519 / X448 (`smime-alg 19/20/21`
+//!   OIDs) and X448.
+//! * Long-term-cert originator path (`OriginatorId::IssuerAndSerial` /
+//!   `SubjectKeyIdentifier`) — current path requires the
+//!   `OriginatorPublicKey` in-band form.
 
 pub mod cms;
 pub mod cms_build;
@@ -108,7 +128,8 @@ pub mod kari;
 pub mod x509;
 
 pub use encode::{
-    PubSecCfGroup, PubSecEncoderConfig, PubSecEncryptionState, PubSecMultiCfConfig, PubSecRecipient,
+    KariRecipient, PubSecCfGroup, PubSecEncoderConfig, PubSecEncryptionState, PubSecKariConfig,
+    PubSecMultiCfConfig, PubSecRecipient,
 };
 
 use crate::decrypt::{CryptMethod, StandardHandler};
@@ -226,13 +247,19 @@ fn stmf_cfm(d: &Dict) -> Option<String> {
 /// envelopes matching the same certificate can also be unwrapped (RFC
 /// 5753 §7.1 + RFC 3394). When absent, KARI envelopes are skipped
 /// (the original round-12 behaviour).
+///
+/// Round 15 generalises the EC slot to carry a [`kari::KariCurve`] tag
+/// alongside the scalar, so the same credential can open KARI
+/// envelopes on any of the supported curves (P-256 / P-384 / X25519).
+/// The `from_parsed_ec_p256` / `with_ec_p256_scalar` round-14 helpers
+/// keep working — they default the curve to [`kari::KariCurve::P256`].
 pub struct PubSecCredential {
     pub(crate) cert: x509::Certificate,
     pub(crate) private_key: Option<rsa::RsaPrivateKey>,
-    /// Optional P-256 SEC1 raw private scalar (32 bytes) — populates
-    /// the round-14 KARI-unwrap path. When `None`, KARI recipient
-    /// slots that match this certificate's RID are silently skipped.
-    pub(crate) ec_private_scalar: Option<Vec<u8>>,
+    /// Optional EC private scalar + curve tag — populates the KARI
+    /// unwrap path. When `None`, KARI recipient slots that match this
+    /// certificate's RID are silently skipped.
+    pub(crate) ec_private: Option<(kari::KariCurve, Vec<u8>)>,
 }
 
 impl PubSecCredential {
@@ -247,7 +274,7 @@ impl PubSecCredential {
         Ok(Self {
             cert,
             private_key: Some(private_key),
-            ec_private_scalar: None,
+            ec_private: None,
         })
     }
 
@@ -259,7 +286,7 @@ impl PubSecCredential {
         Self {
             cert,
             private_key: Some(private_key),
-            ec_private_scalar: None,
+            ec_private: None,
         }
     }
 
@@ -272,10 +299,21 @@ impl PubSecCredential {
     /// an EC certificate, `spki_pubkey_bits` is the SEC1-encoded
     /// public point.
     pub fn from_parsed_ec_p256(cert: x509::Certificate, ec_private_scalar: Vec<u8>) -> Self {
+        Self::from_parsed_ec(cert, kari::KariCurve::P256, ec_private_scalar)
+    }
+
+    /// Round-15: build a credential from a parsed certificate + an EC
+    /// private scalar on the supplied curve. Pass [`kari::KariCurve::P384`]
+    /// or [`kari::KariCurve::X25519`] for the round-15 curves.
+    pub fn from_parsed_ec(
+        cert: x509::Certificate,
+        curve: kari::KariCurve,
+        ec_private_scalar: Vec<u8>,
+    ) -> Self {
         Self {
             cert,
             private_key: None,
-            ec_private_scalar: Some(ec_private_scalar),
+            ec_private: Some((curve, ec_private_scalar)),
         }
     }
 
@@ -284,8 +322,14 @@ impl PubSecCredential {
     /// and KARI (ECDH) envelopes — typical for a recipient who carries
     /// both a long-term RSA cert and a separate EC cert under the same
     /// identity.
-    pub fn with_ec_p256_scalar(mut self, ec_private_scalar: Vec<u8>) -> Self {
-        self.ec_private_scalar = Some(ec_private_scalar);
+    pub fn with_ec_p256_scalar(self, ec_private_scalar: Vec<u8>) -> Self {
+        self.with_ec_scalar(kari::KariCurve::P256, ec_private_scalar)
+    }
+
+    /// Round-15: extend an existing credential with an EC scalar on
+    /// the supplied curve.
+    pub fn with_ec_scalar(mut self, curve: kari::KariCurve, ec_private_scalar: Vec<u8>) -> Self {
+        self.ec_private = Some((curve, ec_private_scalar));
         self
     }
 }
@@ -655,12 +699,13 @@ fn try_unwrap(
                 return Ok(Some(plaintext));
             }
             cms::RecipientInfoVariant::KeyAgree(kari) => {
-                // Only the round-14 P-256 path is implemented. Other
-                // schemes are silently skipped.
-                let Some(ec_scalar) = credential.ec_private_scalar.as_ref() else {
+                // KARI: round-14 P-256 + round-15 P-384 / X25519 paths.
+                // Skip envelopes whose KEA OID doesn't bind to the
+                // credential's EC scalar (different curve / KDF).
+                let Some((curve, ec_scalar)) = credential.ec_private.as_ref() else {
                     continue;
                 };
-                if kari.key_encryption_oid != kari::OID_DH_SINGLE_PASS_STDDH_SHA256_KDF {
+                if kari.key_encryption_oid != curve.kea_oid() {
                     continue;
                 }
                 let Some(slot) = kari::match_kari_slot(
@@ -672,10 +717,11 @@ fn try_unwrap(
                     continue;
                 };
                 let recipient = kari::EcRecipient {
+                    curve: *curve,
                     private_scalar: ec_scalar.clone(),
                     public_point_sec1: credential.cert.spki_pubkey_bits.clone().unwrap_or_default(),
                 };
-                let cek = kari::unwrap_kari_p256(kari, slot, &recipient)?;
+                let cek = kari::unwrap_kari(kari, slot, &recipient)?;
                 let plaintext = decrypt_envelope_content(
                     &envelope.content_encryption,
                     &cek,
