@@ -126,11 +126,18 @@ the matched recipient's permission mask. Round 12 lands the **CMS KARI
 decoder** (RFC 5652 §6.2.2) — KeyAgree (ECDH/DH) recipients parse
 structurally. **Round 14 closes the unwrap**: P-256 ECDH + RFC 5753
 §7.1.2 X9.63-SHA-256 KDF + RFC 3394 AES Key Wrap (128/192/256-bit) for
-the `dhSinglePass-stdDH-sha256kdf-scheme` KEA OID. Pass an EC scalar
-via `PubSecCredential::from_parsed_ec_p256(cert, ec_scalar)` and the
-KARI envelope opens through the same `read_pdf_to_scene_with_certificate`
-entry point as KTRI. P-384 / P-521 / X25519 stay deferred. `RC2 /
-3DES / DES` envelope content algorithms remain out of scope.
+the `dhSinglePass-stdDH-sha256kdf-scheme` KEA OID. **Round 15 extends
+the curve set**: P-384 (`dhSinglePass-stdDH-sha384kdf-scheme`,
+X9.63-SHA-384) and X25519 (RFC 8418 §2.1, secg-scheme `…sha256kdf` +
+`id-X25519`) join P-256 — pass `PubSecCredential::from_parsed_ec(cert,
+KariCurve::P384, scalar)` (or `P256` / `X25519`) and the KARI envelope
+opens through the same `read_pdf_to_scene_with_certificate` entry
+point as KTRI. **Round 15 also lands the writer-side KARI encode**:
+`write_pdf_from_scene_pubsec_kari(scene, &PubSecKariConfig)` mirrors
+the round-11 KTRI writer — each `KariRecipient { curve, … }` becomes
+one CMS KARI envelope with AES-256-WRAP. P-521 + RFC 8418 §2.2 HKDF
+binding stay deferred. `RC2 / 3DES / DES` envelope content algorithms
+remain out of scope.
 
 ## Encryption encode (writer side)
 
@@ -239,10 +246,19 @@ embedded files.
   hint tables (F.4.6) for linearized output — we generate no
   interactive forms / structure trees / embedded files, so the
   per-table content would be empty anyway.
-- CMS KARI for non-P-256 curves (P-384 / P-521 / X25519) — round 14
-  unwraps the most common case (`dhSinglePass-stdDH-sha256kdf-scheme`
-  on P-256 with AES-KW); the structural parser already accepts every
-  curve so a future round extends the matcher.
+- CMS KARI for P-521 (`dhSinglePass-stdDH-sha512kdf-scheme`) — round
+  14 covers P-256, round 15 extends to P-384 + X25519; P-521 is
+  unblocked by the same mechanism (add `sha2::Sha512` to the
+  `KariCurve` enum + a `p521` dep).
+- CMS KARI HKDF binding (RFC 8418 §2.2 — `smime-alg 19/20/21` OIDs
+  for X25519/X448 with HKDF) — round 15 ships the X9.63 binding only.
+- CMS KARI X448 (RFC 8418 §2 — needs an X448 ECDH crate; the dalek
+  ecosystem doesn't ship one, so this likely waits on a third-party
+  crate or hand-rolled curve arithmetic).
+- CMS KARI long-term originator certificates — `OriginatorId::IssuerAndSerial`
+  / `SubjectKeyIdentifier` resolution against a recipient-supplied
+  trust store; current code requires the originator's public key
+  in-band (the only form Adobe ever emits).
 - Transparency groups beyond a per-`Group` `/ca`+`/CA` opacity.
 
 ## Usage
