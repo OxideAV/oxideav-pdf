@@ -24,11 +24,13 @@
 //! ```
 //!
 //! Hint streams (Part 5) follow Tables F.3 / F.4 — we emit the
-//! mandatory page offset hint table only. Shared object hints
-//! (F.4.2), thumbnails (F.4.3), and the various generic hint tables
-//! (F.4.4 / F.4.5 / F.4.6) are not emitted: per-page resources are
-//! independent in our IR, and we generate no thumbnails / outlines
-//! / threads.
+//! mandatory page offset hint table with full per-page entries
+//! (round 13: items 1, 2, 6, 7 — object count, page length, content
+//! stream offset relative to page start, content stream length).
+//! Shared object hints (F.4.2), thumbnails (F.4.3), and the various
+//! generic hint tables (F.4.4 / F.4.5 / F.4.6) are emitted as empty
+//! headers because we generate no shared objects / thumbnails /
+//! outlines / threads / named destinations.
 //!
 //! # Two-pass emission
 //!
@@ -265,12 +267,41 @@ pub fn write_pdf_linearized(scene: &Scene) -> Result<Vec<u8>, PdfError> {
 
     // Part 5: hint stream — page-offset table (F.4.1) followed by
     // empty-shape shared-object (F.4.2) + thumbnail (F.4.3) +
-    // outline (F.4.4) tables. Each follow-on table is its 22..32-byte
-    // header with all entry counts at zero, so the hint stream stays
-    // self-describing without any per-shared-object / per-thumbnail
-    // bytes (we generate none).
+    // outline (F.4.4) tables. The page-offset table now carries
+    // genuine per-page entries (round 13): items 1, 2, 6, 7 (object
+    // count, page length, content offset relative to page start,
+    // content stream length). Bit widths are pinned at 32 bits so the
+    // hint stream's byte size is deterministic from `n_pages` alone.
+    //
+    // Per-page object counts ARE known at this point (they depend on
+    // the resource extras we already pre-flattened above), so we
+    // populate item 1 immediately. Items 2, 6, 7 plus the header
+    // "least *" placeholders are filled with zero now and patched in
+    // pass 2 once every page's byte offset is known.
+    let mut objects_per_page: Vec<u32> = Vec::with_capacity(n_pages);
+    objects_per_page.push(3 + first_page_owned.extra_objects.len() as u32);
+    for owned in &g2_owned {
+        objects_per_page.push(3 + owned.extra_objects.len() as u32);
+    }
+    let least_obj_per_page = *objects_per_page.iter().min().unwrap_or(&0);
+
     let hint_stream_off = out.len() as u64;
-    let page_offset_table = build_page_offset_hint_table(n_pages);
+    let mut page_offset_table = build_page_offset_hint_table(least_obj_per_page);
+    // Offset of the page-offset table's per-page section so we can
+    // patch byte-position values without re-scanning.
+    let per_page_section_off = page_offset_table.len();
+    // Reserve per-page bytes: items 1, 2, 6, 7 each fill 4 bytes per
+    // page (32-bit fixed width); item 3 collapses to 0 bits.
+    let per_page_section_size = n_pages * 16;
+    page_offset_table.resize(per_page_section_off + per_page_section_size, 0);
+    // Pre-fill item 1 (object count per page) — known up front. The
+    // encoded value is `count - least_obj_per_page` per F.4 item 1
+    // (a delta added to item 1 of Table F.3 to recover the count).
+    for (i, &count) in objects_per_page.iter().enumerate() {
+        let delta = count - least_obj_per_page;
+        let off = per_page_section_off + i * 4;
+        page_offset_table[off..off + 4].copy_from_slice(&delta.to_be_bytes());
+    }
     let shared_object_table = build_shared_object_hint_table();
     let thumbnail_table = build_thumbnail_hint_table();
     let outline_table = build_outline_hint_table();
@@ -291,6 +322,9 @@ pub fn write_pdf_linearized(scene: &Scene) -> Result<Vec<u8>, PdfError> {
         .with("T", Object::Integer(t_off as i64))
         // /O = byte offset of outline hint table (F.4.4).
         .with("O", Object::Integer(o_off as i64));
+    // Record where the hint-stream data starts inside the indirect
+    // object body so we can patch placeholder values in pass 2.
+    let hint_obj_start = out.len();
     write_indirect(
         &mut out,
         &IndirectObject {
@@ -300,6 +334,18 @@ pub fn write_pdf_linearized(scene: &Scene) -> Result<Vec<u8>, PdfError> {
     )?;
     let hint_stream_end = out.len() as u64;
     let hint_stream_total_len = hint_stream_end - hint_stream_off;
+    // Locate the byte offset of the hint stream's payload start
+    // (just past `stream\n`). The Stream serializer always emits
+    // `<dict>\nstream\n<data>\nendstream` — find the `stream\n`
+    // anchor inside the hint indirect-object body.
+    let hint_payload_off = {
+        let needle = b"\nstream\n";
+        let pos = out[hint_obj_start..]
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .ok_or_else(|| PdfError::other("linearize: hint stream payload not found"))?;
+        hint_obj_start + pos + needle.len()
+    };
 
     // Part 6: first-page section
     let first_page_off = out.len() as u64;
@@ -424,6 +470,97 @@ pub fn write_pdf_linearized(scene: &Scene) -> Result<Vec<u8>, PdfError> {
                 object: Object::Stream(Stream::new(Dict::new(), owned.content_bytes.clone())),
             },
         )?;
+    }
+
+    // ---- Per-page metrics for the page-offset hint table ----------
+    // Compute page_length (item 2) and content stream offset/length
+    // (items 6, 8) per page. For each page, page_end = offset of the
+    // very next byte after the page's last object. For pages that
+    // have a successor page in the byte stream, that's just the next
+    // page's page-object offset; for the final page it's the start
+    // of the main xref section.
+    let mut page_starts: Vec<u64> = Vec::with_capacity(n_pages);
+    let mut content_starts: Vec<u64> = Vec::with_capacity(n_pages);
+    page_starts.push(first_page_off);
+    content_starts.push(first_contents_off);
+    for (i, _) in g2_owned.iter().enumerate() {
+        page_starts.push(g2_page_offs[i]);
+        content_starts.push(g2_contents_offs[i]);
+    }
+    // page_end[i] = page_starts[i+1] for i < n_pages-1, else main_xref_off
+    let mut page_ends: Vec<u64> = Vec::with_capacity(n_pages);
+    // First page's end is the explicit end-of-first-page marker — the
+    // first-page section is laid out contiguously, so end_of_first_page
+    // equals page_starts[1] when n_pages > 1.
+    page_ends.push(end_of_first_page);
+    for i in 1..n_pages {
+        let end = if i + 1 < n_pages {
+            page_starts[i + 1]
+        } else {
+            // Last page — its tail extends up to (but not including)
+            // the main xref section we're about to emit.
+            out.len() as u64
+        };
+        page_ends.push(end);
+    }
+    // content_end[i] = same logic (content stream is the last object
+    // on the page, so its end coincides with page_end).
+    let content_ends: Vec<u64> = page_ends.clone();
+
+    let page_lengths: Vec<u32> = (0..n_pages)
+        .map(|i| (page_ends[i] - page_starts[i]) as u32)
+        .collect();
+    let content_offsets: Vec<u32> = (0..n_pages)
+        .map(|i| (content_starts[i] - page_starts[i]) as u32)
+        .collect();
+    let content_lengths: Vec<u32> = (0..n_pages)
+        .map(|i| (content_ends[i] - content_starts[i]) as u32)
+        .collect();
+
+    // Item 4 / 6 / 8 header values are the per-document minima.
+    let least_page_length = *page_lengths.iter().min().unwrap_or(&0);
+    let least_content_off = *content_offsets.iter().min().unwrap_or(&0);
+    let least_content_len = *content_lengths.iter().min().unwrap_or(&0);
+
+    // Patch the page-offset hint table in place. The hint stream
+    // payload starts at hint_payload_off; the page-offset table is
+    // the first table inside it.
+    // Item 2 (32-bit): location of first page's page object — at
+    // header offset 4..8.
+    let hdr = hint_payload_off;
+    out[hdr + 4..hdr + 8].copy_from_slice(&(first_page_off as u32).to_be_bytes());
+    // Item 4 (32-bit): least page length — at header offset 10..14.
+    out[hdr + 10..hdr + 14].copy_from_slice(&least_page_length.to_be_bytes());
+    // Item 6 (32-bit): least content stream offset — at header offset 16..20.
+    out[hdr + 16..hdr + 20].copy_from_slice(&least_content_off.to_be_bytes());
+    // Item 8 (32-bit): least content stream length — at header offset 22..26.
+    out[hdr + 22..hdr + 26].copy_from_slice(&least_content_len.to_be_bytes());
+
+    // Patch per-page section. Layout (each item is 4 bytes per page):
+    //   block A (item 1, object count): pages 0..N — already filled
+    //   block B (item 2, page length delta): pages 0..N
+    //   block C (item 6, content offset delta): pages 0..N
+    //   block D (item 7, content length delta): pages 0..N
+    let pp_off = hdr + per_page_section_off;
+    let block_size = n_pages * 4;
+    // Block B: page length deltas (item 2 of per-page entry, sized by
+    // header item 5). Each value = page_lengths[i] - least_page_length.
+    for (i, len) in page_lengths.iter().enumerate() {
+        let delta = len - least_page_length;
+        let off = pp_off + block_size + i * 4;
+        out[off..off + 4].copy_from_slice(&delta.to_be_bytes());
+    }
+    // Block C: content offset deltas (item 6 of per-page entry).
+    for (i, co) in content_offsets.iter().enumerate() {
+        let delta = co - least_content_off;
+        let off = pp_off + 2 * block_size + i * 4;
+        out[off..off + 4].copy_from_slice(&delta.to_be_bytes());
+    }
+    // Block D: content length deltas (item 7 of per-page entry).
+    for (i, cl) in content_lengths.iter().enumerate() {
+        let delta = cl - least_content_len;
+        let off = pp_off + 3 * block_size + i * 4;
+        out[off..off + 4].copy_from_slice(&delta.to_be_bytes());
     }
 
     // Part 11: main xref + trailer
@@ -789,43 +926,45 @@ fn build_outline_hint_table() -> Vec<u8> {
     buf
 }
 
-/// Build the page offset hint table per Tables F.3 + F.4.
+/// Build the page offset hint table header per Table F.3.
 ///
-/// Round-9 emits the minimum-information form: every "bits-needed"
-/// header field is 0 (every page is reported as having the least
-/// number of objects, the least page length, etc.), so the per-page
-/// entries collapse to nothing. The 36-byte header still lands at
-/// offset 0 of the hint stream as required by F.3.6.
+/// Round-13 pins the bits-needed fields for items 1, 2, 6, 7 at 32
+/// bits so the per-page section stays at a deterministic 16 × n_pages
+/// bytes — caller appends the per-page section after this header.
+/// The "least *" placeholders (items 2, 4, 6, 8) start as zeros and
+/// get patched once page byte offsets are known. Item 1 (least
+/// objects per page) IS known up front and is filled here.
 ///
 /// Header field widths (bits): 32 + 32 + 16 + 32 + 16 + 32 + 16 + 32
 /// + 16 + 16 + 16 + 16 + 16 = 288 bits = 36 bytes.
-fn build_page_offset_hint_table(_n_pages: usize) -> Vec<u8> {
+fn build_page_offset_hint_table(least_obj_per_page: u32) -> Vec<u8> {
     let mut buf = Vec::with_capacity(36);
-    // Item 1 (32): least objects per page = 3 (Page + Resources + Contents)
-    buf.extend_from_slice(&3u32.to_be_bytes());
-    // Item 2 (32): location of first page's page object = 0 (placeholder)
+    // Item 1 (32): least objects per page (computed by caller).
+    buf.extend_from_slice(&least_obj_per_page.to_be_bytes());
+    // Item 2 (32): location of first page's page object = 0 (patched in pass 2).
     buf.extend_from_slice(&0u32.to_be_bytes());
-    // Item 3 (16): bits-needed for max-min objects/page delta = 0
-    buf.extend_from_slice(&0u16.to_be_bytes());
-    // Item 4 (32): least page length in bytes = 0
+    // Item 3 (16): bits-needed for max-min objects/page delta = 32.
+    buf.extend_from_slice(&32u16.to_be_bytes());
+    // Item 4 (32): least page length in bytes = 0 (patched in pass 2).
     buf.extend_from_slice(&0u32.to_be_bytes());
-    // Item 5 (16): bits-needed for page length delta = 0
-    buf.extend_from_slice(&0u16.to_be_bytes());
-    // Item 6 (32): least content stream offset = 0
+    // Item 5 (16): bits-needed for page length delta = 32.
+    buf.extend_from_slice(&32u16.to_be_bytes());
+    // Item 6 (32): least content stream offset = 0 (patched in pass 2).
     buf.extend_from_slice(&0u32.to_be_bytes());
-    // Item 7 (16): bits-needed for content stream offset delta = 0
-    buf.extend_from_slice(&0u16.to_be_bytes());
-    // Item 8 (32): least content stream length = 0
+    // Item 7 (16): bits-needed for content stream offset delta = 32.
+    buf.extend_from_slice(&32u16.to_be_bytes());
+    // Item 8 (32): least content stream length = 0 (patched in pass 2).
     buf.extend_from_slice(&0u32.to_be_bytes());
-    // Item 9 (16): bits-needed for content stream length delta = 0
+    // Item 9 (16): bits-needed for content stream length delta = 32.
+    buf.extend_from_slice(&32u16.to_be_bytes());
+    // Item 10 (16): bits-needed for max shared-object count per page = 0.
+    // We emit no shared objects, so item-3 entries collapse to 0 bits.
     buf.extend_from_slice(&0u16.to_be_bytes());
-    // Item 10 (16): bits-needed for max shared-object count per page = 0
+    // Item 11 (16): bits-needed for shared-object id range = 0.
     buf.extend_from_slice(&0u16.to_be_bytes());
-    // Item 11 (16): bits-needed for shared-object id range = 0
+    // Item 12 (16): bits-needed for fractional position numerator = 0.
     buf.extend_from_slice(&0u16.to_be_bytes());
-    // Item 12 (16): bits-needed for fractional position numerator = 0
-    buf.extend_from_slice(&0u16.to_be_bytes());
-    // Item 13 (16): denominator for fractional position = 4
+    // Item 13 (16): denominator for fractional position = 4.
     buf.extend_from_slice(&4u16.to_be_bytes());
     debug_assert_eq!(buf.len(), 36);
     buf
@@ -1011,11 +1150,75 @@ mod tests {
     }
 
     #[test]
-    fn page_offset_hint_table_is_36_bytes() {
-        let table = build_page_offset_hint_table(1);
+    fn page_offset_hint_table_header_is_36_bytes() {
+        let table = build_page_offset_hint_table(3);
         assert_eq!(table.len(), 36);
+        // Item 1 (32-bit): least objects per page.
         assert_eq!(&table[0..4], &3u32.to_be_bytes());
+        // Item 3 (16-bit): bits-needed for object-count delta = 32.
+        assert_eq!(&table[8..10], &32u16.to_be_bytes());
+        // Item 5 (16-bit): bits-needed for page-length delta = 32.
+        assert_eq!(&table[14..16], &32u16.to_be_bytes());
+        // Item 7 (16-bit): bits-needed for content-offset delta = 32.
+        assert_eq!(&table[20..22], &32u16.to_be_bytes());
+        // Item 9 (16-bit): bits-needed for content-length delta = 32.
+        assert_eq!(&table[26..28], &32u16.to_be_bytes());
+        // Item 13 (16-bit): denominator = 4.
         assert_eq!(&table[34..36], &4u16.to_be_bytes());
+    }
+
+    #[test]
+    fn page_offset_per_page_section_size_is_16_bytes_per_page() {
+        // Round-13: per-page section = 4 (item 1) + 4 (item 2) +
+        // 0 (item 3 — no shared objects) + 4 (item 6) + 4 (item 7)
+        // = 16 bytes per page. Verified end-to-end via the hint
+        // stream's /Length field after a multi-page emit.
+        let pdf = write_pdf_linearized(&multi_page_scene()).expect("linearize");
+        let s = pdf_lossy(&pdf);
+        // Locate the hint stream's /Length value. The /Length key
+        // appears in the hint stream's dict (which also carries
+        // /S /T /O — easy to disambiguate from any other stream).
+        let hint_dict_start = s.find("/S ").expect("hint dict /S");
+        let dict_open = s[..hint_dict_start].rfind("<<").unwrap();
+        let dict_close = s[dict_open..].find(">>").unwrap() + dict_open;
+        let dict_str = &s[dict_open..dict_close];
+        let len_idx = dict_str.find("/Length ").expect("hint dict /Length");
+        let after = &dict_str[len_idx + "/Length ".len()..];
+        let value: usize = after
+            .split_ascii_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        // Hint stream payload = 36 (page-offset header) + n*16
+        // (per-page) + 24 (shared) + 28 (thumb) + 14 (outline).
+        let n = 3usize;
+        assert_eq!(value, 36 + n * 16 + 24 + 28 + 14);
+    }
+
+    #[test]
+    fn page_offset_per_page_first_page_object_count_matches() {
+        // Single page = 3 objects (Page + Resources + Contents); no
+        // resource extras for a plain solid-fill rectangle. With one
+        // page, least = 3 and the per-page item-1 delta = count -
+        // least = 0.
+        let pdf = write_pdf_linearized(&single_page_scene()).expect("linearize");
+        // Find the hint stream payload by scanning past the first
+        // `\nstream\n` marker (no other streams precede it because
+        // a solid-fill scene generates no resource extras).
+        let after_stream = pdf
+            .windows(b"\nstream\n".len())
+            .position(|w| w == b"\nstream\n")
+            .unwrap()
+            + b"\nstream\n".len();
+        // Page-offset hint header is 36 bytes; per-page item 1 starts
+        // at offset 36 (block A, page 0 item 1 = 4 bytes).
+        let item1_p0 = u32::from_be_bytes(
+            pdf[after_stream + 36..after_stream + 40]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(item1_p0, 0, "single-page item-1 delta = count - least = 0");
     }
 
     #[test]

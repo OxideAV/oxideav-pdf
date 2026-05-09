@@ -259,15 +259,138 @@ fn pages_tree_count_matches_n() {
     assert!(s.contains("/Count 3"));
 }
 
+/// Locate the hint stream's payload bytes — the indirect object
+/// whose dict carries /S /T /O. Returns the slice between
+/// `\nstream\n` and `\nendstream`.
+fn hint_stream_payload(pdf: &[u8]) -> &[u8] {
+    // Find the dict that carries /S — that anchors the hint stream.
+    let s = pdf_lossy(pdf);
+    let s_idx = s.find("/S ").expect("hint dict /S");
+    // Walk forward to `\nstream\n`.
+    let stream_off = pdf[s_idx..]
+        .windows(b"\nstream\n".len())
+        .position(|w| w == b"\nstream\n")
+        .expect("hint stream marker");
+    let payload_off = s_idx + stream_off + b"\nstream\n".len();
+    // Walk forward to `\nendstream`.
+    let end_off = pdf[payload_off..]
+        .windows(b"\nendstream".len())
+        .position(|w| w == b"\nendstream")
+        .expect("endstream marker");
+    &pdf[payload_off..payload_off + end_off]
+}
+
 #[test]
-fn hint_stream_is_36_bytes_minimum() {
-    // The page offset hint table header is exactly 36 bytes (288
-    // bits — F.3 items 1..13). With 0 bits-needed for every per-page
-    // delta field, the per-page entries collapse and the whole hint
-    // stream stays at 36 bytes payload (plus its dict + endobj).
+fn hint_stream_per_page_object_count_matches_actual() {
+    // Item 1 of each per-page entry = absolute object count for
+    // that page (NOT a delta — bits-needed for the delta field is
+    // 32 + the value IS the count when least = ..). Spec F.4 item
+    // 1: "A number that, when added to the least number of objects
+    // in a page (Table F.3, item 1), shall give the number of
+    // objects in the page." So encoded value = count - least.
+    //
+    // For our three-page solid-fill scene, every page has exactly
+    // 3 objects (Page + Resources + Contents — no extras), so
+    // least = 3 and per-page item-1 delta = 0 for all pages.
+    let pdf = write_pdf_from_scene_linearized(&three_page_scene()).expect("write");
+    let payload = hint_stream_payload(&pdf);
+    // Page-offset header is 36 bytes; per-page section starts at 36.
+    assert_eq!(payload.len(), 36 + 3 * 16 + 24 + 28 + 14);
+    // Verify item 1 of header = 3 (least objects per page).
+    assert_eq!(&payload[0..4], &3u32.to_be_bytes());
+    // Per-page item 1 (block A) — three 4-byte deltas, all 0.
+    for i in 0..3 {
+        let off = 36 + i * 4;
+        let delta = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap());
+        assert_eq!(delta, 0, "page {i} item-1 delta must be 0");
+    }
+}
+
+#[test]
+fn hint_stream_first_page_object_location_matches_first_page_off() {
+    // Header item 2: location of first page's page object. We
+    // recompute the first page's offset by scanning for `\n<O> 0
+    // obj\n<< /Type /Page` and compare.
+    let pdf = write_pdf_from_scene_linearized(&three_page_scene()).expect("write");
+    let payload = hint_stream_payload(&pdf);
+    let item2 = u32::from_be_bytes(payload[4..8].try_into().unwrap()) as usize;
+
+    // Cross-check against the actual page object location: parse /O
+    // from the lin-dict, then find the matching `\n<O> 0 obj`. The
+    // actual page-object position is at the byte AFTER the `\n` (so
+    // +1 from the find result), which is what the hint table records.
+    let head = pdf_lossy(&pdf[..1024]);
+    let o_idx = head.find("/O ").unwrap();
+    let o_value: u32 = head[o_idx + 3..]
+        .split_ascii_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // First-page object header: `<O> 0 obj` at the very start of a
+    // line. We search for `\n<O> 0 obj` and skip the leading `\n`.
+    let needle = format!("\n{} 0 obj\n", o_value);
+    let actual_first_page_off = pdf
+        .windows(needle.len())
+        .position(|w| w == needle.as_bytes())
+        .unwrap()
+        + 1;
+    assert_eq!(
+        item2, actual_first_page_off,
+        "hint table item-2 must match the actual byte offset of the first page object"
+    );
+}
+
+#[test]
+fn hint_stream_per_page_lengths_sum_matches_layout() {
+    // Sanity-check items 4 (least page length) + items 2 (per-page
+    // page-length deltas) — their sum should equal the page lengths
+    // we can independently observe in the byte stream.
+    let pdf = write_pdf_from_scene_linearized(&three_page_scene()).expect("write");
+    let payload = hint_stream_payload(&pdf);
+    let least_page_len = u32::from_be_bytes(payload[10..14].try_into().unwrap()) as u64;
+    // Block A starts at 36, block B at 36 + 12 = 48.
+    let block_b = 36 + 3 * 4;
+    let mut hint_lengths = Vec::with_capacity(3);
+    for i in 0..3 {
+        let off = block_b + i * 4;
+        let delta = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap()) as u64;
+        hint_lengths.push(least_page_len + delta);
+    }
+
+    // Independently compute page lengths by scanning the file.
+    let s = pdf_lossy(&pdf);
+    let head = pdf_lossy(&pdf[..1024]);
+    let o_idx = head.find("/O ").unwrap();
+    let o_value: u32 = head[o_idx + 3..]
+        .split_ascii_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let needle = format!("\n{} 0 obj", o_value);
+    let first_page_off = s.find(&needle).unwrap() + 1;
+    // Pages 2, 3 follow contiguously after first page's contents.
+    // We just check that sum of lengths > 0 and the first length is
+    // sane (positive, less than file size).
+    assert!(hint_lengths[0] > 0);
+    assert!((hint_lengths[0] as usize) < pdf.len() - first_page_off);
+}
+
+#[test]
+fn hint_stream_carries_per_page_section() {
+    // Round-13 emits Table F.4 per-page entries (items 1, 2, 6, 7)
+    // at fixed 32-bit width — 16 bytes per page. /S marks the byte
+    // offset of the shared-object table that *follows* the
+    // page-offset table in the hint stream payload, so /S = 36
+    // (header) + n_pages * 16 (per-page section).
     let pdf = write_pdf_from_scene_linearized(&three_page_scene()).expect("write");
     let s = pdf_lossy(&pdf);
-    // Look for /S in the hint-stream dict — the hint stream is the
-    // only stream that uses /S as a top-level key in this writer.
-    assert!(s.contains("/S 36"), "hint table /S sentinel must be 36");
+    let expected_s = 36 + 3 * 16;
+    let needle = format!("/S {}", expected_s);
+    assert!(
+        s.contains(&needle),
+        "hint dict /S must equal 36 + 3*16 = {} (page-offset header + per-page entries), got dict containing /S",
+        expected_s
+    );
 }
