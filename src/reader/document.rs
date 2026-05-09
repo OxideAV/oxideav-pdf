@@ -33,7 +33,9 @@ use oxideav_scene::{Metadata, Page, Scene};
 use crate::decrypt::{open_with_password, StandardHandler};
 use crate::error::PdfError;
 use crate::objects::{Dict, Object, ObjectId, Stream};
-use crate::pubsec::{open_with_certificate, PubSecCredential};
+use crate::pubsec::{
+    open_with_certificate, open_with_certificate_and_trust_store, PubSecCredential, TrustStore,
+};
 use crate::reader::content::parse_content_stream;
 use crate::reader::parse::Parser;
 use crate::reader::xref::{parse_xref, XrefEntry, XrefTable};
@@ -92,7 +94,26 @@ impl<'a> DocumentReader<'a> {
         credential: &PubSecCredential,
     ) -> Result<Self, PdfError> {
         let xref = parse_xref(input)?;
-        let crypt = build_crypt_pubsec(&xref, input, credential)?;
+        let crypt = build_crypt_pubsec(&xref, input, credential, None)?;
+        Ok(Self {
+            input,
+            xref,
+            cache: HashMap::new(),
+            crypt,
+        })
+    }
+
+    /// Round-17: same as [`Self::open_with_certificate`] but consults a
+    /// [`TrustStore`] when a KARI envelope identifies the originator by
+    /// `IssuerAndSerial` or `SubjectKeyIdentifier` (RFC 5652 §6.2.2)
+    /// instead of carrying its public point in-band.
+    pub fn open_with_certificate_and_trust_store(
+        input: &'a [u8],
+        credential: &PubSecCredential,
+        trust_store: &TrustStore,
+    ) -> Result<Self, PdfError> {
+        let xref = parse_xref(input)?;
+        let crypt = build_crypt_pubsec(&xref, input, credential, Some(trust_store))?;
         Ok(Self {
             input,
             xref,
@@ -374,6 +395,7 @@ fn build_crypt_pubsec(
     xref: &XrefTable,
     input: &[u8],
     credential: &PubSecCredential,
+    trust_store: Option<&TrustStore>,
 ) -> Result<Option<StandardHandler>, PdfError> {
     let encrypt_ref = xref.trailer.entries().iter().find(|(k, _)| k == "Encrypt");
     let Some((_, encrypt_obj)) = encrypt_ref else {
@@ -403,7 +425,10 @@ fn build_crypt_pubsec(
             )))
         }
     };
-    let handler = open_with_certificate(&encrypt_dict, credential)?;
+    let handler = match trust_store {
+        Some(store) => open_with_certificate_and_trust_store(&encrypt_dict, credential, store)?,
+        None => open_with_certificate(&encrypt_dict, credential)?,
+    };
     handler
         .ok_or_else(|| {
             PdfError::other(
@@ -582,6 +607,24 @@ pub fn read_pdf_to_scene_with_certificate(
     credential: &PubSecCredential,
 ) -> Result<Scene, PdfError> {
     let reader = DocumentReader::open_with_certificate(input, credential)?;
+    decode_to_scene(reader)
+}
+
+/// Round-17: variant of [`read_pdf_to_scene_with_certificate`] that
+/// consults a [`TrustStore`] when a KARI envelope identifies the
+/// originator by `IssuerAndSerial` or `SubjectKeyIdentifier` (RFC 5652
+/// §6.2.2) instead of carrying its public point in-band.
+///
+/// In-band `OriginatorPublicKey` envelopes still work without
+/// consulting the trust store — the lookup path is only triggered for
+/// the long-term-cert forms.
+pub fn read_pdf_to_scene_with_certificate_and_trust_store(
+    input: &[u8],
+    credential: &PubSecCredential,
+    trust_store: &TrustStore,
+) -> Result<Scene, PdfError> {
+    let reader =
+        DocumentReader::open_with_certificate_and_trust_store(input, credential, trust_store)?;
     decode_to_scene(reader)
 }
 

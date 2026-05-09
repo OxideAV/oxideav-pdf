@@ -26,6 +26,7 @@ pub mod parse;
 pub mod xref;
 
 pub use document::{
-    read_pdf_to_scene, read_pdf_to_scene_with_certificate, read_pdf_to_scene_with_password,
+    read_pdf_to_scene, read_pdf_to_scene_with_certificate,
+    read_pdf_to_scene_with_certificate_and_trust_store, read_pdf_to_scene_with_password,
     DocumentReader,
 };

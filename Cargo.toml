@@ -109,3 +109,16 @@ x25519-dalek = { version = "2", default-features = false, features = [
 # (the lower-level `wrap` / `unwrap` API requires a pre-sized output
 # buffer; the Vec helpers are simpler at the call site).
 aes-kw = { version = "0.2", features = ["alloc"] }
+# Pure-Rust RC2 block cipher (RustCrypto). Round-17 adds read-only
+# CMS envelope decode for `EncryptedContentInfo.contentEncryptionAlgorithm
+# = rc2-cbc` (OID 1.2.840.113549.3.2) per RFC 3217. PDF 2.0 deprecates
+# RC2 but legacy archives still ship envelopes with it; we accept on
+# decode only (no encode-side support). RC2 is broken cryptographically
+# (RFC 3217 only defined for backward compat); we surface it so legacy
+# files open. The `cbc` wrapper crate is shared with the AES path.
+rc2 = { version = "0.8", default-features = false }
+# Pure-Rust DES / 3DES (TDEA) block cipher (RustCrypto). Round-17 adds
+# read-only CMS envelope decode for `des-EDE3-CBC` (OID 1.2.840.113549.3.7)
+# per RFC 3211 / RFC 5652 §12.4. PDF 2.0 deprecates 3DES — we accept on
+# decode only. The `cbc` wrapper crate is shared with the AES path.
+des = { version = "0.8", default-features = false }

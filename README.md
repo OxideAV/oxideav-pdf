@@ -135,9 +135,18 @@ opens through the same `read_pdf_to_scene_with_certificate` entry
 point as KTRI. **Round 15 also lands the writer-side KARI encode**:
 `write_pdf_from_scene_pubsec_kari(scene, &PubSecKariConfig)` mirrors
 the round-11 KTRI writer — each `KariRecipient { curve, … }` becomes
-one CMS KARI envelope with AES-256-WRAP. P-521 + RFC 8418 §2.2 HKDF
-binding stay deferred. `RC2 / 3DES / DES` envelope content algorithms
-remain out of scope.
+one CMS KARI envelope with AES-256-WRAP. **Round 16** lands P-521 (`dhSinglePass-stdDH-sha512kdf-scheme`,
+X9.63-SHA-512) + RFC 8418 §2.2 HKDF binding for X25519
+(`dhSinglePass-stdDH-hkdf-sha256/384/512-scheme`, smime-alg 19/20/21).
+**Round 17** closes the long-term-cert originator gap: when a KARI
+envelope's `OriginatorIdentifierOrKey` is `IssuerAndSerial` or
+`SubjectKeyIdentifier` rather than the in-band `OriginatorPublicKey`,
+the recipient resolves the originator cert through a `TrustStore` —
+pass it via `read_pdf_to_scene_with_certificate_and_trust_store(pdf,
+&cred, &store)`. Round 17 also adds **read-only** decode for legacy
+RC2-CBC (RFC 2268 + RFC 3217) and DES-EDE3-CBC (3DES, RFC 3370 §5.2)
+envelope content algorithms so PDF 2.0-deprecated archives still open;
+no encode-side support — the writer always uses AES.
 
 ## Encryption encode (writer side)
 

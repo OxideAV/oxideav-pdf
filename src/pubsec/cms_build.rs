@@ -13,7 +13,8 @@
 use crate::error::PdfError;
 
 use super::cms::{
-    OID_AES128_CBC, OID_AES256_CBC, OID_DATA, OID_ENVELOPED_DATA, OID_RC4, OID_RSA_ENCRYPTION,
+    OID_AES128_CBC, OID_AES256_CBC, OID_DATA, OID_DES_EDE3_CBC, OID_ENVELOPED_DATA, OID_RC2_CBC,
+    OID_RC4, OID_RSA_ENCRYPTION,
 };
 use super::der::{
     write_context_constructed, write_context_primitive, write_integer_bytes, write_integer_u64,
@@ -110,6 +111,62 @@ pub fn build_envelope_rc4(recipients: &[RecipientPlain], plaintext: &[u8], cek: 
     build_envelope_inner(recipients, &OID_RC4, None, &encrypted)
 }
 
+/// **Round-17 read-only test fixture** — build an `EnvelopedData`
+/// ContentInfo whose content-encryption algorithm is RC2-CBC (RFC 2268
+/// + RFC 3217 §3 + RFC 3370 §5.1). The CEK is the raw RC2 key bytes
+/// (length matches `effective_key_bits / 8` rounded up); IV is 8 bytes;
+/// padding is PKCS#7. The parameters SEQUENCE carries the RFC 3370
+/// `rc2ParameterVersion` mapping for the supplied `effective_key_bits`
+/// (40 → 160, 64 → 120, 128 → 58; other values pass through verbatim).
+///
+/// PDF 2.0 deprecates RC2 and we provide NO encode-side public API for
+/// new files — this helper exists only so the read-side decoder can be
+/// unit-tested. Marked `#[doc(hidden)]` to keep it off the public
+/// surface (writer code must use AES).
+#[doc(hidden)]
+pub fn build_envelope_rc2_cbc(
+    recipients: &[RecipientPlain],
+    plaintext: &[u8],
+    cek: &[u8],
+    effective_key_bits: u32,
+    iv: &[u8; 8],
+) -> Vec<u8> {
+    let encrypted = rc2_cbc_encrypt_padded(cek, effective_key_bits, iv, plaintext);
+    // Build params SEQUENCE { INTEGER rc2ParameterVersion, OCTET STRING iv }.
+    let version_byte: u32 = match effective_key_bits {
+        40 => 160,
+        64 => 120,
+        128 => 58,
+        v => v,
+    };
+    let mut params_body = super::der::write_integer_u64(version_byte as u64);
+    params_body.extend_from_slice(&super::der::write_octet_string(iv));
+    let params = super::der::write_sequence(&params_body);
+    build_envelope_inner_raw_params(recipients, &OID_RC2_CBC, &params, &encrypted)
+}
+
+/// **Round-17 read-only test fixture** — build an `EnvelopedData`
+/// ContentInfo whose content-encryption algorithm is DES-EDE3-CBC
+/// (3DES, RFC 3370 §5.2 / RFC 5652 §12.4). The CEK is the 24-byte
+/// concatenation of the three DES keys; IV is 8 bytes; padding is
+/// PKCS#7. Parameters are a single OCTET STRING containing the IV.
+///
+/// PDF 2.0 deprecates 3DES and we provide NO encode-side public API for
+/// new files. Marked `#[doc(hidden)]` for the same reason as
+/// [`build_envelope_rc2_cbc`].
+#[doc(hidden)]
+pub fn build_envelope_des_ede3_cbc(
+    recipients: &[RecipientPlain],
+    plaintext: &[u8],
+    cek: &[u8; 24],
+    iv: &[u8; 8],
+) -> Vec<u8> {
+    let encrypted = des_ede3_cbc_encrypt_padded(cek, iv, plaintext);
+    // Params for 3DES is a bare OCTET STRING wrapping the IV.
+    let params = super::der::write_octet_string(iv);
+    build_envelope_inner_raw_params(recipients, &OID_DES_EDE3_CBC, &params, &encrypted)
+}
+
 fn build_envelope_inner(
     recipients: &[RecipientPlain],
     content_alg_oid: &[u64],
@@ -163,6 +220,57 @@ fn build_envelope_inner(
 
     // 4) ContentInfo = SEQUENCE { contentType=envelopedData,
     //                              content [0] EXPLICIT EnvelopedData }.
+    let outer_body = {
+        let mut b = write_oid(&OID_ENVELOPED_DATA);
+        b.extend_from_slice(&write_context_constructed(0, &enveloped));
+        b
+    };
+    write_sequence(&outer_body)
+}
+
+/// Round-17: same as [`build_envelope_inner`] except the
+/// `AlgorithmIdentifier`'s `parameters` is supplied raw (already DER-encoded).
+/// Used by the RC2 / 3DES test fixtures whose parameters shape isn't a
+/// simple "OCTET STRING wrapping a 16-byte IV" — RC2's params are a
+/// SEQUENCE { INTEGER version, OCTET STRING iv } and 3DES's are a bare
+/// 8-byte OCTET STRING.
+fn build_envelope_inner_raw_params(
+    recipients: &[RecipientPlain],
+    content_alg_oid: &[u64],
+    raw_params: &[u8],
+    encrypted_content: &[u8],
+) -> Vec<u8> {
+    let envelope_version: u64 = if recipients
+        .iter()
+        .any(|r| matches!(r.rid, RecipientIdRef::SubjectKeyIdentifier { .. }))
+    {
+        2
+    } else {
+        0
+    };
+    let mut ri_set_body = Vec::new();
+    for r in recipients {
+        ri_set_body.extend_from_slice(&build_ktri(r));
+    }
+    let ri_set = write_set(&ri_set_body);
+    let alg_id = {
+        let mut body = write_oid(content_alg_oid);
+        body.extend_from_slice(raw_params);
+        write_sequence(&body)
+    };
+    let eci = {
+        let mut body = write_oid(&OID_DATA);
+        body.extend_from_slice(&alg_id);
+        body.extend_from_slice(&write_context_primitive(0, encrypted_content));
+        write_sequence(&body)
+    };
+    let enveloped_body = {
+        let mut b = write_integer_u64(envelope_version);
+        b.extend_from_slice(&ri_set);
+        b.extend_from_slice(&eci);
+        b
+    };
+    let enveloped = write_sequence(&enveloped_body);
     let outer_body = {
         let mut b = write_oid(&OID_ENVELOPED_DATA);
         b.extend_from_slice(&write_context_constructed(0, &enveloped));
@@ -231,6 +339,48 @@ fn aes256_cbc_encrypt_padded(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> Vec<
     let mut buf = vec![0u8; pad_block * 16];
     let n = enc
         .encrypt_padded_b2b_mut::<aes::cipher::block_padding::Pkcs7>(data, &mut buf)
+        .expect("PKCS7 padding")
+        .len();
+    buf.truncate(n);
+    buf
+}
+
+/// Round-17 read-only fixture helper: RC2-CBC encrypt with PKCS#7
+/// padding. Goes through `Rc2::new_with_eff_key_len` to honour the
+/// RFC 2268 §6 effective-key-bits parameter independently of the raw
+/// key length (RFC 3370 §5.1 lets the two diverge).
+fn rc2_cbc_encrypt_padded(
+    key: &[u8],
+    effective_key_bits: u32,
+    iv: &[u8; 8],
+    data: &[u8],
+) -> Vec<u8> {
+    use cbc::cipher::{BlockEncryptMut, InnerIvInit};
+    use rc2::Rc2;
+    let cipher = Rc2::new_with_eff_key_len(key, effective_key_bits as usize);
+    let enc = cbc::Encryptor::<Rc2>::inner_iv_slice_init(cipher, iv).expect("RC2 IV init");
+    let pad_block = (data.len() / 8) + 1;
+    let mut buf = vec![0u8; pad_block * 8];
+    let n = enc
+        .encrypt_padded_b2b_mut::<cbc::cipher::block_padding::Pkcs7>(data, &mut buf)
+        .expect("PKCS7 padding")
+        .len();
+    buf.truncate(n);
+    buf
+}
+
+/// Round-17 read-only fixture helper: 3DES-CBC encrypt with PKCS#7
+/// padding. The 24-byte key is treated as the concatenation of three
+/// 8-byte DES sub-keys (RFC 5652 §12.4 / RFC 3370 §5.2).
+fn des_ede3_cbc_encrypt_padded(key: &[u8; 24], iv: &[u8; 8], data: &[u8]) -> Vec<u8> {
+    use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+    use des::TdesEde3;
+    type Enc = cbc::Encryptor<TdesEde3>;
+    let enc = Enc::new(key.into(), iv.into());
+    let pad_block = (data.len() / 8) + 1;
+    let mut buf = vec![0u8; pad_block * 8];
+    let n = enc
+        .encrypt_padded_b2b_mut::<cbc::cipher::block_padding::Pkcs7>(data, &mut buf)
         .expect("PKCS7 padding")
         .len();
     buf.truncate(n);

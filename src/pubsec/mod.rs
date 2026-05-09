@@ -138,12 +138,14 @@ pub mod cms_build;
 pub mod der;
 pub mod encode;
 pub mod kari;
+pub mod trust;
 pub mod x509;
 
 pub use encode::{
     KariRecipient, PubSecCfGroup, PubSecEncoderConfig, PubSecEncryptionState, PubSecKariConfig,
     PubSecMultiCfConfig, PubSecRecipient,
 };
+pub use trust::{CertRef, TrustStore};
 
 use crate::decrypt::{CryptMethod, StandardHandler};
 use crate::error::PdfError;
@@ -386,6 +388,42 @@ pub fn open_with_certificate(
     Ok(open_with_certificate_with_permissions(encrypt, credential)?.map(|m| m.handler))
 }
 
+/// Round-17: variant of [`open_with_certificate`] that consults a
+/// [`TrustStore`] for KARI envelopes whose `OriginatorIdentifierOrKey`
+/// is `IssuerAndSerial` or `SubjectKeyIdentifier` (RFC 5652 §6.2.2)
+/// rather than the in-band `OriginatorPublicKey` form.
+///
+/// When the originator side is a long-term cert reference, the trust
+/// store provides the originator's public point (extracted from the
+/// referenced certificate's SPKI BIT STRING contents). The recipient's
+/// own credential supplies the EC private scalar as before.
+///
+/// In-band `OriginatorPublicKey` envelopes still work without
+/// consulting the trust store — the lookup path is only triggered for
+/// the long-term-cert forms.
+pub fn open_with_certificate_and_trust_store(
+    encrypt: &Dict,
+    credential: &PubSecCredential,
+    trust_store: &TrustStore,
+) -> Result<Option<StandardHandler>, PdfError> {
+    Ok(
+        open_with_certificate_and_trust_store_with_permissions(encrypt, credential, trust_store)?
+            .map(|m| m.handler),
+    )
+}
+
+/// Round-17: extended trust-store entry point that surfaces the matched
+/// CF's name + envelope permissions alongside the handler. Same role as
+/// [`open_with_certificate_with_permissions`] but for the trust-store
+/// path.
+pub fn open_with_certificate_and_trust_store_with_permissions(
+    encrypt: &Dict,
+    credential: &PubSecCredential,
+    trust_store: &TrustStore,
+) -> Result<Option<PubSecMatch>, PdfError> {
+    open_inner(encrypt, credential, Some(trust_store))
+}
+
 /// Round-12 extended entry point — same matching rules as
 /// [`open_with_certificate`] but surfaces the matched CF's name +
 /// envelope permissions alongside the handler. Lets a caller display
@@ -394,6 +432,14 @@ pub fn open_with_certificate(
 pub fn open_with_certificate_with_permissions(
     encrypt: &Dict,
     credential: &PubSecCredential,
+) -> Result<Option<PubSecMatch>, PdfError> {
+    open_inner(encrypt, credential, None)
+}
+
+fn open_inner(
+    encrypt: &Dict,
+    credential: &PubSecCredential,
+    trust_store: Option<&TrustStore>,
 ) -> Result<Option<PubSecMatch>, PdfError> {
     let sub_filter = PubSecSubFilter::from_dict(encrypt)?;
     let candidates = collect_recipient_arrays(encrypt)?;
@@ -420,7 +466,7 @@ pub fn open_with_certificate_with_permissions(
     for candidate in &candidates {
         for blob in &candidate.blobs {
             let envelope = cms::parse_envelope(blob)?;
-            let Some(plaintext) = try_unwrap(&envelope, credential)? else {
+            let Some(plaintext) = try_unwrap(&envelope, credential, trust_store)? else {
                 continue;
             };
             // Plaintext is `seed (20 bytes) [|| 4 bytes permissions]`.
@@ -673,9 +719,16 @@ fn recipients_to_blobs(array: &Object) -> Result<Vec<Vec<u8>>, PdfError> {
 /// scheme isn't `dhSinglePass-stdDH-sha256kdf-scheme` (P-256 +
 /// X9.63-SHA-256 KDF + AES-KW) are skipped silently — a future round
 /// extends this matcher with P-384 / P-521 / X25519.
+///
+/// Round 17: when the KARI envelope's `OriginatorIdentifierOrKey` is
+/// `IssuerAndSerial` or `SubjectKeyIdentifier`, the supplied optional
+/// `trust_store` is consulted to recover the originator's public point
+/// from the long-term cert. `None` keeps the round-14 behaviour
+/// (long-term-cert KARIs are skipped silently).
 fn try_unwrap(
     envelope: &cms::EnvelopedData,
     credential: &PubSecCredential,
+    trust_store: Option<&TrustStore>,
 ) -> Result<Option<Vec<u8>>, PdfError> {
     let our_issuer = &credential.cert.issuer_der;
     let our_serial = &credential.cert.serial;
@@ -738,7 +791,7 @@ fn try_unwrap(
                     private_scalar: ec_scalar.clone(),
                     public_point_sec1: credential.cert.spki_pubkey_bits.clone().unwrap_or_default(),
                 };
-                let cek = kari::unwrap_kari(kari, slot, &recipient)?;
+                let cek = kari::unwrap_kari_with_trust_store(kari, slot, &recipient, trust_store)?;
                 let plaintext = decrypt_envelope_content(
                     &envelope.content_encryption,
                     &cek,
@@ -776,6 +829,14 @@ fn decrypt_envelope_content(
             }
             aes_cbc_decrypt::<aes::Aes256>(cek, iv, ciphertext)
         }
+        // Round-17 read-only legacy CMS content encryption — RC2 / 3DES.
+        // PDF 2.0 deprecates both; we accept on decode only so legacy
+        // archives still open. Keying material lengths follow RFC 3370.
+        cms::ContentEncryption::Rc2Cbc {
+            effective_key_bits,
+            iv,
+        } => rc2_cbc_decrypt(cek, *effective_key_bits, iv, ciphertext),
+        cms::ContentEncryption::DesEde3Cbc { iv } => des_ede3_cbc_decrypt(cek, iv, ciphertext),
     }
 }
 
@@ -801,6 +862,80 @@ where
     let pt = dec
         .decrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(&mut buf)
         .map_err(|e| PdfError::other(format!("PDF pubsec: AES-CBC unpad: {e:?}")))?;
+    Ok(pt.to_vec())
+}
+
+/// Round-17 read-only: decrypt an RC2-CBC envelope content. RC2 is a
+/// 64-bit block cipher (RFC 2268) — the IV is 8 bytes, blocks are
+/// 8 bytes, padding is PKCS#7. The CEK length is the raw key length;
+/// `effective_key_bits` is the RC2 effective-key parameter from RFC 2268
+/// §6 (configured independently of the raw key length per RFC 3370 §5.1).
+///
+/// PDF 2.0 deprecates RC2 entirely; this path exists to open legacy
+/// archives only. No encode-side support.
+fn rc2_cbc_decrypt(
+    cek: &[u8],
+    effective_key_bits: u32,
+    iv: &[u8; 8],
+    ct: &[u8],
+) -> Result<Vec<u8>, PdfError> {
+    use cbc::cipher::{BlockDecryptMut, InnerIvInit};
+    use rc2::Rc2;
+    if ct.len() % 8 != 0 {
+        return Err(PdfError::other(format!(
+            "PDF pubsec: RC2-CBC ciphertext {} not block-aligned (8-byte blocks)",
+            ct.len()
+        )));
+    }
+    if cek.is_empty() || cek.len() > 128 {
+        return Err(PdfError::other(format!(
+            "PDF pubsec: RC2 CEK length {} out of RFC 2268 range (1..=128 bytes)",
+            cek.len()
+        )));
+    }
+    // `rc2`'s public `KeyInit::new_from_slice` always sets eff_key_len =
+    // 8 * key.len(). To honour RFC 3370's separate effective-key
+    // parameter we construct the cipher via `new_with_eff_key_len` and
+    // wrap it into a CBC decryptor through `InnerIvInit`.
+    let cipher = Rc2::new_with_eff_key_len(cek, effective_key_bits as usize);
+    let dec = cbc::Decryptor::<Rc2>::inner_iv_slice_init(cipher, iv)
+        .map_err(|e| PdfError::other(format!("PDF pubsec: RC2-CBC IV init failed: {e}")))?;
+    let mut buf = ct.to_vec();
+    let pt = dec
+        .decrypt_padded_mut::<cbc::cipher::block_padding::Pkcs7>(&mut buf)
+        .map_err(|e| PdfError::other(format!("PDF pubsec: RC2-CBC unpad: {e:?}")))?;
+    Ok(pt.to_vec())
+}
+
+/// Round-17 read-only: decrypt a 3DES-CBC (DES-EDE3-CBC) envelope
+/// content. The CEK is the 24-byte concatenation of the three single-DES
+/// keys (RFC 3370 §5.2 / RFC 5652 §12.4); the IV is 8 bytes; blocks are
+/// 8 bytes; padding is PKCS#7.
+///
+/// PDF 2.0 deprecates 3DES; this path exists to open legacy archives
+/// only. No encode-side support.
+fn des_ede3_cbc_decrypt(cek: &[u8], iv: &[u8; 8], ct: &[u8]) -> Result<Vec<u8>, PdfError> {
+    use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+    use des::TdesEde3;
+    if ct.len() % 8 != 0 {
+        return Err(PdfError::other(format!(
+            "PDF pubsec: 3DES-CBC ciphertext {} not block-aligned (8-byte blocks)",
+            ct.len()
+        )));
+    }
+    if cek.len() != 24 {
+        return Err(PdfError::other(format!(
+            "PDF pubsec: 3DES (TdesEde3) CEK must be 24 bytes (got {})",
+            cek.len()
+        )));
+    }
+    type Dec = cbc::Decryptor<TdesEde3>;
+    let dec = <Dec as KeyIvInit>::new_from_slices(cek, iv)
+        .map_err(|e| PdfError::other(format!("PDF pubsec: 3DES-CBC init failed: {e}")))?;
+    let mut buf = ct.to_vec();
+    let pt = dec
+        .decrypt_padded_mut::<cbc::cipher::block_padding::Pkcs7>(&mut buf)
+        .map_err(|e| PdfError::other(format!("PDF pubsec: 3DES-CBC unpad: {e:?}")))?;
     Ok(pt.to_vec())
 }
 

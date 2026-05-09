@@ -573,6 +573,25 @@ pub fn unwrap_kari(
     recipient_slot: &RecipientEncryptedKey,
     recipient: &EcRecipient,
 ) -> Result<Vec<u8>, PdfError> {
+    unwrap_kari_with_trust_store(kari, recipient_slot, recipient, None)
+}
+
+/// Round-17: KARI unwrap dispatch that consults a [`super::TrustStore`]
+/// when the envelope's `OriginatorIdentifierOrKey` is `IssuerAndSerial`
+/// or `SubjectKeyIdentifier` rather than the in-band `OriginatorPublicKey`
+/// form (RFC 5652 §6.2.2). The trust store maps cert references to
+/// parsed [`super::x509::Certificate`]s whose `spki_pubkey_bits` slot
+/// carries the originator's encoded public point.
+///
+/// `trust_store = None` keeps the round-14 behaviour (long-term-cert
+/// originator forms produce a structured error). Pass `Some(&store)` to
+/// enable the lookup path.
+pub fn unwrap_kari_with_trust_store(
+    kari: &KeyAgreeRecipientInfo,
+    recipient_slot: &RecipientEncryptedKey,
+    recipient: &EcRecipient,
+    trust_store: Option<&super::TrustStore>,
+) -> Result<Vec<u8>, PdfError> {
     // 1. Resolve the KDF from the KEA OID + cross-check it's a binding
     //    the recipient's curve permits (RFC 5753 §7.1.4 / RFC 8418).
     let kdf = KariKdf::from_kea_oid(&kari.key_encryption_oid).ok_or_else(|| {
@@ -602,14 +621,43 @@ pub fn unwrap_kari(
         ))
     })?;
     // 3. Pull the originator's public point + check the curve matches.
+    //    Round 17: long-term cert references resolve through the
+    //    optional trust store.
     let originator_point = match &kari.originator {
         OriginatorId::OriginatorKey(opk) => extract_originator_point(opk, recipient.curve)?,
-        OriginatorId::IssuerAndSerial(_) | OriginatorId::SubjectKeyIdentifier(_) => {
-            return Err(PdfError::other(
-                "PDF pubsec KARI: originator must be OriginatorPublicKey \
-                 (IssuerAndSerial / SubjectKeyIdentifier require an out-of-band \
-                 originator certificate lookup, which is out of scope here)",
-            ))
+        OriginatorId::IssuerAndSerial(ias) => {
+            let store = trust_store.ok_or_else(|| {
+                PdfError::other(
+                    "PDF pubsec KARI: originator is IssuerAndSerial but no TrustStore \
+                     was supplied (use open_with_certificate_and_trust_store)",
+                )
+            })?;
+            let key = super::CertRef::IssuerAndSerial {
+                issuer_der: ias.issuer_der.clone(),
+                serial: ias.serial.clone(),
+            };
+            let cert = store.lookup(&key).ok_or_else(|| {
+                PdfError::other(
+                    "PDF pubsec KARI: originator IssuerAndSerial not found in TrustStore",
+                )
+            })?;
+            originator_point_from_cert(cert, recipient.curve)?
+        }
+        OriginatorId::SubjectKeyIdentifier(ski) => {
+            let store = trust_store.ok_or_else(|| {
+                PdfError::other(
+                    "PDF pubsec KARI: originator is SubjectKeyIdentifier but no TrustStore \
+                     was supplied (use open_with_certificate_and_trust_store)",
+                )
+            })?;
+            let cert = store
+                .lookup(&super::CertRef::SubjectKeyIdentifier(ski.clone()))
+                .ok_or_else(|| {
+                    PdfError::other(
+                        "PDF pubsec KARI: originator SubjectKeyIdentifier not found in TrustStore",
+                    )
+                })?;
+            originator_point_from_cert(cert, recipient.curve)?
         }
     };
     // 4. ECDH key agreement, dispatched on curve.
@@ -633,6 +681,34 @@ pub fn unwrap_kari(
     let kek = derive_kek(kdf, &z, ukm, &shared_info, wrap.kek_len());
     // 7. AES Key Wrap unwrap (RFC 3394).
     aes_kw_unwrap(wrap, &kek, &recipient_slot.encrypted_key)
+}
+
+/// Round-17: pull the originator's encoded public point out of a
+/// trust-store certificate's `spki_pubkey_bits` slot. For NIST EC
+/// curves the SPKI BIT STRING contents IS the SEC1-encoded uncompressed
+/// point (RFC 5480 §2.2); for X25519 the BIT STRING contents IS the
+/// raw 32-byte u-coordinate (RFC 8410 §4). We size-check the bytes
+/// against the curve's expected encoded length.
+fn originator_point_from_cert(
+    cert: &super::x509::Certificate,
+    expected: KariCurve,
+) -> Result<Vec<u8>, PdfError> {
+    let bits = cert.spki_pubkey_bits.as_deref().ok_or_else(|| {
+        PdfError::other(
+            "PDF pubsec KARI: trust-store certificate has no SPKI BIT STRING contents \
+             — cannot recover originator public point",
+        )
+    })?;
+    if bits.len() != expected.pub_point_len() {
+        return Err(PdfError::other(format!(
+            "PDF pubsec KARI: trust-store originator SPKI length {} does not match \
+             {:?} expected {} bytes",
+            bits.len(),
+            expected,
+            expected.pub_point_len()
+        )));
+    }
+    Ok(bits.to_vec())
 }
 
 /// Run ECDH on the supplied curve and return the shared-secret bytes

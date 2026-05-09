@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round-17: **Long-term originator cert via TrustStore**. Closes the
+  RFC 5652 §6.2.2 `OriginatorIdentifierOrKey` `IssuerAndSerial` /
+  `SubjectKeyIdentifier` decoder gap — when a KARI envelope identifies
+  the originator by long-term cert reference rather than carrying its
+  public point in-band, the recipient resolves the cert through a
+  caller-supplied `TrustStore`. New types `pubsec::trust::TrustStore`
+  + `pubsec::trust::CertRef` (re-exported as `oxideav_pdf::TrustStore`
+  / `oxideav_pdf::CertRef`); new entry points
+  `read_pdf_to_scene_with_certificate_and_trust_store(pdf, &cred, &store)`
+  + `pubsec::open_with_certificate_and_trust_store(...)` +
+  `..._with_permissions(...)`. New helper
+  `pubsec::kari::unwrap_kari_with_trust_store(kari, slot, recipient,
+  Option<&TrustStore>)` dispatches the lookup and pulls the
+  originator's encoded public point straight out of the cert's SPKI BIT
+  STRING contents (SEC1 uncompressed for NIST EC curves per RFC 5480
+  §2.2; raw 32-byte u-coordinate for X25519 per RFC 8410 §4). Backwards
+  compatible: the existing `read_pdf_to_scene_with_certificate` /
+  `open_with_certificate` paths still refuse long-term-cert originators
+  with a structured error.
+- Round-17: **RC2 / 3DES envelope content decode (read-only)**. Adds
+  decode support for `EncryptedContentInfo.contentEncryptionAlgorithm`
+  values that legacy CMS envelopes may carry: RC2-CBC
+  (OID `1.2.840.113549.3.2`, RFC 2268 + RFC 3217 §3 + RFC 3370 §5.1
+  with the `rc2ParameterVersion` ↔ effective-key-bits mapping at
+  160→40, 120→64, 58→128) and DES-EDE3-CBC / 3DES
+  (OID `1.2.840.113549.3.7`, RFC 3370 §5.2 / RFC 5652 §12.4). New
+  `pubsec::cms::ContentEncryption::Rc2Cbc { effective_key_bits, iv }` +
+  `pubsec::cms::ContentEncryption::DesEde3Cbc { iv }` enum variants;
+  RC2 dispatch goes through `Rc2::new_with_eff_key_len` to honour the
+  RFC 3370 §5.1 effective-key parameter independently of the raw key
+  length. Hidden test fixtures `pubsec::cms_build::build_envelope_rc2_cbc`
+  + `..._des_ede3_cbc` (`#[doc(hidden)]`) so the read-only path is
+  testable without exposing an encode-side public API. **PDF 2.0
+  deprecates both algorithms** — no encode-side support is provided;
+  the writer always uses AES. New deps: `rc2` 0.8 + `des` 0.8
+  (RustCrypto, pure-Rust).
+- Round-17: **`/EncryptMetadata false` × KARI end-to-end test**. Adds
+  three integration tests confirming that
+  `PubSecKariConfig::encrypt_metadata = false` round-trips through both
+  the `/Encrypt` dict entry AND the SHA-256 file-key derivation's
+  `0xFFFFFFFF` opt-in tail (ISO 32000-2 §7.6.5.3) for both P-256 ECDH
+  and X25519 KARI envelopes — symmetric to the round-8 KTRI coverage
+  in `tests/encrypt_metadata_false.rs`. The plumbing was already
+  present from round 15; round 17 closes the test-coverage gap.
+- Round-17 tests: 16 new tests — 4 `pubsec::trust` unit tests
+  (IAS / SKI / dual-form-insert round-trips + SPKI-absent skip path) +
+  3 `tests/pubsec_round17_kari_encrypt_metadata_false.rs` integration
+  tests + 4 `tests/pubsec_round17_trust_store.rs` integration tests
+  (long-term IAS originator + long-term SKI originator + missing-cert
+  negative + wrong-cert AES-KW-failure negative) + 5
+  `tests/pubsec_round17_rc2_3des.rs` integration tests (RC2-CBC parse +
+  RC2-CBC round-trip + RC2-CBC 64-bit-effective-key round-trip +
+  3DES-CBC parse + 3DES-CBC round-trip).
+
 - Round-16: **P-521 KARI + RFC 8418 §2.2 HKDF binding for X25519**.
   Closes the NIST KARI curve coverage and adds the modern HKDF KDF
   family for X25519. New `pubsec::kari::KariCurve::P521` variant +

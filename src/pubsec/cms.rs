@@ -52,10 +52,33 @@ pub const OID_AES128_CBC: [u64; 9] = [2, 16, 840, 1, 101, 3, 4, 1, 2];
 /// OID 2.16.840.1.101.3.4.1.42 — id-aes256-CBC.
 pub const OID_AES256_CBC: [u64; 9] = [2, 16, 840, 1, 101, 3, 4, 1, 42];
 
+/// OID 1.2.840.113549.3.2 — `rc2-cbc` (RFC 2268 + RFC 3217 §3). Used
+/// by legacy CMS envelopes whose `EncryptedContentInfo.contentEncryptionAlgorithm`
+/// names RC2-CBC. Round-17 adds read-only support so legacy
+/// PDF archives still open; PDF 2.0 deprecates RC2 entirely.
+///
+/// Parameters per RFC 3370 §5.1: SEQUENCE { rc2ParameterVersion INTEGER
+/// OPTIONAL DEFAULT 32, iv OCTET STRING (size 8) }. The
+/// `rc2ParameterVersion` ↔ effective-key-bits mapping (RFC 2268 §6) is:
+/// version 160 → 40 bits, 120 → 64 bits, 58 → 128 bits. We only
+/// support the 128-bit effective-key variant on decode (the 40 / 64-bit
+/// variants are export-grade legacy and would also be acceptable in
+/// principle, but the surface we surface today follows the most-common
+/// modern usage).
+pub const OID_RC2_CBC: [u64; 6] = [1, 2, 840, 113549, 3, 2];
+
+/// OID 1.2.840.113549.3.7 — `des-EDE3-CBC` (RFC 3370 §5.2 + RFC 5652
+/// §12.4). Used by legacy CMS envelopes whose
+/// `EncryptedContentInfo.contentEncryptionAlgorithm` names triple-DES
+/// in CBC mode. Round-17 adds read-only support; PDF 2.0 deprecates 3DES.
+///
+/// Parameters: OCTET STRING (size 8) — the 8-byte CBC IV.
+pub const OID_DES_EDE3_CBC: [u64; 6] = [1, 2, 840, 113549, 3, 7];
+
 /// Symmetric content-encryption algorithm extracted from the
 /// `EnvelopedData::encryptedContentInfo::contentEncryptionAlgorithm`
 /// field. Only the algorithms actually referenced by ISO 32000-1
-/// §7.6.4.3 are listed.
+/// §7.6.4.3 + the read-only legacy round-17 set are listed.
 #[derive(Debug, Clone)]
 pub enum ContentEncryption {
     /// RC4 stream cipher; the algorithm identifier carries no
@@ -66,6 +89,29 @@ pub enum ContentEncryption {
     Aes128Cbc { iv: [u8; 16] },
     /// AES-256-CBC. Same parameter shape as AES-128.
     Aes256Cbc { iv: [u8; 16] },
+    /// **Round-17 read-only** — RC2-CBC (RFC 2268 + RFC 3217 §3). The
+    /// 8-byte CBC IV is carried in the parameters SEQUENCE alongside
+    /// the optional `rc2ParameterVersion` (which we surface as the
+    /// effective-key bit length per RFC 2268 §6 — 40 / 64 / 128).
+    /// PDF 2.0 deprecates RC2; we accept it on decode only.
+    Rc2Cbc {
+        /// RC2 effective-key bit length (RFC 2268 §6) — `40`, `64`, or
+        /// `128`. Defaults to `32` per RFC 3370 §5.1's
+        /// `rc2ParameterVersion` DEFAULT (which translates to 32 effective
+        /// bits — but RFC 3370 also explicitly lists 32 → 32 and writers
+        /// commonly omit the field entirely, in which case we fall back
+        /// to 32).
+        effective_key_bits: u32,
+        /// 8-byte CBC IV.
+        iv: [u8; 8],
+    },
+    /// **Round-17 read-only** — DES-EDE3-CBC (3DES, RFC 3370 §5.2). The
+    /// 8-byte CBC IV is the parameters payload. PDF 2.0 deprecates 3DES;
+    /// we accept it on decode only.
+    DesEde3Cbc {
+        /// 8-byte CBC IV.
+        iv: [u8; 8],
+    },
 }
 
 /// Identifier-and-serial-number pair (RFC 5280 §A.1) that points at
@@ -690,6 +736,91 @@ fn decode_content_alg(oid: &[u64], params: &[u8]) -> Result<ContentEncryption, P
         } else {
             Ok(ContentEncryption::Aes256Cbc { iv: iv_arr })
         }
+    } else if oid == OID_RC2_CBC {
+        // Round-17: RC2-CBC. Parameters per RFC 3370 §5.1:
+        //   RC2CBCParameter ::= SEQUENCE {
+        //     rc2ParameterVersion INTEGER (0..255) DEFAULT 32,  -- effective-key version
+        //     iv OCTET STRING (size 8)
+        //   }
+        // Some legacy writers omit the parameter version; treat that as
+        // the DEFAULT 32 (mapped per RFC 2268 §6 to 32 effective bits).
+        // Other writers wrap params as a bare OCTET STRING (RFC 2268
+        // §6 wire form) — accept both.
+        let (param_seq, after_seq) = match read_sequence(params) {
+            Ok(parts) => parts,
+            Err(_) => {
+                // Bare OCTET STRING fallback (RFC 2268 §6).
+                let (iv_bytes, _) = read_octet_string(params)?;
+                if iv_bytes.len() != 8 {
+                    return Err(PdfError::other(format!(
+                        "CMS: RC2-CBC bare-OCTET-STRING IV must be 8 bytes (got {})",
+                        iv_bytes.len()
+                    )));
+                }
+                let mut iv_arr = [0u8; 8];
+                iv_arr.copy_from_slice(iv_bytes);
+                return Ok(ContentEncryption::Rc2Cbc {
+                    effective_key_bits: 32,
+                    iv: iv_arr,
+                });
+            }
+        };
+        let _ = after_seq;
+        // SEQUENCE-wrapped params: optional INTEGER (rc2ParameterVersion),
+        // mandatory OCTET STRING (iv).
+        let mut cursor = param_seq;
+        let mut effective_key_bits = 32u32;
+        let (peek, _) = super::der::read_tlv(cursor)?;
+        if peek.class == super::der::Class::Universal && peek.tag_number == super::der::tag::INTEGER
+        {
+            let (vers_u64, after) = read_integer_u64(cursor)?;
+            // RFC 2268 §6 mapping: 160 → 40 bits, 120 → 64 bits, 58 →
+            // 128 bits. Other values pass through as the literal
+            // effective-key bit count (RFC 3370 §5.1's 32 default).
+            effective_key_bits = match vers_u64 {
+                160 => 40,
+                120 => 64,
+                58 => 128,
+                v if v <= 255 => v as u32,
+                _ => {
+                    return Err(PdfError::other(format!(
+                        "CMS: RC2 rc2ParameterVersion {vers_u64} out of range (RFC 2268 §6)"
+                    )))
+                }
+            };
+            cursor = after;
+        }
+        let (iv_bytes, rest) = read_octet_string(cursor)?;
+        if !rest.is_empty() {
+            return Err(PdfError::other(
+                "CMS: RC2-CBC parameters trailing bytes after IV",
+            ));
+        }
+        if iv_bytes.len() != 8 {
+            return Err(PdfError::other(format!(
+                "CMS: RC2-CBC IV must be 8 bytes (got {})",
+                iv_bytes.len()
+            )));
+        }
+        let mut iv_arr = [0u8; 8];
+        iv_arr.copy_from_slice(iv_bytes);
+        Ok(ContentEncryption::Rc2Cbc {
+            effective_key_bits,
+            iv: iv_arr,
+        })
+    } else if oid == OID_DES_EDE3_CBC {
+        // Round-17: 3DES-CBC. Parameters per RFC 3370 §5.2 / RFC 5652
+        // §12.4: OCTET STRING (size 8) — the 8-byte CBC IV.
+        let (iv_bytes, _) = read_octet_string(params)?;
+        if iv_bytes.len() != 8 {
+            return Err(PdfError::other(format!(
+                "CMS: DES-EDE3-CBC IV must be 8 bytes (got {})",
+                iv_bytes.len()
+            )));
+        }
+        let mut iv_arr = [0u8; 8];
+        iv_arr.copy_from_slice(iv_bytes);
+        Ok(ContentEncryption::DesEde3Cbc { iv: iv_arr })
     } else {
         Err(PdfError::other(format!(
             "CMS: unsupported contentEncryptionAlgorithm {oid:?}"

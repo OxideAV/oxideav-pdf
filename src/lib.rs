@@ -58,12 +58,15 @@ pub mod writer;
 
 pub use error::PdfError;
 pub use pubsec::{
-    open_with_certificate, open_with_certificate_with_permissions, KariRecipient, PubSecCfGroup,
-    PubSecCredential, PubSecEncoderConfig, PubSecEncryptionState, PubSecKariConfig, PubSecMatch,
-    PubSecMultiCfConfig, PubSecRecipient, PubSecSubFilter,
+    open_with_certificate, open_with_certificate_and_trust_store,
+    open_with_certificate_and_trust_store_with_permissions, open_with_certificate_with_permissions,
+    CertRef, KariRecipient, PubSecCfGroup, PubSecCredential, PubSecEncoderConfig,
+    PubSecEncryptionState, PubSecKariConfig, PubSecMatch, PubSecMultiCfConfig, PubSecRecipient,
+    PubSecSubFilter, TrustStore,
 };
 pub use reader::{
-    read_pdf_to_scene, read_pdf_to_scene_with_certificate, read_pdf_to_scene_with_password,
+    read_pdf_to_scene, read_pdf_to_scene_with_certificate,
+    read_pdf_to_scene_with_certificate_and_trust_store, read_pdf_to_scene_with_password,
 };
 pub use writer::{
     write_pdf, write_pdf_from_scene, write_pdf_from_scene_encrypted,
