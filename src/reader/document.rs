@@ -133,6 +133,45 @@ impl<'a> DocumentReader<'a> {
         self.crypt.is_some()
     }
 
+    /// Round-19: surface the document-level XMP `/Metadata` packet
+    /// per ISO 32000-1 §14.3.2 + Adobe XMP Spec 2012. Returns
+    /// `Ok(None)` when the catalog has no `/Metadata` entry; otherwise
+    /// resolves the referenced stream and returns its decoded payload
+    /// (the raw XMP RDF/XML bytes — caller is expected to do their
+    /// own XML / RDF parse if they need structured access).
+    ///
+    /// Symmetric to [`crate::write_pdf_from_scene_with_xmp`].
+    pub fn xmp_metadata(&mut self) -> Result<Option<Vec<u8>>, PdfError> {
+        let root_id = self.xref.root()?;
+        let catalog = self.resolve(root_id)?;
+        let Object::Dict(catalog) = catalog else {
+            return Err(PdfError::other(format!(
+                "PDF reader: /Root must be a dictionary (got {catalog:?})"
+            )));
+        };
+        let metadata_obj = catalog
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Metadata")
+            .map(|(_, v)| v.clone());
+        let Some(metadata_obj) = metadata_obj else {
+            return Ok(None);
+        };
+        // /Metadata is conventionally an indirect reference (§14.3.2
+        // gives the catalog entry as `metadata stream`). Accept both
+        // direct-stream and reference-to-stream shapes.
+        let stream_obj = match metadata_obj {
+            Object::Reference(id) => self.resolve(id)?,
+            other => other,
+        };
+        let Object::Stream(s) = stream_obj else {
+            return Err(PdfError::other(format!(
+                "PDF reader: catalog /Metadata must resolve to a Stream (got {stream_obj:?})"
+            )));
+        };
+        Ok(Some(decode_stream(&s)?))
+    }
+
     /// Decode the indirect object at `id`. Cached on first hit so a
     /// second `resolve(id)` is O(1). When the file is encrypted, the
     /// per-object decryption is applied here so callers above this

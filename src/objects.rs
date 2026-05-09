@@ -250,6 +250,18 @@ impl Document {
         self.objects.len()
     }
 
+    /// Borrow the object body of the indirect object at `id` for
+    /// mutation. Used by writer code paths that need to extend the
+    /// catalog dictionary after [`crate::page::build_pages`] has
+    /// returned (e.g. to attach `/Metadata <ref>` per ISO 32000-1
+    /// §14.3.2). Returns `None` when `id` was never committed.
+    pub fn object_mut(&mut self, id: ObjectId) -> Option<&mut Object> {
+        self.objects
+            .iter_mut()
+            .find(|o| o.id == id)
+            .map(|o| &mut o.object)
+    }
+
     /// Walk this document into the on-wire layout: header + body +
     /// xref + trailer + startxref. Bytes for sub-objects are emitted
     /// in insertion order.

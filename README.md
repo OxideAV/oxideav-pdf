@@ -159,6 +159,20 @@ generations exist for the same SKI. The `Certificate` parser now also
 extracts the `validity` window (notBefore / notAfter), normalising
 `UTCTime` to `GeneralizedTime` per RFC 5280 §4.1.2.5.1's 1950..2049
 pivot for direct byte-comparison.
+**Round 19** ships two orthogonal additions. **Document-level XMP
+`/Metadata` stream** end-to-end (ISO 32000-1 §14.3.2 + Adobe XMP Spec
+2012): writer entry `write_pdf_from_scene_with_xmp(scene, xmp_bytes)`
+attaches the raw XMP RDF/XML packet to the catalog as a `/Type
+/Metadata /Subtype /XML` stream (no `/Filter`); reader accessor
+`DocumentReader::xmp_metadata()` returns `Some(bytes)` for documents
+that carry one. **CMS `SignedData` parser scaffolding** (RFC 5652 §5
+— PKCS#7): `pubsec::signed_data::parse_signed_data` decodes
+`id-signedData` blobs into typed `SignedData { digest_algorithms,
+encap_content, certs, crls, signer_infos }` + `SignerInfo` (sid,
+digest / signature OIDs, signed / unsigned attribute lists with
+raw-DER values, raw `signature` octets). Signature **verification**
+(hash-then-verify dispatch) is a round-20 deferral; today's surface
+covers every byte the verifier will need.
 
 ## Encryption encode (writer side)
 

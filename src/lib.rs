@@ -73,7 +73,7 @@ pub use writer::{
     write_pdf_from_scene_linearized, write_pdf_from_scene_object_stream,
     write_pdf_from_scene_object_stream_encrypted, write_pdf_from_scene_pubsec_encrypted,
     write_pdf_from_scene_pubsec_kari, write_pdf_from_scene_pubsec_multi_cf,
-    write_pdf_from_scene_xref_stream, write_pdf_incremental_update,
+    write_pdf_from_scene_with_xmp, write_pdf_from_scene_xref_stream, write_pdf_incremental_update,
 };
 
 use oxideav_core::{

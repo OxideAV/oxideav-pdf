@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round-19: **Document-level XMP `/Metadata` stream end-to-end**
+  (ISO 32000-1 §14.3.2 + Adobe XMP Spec 2012). Closes the round-17
+  `EncryptMetadata=false` carve-out by giving the PDF a place to put
+  the unencrypted document-level XMP packet. Writer entry point
+  `write_pdf_from_scene_with_xmp(scene, xmp_bytes)` attaches the raw
+  XMP RDF/XML payload to the catalog as a `/Type /Metadata /Subtype
+  /XML` stream object — no `/Filter` per §14.3.2 (so archival-system
+  grep tools can index the packet without decompressing). Reader
+  accessor `DocumentReader::xmp_metadata() -> Result<Option<Vec<u8>>>`
+  resolves the `/Metadata` indirect reference, decodes the stream, and
+  returns the raw XMP bytes (caller does any XML / RDF parse). New
+  `Document::object_mut` mutation helper enables the post-`build_pages`
+  catalog patch.
+- Round-19: **CMS `SignedData` parser scaffolding** (RFC 5652 §5,
+  PKCS#7). Builds on the existing CMS DER + X.509 + EnvelopedData
+  infrastructure to add parser-side recognition of `id-signedData`
+  (OID `1.2.840.113549.1.7.2`) — the content type that wraps every PDF
+  digital signature (ISO 32000-1 §12.8). New
+  `pubsec::signed_data::SignedData { version, digest_algorithms,
+  encap_content_type, encap_content_octets, certs, crls, signer_infos }`
+  with one-shot accessor `parse_signed_data(der_bytes) ->
+  Result<SignedData, PdfError>`. New
+  `pubsec::signed_data::SignerInfo { version, sid, digest_algorithm_oid,
+  digest_algorithm_params, signed_attrs, signed_attrs_der,
+  signature_algorithm_oid, signature_algorithm_params, signature,
+  unsigned_attrs }` exposes both the structural decode (signed +
+  unsigned attribute lists with raw-DER values, IAS / SKI signer
+  identifier) and the verification-helper bytes (raw `signed_attrs`
+  DER body, ready for the SET-tag re-encode RFC 5652 §5.4 mandates
+  before hashing). New `pubsec::signed_data::SignerIdentifier` mirrors
+  the IAS / SKI CHOICE the CMS RecipientId already exposes for the
+  envelope side. New OID constant `pubsec::cms::OID_SIGNED_DATA`.
+  Signature verification (hash-then-verify dispatch per
+  `digestAlgorithm` + `signatureAlgorithm`) is deferred to round 20.
+- Round-19 tests: 13 new tests — 3 `pubsec::signed_data` unit tests
+  (v=1 IAS attached signature, v=3 SKI with signed attrs, wrong-OID
+  rejection) + 5 `tests/xmp_metadata_round19.rs` (byte-for-byte XMP
+  round-trip, dict-shape inspection, no-metadata-returns-None,
+  binary-payload survives, XMP coexists with `/Info`) + 5
+  `tests/pubsec_round19_signed_data.rs` (attached SignedData parse
+  with all fields surfaced, certs[] surfacing, wrong-OID rejection,
+  truncated-blob rejection, empty-signerInfos rejection).
 - Round-18: **CMS `OriginatorInfo` `certs[]` / `crls[]` surface**. The
   `EnvelopedData.originatorInfo` field (RFC 5652 §10.2.1 — `[0] IMPLICIT
   OriginatorInfo OPTIONAL`) was previously parsed-and-discarded. New

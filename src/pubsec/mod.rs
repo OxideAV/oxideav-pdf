@@ -122,6 +122,21 @@
 //!   writer side; the reader auto-routes by parsing the KEA OID into a
 //!   [`kari::KariKdf`].
 //!
+//! ## Round-19 additions
+//!
+//! * **CMS `SignedData` parser scaffolding** (RFC 5652 §5 — PKCS#7).
+//!   Builds on the existing CMS DER + X.509 + EnvelopedData
+//!   infrastructure to add parser-side recognition of `id-signedData`
+//!   (OID `1.2.840.113549.1.7.2`) — the content type that wraps every
+//!   PDF digital signature (ISO 32000-1 §12.8). New
+//!   [`signed_data::SignedData`] + [`signed_data::SignerInfo`] +
+//!   [`signed_data::SignerIdentifier`] types; new
+//!   [`signed_data::parse_signed_data`] one-shot accessor. Surfaces
+//!   the certs[], crls[], digest_algorithms, encap_content, and
+//!   per-signer (sid, signed_attrs, signature_algorithm, signature)
+//!   fields. Signature **verification** (hash-then-verify dispatch
+//!   per algorithm) is deferred to round 20.
+//!
 //! ## Round-18 additions
 //!
 //! * **`OriginatorInfo certs[] / crls[]` surface** (RFC 5652 §10.2.1).
@@ -153,15 +168,24 @@
 //! * RC2 `rc2ParameterVersion` writer-side encode (read-only currently;
 //!   PDF 2.0 deprecates RC2 so the writer always emits AES — exposing
 //!   an RC2 encoder would only serve archive-replay tooling).
-//! * Document-level XMP metadata stream end-to-end (the writer doesn't
-//!   currently emit XMP `/Metadata` streams; the reader could surface
-//!   them as opaque DER for ISO 32000-1 §14.3.2 / Adobe XMP Spec).
+//! * Full `CertificateChoices` CHOICE dispatch on `OriginatorInfo`
+//!   entries — round 18 surfaces them as opaque DER; future work could
+//!   tag-dispatch each entry into X.509 v3 / extended-cert /
+//!   attribute-cert / other-cert variants per RFC 5652 §10.2.2.
+//! * **Round-19 deferral** — `SignedData` signature verification
+//!   (hash-then-verify dispatch per `digestAlgorithm` +
+//!   `signatureAlgorithm`). The parser surfaces every byte the verifier
+//!   needs (signed_attrs_der, signature, OIDs); a follow-up round
+//!   needs to wire SHA-1 / SHA-256 / SHA-384 / SHA-512 into the
+//!   digest path and RSA-PKCS1v15 / RSA-PSS / ECDSA into the verify
+//!   path with a per-algorithm dispatch table.
 
 pub mod cms;
 pub mod cms_build;
 pub mod der;
 pub mod encode;
 pub mod kari;
+pub mod signed_data;
 pub mod trust;
 pub mod x509;
 

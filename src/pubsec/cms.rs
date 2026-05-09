@@ -36,6 +36,13 @@ use super::der::{
 /// OID 1.2.840.113549.1.7.3 — id-envelopedData.
 pub const OID_ENVELOPED_DATA: [u64; 7] = [1, 2, 840, 113549, 1, 7, 3];
 
+/// OID 1.2.840.113549.1.7.2 — id-signedData (RFC 5652 §5.1). Round-19
+/// adds parser-side recognition; verification is deferred (the round
+/// surfaces `SignedData` structurally so callers can route on the
+/// signed contents + per-signer attributes without a built-in verify
+/// dispatch).
+pub const OID_SIGNED_DATA: [u64; 7] = [1, 2, 840, 113549, 1, 7, 2];
+
 /// OID 1.2.840.113549.1.7.1 — id-data (the contentType inside
 /// `EncryptedContentInfo`).
 pub const OID_DATA: [u64; 7] = [1, 2, 840, 113549, 1, 7, 1];

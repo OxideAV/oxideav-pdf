@@ -125,6 +125,99 @@ pub fn write_pdf_from_scene(scene: &Scene) -> Result<Vec<u8>, PdfError> {
     Ok(out)
 }
 
+/// Round-19: render a [`Scene`] in pages mode and attach a
+/// document-level XMP `/Metadata` stream to the catalog (ISO 32000-1
+/// §14.3.2 + Adobe XMP Spec 2012). `xmp_bytes` is the raw XMP packet
+/// payload (RDF/XML — typically begins with `<?xpacket begin=...?>`
+/// and ends with `<?xpacket end="w"?>`); the writer does not parse or
+/// validate it. Reader-side recovery is via
+/// [`crate::reader::DocumentReader::xmp_metadata`].
+///
+/// The XMP packet lands in a dedicated stream object whose dictionary
+/// carries `/Type /Metadata /Subtype /XML` and **no** `/Filter` —
+/// §14.3.2 explicitly recommends the bytes stay readable to grep-based
+/// tooling for archival systems that index PDF metadata without a full
+/// parser. The catalog dict is patched after [`build_pages`] returns to
+/// add `/Metadata <ref>` per the §14.3.2 catalog-entry contract.
+pub fn write_pdf_from_scene_with_xmp(scene: &Scene, xmp_bytes: &[u8]) -> Result<Vec<u8>, PdfError> {
+    let pages = scene
+        .pages
+        .as_ref()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            PdfError::other(
+                "write_pdf_from_scene_with_xmp: scene is not in pages mode (scene.pages is None or empty)",
+            )
+        })?;
+
+    struct Rendered<'a> {
+        frame: &'a VectorFrame,
+        width: f32,
+        height: f32,
+        content_bytes: Vec<u8>,
+        resources: ResourceCollector,
+    }
+    let rendered: Vec<Rendered<'_>> = pages
+        .iter()
+        .map(|page| {
+            let (content_bytes, resources) = render_frame(&page.content);
+            Rendered {
+                frame: &page.content,
+                width: page.width,
+                height: page.height,
+                content_bytes,
+                resources,
+            }
+        })
+        .collect();
+
+    let inputs: Vec<PageInput<'_>> = rendered
+        .into_iter()
+        .map(|r| PageInput {
+            width: r.width,
+            height: r.height,
+            content_bytes: r.content_bytes,
+            resources: r.resources,
+            frame: r.frame,
+        })
+        .collect();
+
+    let mut doc = Document::new();
+    let pages_build = build_pages(&mut doc, inputs);
+
+    if has_metadata(&scene.metadata) {
+        let info_id = doc.add(Object::Dict(build_info_dict(&scene.metadata)));
+        doc.info = Some(info_id);
+    }
+
+    // XMP packet stream — `/Type /Metadata /Subtype /XML`, no /Filter
+    // (§14.3.2 — keep raw so archival systems can grep without
+    // decompressing). The /Length is added by the serializer.
+    let metadata_dict = Dict::new()
+        .with("Type", Object::Name("Metadata".into()))
+        .with("Subtype", Object::Name("XML".into()));
+    let metadata_id = doc.add(Object::Stream(Stream::new(
+        metadata_dict,
+        xmp_bytes.to_vec(),
+    )));
+
+    // Patch the catalog: append `/Metadata <ref>` to its dictionary.
+    let catalog = doc.object_mut(pages_build.catalog_id).ok_or_else(|| {
+        PdfError::other("write_pdf_from_scene_with_xmp: catalog id missing after build_pages")
+    })?;
+    if let Object::Dict(d) = catalog {
+        d.set("Metadata", Object::Reference(metadata_id));
+    } else {
+        return Err(PdfError::other(
+            "write_pdf_from_scene_with_xmp: catalog object is not a Dict",
+        ));
+    }
+
+    let mut out = Vec::with_capacity(4096 + xmp_bytes.len());
+    doc.write_to(&mut out)?;
+    Ok(out)
+}
+
 /// Render a [`Scene`] in pages mode as a multi-page PDF document and
 /// emit a PDF 1.5+ cross-reference *stream* (`/Type /XRef`,
 /// ISO 32000-1 §7.5.8) instead of the classical `xref`-keyword table.
