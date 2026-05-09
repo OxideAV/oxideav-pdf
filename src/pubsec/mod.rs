@@ -122,16 +122,40 @@
 //!   writer side; the reader auto-routes by parsing the KEA OID into a
 //!   [`kari::KariKdf`].
 //!
+//! ## Round-18 additions
+//!
+//! * **`OriginatorInfo certs[] / crls[]` surface** (RFC 5652 §10.2.1).
+//!   The `EnvelopedData.originatorInfo` field — previously parsed and
+//!   silently dropped — is now exposed via
+//!   [`cms::EnvelopedData::originator_info`] returning
+//!   `Option<&cms::OriginatorInfo>`. Each entry is the raw DER bytes of
+//!   one CertificateChoices / RevocationInfoChoices alternative.
+//! * **`RecipientKeyIdentifier { date, other }` parse**
+//!   (RFC 5652 §6.2.2). The OPTIONAL `date GeneralizedTime` and
+//!   `other OtherKeyAttribute` fields of an RKID — previously dropped
+//!   — are now captured. New
+//!   [`TrustStore::find_with_temporal_validity`] uses the RKID `date`
+//!   to pick among multiple certs sharing an SKI the one whose
+//!   validity window contains the instant. Useful for long-lived
+//!   archives where the same recipient identity has been re-certified
+//!   multiple times.
+//! * **`Certificate.validity` extraction** (RFC 5280 §4.1.2.5). The
+//!   `notBefore` / `notAfter` window is now captured, with `UTCTime`
+//!   normalised to `GeneralizedTime` (RFC 5280 §4.1.2.5.1's 1950..2049
+//!   pivot) so envelope `GeneralizedTime` instants byte-compare
+//!   directly. New helper [`x509::time_within`].
+//!
 //! ## Remaining deferrals
 //!
-//! * `RC2 / 3DES / DES` envelope content algorithms (deprecated in
-//!   PDF 2.0; we accept RC4 / AES-128 / AES-256 only).
 //! * X448 KARI (no vetted pure-Rust implementation in the workspace
 //!   yet — RFC 8418 §2 + RFC 7748 spec is wired through, the
 //!   `KariCurve` enum just needs an `X448` variant once a crate lands).
-//! * Long-term-cert originator path (`OriginatorId::IssuerAndSerial` /
-//!   `SubjectKeyIdentifier`) — current path requires the
-//!   `OriginatorPublicKey` in-band form.
+//! * RC2 `rc2ParameterVersion` writer-side encode (read-only currently;
+//!   PDF 2.0 deprecates RC2 so the writer always emits AES — exposing
+//!   an RC2 encoder would only serve archive-replay tooling).
+//! * Document-level XMP metadata stream end-to-end (the writer doesn't
+//!   currently emit XMP `/Metadata` streams; the reader could surface
+//!   them as opaque DER for ISO 32000-1 §14.3.2 / Adobe XMP Spec).
 
 pub mod cms;
 pub mod cms_build;
