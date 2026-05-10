@@ -335,12 +335,46 @@ generic (F.4.5) and embedded-file-stream (F.4.6) tables are still
 deferred — we generate no interactive forms / structure trees /
 embedded files.
 
+## Text extraction (round 22)
+
+[`DocumentReader::text_extraction`] walks every page's content
+stream and emits one [`TextRun`] per `Tj` / `TJ` / `'` / `"` operator,
+with the text-matrix origin and `Tf` font + size resolved per ISO
+32000-1 §9.4.4. Encoded glyphs are mapped back to Unicode through
+the font's `/ToUnicode` CMap when present (parsing the `bfchar` /
+`bfrange` blocks defined in §9.10.3 + Adobe Tech Note #5014); for
+Identity-H Type 0 fonts without `/ToUnicode` the walker falls back
+to interpreting each 2-byte CID as a BMP code point. Simple fonts
+honour `/Encoding /WinAnsiEncoding` and `/Encoding /MacRomanEncoding`
+(Annex D.2), with a Latin-1 fallback for everything else.
+
+```rust,ignore
+use oxideav_pdf::reader::DocumentReader;
+
+let pdf = std::fs::read("invoice.pdf")?;
+let mut reader = DocumentReader::open(&pdf)?;
+let extraction = reader.text_extraction()?;
+for run in &extraction.runs {
+    println!("@({:.0},{:.0}) {}/{}: {}",
+        run.position.0, run.position.1,
+        run.font_name, run.font_size, run.text);
+}
+println!("flat: {}", extraction.flat_text());
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Runs come out in stream order — the rendering order the page would
+have laid down. Reading-order reconstruction (column / paragraph
+segmentation) is a future-round followup; round 22 gives the raw
+runs plus matrix positions so a downstream layout pass can do its
+own segmentation.
+
 ## Deferred
 
-- **Text extraction / emission** (waiting on `Node::Text`; will use
-  Type 0 fonts with a CIDFont built via `oxideav-ttf`/`oxideav-otf`).
-  Reader-side text-run extraction (`Tj`/`TJ`/`'`/`"` walker with CMap
-  resolution) is the same scope inverted — both sides land together.
+- **Text emission** — writer-side `BT … Tj … ET` for `Node::Text`
+  using Type 0 fonts with a CIDFont built via
+  `oxideav-ttf`/`oxideav-otf`. The reader-side extraction surface
+  landed in round 22 (see above).
 - **JPEG passthrough on `ImageRef` (DCTDecode XObject)** — needs core
   IR support for "raw codec bytes" alongside the decoded VideoFrame
   on the writer side; reader-side surface for a `PdfImageXObject`

@@ -24,6 +24,7 @@ pub mod document;
 pub mod lex;
 pub mod parse;
 pub mod sig;
+pub mod text;
 pub mod xref;
 
 pub use document::{
@@ -32,3 +33,4 @@ pub use document::{
     DocumentReader,
 };
 pub use sig::{signatures, signed_bytes, PdfSignature};
+pub use text::{extract_text, PdfTextExtraction, TextRun};

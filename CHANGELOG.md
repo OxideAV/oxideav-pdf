@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Round 22: text extraction. `DocumentReader::text_extraction()` walks
+  every page's content stream and emits `TextRun`s (text + position +
+  font name + font size) for `Tj` / `TJ` / `'` / `"` operators. Maps
+  encoded glyphs back to Unicode through embedded `/ToUnicode` CMaps
+  (`bfchar` / `bfrange` per ISO 32000-1 §9.10.3), Identity-H Type 0
+  CIDs, WinAnsiEncoding, and MacRomanEncoding (Annex D.2). Cross-checked
+  against `pdftotext` (poppler) as a black-box validator.
+
 ## [0.1.1](https://github.com/OxideAV/oxideav-pdf/compare/v0.1.0...v0.1.1) - 2026-05-09
 
 ### Other

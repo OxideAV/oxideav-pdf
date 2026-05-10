@@ -65,9 +65,10 @@ pub use pubsec::{
     PubSecSubFilter, TrustStore,
 };
 pub use reader::{
-    read_pdf_to_scene, read_pdf_to_scene_with_certificate,
+    extract_text as extract_pdf_text, read_pdf_to_scene, read_pdf_to_scene_with_certificate,
     read_pdf_to_scene_with_certificate_and_trust_store, read_pdf_to_scene_with_password,
     signatures as read_pdf_signatures, signed_bytes as pdf_signed_bytes, PdfSignature,
+    PdfTextExtraction, TextRun,
 };
 pub use writer::{
     write_pdf, write_pdf_from_scene, write_pdf_from_scene_encrypted,
