@@ -138,6 +138,13 @@ the round-11 KTRI writer — each `KariRecipient { curve, … }` becomes
 one CMS KARI envelope with AES-256-WRAP. **Round 16** lands P-521 (`dhSinglePass-stdDH-sha512kdf-scheme`,
 X9.63-SHA-512) + RFC 8418 §2.2 HKDF binding for X25519
 (`dhSinglePass-stdDH-hkdf-sha256/384/512-scheme`, smime-alg 19/20/21).
+**Round 24** closes the RFC 8418 curve set with X448 (RFC 7748 §5 / RFC
+8410 §3 — `id-X448` 1.3.101.111, 56-byte raw u-coordinate, 224-bit
+security level): pass `KariCurve::X448` and the same writer + reader
+entry points handle it. Default KDF is X9.63-SHA-512 (security-strength
+match); HKDF SHA-256/384/512 are also valid via the
+`KariRecipient::x448_hkdf_*` constructors. Cross-checked against the
+RFC 7748 §6.2 Alice/Bob shared-secret vector byte-for-byte.
 **Round 17** closes the long-term-cert originator gap: when a KARI
 envelope's `OriginatorIdentifierOrKey` is `IssuerAndSerial` or
 `SubjectKeyIdentifier` rather than the in-band `OriginatorPublicKey`,
@@ -421,10 +428,6 @@ the bytes are byte-identical.
   + signature dict with reservable `/Contents` / `/ByteRange` slots
   (so a downstream signing tool can fill them in place) is the
   symmetric follow-up.
-- **CMS KARI X448** (RFC 8418 §2.1 + §2.2) — needs an X448 ECDH crate
-  (the dalek ecosystem doesn't ship one; pure-Rust `x448` /
-  `crate-crypto/x448` exist on crates.io and are a one-week port to
-  the same `KariCurve` dispatch the X25519 path uses).
 - Extended generic hint tables (F.4.5) and embedded-file-stream
   hint tables (F.4.6) for linearized output — we generate no
   interactive forms / structure trees / embedded files, so the

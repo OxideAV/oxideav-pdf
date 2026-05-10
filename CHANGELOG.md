@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 24: **CMS KARI X448 ECDH** (RFC 7748 §5 + RFC 8410 §3 + RFC 8418
+  §2.1 + §2.2). New `KariCurve::X448` joins the existing P-256/P-384/
+  P-521/X25519 dispatch — `id-X448` (OID 1.3.101.111), 56-byte raw
+  u-coordinate keys, 224-bit security level. Default KDF binding is
+  X9.63-SHA-512 (security-strength match); HKDF SHA-256/384/512 are
+  also valid via the new `KariRecipient::x448_hkdf_*` constructors.
+  Reader (`unwrap_kari` / `read_pdf_to_scene_with_certificate`) and
+  writer (`write_pdf_from_scene_pubsec_kari`) both handle X448 KARI
+  envelopes through the existing entry points. RFC 7748 §6.2
+  Alice/Bob test vector cross-checked byte-for-byte. Backed by the
+  pure-Rust `x448` (RustCrypto / `ed448-goldilocks`) crate.
 - Round 23: **JPEG passthrough on `/Filter /DCTDecode` Image XObjects**
   (ISO 32000-1 §7.4.8 + §8.9). New `DocumentReader::image_xobjects()`
   walks every page's `/Resources /XObject` subdict and surfaces every

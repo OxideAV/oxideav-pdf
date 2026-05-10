@@ -1,13 +1,17 @@
-//! Round-14 / round-15 / round-16: KARI unwrap — RFC 5753 / RFC 8418
-//! ECDH key agreement + RFC 3394 AES Key Wrap. Round 14 closed the
-//! round-12 deferral by surfacing the wrapped CEK on P-256; round 15
-//! extended coverage to P-384 (NIST FIPS 186-4) and X25519 (RFC 7748
+//! Round-14 / round-15 / round-16 / round-24: KARI unwrap — RFC 5753 /
+//! RFC 8418 ECDH key agreement + RFC 3394 AES Key Wrap. Round 14 closed
+//! the round-12 deferral by surfacing the wrapped CEK on P-256; round
+//! 15 extended coverage to P-384 (NIST FIPS 186-4) and X25519 (RFC 7748
 //! / RFC 8418 §2.1) and added the symmetric writer-side helper
 //! [`wrap_cek_for_recipient`] used by `write_pdf_from_scene_pubsec_kari`;
-//! round 16 closes both the curve coverage (P-521 — NIST FIPS 186-4
-//! `secp521r1` + X9.63-SHA-512 KDF) and the modern KDF binding (RFC
-//! 8418 §2.2 HKDF for X25519 — `dhSinglePass-stdDH-hkdf-sha256/384/512-scheme`,
-//! smime-alg 19 / 20 / 21).
+//! round 16 closes both the NIST curve coverage (P-521 — NIST FIPS
+//! 186-4 `secp521r1` + X9.63-SHA-512 KDF) and the modern KDF binding
+//! (RFC 8418 §2.2 HKDF for X25519 — `dhSinglePass-stdDH-hkdf-sha256/384/512-scheme`,
+//! smime-alg 19 / 20 / 21). Round 24 closes the RFC 8418 curve set by
+//! adding X448 (RFC 7748 §5 / RFC 8410 §3 — `id-X448` 1.3.101.111,
+//! 56-byte raw u-coordinate keys, 224-bit security level paired with
+//! the X9.63-SHA-512 KDF as the default + every HKDF flavour per RFC
+//! 8418 §2 which permits all six schemes for both X25519 and X448).
 //!
 //! ## Coverage
 //!
@@ -20,13 +24,21 @@
 //! | X25519 | HKDF-SHA-256         | AES-128/192/256-WRAP | 1.2.840.113549.1.9.16.3.19 (`hkdf-sha256`) |
 //! | X25519 | HKDF-SHA-384         | AES-128/192/256-WRAP | 1.2.840.113549.1.9.16.3.20 (`hkdf-sha384`) |
 //! | X25519 | HKDF-SHA-512         | AES-128/192/256-WRAP | 1.2.840.113549.1.9.16.3.21 (`hkdf-sha512`) |
+//! | X448   | X9.63 + SHA-512      | AES-128/192/256-WRAP | 1.3.132.1.11.3 (`stdDH-sha512kdf`)       |
+//! | X448   | HKDF-SHA-256         | AES-128/192/256-WRAP | 1.2.840.113549.1.9.16.3.19 (`hkdf-sha256`) |
+//! | X448   | HKDF-SHA-384         | AES-128/192/256-WRAP | 1.2.840.113549.1.9.16.3.20 (`hkdf-sha384`) |
+//! | X448   | HKDF-SHA-512         | AES-128/192/256-WRAP | 1.2.840.113549.1.9.16.3.21 (`hkdf-sha512`) |
 //!
-//! For X25519 we follow RFC 8418 §2.1 (X9.63 binding, secg-scheme OID
-//! family) AND RFC 8418 §2.2 (HKDF binding, smime-alg OID family). The
-//! per-recipient choice is carried in [`KariKdf`]; the writer's
-//! [`KariRecipient`] carries it explicitly while the reader infers
-//! the KDF from the parsed `KeyAgreeRecipientInfo.keyEncryptionAlgorithm`
-//! OID. X448 is deferred until a vetted pure-Rust crate appears.
+//! For the modern Edwards-family curves (X25519 + X448) we follow RFC
+//! 8418 §2.1 (X9.63 binding, secg-scheme OID family) AND RFC 8418 §2.2
+//! (HKDF binding, smime-alg OID family). The per-recipient choice is
+//! carried in [`KariKdf`]; the writer's [`KariRecipient`] carries it
+//! explicitly while the reader infers the KDF from the parsed
+//! `KeyAgreeRecipientInfo.keyEncryptionAlgorithm` OID. X25519 defaults
+//! to the SHA-256 X9.63 binding (matches its 128-bit security level);
+//! X448 defaults to the SHA-512 X9.63 binding (matches its 224-bit
+//! security level — RFC 8418 §2 imposes no curve→hash mandate, but the
+//! security-strength match is the canonical choice).
 //!
 //! ## Algorithm summary (RFC 5753 §3.1 + §7.1, RFC 3394 §2.2.2)
 //!
@@ -77,6 +89,13 @@ pub const OID_SECP521R1: [u64; 5] = [1, 3, 132, 0, 35];
 /// 8418 §2 mandates an absent `parameters` field (no OID nor NULL) for
 /// the AlgorithmIdentifier carrying this OID.
 pub const OID_X25519: [u64; 4] = [1, 3, 101, 110];
+
+/// OID `1.3.101.111` — `id-X448` (RFC 8410 §3). Round-24 curve identifier
+/// for X448 inside both X.509 SPKIs and CMS KARI's `OriginatorPublicKey`.
+/// Same encoding shape as `id-X25519`: parameters MUST be absent (no OID,
+/// no NULL); the BIT STRING contents IS the raw 56-byte u-coordinate (RFC
+/// 7748 §5).
+pub const OID_X448: [u64; 4] = [1, 3, 101, 111];
 
 /// OID `1.3.132.1.11.1` — `dhSinglePass-stdDH-sha256kdf-scheme` (RFC
 /// 5753 §7.1.4 + RFC 8418 §2.1). Combined ECDH + X9.63-SHA-256 KDF
@@ -171,11 +190,11 @@ impl WrapAlgorithm {
     }
 }
 
-/// Curves the round-16 dispatch can route to. Selects the ECDH
-/// primitive (P-256 / P-384 / P-521 / X25519). The KDF binding is
-/// curve-fixed for the NIST curves per RFC 5753 §7.1.4 (P-256 →
-/// SHA-256, P-384 → SHA-384, P-521 → SHA-512) and configurable via
-/// [`KariKdf`] for X25519 per RFC 8418 §2.1 + §2.2.
+/// Curves the round-16/round-24 dispatch can route to. Selects the
+/// ECDH primitive (P-256 / P-384 / P-521 / X25519 / X448). The KDF
+/// binding is curve-fixed for the NIST curves per RFC 5753 §7.1.4
+/// (P-256 → SHA-256, P-384 → SHA-384, P-521 → SHA-512) and configurable
+/// via [`KariKdf`] for X25519 + X448 per RFC 8418 §2.1 + §2.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KariCurve {
     /// NIST P-256 (`secp256r1`) + X9.63-SHA-256 KDF. KEA OID is
@@ -193,6 +212,12 @@ pub enum KariCurve {
     /// binding (RFC 8418 §2.2) is selectable on the writer side via
     /// [`KariKdf::HkdfSha256`] / `HkdfSha384` / `HkdfSha512`.
     X25519,
+    /// X448 (`id-X448`, RFC 7748 §5 / RFC 8410). 224-bit security level.
+    /// KDF defaults to the X9.63-SHA-512 binding (RFC 8418 §2.1, KEA OID
+    /// [`OID_DH_SINGLE_PASS_STDDH_SHA512_KDF`] — matching X448's security
+    /// strength); the HKDF flavours (RFC 8418 §2.2) are also valid for
+    /// X448 per RFC 8418 §2 (same six-OID set as X25519). Round-24.
+    X448,
 }
 
 impl KariCurve {
@@ -203,18 +228,20 @@ impl KariCurve {
         match self {
             Self::P256 | Self::P384 | Self::P521 => &OID_EC_PUBLIC_KEY,
             Self::X25519 => &OID_X25519,
+            Self::X448 => &OID_X448,
         }
     }
 
     /// Bytes that go into the AlgorithmIdentifier's `parameters` slot.
-    /// For NIST curves this is the named-curve OID DER; X25519 has no
-    /// parameters per RFC 8410 §3 (the slot is absent rather than NULL).
+    /// For NIST curves this is the named-curve OID DER; the Edwards-
+    /// family curves (X25519 / X448) have no parameters per RFC 8410 §3
+    /// (the slot is absent rather than NULL).
     pub fn algorithm_params(self) -> Vec<u8> {
         match self {
             Self::P256 => write_oid(&OID_SECP256R1),
             Self::P384 => write_oid(&OID_SECP384R1),
             Self::P521 => write_oid(&OID_SECP521R1),
-            Self::X25519 => Vec::new(),
+            Self::X25519 | Self::X448 => Vec::new(),
         }
     }
 
@@ -222,23 +249,27 @@ impl KariCurve {
     /// `KeyAgreeRecipientInfo.keyEncryptionAlgorithm` for this curve
     /// when no explicit [`KariKdf`] override is supplied. Encodes the
     /// (curve → X9.63 KDF) binding from RFC 5753 §7.1.4 / RFC 8418
-    /// §2.1: P-256/X25519 → SHA-256; P-384 → SHA-384; P-521 → SHA-512.
+    /// §2.1: P-256/X25519 → SHA-256; P-384 → SHA-384; P-521/X448 →
+    /// SHA-512 (matches each curve's security-strength).
     pub fn kea_oid(self) -> &'static [u64] {
         match self {
             Self::P256 | Self::X25519 => &OID_DH_SINGLE_PASS_STDDH_SHA256_KDF,
             Self::P384 => &OID_DH_SINGLE_PASS_STDDH_SHA384_KDF,
-            Self::P521 => &OID_DH_SINGLE_PASS_STDDH_SHA512_KDF,
+            Self::P521 | Self::X448 => &OID_DH_SINGLE_PASS_STDDH_SHA512_KDF,
         }
     }
 
     /// Default KDF for this curve. NIST curves are pinned by RFC 5753
-    /// §7.1.4; X25519 defaults to X9.63-SHA-256 per RFC 8418 §2.1
-    /// (the HKDF variants are explicit-opt-in on the writer side).
+    /// §7.1.4; X25519 defaults to X9.63-SHA-256 per RFC 8418 §2.1; X448
+    /// defaults to X9.63-SHA-512 (security-strength match — RFC 8418 §2
+    /// permits any of the six schemes for both Edwards-family curves but
+    /// the security-level pairing is the canonical choice). The HKDF
+    /// variants are explicit-opt-in on the writer side.
     pub fn default_kdf(self) -> KariKdf {
         match self {
             Self::P256 | Self::X25519 => KariKdf::X963Sha256,
             Self::P384 => KariKdf::X963Sha384,
-            Self::P521 => KariKdf::X963Sha512,
+            Self::P521 | Self::X448 => KariKdf::X963Sha512,
         }
     }
 
@@ -253,6 +284,9 @@ impl KariCurve {
             Self::P521 => 133,
             // X25519 raw u-coordinate (RFC 7748 §5).
             Self::X25519 => 32,
+            // X448 raw u-coordinate (RFC 7748 §5 — Curve448 field is
+            // 448 bits → 56-byte u-coordinate, no SEC1 framing).
+            Self::X448 => 56,
         }
     }
 }
@@ -332,7 +366,13 @@ impl KariKdf {
     ///   matching SHA hash (RFC 5753 §7.1.4).
     /// * X25519 MAY use any of the X9.63-SHA-256 (RFC 8418 §2.1) or
     ///   HKDF-SHA-256/384/512 (RFC 8418 §2.2) schemes; SHA-384 and
-    ///   SHA-512 X9.63 bindings are NOT defined for X25519.
+    ///   SHA-512 X9.63 bindings are NOT defined for X25519 in
+    ///   security-strength-matched practice.
+    /// * X448 MAY use the X9.63-SHA-512 binding (RFC 8418 §2.1 — the
+    ///   security-strength match) or any HKDF flavour (RFC 8418 §2.2).
+    ///   The SHA-256 / SHA-384 X9.63 bindings under-shoot X448's
+    ///   224-bit security level so we reject them, mirroring the
+    ///   conservative X25519 stance above.
     pub fn is_valid_for(self, curve: KariCurve) -> bool {
         match curve {
             KariCurve::P256 => self == Self::X963Sha256,
@@ -341,6 +381,10 @@ impl KariKdf {
             KariCurve::X25519 => matches!(
                 self,
                 Self::X963Sha256 | Self::HkdfSha256 | Self::HkdfSha384 | Self::HkdfSha512
+            ),
+            KariCurve::X448 => matches!(
+                self,
+                Self::X963Sha512 | Self::HkdfSha256 | Self::HkdfSha384 | Self::HkdfSha512
             ),
         }
     }
@@ -534,6 +578,20 @@ impl EcRecipient {
     pub fn x25519(private_scalar: Vec<u8>, public_point_sec1: Vec<u8>) -> Self {
         Self {
             curve: KariCurve::X25519,
+            private_scalar,
+            public_point_sec1,
+        }
+    }
+
+    /// Round-24: build an X448 recipient. `private_scalar` is the
+    /// 56-byte secret + `public_point_sec1` is the 56-byte raw
+    /// u-coordinate (RFC 7748 §5 — the X448 base point of Curve448
+    /// produces a 56-byte u value with no SEC1 framing). The bytes
+    /// flow directly into `id-X448` SPKI BIT STRING contents per RFC
+    /// 8410 §4.
+    pub fn x448(private_scalar: Vec<u8>, public_point_sec1: Vec<u8>) -> Self {
+        Self {
+            curve: KariCurve::X448,
             private_scalar,
             public_point_sec1,
         }
@@ -791,6 +849,45 @@ fn ecdh_z(curve: KariCurve, scalar: &[u8], originator_point: &[u8]) -> Result<Ve
             }
             Ok(shared.as_bytes().to_vec())
         }
+        KariCurve::X448 => {
+            // RFC 7748 §5 — Curve448 ECDH. Inputs are 56-byte raw
+            // little-endian u-coordinates (no SEC1 wrapper). The
+            // `x448` crate's `PublicKey::from_bytes` performs the
+            // RFC 7748 §6.2 low-order-point check internally — we
+            // surface a structured error matching the X25519 path's
+            // RFC 8418 §3 message.
+            use x448::{PublicKey, StaticSecret};
+            if scalar.len() != 56 {
+                return Err(PdfError::other(format!(
+                    "PDF pubsec KARI: X448 scalar must be 56 bytes (got {})",
+                    scalar.len()
+                )));
+            }
+            if originator_point.len() != 56 {
+                return Err(PdfError::other(format!(
+                    "PDF pubsec KARI: X448 originator point must be 56 bytes (got {})",
+                    originator_point.len()
+                )));
+            }
+            let mut s_arr = [0u8; 56];
+            s_arr.copy_from_slice(scalar);
+            let secret = StaticSecret::from(s_arr);
+            let pub_point = PublicKey::from_bytes(originator_point).ok_or_else(|| {
+                PdfError::other(
+                    "PDF pubsec KARI: X448 originator point is low-order \
+                     (RFC 8418 §3 reject)",
+                )
+            })?;
+            let shared = secret.diffie_hellman(&pub_point);
+            // RFC 8418 §3 — defensive check; the low-order rejection
+            // in `from_bytes` should already prevent this.
+            if shared.as_bytes().iter().all(|b| *b == 0) {
+                return Err(PdfError::other(
+                    "PDF pubsec KARI: X448 shared secret is all-zero (RFC 8418 §3 reject)",
+                ));
+            }
+            Ok(shared.as_bytes().to_vec())
+        }
     }
 }
 
@@ -879,7 +976,7 @@ fn extract_originator_point(
                 KariCurve::P256 => &OID_SECP256R1,
                 KariCurve::P384 => &OID_SECP384R1,
                 KariCurve::P521 => &OID_SECP521R1,
-                KariCurve::X25519 => unreachable!(),
+                KariCurve::X25519 | KariCurve::X448 => unreachable!(),
             };
             if curve_oid != want {
                 return Err(PdfError::other(format!(
@@ -899,6 +996,17 @@ fn extract_originator_point(
             // RFC 8410 §3: parameters MUST be absent. We tolerate an
             // empty slice as well as a NULL TLV for compatibility with
             // writers that emit one anyway.
+            Ok(opk.public_key.clone())
+        }
+        KariCurve::X448 => {
+            if opk.algorithm_oid != OID_X448 {
+                return Err(PdfError::other(format!(
+                    "PDF pubsec KARI: originator algorithm OID {:?} is not id-X448",
+                    opk.algorithm_oid
+                )));
+            }
+            // RFC 8410 §3: parameters MUST be absent. Same tolerance
+            // as the X25519 path above.
             Ok(opk.public_key.clone())
         }
     }
@@ -1112,6 +1220,43 @@ pub fn wrap_cek_for_recipient_with_kdf(
             if shared.as_bytes().iter().all(|b| *b == 0) {
                 return Err(PdfError::other(
                     "PDF pubsec KARI build: X25519 shared secret is all-zero \
+                     (RFC 8418 §3 reject — bad recipient public key)",
+                ));
+            }
+            (originator_pub, shared.as_bytes().to_vec())
+        }
+        KariCurve::X448 => {
+            // Round-24: RFC 7748 §5 X448 ECDH — symmetric to the
+            // X25519 path above. 56-byte raw u-coordinates, low-order
+            // recipient point rejected by `PublicKey::from_bytes`
+            // (RFC 8418 §3 + RFC 7748 §6.2).
+            use x448::{PublicKey, StaticSecret};
+            if ephemeral_scalar.len() != 56 {
+                return Err(PdfError::other(format!(
+                    "PDF pubsec KARI build: X448 ephemeral must be 56 bytes (got {})",
+                    ephemeral_scalar.len()
+                )));
+            }
+            if recipient_pub_bytes.len() != 56 {
+                return Err(PdfError::other(format!(
+                    "PDF pubsec KARI build: X448 recipient point must be 56 bytes (got {})",
+                    recipient_pub_bytes.len()
+                )));
+            }
+            let mut s_arr = [0u8; 56];
+            s_arr.copy_from_slice(ephemeral_scalar);
+            let secret = StaticSecret::from(s_arr);
+            let originator_pub = PublicKey::from(&secret).as_bytes().to_vec();
+            let recipient_public = PublicKey::from_bytes(recipient_pub_bytes).ok_or_else(|| {
+                PdfError::other(
+                    "PDF pubsec KARI build: X448 recipient point is low-order \
+                     (RFC 8418 §3 reject — bad recipient public key)",
+                )
+            })?;
+            let shared = secret.diffie_hellman(&recipient_public);
+            if shared.as_bytes().iter().all(|b| *b == 0) {
+                return Err(PdfError::other(
+                    "PDF pubsec KARI build: X448 shared secret is all-zero \
                      (RFC 8418 §3 reject — bad recipient public key)",
                 ));
             }
@@ -1790,6 +1935,209 @@ mod tests {
         let msg = format!("{err}");
         assert!(
             msg.contains("not a valid binding"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// Round-24: X448 ECDH against the RFC 7748 §6.2 published
+    /// Alice/Bob test vector. Pin the scalars to the RFC bytes and
+    /// assert the shared secret byte-for-byte. This validates that our
+    /// `ecdh_z` dispatch produces the same Curve448 shared u-coordinate
+    /// the IETF reference does — independent of the surrounding KDF /
+    /// KW machinery.
+    #[test]
+    fn x448_rfc7748_alice_bob_shared_secret() {
+        // RFC 7748 §6.2 — Alice's private scalar (56 bytes, the bytes
+        // pre-clamping; the x448 crate clamps internally per §5).
+        let alice_priv: [u8; 56] = [
+            0x9a, 0x8f, 0x49, 0x25, 0xd1, 0x51, 0x9f, 0x57, 0x75, 0xcf, 0x46, 0xb0, 0x4b, 0x58,
+            0x00, 0xd4, 0xee, 0x9e, 0xe8, 0xba, 0xe8, 0xbc, 0x55, 0x65, 0xd4, 0x98, 0xc2, 0x8d,
+            0xd9, 0xc9, 0xba, 0xf5, 0x74, 0xa9, 0x41, 0x97, 0x44, 0x89, 0x73, 0x91, 0x00, 0x63,
+            0x82, 0xa6, 0xf1, 0x27, 0xab, 0x1d, 0x9a, 0xc2, 0xd8, 0xc0, 0xa5, 0x98, 0x72, 0x6b,
+        ];
+        // Bob's public key (`X448(b, 5)` from the RFC).
+        let bob_pub: [u8; 56] = [
+            0x3e, 0xb7, 0xa8, 0x29, 0xb0, 0xcd, 0x20, 0xf5, 0xbc, 0xfc, 0x0b, 0x59, 0x9b, 0x6f,
+            0xec, 0xcf, 0x6d, 0xa4, 0x62, 0x71, 0x07, 0xbd, 0xb0, 0xd4, 0xf3, 0x45, 0xb4, 0x30,
+            0x27, 0xd8, 0xb9, 0x72, 0xfc, 0x3e, 0x34, 0xfb, 0x42, 0x32, 0xa1, 0x3c, 0xa7, 0x06,
+            0xdc, 0xb5, 0x7a, 0xec, 0x3d, 0xae, 0x07, 0xbd, 0xc1, 0xc6, 0x7b, 0xf3, 0x36, 0x09,
+        ];
+        // Expected shared secret (also from §6.2).
+        let want_shared: [u8; 56] = [
+            0x07, 0xff, 0xf4, 0x18, 0x1a, 0xc6, 0xcc, 0x95, 0xec, 0x1c, 0x16, 0xa9, 0x4a, 0x0f,
+            0x74, 0xd1, 0x2d, 0xa2, 0x32, 0xce, 0x40, 0xa7, 0x75, 0x52, 0x28, 0x1d, 0x28, 0x2b,
+            0xb6, 0x0c, 0x0b, 0x56, 0xfd, 0x24, 0x64, 0xc3, 0x35, 0x54, 0x39, 0x36, 0x52, 0x1c,
+            0x24, 0x40, 0x30, 0x85, 0xd5, 0x9a, 0x44, 0x9a, 0x50, 0x37, 0x51, 0x4a, 0x87, 0x9d,
+        ];
+        let got = ecdh_z(KariCurve::X448, &alice_priv, &bob_pub).expect("ECDH");
+        assert_eq!(got.len(), 56);
+        assert_eq!(got, want_shared.to_vec(), "RFC 7748 §6.2 vector mismatch");
+    }
+
+    /// Round-24: X448 + X9.63-SHA-512 + AES-256 KW unwrap round trip.
+    /// Mirrors the X25519 round-trip but on the 56-byte curve. The
+    /// recipient generates a real keypair (deterministic scalar), the
+    /// originator wraps a CEK against it, and the recipient's
+    /// `unwrap_kari` recovers the same CEK byte-for-byte.
+    #[test]
+    fn x448_aes256_wrap_unwrap_round_trip() {
+        use x448::{PublicKey, StaticSecret};
+        let recipient_scalar_arr = [0x44u8; 56];
+        let secret = StaticSecret::from(recipient_scalar_arr);
+        let recipient_pub = PublicKey::from(&secret).as_bytes().to_vec();
+        let ephemeral_scalar = [0x66u8; 56];
+        let cek = vec![0xC1u8; 32];
+        let ukm = b"OXIDEAV-UKM-X448-963-512";
+        let (originator_pub, wrapped) = wrap_cek_for_recipient(
+            KariCurve::X448,
+            &ephemeral_scalar,
+            &recipient_pub,
+            Some(ukm),
+            &cek,
+            WrapAlgorithm::Aes256,
+        )
+        .expect("wrap X448");
+        // X448 raw u-coordinate = 56 bytes.
+        assert_eq!(originator_pub.len(), 56);
+        let kari = KeyAgreeRecipientInfo {
+            originator: OriginatorId::OriginatorKey(OriginatorPublicKey {
+                algorithm_oid: OID_X448.to_vec(),
+                algorithm_params: Vec::new(),
+                public_key: originator_pub,
+            }),
+            ukm: ukm.to_vec(),
+            key_encryption_oid: OID_DH_SINGLE_PASS_STDDH_SHA512_KDF.to_vec(),
+            key_encryption_params: write_sequence(&write_oid(&OID_AES256_WRAP)),
+            recipient_encrypted_keys: vec![RecipientEncryptedKey {
+                rid: KeyAgreeRecipientId::RecipientKeyIdentifier {
+                    ski: vec![0xABu8; 20],
+                    date: None,
+                    other: None,
+                },
+                encrypted_key: wrapped,
+            }],
+        };
+        let recipient = EcRecipient::x448(recipient_scalar_arr.to_vec(), recipient_pub);
+        let unwrapped =
+            unwrap_kari(&kari, &kari.recipient_encrypted_keys[0], &recipient).expect("unwrap");
+        assert_eq!(unwrapped, cek);
+    }
+
+    /// Round-24: X448 + RFC 8418 §2.2 HKDF-SHA-512 + AES-256 KW round
+    /// trip. `dhSinglePass-stdDH-hkdf-sha512-scheme`, smime-alg 21 —
+    /// the security-strength match for X448 under the modern HKDF
+    /// binding.
+    #[test]
+    fn x448_hkdf_sha512_aes256_wrap_unwrap_round_trip() {
+        use x448::{PublicKey, StaticSecret};
+        let recipient_scalar_arr = [0x77u8; 56];
+        let secret = StaticSecret::from(recipient_scalar_arr);
+        let recipient_pub = PublicKey::from(&secret).as_bytes().to_vec();
+        let ephemeral_scalar = [0xE3u8; 56];
+        let cek = vec![0xF1u8; 32];
+        let ukm = b"X448-HKDF-512-UKM";
+        let (originator_pub, wrapped) = wrap_cek_for_recipient_with_kdf(
+            KariCurve::X448,
+            KariKdf::HkdfSha512,
+            &ephemeral_scalar,
+            &recipient_pub,
+            Some(ukm),
+            &cek,
+            WrapAlgorithm::Aes256,
+        )
+        .expect("wrap X448 HKDF-512");
+        let kari = KeyAgreeRecipientInfo {
+            originator: OriginatorId::OriginatorKey(OriginatorPublicKey {
+                algorithm_oid: OID_X448.to_vec(),
+                algorithm_params: Vec::new(),
+                public_key: originator_pub,
+            }),
+            ukm: ukm.to_vec(),
+            key_encryption_oid: OID_DH_SINGLE_PASS_STDDH_HKDF_SHA512_SCHEME.to_vec(),
+            key_encryption_params: write_sequence(&write_oid(&OID_AES256_WRAP)),
+            recipient_encrypted_keys: vec![RecipientEncryptedKey {
+                rid: KeyAgreeRecipientId::RecipientKeyIdentifier {
+                    ski: vec![0xEFu8; 20],
+                    date: None,
+                    other: None,
+                },
+                encrypted_key: wrapped,
+            }],
+        };
+        let recipient = EcRecipient::x448(recipient_scalar_arr.to_vec(), recipient_pub);
+        let unwrapped =
+            unwrap_kari(&kari, &kari.recipient_encrypted_keys[0], &recipient).expect("unwrap");
+        assert_eq!(unwrapped, cek);
+    }
+
+    /// Round-24: X448 dispatch sanity. Curve OIDs + default KDF +
+    /// pub-point length all line up with the RFC 8410 / RFC 8418 /
+    /// RFC 7748 prescriptions.
+    #[test]
+    fn x448_curve_dispatch_consistency() {
+        assert_eq!(KariCurve::X448.algorithm_oid(), &OID_X448);
+        assert!(KariCurve::X448.algorithm_params().is_empty()); // RFC 8410 §3
+        assert_eq!(
+            KariCurve::X448.kea_oid(),
+            &OID_DH_SINGLE_PASS_STDDH_SHA512_KDF
+        );
+        assert_eq!(KariCurve::X448.default_kdf(), KariKdf::X963Sha512);
+        assert_eq!(KariCurve::X448.pub_point_len(), 56);
+    }
+
+    /// Round-24: KDF / curve pairing matrix for X448. RFC 8418 §2
+    /// permits the security-strength match (X9.63-SHA-512) plus all
+    /// HKDF flavours; the lower X9.63 flavours under-shoot the
+    /// 224-bit security level so we reject them (mirrors the
+    /// conservative X25519 stance).
+    #[test]
+    fn x448_kdf_curve_pairing_matrix() {
+        // X448 — accepts X9.63-SHA-512 + every HKDF flavour.
+        assert!(KariKdf::X963Sha512.is_valid_for(KariCurve::X448));
+        assert!(KariKdf::HkdfSha256.is_valid_for(KariCurve::X448));
+        assert!(KariKdf::HkdfSha384.is_valid_for(KariCurve::X448));
+        assert!(KariKdf::HkdfSha512.is_valid_for(KariCurve::X448));
+        // Lower-strength X9.63 bindings are rejected for X448.
+        assert!(!KariKdf::X963Sha256.is_valid_for(KariCurve::X448));
+        assert!(!KariKdf::X963Sha384.is_valid_for(KariCurve::X448));
+    }
+
+    /// Round-24 negative: `wrap_cek_for_recipient_with_kdf` rejects the
+    /// X9.63-SHA-256 KDF against an X448 curve at build time (illegal
+    /// pairing per `is_valid_for`).
+    #[test]
+    fn x448_invalid_kdf_pairing_rejected_at_build() {
+        let err = wrap_cek_for_recipient_with_kdf(
+            KariCurve::X448,
+            KariKdf::X963Sha256,
+            &[0u8; 56],
+            &[0u8; 56],
+            None,
+            &[0u8; 32],
+            WrapAlgorithm::Aes256,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not a valid binding"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// Round-24 negative: an X448 originator point of all-zeros (a
+    /// low-order point per RFC 7748 §6.2) is rejected at the
+    /// `PublicKey::from_bytes` validation step inside `ecdh_z`.
+    #[test]
+    fn x448_low_order_originator_rejected() {
+        // Recipient: a real keypair so we get past the scalar length
+        // check; originator: 56 zero bytes (the all-zero u is a
+        // small-subgroup point per RFC 7748 §6.2).
+        let recipient_scalar = [0x55u8; 56];
+        let zero_originator = [0u8; 56];
+        let err = ecdh_z(KariCurve::X448, &recipient_scalar, &zero_originator).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("low-order") || msg.contains("all-zero"),
             "unexpected error: {msg}"
         );
     }

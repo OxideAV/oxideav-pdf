@@ -122,6 +122,18 @@
 //!   writer side; the reader auto-routes by parsing the KEA OID into a
 //!   [`kari::KariKdf`].
 //!
+//! ## Round-24 additions
+//!
+//! * **X448 KARI** (RFC 7748 §5 + RFC 8410 §3 + RFC 8418 §2.1 + §2.2).
+//!   `KariCurve::X448` (OID `1.3.101.111`, 56-byte raw u-coordinate,
+//!   224-bit security level) joins the existing P-256 / P-384 / P-521 /
+//!   X25519 dispatch. Default KDF binding is X9.63-SHA-512
+//!   (security-strength match); HKDF-SHA-256 / 384 / 512 are also valid
+//!   per RFC 8418 §2 via the new `KariRecipient::x448_hkdf_*`
+//!   constructors. RFC 7748 §6.2 Alice/Bob shared-secret vector
+//!   cross-checked. Backed by the pure-Rust `x448` (RustCrypto /
+//!   `ed448-goldilocks`) crate.
+//!
 //! ## Round-19 additions
 //!
 //! * **CMS `SignedData` parser scaffolding** (RFC 5652 §5 — PKCS#7).
@@ -184,9 +196,6 @@
 //!
 //! ## Remaining deferrals
 //!
-//! * X448 KARI (no vetted pure-Rust implementation in the workspace
-//!   yet — RFC 8418 §2 + RFC 7748 spec is wired through, the
-//!   `KariCurve` enum just needs an `X448` variant once a crate lands).
 //! * RC2 `rc2ParameterVersion` writer-side encode (read-only currently;
 //!   PDF 2.0 deprecates RC2 so the writer always emits AES — exposing
 //!   an RC2 encoder would only serve archive-replay tooling).
@@ -340,9 +349,10 @@ fn stmf_cfm(d: &Dict) -> Option<String> {
 ///
 /// Round 15 generalises the EC slot to carry a [`kari::KariCurve`] tag
 /// alongside the scalar, so the same credential can open KARI
-/// envelopes on any of the supported curves (P-256 / P-384 / X25519).
-/// The `from_parsed_ec_p256` / `with_ec_p256_scalar` round-14 helpers
-/// keep working — they default the curve to [`kari::KariCurve::P256`].
+/// envelopes on any of the supported curves (P-256 / P-384 / P-521 /
+/// X25519 / X448 — round 24). The `from_parsed_ec_p256` /
+/// `with_ec_p256_scalar` round-14 helpers keep working — they default
+/// the curve to [`kari::KariCurve::P256`].
 pub struct PubSecCredential {
     pub(crate) cert: x509::Certificate,
     pub(crate) private_key: Option<rsa::RsaPrivateKey>,
@@ -394,7 +404,9 @@ impl PubSecCredential {
 
     /// Round-15: build a credential from a parsed certificate + an EC
     /// private scalar on the supplied curve. Pass [`kari::KariCurve::P384`]
-    /// or [`kari::KariCurve::X25519`] for the round-15 curves.
+    /// or [`kari::KariCurve::X25519`] for the round-15 curves; round-16
+    /// adds [`kari::KariCurve::P521`] and round-24 adds
+    /// [`kari::KariCurve::X448`] to the same surface.
     pub fn from_parsed_ec(
         cert: x509::Certificate,
         curve: kari::KariCurve,

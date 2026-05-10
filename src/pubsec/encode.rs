@@ -899,6 +899,85 @@ impl KariRecipient {
             ephemeral_scalar,
         }
     }
+
+    /// Round-24: build an X448 recipient with the default X9.63-SHA-512
+    /// KDF binding (RFC 8418 §2.1 — `dhSinglePass-stdDH-sha512kdf-scheme`).
+    /// `recipient_pub_x448` is the recipient's 56-byte raw u-coordinate;
+    /// `ephemeral_scalar` is the 56-byte ephemeral private key (RFC 7748
+    /// §5 clamping is applied by the underlying `x448` crate at scalar
+    /// load).
+    pub fn x448(
+        issuer_der: Vec<u8>,
+        serial: Vec<u8>,
+        recipient_pub_x448: Vec<u8>,
+        ephemeral_scalar: Vec<u8>,
+    ) -> Self {
+        Self {
+            issuer_der,
+            serial,
+            curve: super::kari::KariCurve::X448,
+            kdf: super::kari::KariKdf::X963Sha512,
+            recipient_pub_bytes: recipient_pub_x448,
+            ephemeral_scalar,
+        }
+    }
+
+    /// Round-24: build an X448 recipient with the modern HKDF-SHA-256
+    /// KDF binding (RFC 8418 §2.2 — `dhSinglePass-stdDH-hkdf-sha256-scheme`,
+    /// smime-alg 19). Same shape as [`Self::x448`] but with the HKDF
+    /// flavour swapped in.
+    pub fn x448_hkdf_sha256(
+        issuer_der: Vec<u8>,
+        serial: Vec<u8>,
+        recipient_pub_x448: Vec<u8>,
+        ephemeral_scalar: Vec<u8>,
+    ) -> Self {
+        Self {
+            issuer_der,
+            serial,
+            curve: super::kari::KariCurve::X448,
+            kdf: super::kari::KariKdf::HkdfSha256,
+            recipient_pub_bytes: recipient_pub_x448,
+            ephemeral_scalar,
+        }
+    }
+
+    /// Round-24: build an X448 recipient with HKDF-SHA-384 (RFC 8418
+    /// §2.2 — `dhSinglePass-stdDH-hkdf-sha384-scheme`, smime-alg 20).
+    pub fn x448_hkdf_sha384(
+        issuer_der: Vec<u8>,
+        serial: Vec<u8>,
+        recipient_pub_x448: Vec<u8>,
+        ephemeral_scalar: Vec<u8>,
+    ) -> Self {
+        Self {
+            issuer_der,
+            serial,
+            curve: super::kari::KariCurve::X448,
+            kdf: super::kari::KariKdf::HkdfSha384,
+            recipient_pub_bytes: recipient_pub_x448,
+            ephemeral_scalar,
+        }
+    }
+
+    /// Round-24: build an X448 recipient with HKDF-SHA-512 (RFC 8418
+    /// §2.2 — `dhSinglePass-stdDH-hkdf-sha512-scheme`, smime-alg 21 —
+    /// the security-strength match for X448's 224-bit level under HKDF).
+    pub fn x448_hkdf_sha512(
+        issuer_der: Vec<u8>,
+        serial: Vec<u8>,
+        recipient_pub_x448: Vec<u8>,
+        ephemeral_scalar: Vec<u8>,
+    ) -> Self {
+        Self {
+            issuer_der,
+            serial,
+            curve: super::kari::KariCurve::X448,
+            kdf: super::kari::KariKdf::HkdfSha512,
+            recipient_pub_bytes: recipient_pub_x448,
+            ephemeral_scalar,
+        }
+    }
 }
 
 /// Configuration for a writer-side KARI public-key envelope. AES-256
