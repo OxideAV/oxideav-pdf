@@ -21,6 +21,7 @@
 
 pub mod content;
 pub mod document;
+pub mod images;
 pub mod lex;
 pub mod parse;
 pub mod sig;
@@ -32,5 +33,6 @@ pub use document::{
     read_pdf_to_scene_with_certificate_and_trust_store, read_pdf_to_scene_with_password,
     DocumentReader,
 };
+pub use images::{image_xobjects, ColorSpace, PdfImageXObject};
 pub use sig::{signatures, signed_bytes, PdfSignature};
 pub use text::{extract_text, PdfTextExtraction, TextRun};

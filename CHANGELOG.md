@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 23: **JPEG passthrough on `/Filter /DCTDecode` Image XObjects**
+  (ISO 32000-1 §7.4.8 + §8.9). New `DocumentReader::image_xobjects()`
+  walks every page's `/Resources /XObject` subdict and surfaces every
+  Image XObject whose final filter is `/DCTDecode`. The returned
+  `PdfImageXObject` carries the unmodified JPEG bytes (ready for any
+  JPEG decoder), the `/Width` / `/Height`, the `/ColorSpace`
+  (`DeviceRGB` / `DeviceCMYK` / `DeviceGray` / `Indexed` / `Other`),
+  and the `/BitsPerComponent`. Wrapping `/ASCII85Decode` /
+  `/ASCIIHexDecode` / `/FlateDecode` filters preceding `/DCTDecode` are
+  unwrapped before the JPEG payload is returned. Cross-checked against
+  `pdfimages -all` (poppler-utils) as a black-box validator — extracted
+  bytes are byte-identical to both the source JPEG and `pdfimages`'s
+  dump.
 - Round 22: text extraction. `DocumentReader::text_extraction()` walks
   every page's content stream and emits `TextRun`s (text + position +
   font name + font size) for `Tj` / `TJ` / `'` / `"` operators. Maps

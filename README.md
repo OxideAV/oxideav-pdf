@@ -369,17 +369,53 @@ segmentation) is a future-round followup; round 22 gives the raw
 runs plus matrix positions so a downstream layout pass can do its
 own segmentation.
 
+## JPEG passthrough on Image XObjects (round 23)
+
+[`DocumentReader::image_xobjects`] walks every page's
+`/Resources /XObject` subdict and surfaces every Image XObject whose
+final filter is `/DCTDecode` (ISO 32000-1 §7.4.8). The returned
+[`PdfImageXObject`] carries the unmodified JPEG bytes — the exact
+JPEG-1 / JFIF stream a JPEG decoder needs — plus the dictionary's
+`/Width`, `/Height`, `/ColorSpace` (mapped to the [`ColorSpace`] tag:
+`DeviceRGB` / `DeviceCMYK` / `DeviceGray` / `Indexed` / `Other`), and
+`/BitsPerComponent`. Wrapping `/ASCII85Decode` / `/ASCIIHexDecode` /
+`/FlateDecode` filters preceding `/DCTDecode` are unwrapped before
+the JPEG payload is returned, so callers always get a self-contained
+JPEG stream (the standard `pdfimages -all` shape).
+
+```rust,ignore
+use oxideav_pdf::reader::DocumentReader;
+
+let pdf = std::fs::read("photos.pdf")?;
+let mut reader = DocumentReader::open(&pdf)?;
+for (id, image) in reader.image_xobjects()? {
+    let path = format!("xobj-{}.jpg", id.number);
+    std::fs::write(&path, &image.data)?;
+    println!("{} ({}x{} {:?}, {} bpc)", path,
+        image.width, image.height, image.color_space,
+        image.bits_per_component);
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The same XObject referenced from multiple pages is returned once
+(deduplicated by `ObjectId`). Image XObjects with non-DCTDecode
+filters (`FlateDecode`-only raster XObjects, `JBIG2Decode`, `JPXDecode`,
+`CCITTFaxDecode`) are silently skipped — the round-23 walker is
+JPEG-only. Cross-checked against `pdfimages -all` (poppler-utils):
+the bytes are byte-identical.
+
 ## Deferred
 
 - **Text emission** — writer-side `BT … Tj … ET` for `Node::Text`
   using Type 0 fonts with a CIDFont built via
   `oxideav-ttf`/`oxideav-otf`. The reader-side extraction surface
   landed in round 22 (see above).
-- **JPEG passthrough on `ImageRef` (DCTDecode XObject)** — needs core
-  IR support for "raw codec bytes" alongside the decoded VideoFrame
-  on the writer side; reader-side surface for a `PdfImageXObject`
-  with `/Filter /DCTDecode` would let consumers pass the JPEG bytes
-  directly into the JPEG decoder without re-encoding.
+- **Writer-side JPEG passthrough on `ImageRef` (DCTDecode XObject)** —
+  needs core IR support for "raw codec bytes" alongside the decoded
+  VideoFrame so the writer can emit `/Filter /DCTDecode` instead of
+  re-encoding every JPEG to FlateDecoded raw RGBA. The *reader-side*
+  surface landed in round 23 (see above).
 - **PDF `/Sig` annotation writer** — round 21 lands the reader; the
   writer-side path that lays out an `/AcroForm /Fields [.. Sig ..]`
   + signature dict with reservable `/Contents` / `/ByteRange` slots
