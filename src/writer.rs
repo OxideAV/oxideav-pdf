@@ -20,11 +20,12 @@ use oxideav_scene::Scene;
 use crate::encrypt::{EncryptionConfig, EncryptionState};
 use crate::error::PdfError;
 use crate::info::{build_info_dict, has_metadata};
-use crate::objects::{Dict, Document, Object, Stream};
+use crate::objects::{Dict, Document, Object, ObjectId, Stream};
 use crate::operators::{
     concat_matrix, emit_clip_marker, emit_path, paint, restore, save, set_ext_gstate,
     set_fill_paint, set_stroke_style, OpBuf, PaintMode,
 };
+use crate::outline::{LinkAnnotationSpec, LinkTarget, OutlineDestination, OutlineSpec};
 use crate::page::{build_page, build_pages, PageInput};
 use crate::reader::xref::{find_startxref_offset, parse_xref};
 use crate::resources::ResourceCollector;
@@ -216,6 +217,392 @@ pub fn write_pdf_from_scene_with_xmp(scene: &Scene, xmp_bytes: &[u8]) -> Result<
     let mut out = Vec::with_capacity(4096 + xmp_bytes.len());
     doc.write_to(&mut out)?;
     Ok(out)
+}
+
+/// Round-25: render a [`Scene`] in pages mode and attach an outline
+/// (bookmark) tree to the catalog per ISO 32000-1 §12.3.3 + Table 152
+/// + Table 153.
+///
+/// The supplied `outlines` slice is a forest of [`OutlineSpec`] roots
+/// — top-level bookmarks. Each [`OutlineSpec`] may carry its own
+/// `children` recursively. The writer materialises the spec's
+/// doubly-linked-list shape (`/First`, `/Last`, `/Next`, `/Prev`,
+/// `/Parent`) at every level, derives the `/Count` per Table 153
+/// (sum of *visible* descendants — open items contribute their
+/// children, closed items don't, but the absolute value of `/Count`
+/// is still recorded as a hint for the reader), and links the root
+/// outline dictionary into the catalog as `/Outlines <ref>`.
+///
+/// Each leaf's [`OutlineDestination`] lowers to the explicit-array
+/// form per Table 151 (`[<page-ref> /Mode …]`). Page references are
+/// resolved against the writer's own per-page object ids (the
+/// 0-based `page_index` selects [`oxideav_scene::Scene::pages`] in
+/// order). An out-of-range index is a [`PdfError::Other`] — fail
+/// loud rather than silently emit a dangling destination.
+///
+/// Reader-side recovery is via
+/// [`crate::reader::DocumentReader::outline`].
+pub fn write_pdf_from_scene_with_outlines(
+    scene: &Scene,
+    outlines: &[OutlineSpec],
+) -> Result<Vec<u8>, PdfError> {
+    write_pdf_from_scene_with_outlines_and_links(scene, outlines, &[])
+}
+
+/// Round-25: like [`write_pdf_from_scene_with_outlines`] but also
+/// emits per-page Link annotations (ISO 32000-1 §12.5.6.5 Table 173)
+/// for the supplied [`LinkAnnotationSpec`] slice.
+///
+/// Each annotation's `source_page_index` selects which page's
+/// `/Annots` array carries it. Internal-target links lower to
+/// `/Dest <explicit-array>`; URI-target links lower to a `/A` dict
+/// holding a `/S /URI` action with the literal URI string.
+///
+/// Pass an empty `outlines` slice to emit links only; pass an empty
+/// `links` slice to emit outlines only (or use the higher-level
+/// [`write_pdf_from_scene_with_outlines`] for that). When both are
+/// empty this still produces a valid document (it emits the same
+/// bytes as [`write_pdf_from_scene`]).
+pub fn write_pdf_from_scene_with_outlines_and_links(
+    scene: &Scene,
+    outlines: &[OutlineSpec],
+    links: &[LinkAnnotationSpec],
+) -> Result<Vec<u8>, PdfError> {
+    let pages = scene
+        .pages
+        .as_ref()
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            PdfError::other(
+                "write_pdf_from_scene_with_outlines: scene is not in pages mode (scene.pages is None or empty)",
+            )
+        })?;
+
+    struct Rendered<'a> {
+        frame: &'a VectorFrame,
+        width: f32,
+        height: f32,
+        content_bytes: Vec<u8>,
+        resources: ResourceCollector,
+    }
+    let rendered: Vec<Rendered<'_>> = pages
+        .iter()
+        .map(|page| {
+            let (content_bytes, resources) = render_frame(&page.content);
+            Rendered {
+                frame: &page.content,
+                width: page.width,
+                height: page.height,
+                content_bytes,
+                resources,
+            }
+        })
+        .collect();
+
+    let inputs: Vec<PageInput<'_>> = rendered
+        .into_iter()
+        .map(|r| PageInput {
+            width: r.width,
+            height: r.height,
+            content_bytes: r.content_bytes,
+            resources: r.resources,
+            frame: r.frame,
+        })
+        .collect();
+
+    let mut doc = Document::new();
+    let pages_build = build_pages(&mut doc, inputs);
+
+    if has_metadata(&scene.metadata) {
+        let info_id = doc.add(Object::Dict(build_info_dict(&scene.metadata)));
+        doc.info = Some(info_id);
+    }
+
+    // Validate every destination's page_index up front — saves us
+    // emitting a half-formed outline tree we then can't fix.
+    let n_pages = pages_build.page_ids.len();
+    validate_outlines(outlines, n_pages)?;
+    for link in links {
+        if link.source_page_index >= n_pages {
+            return Err(PdfError::other(format!(
+                "write_pdf_from_scene_with_outlines: link annotation source_page_index {} \
+                 out of range (scene has {} page(s))",
+                link.source_page_index, n_pages
+            )));
+        }
+        if let LinkTarget::Internal(dest) = &link.target {
+            if dest.page_index() >= n_pages {
+                return Err(PdfError::other(format!(
+                    "write_pdf_from_scene_with_outlines: link annotation destination page_index {} \
+                     out of range (scene has {} page(s))",
+                    dest.page_index(),
+                    n_pages
+                )));
+            }
+        }
+    }
+
+    // Emit the outline tree first (allocates ids; references resolve
+    // forward via the doubly-linked list). When the forest is empty
+    // we skip everything outline-related — the catalog stays
+    // outline-free.
+    if !outlines.is_empty() {
+        let outline_root_id = doc.allocate_id();
+        let (first_id, last_id, top_visible) =
+            emit_outline_level(&mut doc, outlines, outline_root_id, &pages_build.page_ids);
+        // Root outline dict — Table 152.
+        let root_dict = Dict::new()
+            .with("Type", Object::Name("Outlines".into()))
+            .with("First", Object::Reference(first_id))
+            .with("Last", Object::Reference(last_id))
+            .with("Count", Object::Integer(top_visible as i64));
+        doc.add_object(outline_root_id, Object::Dict(root_dict));
+
+        // Patch the catalog to add `/Outlines <ref>`.
+        let catalog = doc.object_mut(pages_build.catalog_id).ok_or_else(|| {
+            PdfError::other(
+                "write_pdf_from_scene_with_outlines: catalog id missing after build_pages",
+            )
+        })?;
+        if let Object::Dict(d) = catalog {
+            d.set("Outlines", Object::Reference(outline_root_id));
+        } else {
+            return Err(PdfError::other(
+                "write_pdf_from_scene_with_outlines: catalog object is not a Dict",
+            ));
+        }
+    }
+
+    // Emit Link annotations second — group by source page, emit one
+    // /Annot indirect per spec, then patch the matching Page dict's
+    // /Annots array.
+    if !links.is_empty() {
+        let mut by_page: Vec<Vec<&LinkAnnotationSpec>> = (0..n_pages).map(|_| Vec::new()).collect();
+        for link in links {
+            by_page[link.source_page_index].push(link);
+        }
+        for (page_idx, page_links) in by_page.iter().enumerate() {
+            if page_links.is_empty() {
+                continue;
+            }
+            let page_id = pages_build.page_ids[page_idx];
+            let annot_refs: Vec<Object> = page_links
+                .iter()
+                .map(|link| {
+                    let dict = build_link_annot_dict(link, &pages_build.page_ids);
+                    let id = doc.add(Object::Dict(dict));
+                    Object::Reference(id)
+                })
+                .collect();
+            // Patch the page dict.
+            let page_obj = doc.object_mut(page_id).ok_or_else(|| {
+                PdfError::other(
+                    "write_pdf_from_scene_with_outlines: page id missing after build_pages",
+                )
+            })?;
+            if let Object::Dict(d) = page_obj {
+                d.set("Annots", Object::Array(annot_refs));
+            } else {
+                return Err(PdfError::other(
+                    "write_pdf_from_scene_with_outlines: page object is not a Dict",
+                ));
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(4096);
+    doc.write_to(&mut out)?;
+    Ok(out)
+}
+
+/// Walk every outline subtree once to verify each destination's
+/// page_index is in `[0, n_pages)`. Failing fast keeps the writer
+/// from producing a half-emitted document.
+fn validate_outlines(outlines: &[OutlineSpec], n_pages: usize) -> Result<(), PdfError> {
+    for o in outlines {
+        if o.destination.page_index() >= n_pages {
+            return Err(PdfError::other(format!(
+                "write_pdf_from_scene_with_outlines: outline `{}` destination page_index {} \
+                 out of range (scene has {} page(s))",
+                o.title,
+                o.destination.page_index(),
+                n_pages
+            )));
+        }
+        validate_outlines(&o.children, n_pages)?;
+    }
+    Ok(())
+}
+
+/// Emit every sibling at one outline level. Returns
+/// `(first_id, last_id, visible_count)` so the parent can wire its
+/// `/First` + `/Last` (and so the recursion can update the
+/// per-level visible-count for the parent's `/Count`).
+///
+/// `parent_id` is the indirect-id of either the outline-root dict or
+/// the parent outline-item dict. Each emitted item carries a
+/// `/Parent <parent_id>` per Table 153.
+fn emit_outline_level(
+    doc: &mut Document,
+    siblings: &[OutlineSpec],
+    parent_id: ObjectId,
+    page_ids: &[ObjectId],
+) -> (ObjectId, ObjectId, usize) {
+    // Allocate every sibling's id up front so /Prev / /Next can wire.
+    let sibling_ids: Vec<ObjectId> = siblings.iter().map(|_| doc.allocate_id()).collect();
+
+    let mut visible_at_this_level = siblings.len();
+
+    for (i, spec) in siblings.iter().enumerate() {
+        let my_id = sibling_ids[i];
+        let mut item = Dict::new()
+            .with("Title", outline_text_string(&spec.title))
+            .with("Parent", Object::Reference(parent_id))
+            .with("Dest", build_destination_array(&spec.destination, page_ids));
+
+        if i > 0 {
+            item.set("Prev", Object::Reference(sibling_ids[i - 1]));
+        }
+        if i + 1 < sibling_ids.len() {
+            item.set("Next", Object::Reference(sibling_ids[i + 1]));
+        }
+
+        if !spec.children.is_empty() {
+            let (child_first, child_last, child_visible) =
+                emit_outline_level(doc, &spec.children, my_id, page_ids);
+            item.set("First", Object::Reference(child_first));
+            item.set("Last", Object::Reference(child_last));
+            // Per Table 153: open ⇒ Count = +visible_descendants;
+            // closed ⇒ Count = -|hidden_descendants|.
+            let signed = if spec.open {
+                child_visible as i64
+            } else {
+                -(child_visible as i64)
+            };
+            item.set("Count", Object::Integer(signed));
+            if spec.open {
+                visible_at_this_level += child_visible;
+            }
+        }
+
+        doc.add_object(my_id, Object::Dict(item));
+    }
+
+    (
+        sibling_ids[0],
+        *sibling_ids.last().unwrap(),
+        visible_at_this_level,
+    )
+}
+
+/// Lower an [`OutlineDestination`] to the explicit-array form
+/// `[ <page-ref> /Mode … ]` per ISO 32000-1 §12.3.2.2 Table 151.
+///
+/// `None`-valued left/top/zoom/etc. parameters lower to the literal
+/// `null` per Table 151 ("A null value for any of the parameters
+/// left, top, or zoom specifies that the current value of that
+/// parameter shall be retained unchanged").
+fn build_destination_array(dest: &OutlineDestination, page_ids: &[ObjectId]) -> Object {
+    let page_ref = Object::Reference(page_ids[dest.page_index()]);
+    let opt_num = |v: Option<f32>| match v {
+        Some(n) => Object::Real(n as f64),
+        None => Object::Null,
+    };
+    match *dest {
+        OutlineDestination::Xyz {
+            left, top, zoom, ..
+        } => Object::Array(vec![
+            page_ref,
+            Object::Name("XYZ".into()),
+            opt_num(left),
+            opt_num(top),
+            opt_num(zoom),
+        ]),
+        OutlineDestination::Fit { .. } => Object::Array(vec![page_ref, Object::Name("Fit".into())]),
+        OutlineDestination::FitH { top, .. } => {
+            Object::Array(vec![page_ref, Object::Name("FitH".into()), opt_num(top)])
+        }
+        OutlineDestination::FitV { left, .. } => {
+            Object::Array(vec![page_ref, Object::Name("FitV".into()), opt_num(left)])
+        }
+        OutlineDestination::FitR {
+            left,
+            bottom,
+            right,
+            top,
+            ..
+        } => Object::Array(vec![
+            page_ref,
+            Object::Name("FitR".into()),
+            Object::Real(left as f64),
+            Object::Real(bottom as f64),
+            Object::Real(right as f64),
+            Object::Real(top as f64),
+        ]),
+        OutlineDestination::FitB { .. } => {
+            Object::Array(vec![page_ref, Object::Name("FitB".into())])
+        }
+        OutlineDestination::FitBH { top, .. } => {
+            Object::Array(vec![page_ref, Object::Name("FitBH".into()), opt_num(top)])
+        }
+        OutlineDestination::FitBV { left, .. } => {
+            Object::Array(vec![page_ref, Object::Name("FitBV".into()), opt_num(left)])
+        }
+    }
+}
+
+/// Build one Link annotation dict per ISO 32000-1 §12.5.6.5 Table 173.
+///
+/// Always emits `/Type /Annot /Subtype /Link /Rect [...]`. The
+/// destination / action lowers to either `/Dest <array>` (internal)
+/// or `/A << /S /URI /URI (...) >>` (external). `/Border [0 0 0]` is
+/// added so the default visible rectangle is suppressed (most
+/// authoring tools default to the same — a visible border on
+/// hyperlinks is widely considered noise in modern PDFs).
+fn build_link_annot_dict(link: &LinkAnnotationSpec, page_ids: &[ObjectId]) -> Dict {
+    let rect = Object::Array(link.rect.iter().map(|v| Object::Real(*v as f64)).collect());
+    let mut dict = Dict::new()
+        .with("Type", Object::Name("Annot".into()))
+        .with("Subtype", Object::Name("Link".into()))
+        .with("Rect", rect)
+        .with(
+            "Border",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(0),
+            ]),
+        );
+    match &link.target {
+        LinkTarget::Internal(dest) => {
+            dict.set("Dest", build_destination_array(dest, page_ids));
+        }
+        LinkTarget::Uri(uri) => {
+            let action = Dict::new()
+                .with("Type", Object::Name("Action".into()))
+                .with("S", Object::Name("URI".into()))
+                .with("URI", Object::LiteralString(uri.as_bytes().to_vec()));
+            dict.set("A", Object::Dict(action));
+        }
+    }
+    dict
+}
+
+/// PDF "text string" form for outline titles. Mirrors
+/// `crate::info::text_string` (private) — ASCII passes through as a
+/// literal string; non-ASCII becomes UTF-16BE-with-BOM in a hex
+/// string per ISO 32000-1 §7.9.2.2.1.
+fn outline_text_string(s: &str) -> Object {
+    if s.bytes().all(|b| b.is_ascii() && b != 0) {
+        Object::LiteralString(s.as_bytes().to_vec())
+    } else {
+        let mut bytes = vec![0xFE, 0xFF];
+        for cp in s.encode_utf16() {
+            bytes.push((cp >> 8) as u8);
+            bytes.push((cp & 0xFF) as u8);
+        }
+        Object::HexString(bytes)
+    }
 }
 
 /// Render a [`Scene`] in pages mode as a multi-page PDF document and

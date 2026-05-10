@@ -23,6 +23,8 @@ pub mod content;
 pub mod document;
 pub mod images;
 pub mod lex;
+pub mod link;
+pub mod outline;
 pub mod parse;
 pub mod sig;
 pub mod text;
@@ -34,5 +36,7 @@ pub use document::{
     DocumentReader,
 };
 pub use images::{image_xobjects, ColorSpace, PdfImageXObject};
+pub use link::{links, PdfLink, PdfLinkTarget};
+pub use outline::{outline, OutlineNode, PdfOutline};
 pub use sig::{signatures, signed_bytes, PdfSignature};
 pub use text::{extract_text, PdfTextExtraction, TextRun};

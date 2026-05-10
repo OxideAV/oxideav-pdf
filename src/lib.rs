@@ -50,6 +50,7 @@ pub mod info;
 pub mod linearize;
 pub mod objects;
 pub mod operators;
+pub mod outline;
 pub mod page;
 pub mod pubsec;
 pub mod reader;
@@ -57,6 +58,7 @@ pub mod resources;
 pub mod writer;
 
 pub use error::PdfError;
+pub use outline::{LinkAnnotationSpec, LinkTarget, OutlineDestination, OutlineSpec};
 pub use pubsec::{
     open_with_certificate, open_with_certificate_and_trust_store,
     open_with_certificate_and_trust_store_with_permissions, open_with_certificate_with_permissions,
@@ -65,17 +67,19 @@ pub use pubsec::{
     PubSecSubFilter, TrustStore,
 };
 pub use reader::{
-    extract_text as extract_pdf_text, image_xobjects as read_pdf_image_xobjects, read_pdf_to_scene,
+    extract_text as extract_pdf_text, image_xobjects as read_pdf_image_xobjects,
+    links as read_pdf_links, outline as read_pdf_outline, read_pdf_to_scene,
     read_pdf_to_scene_with_certificate, read_pdf_to_scene_with_certificate_and_trust_store,
     read_pdf_to_scene_with_password, signatures as read_pdf_signatures,
-    signed_bytes as pdf_signed_bytes, ColorSpace, PdfImageXObject, PdfSignature, PdfTextExtraction,
-    TextRun,
+    signed_bytes as pdf_signed_bytes, ColorSpace, OutlineNode, PdfImageXObject, PdfLink,
+    PdfLinkTarget, PdfOutline, PdfSignature, PdfTextExtraction, TextRun,
 };
 pub use writer::{
     write_pdf, write_pdf_from_scene, write_pdf_from_scene_encrypted,
     write_pdf_from_scene_linearized, write_pdf_from_scene_object_stream,
     write_pdf_from_scene_object_stream_encrypted, write_pdf_from_scene_pubsec_encrypted,
     write_pdf_from_scene_pubsec_kari, write_pdf_from_scene_pubsec_multi_cf,
+    write_pdf_from_scene_with_outlines, write_pdf_from_scene_with_outlines_and_links,
     write_pdf_from_scene_with_xmp, write_pdf_from_scene_xref_stream, write_pdf_incremental_update,
 };
 

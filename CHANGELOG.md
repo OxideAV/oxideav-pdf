@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 25: **Document outline (bookmarks) + Link annotations**
+  (ISO 32000-1 §12.3.3 Tables 152+153 + §12.5.6.5 Table 173 + §12.3.2
+  Table 151 destinations). New writer entry points
+  `write_pdf_from_scene_with_outlines` + `…_with_outlines_and_links`
+  attach a `/Outlines` tree to the catalog and per-page `/Annots
+  [/Subtype /Link]` arrays without disturbing the existing single-/
+  multi-page entry points. New reader functions `read_pdf_outline`
+  + `read_pdf_links` walk the bookmark tree (the doubly-linked
+  `/First`/`/Last`/`/Next`/`/Prev` shape collapses back into a
+  parent-owned `children` Vec) and per-page link list. Destinations
+  cover all eight Table 151 forms — `Xyz` / `Fit` / `FitH` / `FitV`
+  / `FitR` / `FitB` / `FitBH` / `FitBV` — with `null` retain-current
+  semantics on the optional numerics. Link targets cover both
+  internal `/Dest <explicit-array>` go-to and external
+  `/A << /S /URI /URI (...) >>` action forms. Outline `/Count`
+  honours the open / closed sign per Table 153 (open ⇒
+  +visible_descendants; closed ⇒ -|hidden_descendants|), and the
+  reader's `OutlineNode::is_open()` / `descendant_count()` helpers
+  expose the same convention to callers. Tested end-to-end with
+  `+19 tests` (16 integration in `tests/outline_round25.rs` covering
+  three-bookmark catalog, nested open/closed chapters, every dest
+  variant, Unicode title, URI + go-to link, multi-page link
+  grouping, out-of-range writer rejection, combined outline+link
+  round-trip, and empty-input baseline; +13 unit tests across
+  `src/outline.rs` + `src/reader/outline.rs` + `src/reader/link.rs`).
 - Round 24: **CMS KARI X448 ECDH** (RFC 7748 §5 + RFC 8410 §3 + RFC 8418
   §2.1 + §2.2). New `KariCurve::X448` joins the existing P-256/P-384/
   P-521/X25519 dispatch — `id-X448` (OID 1.3.101.111), 56-byte raw
