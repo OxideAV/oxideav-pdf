@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/OxideAV/oxideav-pdf/compare/v0.1.0...v0.1.1) - 2026-05-09
+
+### Other
+
+- CMS SignedData signature verification (RFC 5652 §5.4)
+- XMP /Metadata stream end-to-end + CMS SignedData parser scaffolding
+- round-18 docs: refresh pubsec module-level deferrals list
+- OriginatorInfo certs[]/crls[] surface + RKID date/other parse + temporal trust-store lookup
+- TrustStore originator lookup + RC2/3DES decode + KARI EM=false test
+- KARI P-521 + RFC 8418 §2.2 HKDF binding for X25519
+- round-15 KARI multi-curve + writer entry-point
+- KARI multi-curve (P-384 + X25519) + writer-side encode
+- KARI unwrap (P-256 ECDH + RFC 5753 KDF + RFC 3394 AES-KW)
+- round 13 emits per-page hint table entries
+- page-offset hint table per-page entries (Annex F.4.1)
+- per-CF recipient lists + CMS KARI decoder
+- public-key encryption encode + SubjectKeyIdentifier matching
+- public-key encryption decode (adbe.pkcs7.s3/s4/s5)
+- linearization (Fast Web View) + ObjStm-with-encryption combo
+- ObjStm encoder + incremental updates + EncryptMetadata false
+- xref-stream encode + ObjStm resolve + /Crypt /Identity
+- encryption encode + XRef stream decode
+- round-5 AES-256 standard handler (R=5 Adobe ext + R=6 ISO 2.0)
+- round-4 standard-handler decryption (RC4-40 / RC4-128 / AES-128)
+- reframe FFI claim — HW-engine crates use OS FFI by necessity
+- drop stale REGISTRARS / with_all_features intra-doc links
+- drop dead `linkme` dep
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-pdf/pull/502))
+- release v0.0.3 ([#2](https://github.com/OxideAV/oxideav-pdf/pull/2))
+
 ### Added
 
 - Round-20: **CMS `SignedData` signature verification** (RFC 5652 §5.4 +
