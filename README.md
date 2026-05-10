@@ -191,6 +191,53 @@ Round-20 also extends `x509::Certificate` to capture
 `spki_algorithm_oid` + `spki_algorithm_params` so the verifier can
 route ECDSA on the named-curve OID without re-parsing the certificate.
 
+**Round 21** closes the reader half of the round-20 follow-up list:
+**PDF `/Sig` annotation reader** (ISO 32000-1 §12.7.4.5 + §12.8.1).
+`DocumentReader::signatures()` walks the catalog → `/AcroForm /Fields`
+tree (honouring `/FT` inheritance through non-terminal `/Kids`
+parents per §12.7.3.1) and surfaces one [`PdfSignature`] per `/V`
+signature dictionary it can parse. Each value carries the
+[a, b, c, d] `/ByteRange`, the hex-decoded `/Contents` blob, the
+`/SubFilter` (`adbe.pkcs7.detached` / `ETSI.CAdES.detached` etc.),
+the optional metadata fields (`/Name`, `/Reason`, `/Location`,
+`/ContactInfo`, `/M`), and — for the CMS-detached SubFilters — the
+parsed [`pubsec::signed_data::SignedData`]. `PdfSignature::signed_message(pdf)`
+concatenates the two `/ByteRange`-named slices into the byte string
+the signing tool hashed; pass it as `AttachedContent::External(...)`
+to the existing [`pubsec::verify::verify_signature`] for a full
+end-to-end verify.
+
+```rust,ignore
+use oxideav_pdf::reader::DocumentReader;
+use oxideav_pdf::pubsec::verify::{verify_signature, AttachedContent};
+use oxideav_pdf::pubsec::x509::parse_certificate;
+
+let mut r = DocumentReader::open(&pdf_bytes)?;
+for sig in r.signatures()? {
+    if !sig.is_cms_detached() { continue; }
+    let signed = sig.signed_message(&pdf_bytes)?;
+    let sd = sig.signed_data.as_ref().expect("CMS-detached parsed");
+    let certs: Vec<_> = sd.certs.iter()
+        .filter_map(|der| parse_certificate(der).ok())
+        .collect();
+    let ok = verify_signature(
+        &sd.signer_infos[0],
+        &certs,
+        AttachedContent::External(&signed),
+    )?;
+    println!("signature verifies: {ok}");
+}
+# Ok::<(), oxideav_pdf::PdfError>(())
+```
+
+The reader is tolerant of unsigned slots (a Sig form field whose `/V`
+is absent — common for "approval line still pending" templates), of
+non-terminal parent fields without their own `/V`, and of malformed
+`/Contents` blobs (the dict surfaces but `signed_data` is `None`).
+Writer-side emission of `/Sig` annotations still deferred — round 21
+covers the reader path only; signing tools today produce the bytes
+oxideav-pdf now reads back.
+
 ## Encryption encode (writer side)
 
 The writer emits password-protected PDFs across the same revision range
@@ -290,27 +337,31 @@ embedded files.
 
 ## Deferred
 
-- Text (waiting on `Node::Text`; will use Type 0 fonts with a
-  CIDFont built via `oxideav-ttf`/`oxideav-otf`).
-- JPEG passthrough on `ImageRef` (DCTDecode XObject) — needs core
-  IR support for "raw codec bytes" alongside the decoded VideoFrame.
+- **Text extraction / emission** (waiting on `Node::Text`; will use
+  Type 0 fonts with a CIDFont built via `oxideav-ttf`/`oxideav-otf`).
+  Reader-side text-run extraction (`Tj`/`TJ`/`'`/`"` walker with CMap
+  resolution) is the same scope inverted — both sides land together.
+- **JPEG passthrough on `ImageRef` (DCTDecode XObject)** — needs core
+  IR support for "raw codec bytes" alongside the decoded VideoFrame
+  on the writer side; reader-side surface for a `PdfImageXObject`
+  with `/Filter /DCTDecode` would let consumers pass the JPEG bytes
+  directly into the JPEG decoder without re-encoding.
+- **PDF `/Sig` annotation writer** — round 21 lands the reader; the
+  writer-side path that lays out an `/AcroForm /Fields [.. Sig ..]`
+  + signature dict with reservable `/Contents` / `/ByteRange` slots
+  (so a downstream signing tool can fill them in place) is the
+  symmetric follow-up.
+- **CMS KARI X448** (RFC 8418 §2.1 + §2.2) — needs an X448 ECDH crate
+  (the dalek ecosystem doesn't ship one; pure-Rust `x448` /
+  `crate-crypto/x448` exist on crates.io and are a one-week port to
+  the same `KariCurve` dispatch the X25519 path uses).
 - Extended generic hint tables (F.4.5) and embedded-file-stream
   hint tables (F.4.6) for linearized output — we generate no
   interactive forms / structure trees / embedded files, so the
   per-table content would be empty anyway.
-- CMS KARI for P-521 (`dhSinglePass-stdDH-sha512kdf-scheme`) — round
-  14 covers P-256, round 15 extends to P-384 + X25519; P-521 is
-  unblocked by the same mechanism (add `sha2::Sha512` to the
-  `KariCurve` enum + a `p521` dep).
-- CMS KARI HKDF binding (RFC 8418 §2.2 — `smime-alg 19/20/21` OIDs
-  for X25519/X448 with HKDF) — round 15 ships the X9.63 binding only.
-- CMS KARI X448 (RFC 8418 §2 — needs an X448 ECDH crate; the dalek
-  ecosystem doesn't ship one, so this likely waits on a third-party
-  crate or hand-rolled curve arithmetic).
-- CMS KARI long-term originator certificates — `OriginatorId::IssuerAndSerial`
-  / `SubjectKeyIdentifier` resolution against a recipient-supplied
-  trust store; current code requires the originator's public key
-  in-band (the only form Adobe ever emits).
+- Ed25519 / Ed448 signature dispatch in `pubsec::verify` — round 20
+  covers RSA-PKCS#1 v1.5 / RSA-PSS / ECDSA on P-256 / P-384 / P-521;
+  EdDSA needs an `ed25519-dalek` (or `ed448-goldilocks`) dep.
 - Transparency groups beyond a per-`Group` `/ca`+`/CA` opacity.
 
 ## Usage

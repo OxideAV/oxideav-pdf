@@ -194,14 +194,17 @@
 //!   entries — round 18 surfaces them as opaque DER; future work could
 //!   tag-dispatch each entry into X.509 v3 / extended-cert /
 //!   attribute-cert / other-cert variants per RFC 5652 §10.2.2.
-//! * **Round-20 follow-ups** — PDF `/Sig` annotation reader/writer (the
-//!   container PDF object that points at a SignedData blob via
-//!   `/Contents` + `/ByteRange`); Ed25519 / Ed448 signature dispatch in
-//!   the verifier (no Ed25519/Ed448 dep yet); full
-//!   `id-RSASSA-PSS` parameter parsing (round-20 accepts the OID with
-//!   default SHA-1 / SHA-256 / SHA-384 / SHA-512 via `digestAlgorithm`
-//!   but doesn't yet honour explicit MGF1 hash / salt-length parameters
-//!   if they differ from the digest hash).
+//! * **Round-21 follow-ups** — PDF `/Sig` annotation **writer** (the
+//!   round-21 reader path already lands via
+//!   [`crate::reader::sig::signatures`]; the writer-side path that
+//!   lays out an `/AcroForm /Fields [.. Sig ..]` + signature dict with
+//!   reservable `/Contents` / `/ByteRange` slots is still deferred);
+//!   Ed25519 / Ed448 signature dispatch in the verifier (no Ed25519
+//!   / Ed448 dep yet); full `id-RSASSA-PSS` parameter parsing
+//!   (round-20 accepts the OID with default SHA-1 / SHA-256 /
+//!   SHA-384 / SHA-512 via `digestAlgorithm` but doesn't yet honour
+//!   explicit MGF1 hash / salt-length parameters if they differ from
+//!   the digest hash).
 
 pub mod cms;
 pub mod cms_build;

@@ -23,6 +23,7 @@ pub mod content;
 pub mod document;
 pub mod lex;
 pub mod parse;
+pub mod sig;
 pub mod xref;
 
 pub use document::{
@@ -30,3 +31,4 @@ pub use document::{
     read_pdf_to_scene_with_certificate_and_trust_store, read_pdf_to_scene_with_password,
     DocumentReader,
 };
+pub use sig::{signatures, signed_bytes, PdfSignature};

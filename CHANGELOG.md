@@ -40,6 +40,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round-21: **PDF `/Sig` annotation reader** (ISO 32000-1 §12.7.4.5
+  + §12.8.1) — closes the round-20 follow-up that surfaced
+  `pubsec::verify::verify_signature` without a way to feed it real
+  PDF signatures. New `reader::sig::PdfSignature` carries the parsed
+  `[a, b, c, d]` `/ByteRange`, the hex-decoded `/Contents` blob, the
+  `/SubFilter` name (`adbe.pkcs7.detached` /
+  `ETSI.CAdES.detached` etc.), the optional metadata fields
+  (`/Name`, `/Reason`, `/Location`, `/ContactInfo`, `/M`), and — for
+  the CMS-detached SubFilters — the parsed
+  [`pubsec::signed_data::SignedData`] (CMS trim handles trailing
+  zero-padding bytes after the outer SEQUENCE, which Adobe and iText
+  routinely emit when the `/Contents` hex budget exceeds the actual
+  signature size). `DocumentReader::signatures()` walks the catalog
+  → `/AcroForm /Fields` tree honouring `/FT` inheritance through
+  non-terminal `/Kids` parents per ISO 32000-1 §12.7.3.1 (a parent
+  carrying `/FT /Sig` propagates to its child fields), and is
+  tolerant of unsigned slots (a Sig field whose `/V` is absent —
+  common for "approval line still pending" templates), of malformed
+  `/Contents` blobs, and of documents without an `/AcroForm`
+  (returns an empty Vec). New `PdfSignature::signed_message(pdf)`
+  helper concatenates the two `/ByteRange`-named slices into the
+  byte string the signing tool hashed; pass it as
+  `AttachedContent::External(...)` to the round-20
+  `verify_signature` for end-to-end verification. Tested end-to-end
+  with a hand-laid PDF 1.4 fixture carrying one
+  `adbe.pkcs7.detached` signature signed with RSA-PKCS#1 v1.5 +
+  SHA-256 over a `signedAttrs` set with the RFC 5652 §11.2
+  `messageDigest` cross-check; tamper detection (flip a byte outside
+  `/Contents`) is also exercised. `+14 tests` (8 integration in
+  `tests/sig_round21.rs` + 6 unit in `src/reader/sig.rs`). The
+  writer side (laying out an `/AcroForm /Fields` with reservable
+  `/Contents` / `/ByteRange` slots so a downstream signing tool can
+  fill them in place) is the round-22+ follow-up.
+
 - Round-20: **CMS `SignedData` signature verification** (RFC 5652 §5.4 +
   §11.2 + RFC 8017 + RFC 5754 + RFC 5758). Closes the round-19 deferral
   that surfaced parsed `SignerInfo` bytes without a verifier. New

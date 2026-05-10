@@ -133,6 +133,29 @@ impl<'a> DocumentReader<'a> {
         self.crypt.is_some()
     }
 
+    /// Round-21: enumerate every `/Sig` form-field signature dictionary
+    /// embedded in this PDF. See [`crate::reader::sig::signatures`] for
+    /// the full contract — this is a thin convenience wrapper.
+    ///
+    /// ```rust,ignore
+    /// use oxideav_pdf::reader::DocumentReader;
+    /// use oxideav_pdf::pubsec::verify::{verify_signature, AttachedContent};
+    ///
+    /// let mut r = DocumentReader::open(&pdf)?;
+    /// for sig in r.signatures()? {
+    ///     if !sig.is_cms_detached() { continue; }
+    ///     let signed = sig.signed_message(&pdf)?;
+    ///     let sd = sig.signed_data.as_ref().unwrap();
+    ///     // ... resolve certs from sd.certs[] ...
+    ///     let ok = verify_signature(&sd.signer_infos[0], &certs,
+    ///         AttachedContent::External(&signed))?;
+    /// }
+    /// # Ok::<(), oxideav_pdf::PdfError>(())
+    /// ```
+    pub fn signatures(&mut self) -> Result<Vec<crate::reader::sig::PdfSignature>, PdfError> {
+        crate::reader::sig::signatures(self)
+    }
+
     /// Round-19: surface the document-level XMP `/Metadata` packet
     /// per ISO 32000-1 §14.3.2 + Adobe XMP Spec 2012. Returns
     /// `Ok(None)` when the catalog has no `/Metadata` entry; otherwise
