@@ -22,11 +22,14 @@
 pub mod annotation;
 pub mod content;
 pub mod document;
+pub mod hierarchy;
 pub mod images;
 pub mod lex;
+pub mod linearize;
 pub mod link;
 pub mod outline;
 pub mod parse;
+pub mod pdfa;
 pub mod sig;
 pub mod text;
 pub mod xmp;
@@ -38,9 +41,12 @@ pub use document::{
     read_pdf_to_scene_with_certificate_and_trust_store, read_pdf_to_scene_with_password,
     DocumentReader,
 };
+pub use hierarchy::{verify_hierarchy, HierarchyIssue, HierarchyReport, IssueSeverity};
 pub use images::{image_xobjects, ColorSpace, PdfImageXObject};
+pub use linearize::{parse_linearization_dict, LinearizationParams};
 pub use link::{links, PdfLink, PdfLinkTarget};
 pub use outline::{outline, OutlineNode, PdfOutline};
+pub use pdfa::{pdfa_signals, PdfACatalogSignals, PdfAConformance};
 pub use sig::{signatures, signed_bytes, PdfSignature};
 pub use text::{extract_text, PdfTextExtraction, TextRun};
 pub use xmp::XmpPacket;

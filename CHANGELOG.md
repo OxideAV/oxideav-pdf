@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 27: **Linearization Parameter Dictionary reader + Object
+  Hierarchy validator + PDF/A conformance detection beyond XMP**
+  (ISO 32000-1 §F.2 + §7.7.2 + §7.7.3 / ISO 19005-1..4 §6.x).
+  Three new reader-side surfaces:
+  * `parse_linearization_dict(bytes) -> Result<Option<LinearizationParams>>`
+    and `DocumentReader::linearization()` parse the `/Linearized 1 /L /H
+    [off len] /O /E /N /T` first-object dictionary every Fast-Web-View
+    PDF emits in its head (§F.3.3 — entirely within first 1024 bytes).
+    Round 9's writer-side emission now has its reader-side complement.
+    `LinearizationParams::verify(&bytes)` cross-checks `/L` against the
+    actual file length and bounds-checks `/T`, `/E`, `/H`. The parser
+    returns `Ok(None)` for plain (non-linearized) files so callers can
+    branch on the Option. Hint-table decoding (Annex F.4) is round 28+.
+  * `verify_pdf_hierarchy(reader) -> Result<HierarchyReport>` (and
+    `DocumentReader::verify_hierarchy()`) walks Catalog → Pages → Page
+    and collects every spec divergence as a `HierarchyIssue` with
+    `IssueSeverity::Error` or `Warning`: Catalog `/Type` + `/Pages`
+    presence (§7.7.2 Table 28), `/Pages` node `/Type` / `/Kids` /
+    `/Count` (§7.7.3.2 Table 29), `/Page` leaf `/Parent` back-reference
+    + `/MediaBox` presence (§7.7.3.3 Table 30), cycle detection with
+    a 32-hop depth guard. Never aborts the walk — surfaces every issue
+    at once so a downstream tool can `report.is_valid()` or filter by
+    severity.
+  * `read_pdf_pdfa_signals(reader) -> Result<PdfACatalogSignals>` (and
+    `DocumentReader::pdfa_signals()` + `::pdfa_conformance()`) surface
+    the structural PDF/A signals from the catalog independently of the
+    XMP `pdfaid:part` claim: `/MarkInfo /Marked|UserProperties|Suspects`,
+    `/StructTreeRoot` presence, `/Lang`, `/OutputIntents` count, and
+    `/Metadata` presence. `PdfAConformance::from_signals_and_xmp` cross-
+    verifies the XMP-declared part + conformance against the structural
+    prerequisites ISO 19005-1 §6.2.2 / §6.7 / §6.8 require — an `A`-level
+    claim missing `/MarkInfo /Marked true` or `/StructTreeRoot` flags
+    `claim_inconsistent = true` with a free-form diagnostic.
+  Tested end-to-end with +33 tests (15 integration in `tests/round27.rs`
+  + 10 unit in `src/reader/linearize.rs` + 4 unit in
+  `src/reader/hierarchy.rs` + 7 unit in `src/reader/pdfa.rs`).
+
 - Round 26: **Annotations beyond Link + XMP packet field extraction**
   (ISO 32000-1 §12.5.6 Tables 169..209 + §14.3.2 / Adobe XMP Spec
   2012 / ISO 16684-1 / ISO 19005-1..3 §6.x). New reader entry

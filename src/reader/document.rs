@@ -180,6 +180,61 @@ impl<'a> DocumentReader<'a> {
         crate::reader::annotation::annotations(self)
     }
 
+    /// Round-27: parse the Linearization Parameter Dictionary at the
+    /// head of the file (ISO 32000-1 §F.2 + Annex F.3). Returns
+    /// `Ok(None)` for non-linearized files (the common case);
+    /// returns `Ok(Some(_))` with parsed `/L /H /O /E /N /T` for
+    /// "Fast Web View" PDFs.
+    ///
+    /// Independent of the rest of the open path — the lin-dict
+    /// is parsed from the raw bytes, NOT from the resolved xref.
+    /// A reader can poll for linearization status without paying
+    /// the xref-walk cost.
+    pub fn linearization(
+        &self,
+    ) -> Result<Option<crate::reader::linearize::LinearizationParams>, PdfError> {
+        crate::reader::linearize::LinearizationParams::parse(self.input)
+    }
+
+    /// Round-27: walk Catalog → Pages → Page and collect every
+    /// integrity divergence per ISO 32000-1 §7.7.2 + §7.7.3. The
+    /// returned [`crate::reader::hierarchy::HierarchyReport`] is
+    /// permissive — it never aborts the walk, so callers can decide
+    /// per-issue what to do with warnings vs. errors.
+    pub fn verify_hierarchy(
+        &mut self,
+    ) -> Result<crate::reader::hierarchy::HierarchyReport, PdfError> {
+        crate::reader::hierarchy::verify_hierarchy(self)
+    }
+
+    /// Round-27: surface the structural PDF/A catalog signals
+    /// (`/MarkInfo`, `/StructTreeRoot`, `/Lang`, `/OutputIntents`,
+    /// `/Metadata`) independent of the XMP packet's claim.
+    ///
+    /// Pair with [`Self::xmp_packet`] + [`crate::reader::pdfa::PdfAConformance::from_signals_and_xmp`]
+    /// to cross-verify a `pdfaid:part` declaration against the
+    /// structural prerequisites ISO 19005-x requires.
+    pub fn pdfa_signals(&mut self) -> Result<crate::reader::pdfa::PdfACatalogSignals, PdfError> {
+        crate::reader::pdfa::pdfa_signals(self)
+    }
+
+    /// Round-27: combined PDF/A conformance picture — the XMP
+    /// packet's `pdfaid:part` / `pdfaid:conformance` claim cross-
+    /// verified against the catalog's structural signals
+    /// (`/MarkInfo /Marked`, `/StructTreeRoot`, `/OutputIntents`).
+    ///
+    /// Returns a [`crate::reader::pdfa::PdfAConformance`] whose
+    /// `claim_inconsistent` is `true` when the document declares
+    /// PDF/A in XMP but lacks one or more structural prerequisites.
+    pub fn pdfa_conformance(&mut self) -> Result<crate::reader::pdfa::PdfAConformance, PdfError> {
+        let signals = self.pdfa_signals()?;
+        let xmp = self.xmp_packet()?;
+        Ok(crate::reader::pdfa::PdfAConformance::from_signals_and_xmp(
+            &signals,
+            xmp.as_ref(),
+        ))
+    }
+
     /// Round-26: surface the document-level XMP `/Metadata` packet as
     /// a structured [`crate::reader::xmp::XmpPacket`] — the most-used
     /// Dublin Core / XMP Basic / PDF / PDF/A identification fields,
