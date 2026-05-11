@@ -72,11 +72,45 @@ pub struct TextRun {
     pub font_size: f32,
 }
 
+/// One [`TextRun`] together with the marked-content tag stack it was
+/// emitted under (ISO 32000-1 §14.6 — Tagged PDF). Round-29 piggybacks
+/// on the same content-stream walker as [`extract_text`]; the only
+/// difference is that this variant records the most-recently-opened
+/// `BDC` block's `/MCID` (if any) and the indirect-object number of
+/// the page the run came from. The reading-order layout pass under
+/// [`crate::reader::layout`] consumes these to assemble runs in the
+/// order the StructTreeRoot's `/K` tree dictates (rather than the
+/// raster x/y order [`extract_text`] returns).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarkedTextRun {
+    /// The visual text run — same shape as [`TextRun`].
+    pub run: TextRun,
+    /// Most recently opened marked-content `/MCID` integer at the moment
+    /// of the show. `None` when no enclosing `BDC` block declared
+    /// `/MCID` (e.g. plain `BMC … EMC` decorative groupings).
+    pub mcid: Option<u32>,
+    /// PDF object number of the page the run came from. The reading-
+    /// order layout pass keys MCID lookups by `(page_obj_num, mcid)`
+    /// because a Tagged PDF may emit MCID 0 on every page.
+    pub page_obj_num: u32,
+    /// Zero-based page index in walk order (0 for the first page found).
+    pub page_index: u32,
+}
+
 /// All text runs collected from one page (or one whole document — the
 /// caller decides whether to merge across pages).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PdfTextExtraction {
     pub runs: Vec<TextRun>,
+}
+
+/// All [`MarkedTextRun`]s collected from every page in walk order.
+/// Round-29 helper that the layout pass consumes; the runs themselves
+/// are still emitted in raster (content-stream) order — it's the
+/// `mcid` tag that lets the layout pass reorder them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PdfMarkedTextExtraction {
+    pub runs: Vec<MarkedTextRun>,
 }
 
 impl PdfTextExtraction {
@@ -103,6 +137,15 @@ impl<'a> DocumentReader<'a> {
     pub fn text_extraction(&mut self) -> Result<PdfTextExtraction, PdfError> {
         extract_text(self)
     }
+
+    /// Round-29: extract every text run alongside the marked-content
+    /// `/MCID` tag the show was issued under (ISO 32000-1 §14.6 + §14.8).
+    /// Pair with [`crate::reader::layout::read_in_logical_order`] to
+    /// reorder the resulting runs by the StructTreeRoot's logical
+    /// `/K` tree.
+    pub fn marked_text_extraction(&mut self) -> Result<PdfMarkedTextExtraction, PdfError> {
+        extract_text_marked(self)
+    }
 }
 
 // ────────────────────────── walker entry point ──────────────────────────
@@ -110,6 +153,36 @@ impl<'a> DocumentReader<'a> {
 /// Walk every page in `reader`'s catalog and collect text runs in
 /// stream order.
 pub fn extract_text(reader: &mut DocumentReader<'_>) -> Result<PdfTextExtraction, PdfError> {
+    let leaves = collect_page_leaves(reader)?;
+    let mut out = PdfTextExtraction::default();
+    for leaf in leaves {
+        extract_page(reader, leaf, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// Round-29: walk every page in `reader`'s catalog and collect
+/// marked-content-tagged text runs in stream order. The `mcid` slot
+/// reflects the most-recently-opened `BDC … EMC` block's `/MCID`
+/// integer; runs outside any `BDC` block (or inside a `BMC` block,
+/// which has no MCID) get `mcid = None`.
+pub fn extract_text_marked(
+    reader: &mut DocumentReader<'_>,
+) -> Result<PdfMarkedTextExtraction, PdfError> {
+    let leaves = collect_page_leaves(reader)?;
+    let mut out = PdfMarkedTextExtraction::default();
+    for (page_index, leaf) in leaves.into_iter().enumerate() {
+        extract_page_marked(reader, leaf, page_index as u32, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// Walk catalog → /Pages tree and collect every leaf page's
+/// [`ObjectId`] in document order. Shared between [`extract_text`] and
+/// [`extract_text_marked`].
+pub(crate) fn collect_page_leaves(
+    reader: &mut DocumentReader<'_>,
+) -> Result<Vec<ObjectId>, PdfError> {
     let root_id = reader.xref().root()?;
     let catalog_obj = reader.resolve(root_id)?;
     let Object::Dict(catalog) = catalog_obj else {
@@ -130,11 +203,7 @@ pub fn extract_text(reader: &mut DocumentReader<'_>) -> Result<PdfTextExtraction
     };
     let mut leaves = Vec::new();
     walk_pages(reader, pages_root_id, &mut leaves)?;
-    let mut out = PdfTextExtraction::default();
-    for leaf in leaves {
-        extract_page(reader, leaf, &mut out)?;
-    }
-    Ok(out)
+    Ok(leaves)
 }
 
 fn walk_pages(
@@ -192,14 +261,20 @@ fn walk_pages(
     }
 }
 
-fn extract_page(
+/// Per-font byte→Unicode decoders keyed by `/Resources /Font` slot.
+type PageFonts = HashMap<String, FontDecoder>;
+
+/// Resolve a page leaf into the pieces the text walker needs:
+/// per-font byte→Unicode decoders + the concatenated content stream.
+/// Returns `None` when the page has no `/Contents` (a perfectly valid
+/// blank page — emit nothing).
+fn load_page_for_text(
     reader: &mut DocumentReader<'_>,
     page_id: ObjectId,
-    out: &mut PdfTextExtraction,
-) -> Result<(), PdfError> {
+) -> Result<Option<(PageFonts, Vec<u8>)>, PdfError> {
     let page_obj = reader.resolve(page_id)?;
     let Object::Dict(page_dict) = page_obj else {
-        return Ok(());
+        return Ok(None);
     };
 
     // Resolve the page's /Resources /Font subdict — each entry maps a
@@ -214,7 +289,7 @@ fn extract_page(
     let resources = match resources {
         Some(Object::Reference(id)) => reader.resolve(id)?,
         Some(other) => other,
-        None => return Ok(()),
+        None => return Ok(None),
     };
     let mut fonts: HashMap<String, FontDecoder> = HashMap::new();
     if let Object::Dict(rdict) = resources {
@@ -261,12 +336,47 @@ fn extract_page(
             }
             all
         }
-        _ => return Ok(()),
+        _ => return Ok(None),
     };
 
+    Ok(Some((fonts, content_bytes)))
+}
+
+fn extract_page(
+    reader: &mut DocumentReader<'_>,
+    page_id: ObjectId,
+    out: &mut PdfTextExtraction,
+) -> Result<(), PdfError> {
+    let Some((fonts, content_bytes)) = load_page_for_text(reader, page_id)? else {
+        return Ok(());
+    };
     let mut walker = TextWalker::new(fonts);
     walker.parse(&content_bytes)?;
     out.runs.extend(walker.into_runs());
+    Ok(())
+}
+
+fn extract_page_marked(
+    reader: &mut DocumentReader<'_>,
+    page_id: ObjectId,
+    page_index: u32,
+    out: &mut PdfMarkedTextExtraction,
+) -> Result<(), PdfError> {
+    let Some((fonts, content_bytes)) = load_page_for_text(reader, page_id)? else {
+        return Ok(());
+    };
+    let mut walker = TextWalker::new(fonts);
+    walker.track_mcid = true;
+    walker.parse(&content_bytes)?;
+    let runs = walker.into_runs_with_mcid();
+    for (run, mcid) in runs {
+        out.runs.push(MarkedTextRun {
+            run,
+            mcid,
+            page_obj_num: page_id.number,
+            page_index,
+        });
+    }
     Ok(())
 }
 
@@ -853,6 +963,11 @@ fn skip_token(bytes: &[u8], i: usize) -> usize {
 struct TextWalker {
     fonts: HashMap<String, FontDecoder>,
     runs: Vec<TextRun>,
+    /// Parallel to `runs`: the MCID in scope at the moment of each
+    /// emit. Populated even when `track_mcid` is false (it's free —
+    /// just a `Vec<Option<u32>>` of `None`s). Round-29 marked-text
+    /// extraction reads this; the round-22 raster path ignores it.
+    run_mcids: Vec<Option<u32>>,
 
     // Operand stack — same shape as the path walker but text-flavoured
     // (we accept hex strings + literal strings as "string" operands and
@@ -878,6 +993,17 @@ struct TextWalker {
     /// graphics state (paint, transform, etc.) since the path walker
     /// already covers those; just the text-relevant slots.
     saved: Vec<SavedTextState>,
+
+    // ── marked-content state ────────────────────────────────────────
+    /// Round-29 toggle: when `true`, `BDC`/`BMC`/`EMC` push and pop
+    /// onto `mcid_stack` and emitted runs carry the top of the stack
+    /// in `run_mcids`. When `false`, BDC/BMC/EMC are still tolerated
+    /// (operands are dropped) but no per-run MCID is recorded.
+    track_mcid: bool,
+    /// Stack of `/MCID` integers (or `None` for `BDC` blocks whose
+    /// property dict has no MCID, and for `BMC` blocks). The top of
+    /// the stack is what `emit_show` stamps into `run_mcids`.
+    mcid_stack: Vec<Option<u32>>,
 }
 
 #[derive(Clone, Debug)]
@@ -887,6 +1013,12 @@ enum TextOperand {
     /// `TJ` array — alternating strings and numeric kern offsets.
     Array(Vec<TJItem>),
     Name(String),
+    /// Inline dict literal `<<...>>`. We don't keep the full dict —
+    /// only the `/MCID` hint we scanned out of it (None when the dict
+    /// has no MCID slot). Used by `BDC` to push a marked-content frame.
+    Dict {
+        mcid: Option<u32>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -915,6 +1047,7 @@ impl TextWalker {
         Self {
             fonts,
             runs: Vec::new(),
+            run_mcids: Vec::new(),
             operands: Vec::new(),
             in_text: false,
             cur_font: String::new(),
@@ -923,11 +1056,17 @@ impl TextWalker {
             tlm: identity(),
             leading: 0.0,
             saved: Vec::new(),
+            track_mcid: false,
+            mcid_stack: Vec::new(),
         }
     }
 
     fn into_runs(self) -> Vec<TextRun> {
         self.runs
+    }
+
+    fn into_runs_with_mcid(self) -> Vec<(TextRun, Option<u32>)> {
+        self.runs.into_iter().zip(self.run_mcids).collect()
     }
 
     fn parse(&mut self, input: &[u8]) -> Result<(), PdfError> {
@@ -957,7 +1096,12 @@ impl TextWalker {
                 continue;
             }
             if b == b'<' && input.get(i + 1) == Some(&b'<') {
-                // Dict literal — skip, e.g. inline-image dicts.
+                // Dict literal. We scan it for an `/MCID <int>` slot
+                // (so `BDC` operands can recover the marked-content
+                // identifier) but do NOT keep arbitrary dict payload
+                // on the operand stack — only the MCID hint, encoded
+                // as a special `TextOperand::Dict { mcid }` value.
+                let start = i;
                 let mut depth = 1u32;
                 i += 2;
                 while i + 1 < input.len() && depth > 0 {
@@ -971,6 +1115,8 @@ impl TextWalker {
                         i += 1;
                     }
                 }
+                let mcid = scan_inline_mcid(&input[start..i]);
+                self.operands.push(TextOperand::Dict { mcid });
                 continue;
             }
             if b == b'[' {
@@ -1159,6 +1305,52 @@ impl TextWalker {
             b"Tc" | b"Tw" | b"Tz" | b"Tr" | b"Ts" => {
                 self.operands.clear();
             }
+            // Marked-content operators (ISO 32000-1 §14.6).
+            b"BDC" => {
+                // tag properties BDC. Pop properties, then tag.
+                let mcid = match self.operands.pop() {
+                    Some(TextOperand::Dict { mcid }) => mcid,
+                    Some(TextOperand::Name(_)) => {
+                        // /Properties resource ref — round-29 doesn't
+                        // resolve indirect property dicts (the writer
+                        // never emits them; pdftotext likewise treats
+                        // unresolved property refs as MCID-less).
+                        None
+                    }
+                    Some(other) => {
+                        self.operands.push(other);
+                        None
+                    }
+                    None => None,
+                };
+                let _tag = self.pop_name();
+                if self.track_mcid {
+                    self.mcid_stack.push(mcid);
+                }
+                self.operands.clear();
+            }
+            b"BMC" => {
+                // tag BMC — no properties dict, no MCID.
+                let _tag = self.pop_name();
+                if self.track_mcid {
+                    self.mcid_stack.push(None);
+                }
+                self.operands.clear();
+            }
+            b"EMC" => {
+                if self.track_mcid {
+                    self.mcid_stack.pop();
+                }
+                self.operands.clear();
+            }
+            b"MP" => {
+                // tag MP — marked-point with no properties.
+                self.operands.clear();
+            }
+            b"DP" => {
+                // tag properties DP — marked-point with properties.
+                self.operands.clear();
+            }
             // Anything else (path / colour / state operators) — drop the
             // operands and continue.
             _ => {
@@ -1247,6 +1439,9 @@ impl TextWalker {
             font_name: self.cur_font.clone(),
             font_size: self.cur_size,
         });
+        // Stamp the current MCID (top of stack) onto the run.
+        let cur_mcid = self.mcid_stack.last().copied().unwrap_or(None);
+        self.run_mcids.push(cur_mcid);
         self.operands.clear();
     }
 }
@@ -1284,6 +1479,71 @@ fn scan_kw_end(input: &[u8], start: usize) -> usize {
         end += 1;
     }
     end
+}
+
+/// Best-effort scan of a top-level inline-dict slice (`<<...>>`) for
+/// `/MCID <integer>`. We only care about the MCID at the dict's top
+/// level — nested dicts are skipped wholesale. Whitespace tolerant;
+/// returns `None` if no `/MCID` key is present.
+fn scan_inline_mcid(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() < 4 || &bytes[..2] != b"<<" {
+        return None;
+    }
+    let body = &bytes[2..bytes.len().saturating_sub(2)];
+    let mut i = 0;
+    let mut depth = 0u32;
+    while i < body.len() {
+        let b = body[i];
+        if is_ws(b) {
+            i += 1;
+            continue;
+        }
+        if b == b'<' && body.get(i + 1) == Some(&b'<') {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if b == b'>' && body.get(i + 1) == Some(&b'>') {
+            depth = depth.saturating_sub(1);
+            i += 2;
+            continue;
+        }
+        if depth > 0 {
+            // Inside a nested dict — skip.
+            i += 1;
+            continue;
+        }
+        if b == b'/' {
+            // Read name.
+            let mut end = i + 1;
+            while end < body.len() && !is_ws(body[end]) && !is_delim(body[end]) {
+                end += 1;
+            }
+            let name = &body[i + 1..end];
+            i = end;
+            if name == b"MCID" {
+                // Skip ws.
+                while i < body.len() && is_ws(body[i]) {
+                    i += 1;
+                }
+                // Read integer.
+                let mut e = i;
+                while e < body.len() && (body[e].is_ascii_digit() || body[e] == b'-') {
+                    e += 1;
+                }
+                if e == i {
+                    return None;
+                }
+                let s = std::str::from_utf8(&body[i..e]).ok()?;
+                return s.parse::<u32>().ok();
+            }
+            // Else: skip the value that follows.
+            continue;
+        }
+        // Skip any other top-level token.
+        i += 1;
+    }
+    None
 }
 
 fn read_literal_string(input: &[u8], start: usize) -> Result<(usize, Vec<u8>), PdfError> {

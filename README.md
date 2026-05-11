@@ -503,6 +503,46 @@ base encodings are recognised: `WinAnsi` / `MacRoman` / `MacExpert` /
 `Standard` / `Symbol` / `ZapfDingbats`. Full AGL coverage (CJK,
 Cyrillic, Devanagari) is round-29+.
 
+## Reading-order layout pass (round 29)
+
+[`DocumentReader::read_in_logical_order`] walks the catalog's
+`/StructTreeRoot /K` tree and emits text runs in *author-intended*
+reading order rather than the painter's raster order (ISO 32000-1
+§14.6 + §14.7 + §14.8 — Tagged PDF). For a 2-column document, naive
+raster extraction interleaves column 1's first row, column 2's first
+row, column 1's second row, …; the round-29 pass walks `[Sect_col1,
+Sect_col2]` and emits all of column 1 before any of column 2. The
+walker handles every leaf shape ISO 32000-1 §14.7.4.4 defines:
+bare-integer MCID kids (resolve against the ancestor's inheritable
+`/Pg`), `<</Type /MCR /Pg p /MCID m>>` marked-content references with
+their own `/Pg` overrides (cross-page tables), `<</Type /OBJR …>>`
+object references (skipped — they reference annotations, not text),
+and nested `/StructElem` kids which recurse with a 64-deep cycle
+guard.
+
+```rust,ignore
+use oxideav_pdf::reader::{DocumentReader, LayoutMode};
+
+let mut r = DocumentReader::open(&pdf_bytes)?;
+let result = r.read_in_logical_order()?;
+match result.mode {
+    LayoutMode::Tagged => println!("logical reading order:"),
+    LayoutMode::Raster => println!("raster fallback (no /StructTreeRoot):"),
+}
+for run in &result.runs {
+    println!("  {}", run.text);
+}
+# Ok::<(), oxideav_pdf::PdfError>(())
+```
+
+Documents *without* a `/StructTreeRoot` (or with a malformed / empty
+tree) fall back to the existing raster-order extraction with
+`LayoutMode::Raster` set on the return so callers can branch. The
+pass also exposes `extract_text_marked(reader)` which emits every
+text run alongside the marked-content `/MCID` it was painted under
+(for callers that want to assemble a custom logical order outside the
+StructTreeRoot — e.g. PDF/UA accessibility audits).
+
 ## Deferred
 
 - **Text emission** — writer-side `BT … Tj … ET` for `Node::Text`

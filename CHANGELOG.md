@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 29: **Reading-order layout pass over Tagged PDF
+  StructTreeRoot** (ISO 32000-1 §14.6 + §14.7 + §14.8). New
+  `oxideav_pdf::reader::layout::read_in_logical_order(reader)` — and
+  the convenience `DocumentReader::read_in_logical_order()` — walks
+  the catalog's `/StructTreeRoot /K` tree and emits text runs in
+  *author-intended* reading order rather than the painter's raster
+  order. For a 2-column document, raster extraction interleaves
+  column 1's first row, column 2's first row, column 1's second row,
+  …; the round-29 pass walks `[Sect_col1, Sect_col2]` and emits all
+  of column 1 before any of column 2. The walker handles every leaf
+  shape ISO 32000-1 §14.7.4.4 defines:
+  * Bare-integer MCID kids resolve against the inheritable `/Pg`
+    field on the nearest ancestor.
+  * `<</Type /MCR /Pg p /MCID m>>` marked-content references override
+    the inherited `/Pg`, supporting Tagged tables whose rows draw
+    from multiple pages.
+  * `<</Type /OBJR …>>` object references (annotations, not content)
+    are skipped — they carry no text.
+  * Nested `/StructElem` kids (Sect inside Div inside …) recurse;
+    indirect refs are followed with a 64-deep cycle guard.
+  Documents *without* a `/StructTreeRoot` (or a malformed / empty
+  tree) fall back to the existing raster-order extraction with
+  `LayoutMode::Raster` set on the return so callers can branch.
+
+  The pass piggybacks on a round-29 addition to the round-22 text
+  walker: the new `extract_text_marked(reader)` (and matching
+  `DocumentReader::marked_text_extraction()`) emits every text run
+  alongside the marked-content `/MCID` it was painted under (ISO
+  32000-1 §14.6 — `BDC` / `BMC` / `EMC` operators). The walker
+  recognises `BDC` / `BMC` / `EMC` / `MP` / `DP` keywords and parses
+  the `/MCID` slot out of inline `<</MCID n>>` property dicts at the
+  top level. New public surfaces under `oxideav_pdf::reader`:
+  * `MarkedTextRun { run, mcid, page_obj_num, page_index }`
+  * `PdfMarkedTextExtraction { runs }`
+  * `LayoutMode { Tagged, Raster }`
+  * `ReadingOrderText { mode, runs }` (with `flat_text()`)
+
+  Seven fixtures under `tests/reading_order_round29.rs` cover:
+  two-column tagged-PDF logical reordering vs. raster baseline,
+  non-tagged fallback, cross-page MCRs (`/MCR /Pg ... /MCID ...`),
+  marked-text MCID accounting, and nested `/Sect > /P > MCID`
+  recursion. No external library was consulted.
+
 - Round 28: **Simple-font `/Encoding /Differences` resolver wired into
   text extraction** (ISO 32000-1 §9.6.6.1 + §D.2 + Adobe Glyph List v2.0
   public document). When a simple Type1 / TrueType / Type3 font carries

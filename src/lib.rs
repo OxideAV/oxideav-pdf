@@ -68,15 +68,17 @@ pub use pubsec::{
 };
 pub use reader::{
     annotations as read_pdf_annotations, extract_text as extract_pdf_text,
-    image_xobjects as read_pdf_image_xobjects, links as read_pdf_links,
-    outline as read_pdf_outline, parse_linearization_dict, pdfa_signals as read_pdf_pdfa_signals,
+    extract_text_marked as extract_pdf_text_marked, image_xobjects as read_pdf_image_xobjects,
+    links as read_pdf_links, outline as read_pdf_outline, parse_linearization_dict,
+    pdfa_signals as read_pdf_pdfa_signals, read_in_logical_order as read_pdf_in_logical_order,
     read_pdf_to_scene, read_pdf_to_scene_with_certificate,
     read_pdf_to_scene_with_certificate_and_trust_store, read_pdf_to_scene_with_password,
     signatures as read_pdf_signatures, signed_bytes as pdf_signed_bytes,
     verify_hierarchy as verify_pdf_hierarchy, AnnotationKind, ColorSpace, HierarchyIssue,
-    HierarchyReport, IssueSeverity, LinearizationParams, OutlineNode, PdfACatalogSignals,
-    PdfAConformance, PdfAnnotation, PdfImageXObject, PdfLink, PdfLinkTarget, PdfOutline,
-    PdfSignature, PdfTextExtraction, TextMarkupVariant, TextRun, XmpPacket,
+    HierarchyReport, IssueSeverity, LayoutMode, LinearizationParams, MarkedTextRun, OutlineNode,
+    PdfACatalogSignals, PdfAConformance, PdfAnnotation, PdfImageXObject, PdfLink, PdfLinkTarget,
+    PdfMarkedTextExtraction, PdfOutline, PdfSignature, PdfTextExtraction, ReadingOrderText,
+    TextMarkupVariant, TextRun, XmpPacket,
 };
 pub use writer::{
     write_pdf, write_pdf_from_scene, write_pdf_from_scene_encrypted,
