@@ -468,6 +468,41 @@ if let Some(p) = r.xmp_packet()? {
 # Ok::<(), oxideav_pdf::PdfError>(())
 ```
 
+## Simple-font `/Encoding /Differences` resolver (round 28)
+
+Simple Type 1 / TrueType / Type 3 fonts may carry their `/Encoding` as
+a dictionary that overlays a `/Differences` array on top of a named
+`/BaseEncoding` (ISO 32000-1 §9.6.6.1). The reader resolves this
+properly: the array's flat `[N name1 name2 … M nameK …]` form is
+parsed (numeric tokens reset the running code; names land at
+consecutive slots), and each glyph name maps to its Unicode scalar
+through the Adobe Glyph List (subset staged under
+`docs/document/pdf/agl/subset.txt`, ~320 glyph names). The resolver
+plugs into the [`DocumentReader::text_extraction`] path so a
+`/Differences`-using font decodes correctly to Unicode.
+
+```rust,ignore
+use oxideav_pdf::reader::{
+    apply_encoding_differences, parse_encoding_differences, BaseEncoding,
+    EncodingMap,
+};
+// Imagine an inline encoding dict resolved from a PDF font:
+//   /Encoding << /BaseEncoding /WinAnsiEncoding
+//                /Differences [24 /breve /caron /circumflex] >>
+let diffs = parse_encoding_differences(&diffs_array)?;
+let base  = EncodingMap::from_base(BaseEncoding::WinAnsi);
+let map   = apply_encoding_differences(&base, &diffs);
+assert_eq!(map.decode(&[0x18]), "\u{02D8}"); // breve
+# Ok::<(), oxideav_pdf::PdfError>(())
+```
+
+Unknown glyph names emit U+FFFD as a marker (matching what
+`pdftotext --raw` does for un-resolvable glyphs). Multi-character
+glyph expansions (`/fi` → "fi", `/fl` → "fl") are accommodated. Six
+base encodings are recognised: `WinAnsi` / `MacRoman` / `MacExpert` /
+`Standard` / `Symbol` / `ZapfDingbats`. Full AGL coverage (CJK,
+Cyrillic, Devanagari) is round-29+.
+
 ## Deferred
 
 - **Text emission** — writer-side `BT … Tj … ET` for `Node::Text`

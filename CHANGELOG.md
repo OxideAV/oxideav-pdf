@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 28: **Simple-font `/Encoding /Differences` resolver wired into
+  text extraction** (ISO 32000-1 §9.6.6.1 + §D.2 + Adobe Glyph List v2.0
+  public document). When a simple Type1 / TrueType / Type3 font carries
+  an encoding *dictionary* (not just a name) the reader now overlays the
+  `/Differences` array onto the `/BaseEncoding` map before mapping bytes
+  back to Unicode. Three new public surfaces under
+  `oxideav_pdf::reader::encoding`:
+  * `parse_encoding_differences(arr) -> EncodingDifferences` walks the
+    flat `[N name1 name2 … M nameK …]` form per §9.6.6.1 — numeric
+    tokens reset the running code, names land at consecutive slots,
+    unknown tokens are tolerated. Honours `Object::Integer` AND
+    `Object::Real` numeric forms.
+  * `apply_encoding_differences(&base, &diffs) -> EncodingMap` overlays
+    one parsed array on top of any of the six named `BaseEncoding`
+    variants (`WinAnsi` / `MacRoman` / `MacExpert` / `Standard` /
+    `Symbol` / `ZapfDingbats`). Unknown glyph names leave the slot
+    empty so the decoder emits U+FFFD as a marker (matching what
+    `pdftotext --raw` does for un-resolvable glyphs).
+  * `EncodingMap::from_base(BaseEncoding)` ships a 256-entry table per
+    Annex D.2 / D.4 / D.5 / D.6 plus the Adobe Type 1 Standard
+    encoding. Multi-character glyph expansions (`/fi` → "fi", `/fl` →
+    "fl") are accommodated; the table slot is a short `String` rather
+    than a single `char`.
+
+  The Adobe Glyph List subset shipped with the resolver covers the
+  PostScript Latin character set, common Greek letters, smart-quote /
+  dash / fraction set, math operators, arrows, and the `/fi` and `/fl`
+  ligatures — about 320 glyph names. Extension to the full ~4280-line
+  AGL is round-29+. Glyph list staged under
+  `docs/document/pdf/agl/subset.txt` and the README there cites the AGL
+  v2.0 public-document source. Seven new fixtures under
+  `tests/encoding_differences_round28.rs` cover smart-quote overrides,
+  Greek glyph remap, `/fi` / `/fl` ligature expansion, multi-segment
+  arrays with running-code resets, unknown-glyph replacement-char
+  fallback, empty `/Differences`, and `/MacRomanEncoding` base
+  encoding. Three of them feed the fixture PDF to a system `pdftotext`
+  binary when available and assert the extracted text contains the
+  expected substring.
+
 - Round 27: **Linearization Parameter Dictionary reader + Object
   Hierarchy validator + PDF/A conformance detection beyond XMP**
   (ISO 32000-1 §F.2 + §7.7.2 + §7.7.3 / ISO 19005-1..4 §6.x).

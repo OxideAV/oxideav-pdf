@@ -22,6 +22,7 @@
 pub mod annotation;
 pub mod content;
 pub mod document;
+pub mod encoding;
 pub mod hierarchy;
 pub mod images;
 pub mod lex;
@@ -40,6 +41,10 @@ pub use document::{
     read_pdf_to_scene, read_pdf_to_scene_with_certificate,
     read_pdf_to_scene_with_certificate_and_trust_store, read_pdf_to_scene_with_password,
     DocumentReader,
+};
+pub use encoding::{
+    apply_encoding_differences, parse_encoding_differences, BaseEncoding, EncodingDifferences,
+    EncodingMap, EncodingOverride,
 };
 pub use hierarchy::{verify_hierarchy, HierarchyIssue, HierarchyReport, IssueSeverity};
 pub use images::{image_xobjects, ColorSpace, PdfImageXObject};

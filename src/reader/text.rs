@@ -38,6 +38,9 @@ use std::str;
 use crate::error::PdfError;
 use crate::objects::{Dict, Object, ObjectId};
 use crate::reader::document::{decode_stream, DocumentReader};
+use crate::reader::encoding::{
+    apply_encoding_differences, parse_encoding_differences, BaseEncoding, EncodingMap,
+};
 
 // ────────────────────────── public surface ──────────────────────────
 
@@ -291,10 +294,17 @@ enum FontDecoder {
     /// Identity-H / Identity-V without /ToUnicode — interpret each
     /// 2-byte CID as the equivalent BMP code point.
     IdentityNoCMap,
-    /// Simple font with /Encoding /WinAnsiEncoding.
-    WinAnsi,
-    /// Simple font with /Encoding /MacRomanEncoding (PDF spec 9.6.6.4).
-    MacRoman,
+    /// Simple font (Type1 / TrueType / Type3) with a resolved
+    /// 256-entry byte → Unicode table. Captures every variant of
+    /// ISO 32000-1 §9.6.6.1 — named base encodings, encoding-dict
+    /// `/BaseEncoding` + `/Differences`, and the implicit
+    /// StandardEncoding default. Replaces the old `WinAnsi` /
+    /// `MacRoman` enum tags so a single code path handles every
+    /// simple-font encoding variant (round 28).
+    ///
+    /// Boxed because the 256-entry table dwarfs the other variants
+    /// and `clippy::large_enum_variant` flags the unboxed form.
+    SimpleMap(Box<EncodingMap>),
     /// No discernible encoding — fall back to Latin-1 byte → code
     /// point (identity for ASCII; reasonable for CP1252 punctuation).
     Latin1,
@@ -357,17 +367,27 @@ impl FontDecoder {
             .find(|(k, _)| k == "Encoding")
             .map(|(_, v)| v.clone());
         if let Some(Object::Name(name)) = enc {
-            return Ok(match name.as_str() {
-                "WinAnsiEncoding" => FontDecoder::WinAnsi,
-                "MacRomanEncoding" => FontDecoder::MacRoman,
-                _ => FontDecoder::Latin1,
-            });
+            if let Some(base) = BaseEncoding::from_name(name.as_str()) {
+                return Ok(FontDecoder::SimpleMap(Box::new(EncodingMap::from_base(
+                    base,
+                ))));
+            }
+            // Unknown base name — fall back to Latin-1.
+            return Ok(FontDecoder::Latin1);
         }
-        // /Encoding may also be a dict with /BaseEncoding — round-22
-        // honours the base, ignoring per-glyph /Differences (those
-        // would need a glyph-name → Unicode table; deferred).
+        // /Encoding may also be a dict — `/BaseEncoding` + `/Differences`
+        // per ISO 32000-1 §9.6.6.1. Round 28 honours both: the
+        // /Differences array overrides specific byte slots from the
+        // base map, and each glyph name is resolved through the AGL.
         if let Some(Object::Dict(enc_d)) = enc {
-            let base = enc_d
+            // Resolve the base map. Per the spec, when /BaseEncoding
+            // is absent the default depends on the font subtype — for
+            // Type1 / Type3 it's the font's built-in encoding (which
+            // we don't have access to here, so we use Standard as the
+            // closest documented fallback); for TrueType it's the
+            // implementation-defined platform encoding (we use
+            // WinAnsi because Acrobat / Distiller default to it).
+            let base_name = enc_d
                 .entries()
                 .iter()
                 .find(|(k, _)| k == "BaseEncoding")
@@ -375,19 +395,44 @@ impl FontDecoder {
                     Object::Name(s) => Some(s.clone()),
                     _ => None,
                 });
-            if let Some(name) = base {
-                return Ok(match name.as_str() {
-                    "WinAnsiEncoding" => FontDecoder::WinAnsi,
-                    "MacRomanEncoding" => FontDecoder::MacRoman,
-                    _ => FontDecoder::Latin1,
-                });
-            }
+            let base_map = match base_name.as_deref().and_then(BaseEncoding::from_name) {
+                Some(b) => EncodingMap::from_base(b),
+                None => {
+                    // No (recognised) /BaseEncoding — pick a sensible
+                    // default per the font subtype.
+                    let default = match subtype {
+                        "TrueType" => BaseEncoding::WinAnsi,
+                        _ => BaseEncoding::Standard,
+                    };
+                    EncodingMap::from_base(default)
+                }
+            };
+            // Overlay /Differences if present.
+            let diffs_obj = enc_d
+                .entries()
+                .iter()
+                .find(|(k, _)| k == "Differences")
+                .map(|(_, v)| v.clone());
+            let final_map = match diffs_obj {
+                Some(arr @ Object::Array(_)) => {
+                    let diffs = parse_encoding_differences(&arr)?;
+                    apply_encoding_differences(&base_map, &diffs)
+                }
+                _ => base_map,
+            };
+            return Ok(FontDecoder::SimpleMap(Box::new(final_map)));
         }
-        // Default for Type1/TrueType is implementation-dependent
-        // ("StandardEncoding" for Type 1; built-in for TrueType). We
-        // pick Latin-1 — closest match for the ASCII core that
-        // matters for keyword search.
-        Ok(FontDecoder::Latin1)
+        // Default for Type1 / Type3 with no /Encoding is
+        // StandardEncoding (§9.6.6.1). TrueType with no /Encoding is
+        // implementation-dependent — use WinAnsi.
+        let default = match subtype {
+            "TrueType" => BaseEncoding::WinAnsi,
+            "Type1" | "Type3" | "MMType1" => BaseEncoding::Standard,
+            _ => return Ok(FontDecoder::Latin1),
+        };
+        Ok(FontDecoder::SimpleMap(Box::new(EncodingMap::from_base(
+            default,
+        ))))
     }
 
     /// Decode a `Tj` / `TJ` operand byte-string into Unicode.
@@ -431,8 +476,7 @@ impl FontDecoder {
                 }
                 out
             }
-            FontDecoder::WinAnsi => bytes.iter().map(|&b| winansi_to_char(b)).collect(),
-            FontDecoder::MacRoman => bytes.iter().map(|&b| macroman_to_char(b)).collect(),
+            FontDecoder::SimpleMap(map) => map.decode(bytes),
             FontDecoder::Latin1 => bytes.iter().map(|&b| b as char).collect(),
         }
     }
@@ -1385,84 +1429,10 @@ fn read_tj_array(input: &[u8], start: usize) -> Result<(usize, Vec<TJItem>), Pdf
     }
 }
 
-// ────────────────────────── encoding tables ──────────────────────────
-
-/// WinAnsiEncoding (CP1252) byte → Unicode. Per ISO 32000-1 Annex D.2,
-/// Table D.2. Bytes outside the printable range round-trip through
-/// Latin-1 (the spec's "undefined" slots).
-fn winansi_to_char(b: u8) -> char {
-    match b {
-        0x80 => '\u{20AC}',
-        0x82 => '\u{201A}',
-        0x83 => '\u{0192}',
-        0x84 => '\u{201E}',
-        0x85 => '\u{2026}',
-        0x86 => '\u{2020}',
-        0x87 => '\u{2021}',
-        0x88 => '\u{02C6}',
-        0x89 => '\u{2030}',
-        0x8A => '\u{0160}',
-        0x8B => '\u{2039}',
-        0x8C => '\u{0152}',
-        0x8E => '\u{017D}',
-        0x91 => '\u{2018}',
-        0x92 => '\u{2019}',
-        0x93 => '\u{201C}',
-        0x94 => '\u{201D}',
-        0x95 => '\u{2022}',
-        0x96 => '\u{2013}',
-        0x97 => '\u{2014}',
-        0x98 => '\u{02DC}',
-        0x99 => '\u{2122}',
-        0x9A => '\u{0161}',
-        0x9B => '\u{203A}',
-        0x9C => '\u{0153}',
-        0x9E => '\u{017E}',
-        0x9F => '\u{0178}',
-        _ => b as char,
-    }
-}
-
-/// MacRomanEncoding byte → Unicode. ISO 32000-1 Annex D.2, Table D.2.
-/// Only the bytes that differ from Latin-1 are listed; the rest round-
-/// trip 1:1.
-fn macroman_to_char(b: u8) -> char {
-    match b {
-        0x80 => '\u{00C4}',
-        0x81 => '\u{00C5}',
-        0x82 => '\u{00C7}',
-        0x83 => '\u{00C9}',
-        0x84 => '\u{00D1}',
-        0x85 => '\u{00D6}',
-        0x86 => '\u{00DC}',
-        0x87 => '\u{00E1}',
-        0x88 => '\u{00E0}',
-        0x89 => '\u{00E2}',
-        0x8A => '\u{00E4}',
-        0x8B => '\u{00E3}',
-        0x8C => '\u{00E5}',
-        0x8D => '\u{00E7}',
-        0x8E => '\u{00E9}',
-        0x8F => '\u{00E8}',
-        0x90 => '\u{00EA}',
-        0x91 => '\u{00EB}',
-        0x92 => '\u{00ED}',
-        0x93 => '\u{00EC}',
-        0x94 => '\u{00EE}',
-        0x95 => '\u{00EF}',
-        0x96 => '\u{00F1}',
-        0x97 => '\u{00F3}',
-        0x98 => '\u{00F2}',
-        0x99 => '\u{00F4}',
-        0x9A => '\u{00F6}',
-        0x9B => '\u{00F5}',
-        0x9C => '\u{00FA}',
-        0x9D => '\u{00F9}',
-        0x9E => '\u{00FB}',
-        0x9F => '\u{00FC}',
-        _ => b as char,
-    }
-}
+// Encoding tables have moved to `crate::reader::encoding` — round 28
+// replaced the inline match-based helpers with a 256-entry
+// `EncodingMap` that also accommodates `/Differences` overlays and
+// multi-character ligature glyphs.
 
 #[cfg(test)]
 mod tests {
@@ -1507,10 +1477,13 @@ mod tests {
     }
 
     #[test]
-    fn winansi_smart_quote() {
-        // 0x93 = U+201C left double smart quote
-        assert_eq!(winansi_to_char(0x93), '\u{201C}');
-        assert_eq!(winansi_to_char(b'A'), 'A');
+    fn winansi_smart_quote_via_encoding_map() {
+        // 0x93 = U+201C left double smart quote — verifies the
+        // round-28 `EncodingMap` path produces the same bytes the
+        // old inline `winansi_to_char` match did.
+        let m = EncodingMap::from_base(BaseEncoding::WinAnsi);
+        assert_eq!(m.decode(&[0x93]), "\u{201C}");
+        assert_eq!(m.decode(b"A"), "A");
     }
 
     #[test]
