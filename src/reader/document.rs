@@ -164,6 +164,35 @@ impl<'a> DocumentReader<'a> {
     /// own XML / RDF parse if they need structured access).
     ///
     /// Symmetric to [`crate::write_pdf_from_scene_with_xmp`].
+    /// Round-26: walk every page's `/Annots` array and surface each
+    /// annotation as a [`crate::reader::annotation::PdfAnnotation`]
+    /// (ISO 32000-1 §12.5).
+    ///
+    /// Subsumes [`Self::signatures`] (those land as `Other { subtype:
+    /// "Widget" }` plus `/FT /Sig` widget hosting) at a higher level —
+    /// callers that just want the structured `/Sig` slot should keep
+    /// using `signatures()`; callers that want every annotation across
+    /// every page (Text, FreeText, Stamp, Highlight, Square, Link,
+    /// Widget, …) want `annotations()`.
+    pub fn annotations(
+        &mut self,
+    ) -> Result<Vec<crate::reader::annotation::PdfAnnotation>, PdfError> {
+        crate::reader::annotation::annotations(self)
+    }
+
+    /// Round-26: surface the document-level XMP `/Metadata` packet as
+    /// a structured [`crate::reader::xmp::XmpPacket`] — the most-used
+    /// Dublin Core / XMP Basic / PDF / PDF/A identification fields,
+    /// pre-decoded from the raw bytes [`Self::xmp_metadata`] returns.
+    ///
+    /// Returns `Ok(None)` when the catalog has no `/Metadata` entry.
+    pub fn xmp_packet(&mut self) -> Result<Option<crate::reader::xmp::XmpPacket>, PdfError> {
+        Ok(self
+            .xmp_metadata()?
+            .as_deref()
+            .map(crate::reader::xmp::XmpPacket::parse))
+    }
+
     pub fn xmp_metadata(&mut self) -> Result<Option<Vec<u8>>, PdfError> {
         let root_id = self.xref.root()?;
         let catalog = self.resolve(root_id)?;

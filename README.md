@@ -412,6 +412,62 @@ filters (`FlateDecode`-only raster XObjects, `JBIG2Decode`, `JPXDecode`,
 JPEG-only. Cross-checked against `pdfimages -all` (poppler-utils):
 the bytes are byte-identical.
 
+## Annotations beyond Link + XMP packet fields (round 26)
+
+[`DocumentReader::annotations`] walks every page's `/Annots` array and
+surfaces every entry as a [`PdfAnnotation`] (ISO 32000-1 §12.5.6
+Tables 169..209). Per-subtype payload covers `/Text` (sticky notes —
+`/Open`, `/Name` icon, `/State`, `/StateModel`), `/FreeText` (`/DA`,
+`/Q` quadding, `/RC`, `/IT` intent), `/Stamp` (icon name), the four
+text-markup variants `/Highlight` / `/Underline` / `/Squiggly` /
+`/StrikeOut` (`/QuadPoints`), `/Square` + `/Circle` (`/IC`, `/RD`),
+`/Link` (re-uses the round-25 go-to / URI decoder), and `/Widget`
+(`/FT`, `/T`, `/V`). Unknown subtypes (Movie, Sound, 3D, RichMedia,
+…) surface as `AnnotationKind::Other { subtype }`. Common Table 164
+fields (`/Rect`, `/Contents`, `/NM`, `/M`, `/F`, `/C`, `/Border`) are
+decoded for every subtype.
+
+```rust,ignore
+use oxideav_pdf::{reader::DocumentReader, AnnotationKind};
+
+let mut r = DocumentReader::open(&pdf_bytes)?;
+for a in r.annotations()? {
+    println!("page {} {:?}: {}", a.source_page_index, a.rect,
+        a.contents.as_deref().unwrap_or(""));
+    if let AnnotationKind::Stamp { icon } = &a.kind {
+        println!("  stamp icon: {icon}");
+    }
+}
+# Ok::<(), oxideav_pdf::PdfError>(())
+```
+
+[`DocumentReader::xmp_packet`] parses the document-level XMP packet
+round-19 surfaces into a structured [`XmpPacket`] (ISO 32000-1
+§14.3.2 + Adobe XMP Spec 2012 / ISO 16684-1 / ISO 19005-1..3 §6.x).
+Covers the most-used Dublin Core (`dc:title` through `rdf:Alt`,
+`dc:creator` through `rdf:Seq`, `dc:subject` `rdf:Bag`, `dc:rights`,
+`dc:format`), XMP Basic (`xmp:CreateDate` / `xmp:ModifyDate` /
+`xmp:MetadataDate` / `xmp:CreatorTool`), PDF schema (`pdf:Producer` /
+`pdf:Keywords` / `pdf:PDFVersion` / `pdf:Trapped`), and PDF/A
+identification (`pdfaid:part` / `pdfaid:conformance`) fields. Element
+and attribute forms both recognised; XML entities (`&amp;` / `&lt;` /
+`&gt;` / `&quot;` / `&apos;`) plus numeric character references
+decode. `XmpPacket::is_pdf_a()` + `pdf_a_conformance()` collapse the
+pair into a `1B`-style PDF/A conformance designator.
+
+```rust,ignore
+let mut r = oxideav_pdf::reader::DocumentReader::open(&pdf_bytes)?;
+if let Some(p) = r.xmp_packet()? {
+    println!("title:    {:?}", p.dc_title);
+    println!("creator:  {:?}", p.dc_creator);
+    println!("producer: {:?}", p.pdf_producer);
+    if p.is_pdf_a() {
+        println!("PDF/A conformance: {:?}", p.pdf_a_conformance());
+    }
+}
+# Ok::<(), oxideav_pdf::PdfError>(())
+```
+
 ## Deferred
 
 - **Text emission** — writer-side `BT … Tj … ET` for `Node::Text`

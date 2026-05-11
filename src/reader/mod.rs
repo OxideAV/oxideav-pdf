@@ -19,6 +19,7 @@
 //! [`PathCommand`]: oxideav_core::vector::PathCommand
 //! [`Transform2D`]: oxideav_core::vector::Transform2D
 
+pub mod annotation;
 pub mod content;
 pub mod document;
 pub mod images;
@@ -28,8 +29,10 @@ pub mod outline;
 pub mod parse;
 pub mod sig;
 pub mod text;
+pub mod xmp;
 pub mod xref;
 
+pub use annotation::{annotations, AnnotationKind, PdfAnnotation, TextMarkupVariant};
 pub use document::{
     read_pdf_to_scene, read_pdf_to_scene_with_certificate,
     read_pdf_to_scene_with_certificate_and_trust_store, read_pdf_to_scene_with_password,
@@ -40,3 +43,4 @@ pub use link::{links, PdfLink, PdfLinkTarget};
 pub use outline::{outline, OutlineNode, PdfOutline};
 pub use sig::{signatures, signed_bytes, PdfSignature};
 pub use text::{extract_text, PdfTextExtraction, TextRun};
+pub use xmp::XmpPacket;

@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 26: **Annotations beyond Link + XMP packet field extraction**
+  (ISO 32000-1 §12.5.6 Tables 169..209 + §14.3.2 / Adobe XMP Spec
+  2012 / ISO 16684-1 / ISO 19005-1..3 §6.x). New reader entry
+  `DocumentReader::annotations()` (free function: `read_pdf_annotations`)
+  walks every page's `/Annots` array and surfaces every entry as a
+  `PdfAnnotation`. Per-subtype payload covers `/Text` (§12.5.6.4 Table
+  172 — `/Open`, `/Name` icon, `/State`, `/StateModel`), `/FreeText`
+  (§12.5.6.6 Table 174 — `/DA`, `/Q` quadding, `/RC`, `/IT` intent),
+  `/Stamp` (§12.5.6.13 Table 184 — icon name), the four text-markup
+  variants `/Highlight` / `/Underline` / `/Squiggly` / `/StrikeOut`
+  (§12.5.6.10 Table 179 — `/QuadPoints`), `/Square` + `/Circle`
+  (§12.5.6.8 Table 177 — `/IC`, `/RD`), `/Link` (re-uses round-25's
+  go-to / URI dispatch), and `/Widget` (§12.5.6.19 Table 188 + §12.7.4
+  Table 220 — `/FT`, `/T`, `/V`). Unknown subtypes surface as
+  `AnnotationKind::Other { subtype }`. Common Table 164 fields
+  (`/Rect`, `/Contents`, `/NM`, `/M`, `/F`, `/C`, `/Border`) are
+  decoded for every subtype.
+  New `DocumentReader::xmp_packet()` (and `XmpPacket::parse(bytes)` for
+  callers with the raw bytes already in hand) parses the document-level
+  XMP packet round-19 surfaces into a structured view of the most-used
+  Dublin Core (`dc:title` through `rdf:Alt` / `dc:creator` through
+  `rdf:Seq` / `dc:subject` `rdf:Bag` / `dc:rights` / `dc:format`),
+  XMP Basic (`xmp:CreateDate` / `xmp:ModifyDate` / `xmp:MetadataDate`
+  / `xmp:CreatorTool`), PDF schema (`pdf:Producer` / `pdf:Keywords` /
+  `pdf:PDFVersion` / `pdf:Trapped`), and PDF/A identification schema
+  (`pdfaid:part` / `pdfaid:conformance`) fields. Element-body and
+  attribute forms both recognised; the standard five XML entities
+  (`&amp;` / `&lt;` / `&gt;` / `&quot;` / `&apos;`) plus numeric
+  character references decode. `XmpPacket::is_pdf_a()` and
+  `pdf_a_conformance()` collapse the pair into a `1B`-style designator
+  for PDF/A conformance detection. Tested end-to-end with +36 tests
+  (19 integration in `tests/annotations_round26.rs` covering every
+  subtype dispatch, common-field decode, page-without-annots baseline,
+  unified-reader round-trip of the writer's Link annotations, XMP
+  Dublin Core / XMP Basic / PDF / PDF/A identification, attribute-form
+  XMP, XML-entity decode, and absent-XMP `None`; +6 unit tests in
+  `src/reader/annotation.rs` and +11 unit tests in `src/reader/xmp.rs`).
 - Round 25: **Document outline (bookmarks) + Link annotations**
   (ISO 32000-1 §12.3.3 Tables 152+153 + §12.5.6.5 Table 173 + §12.3.2
   Table 151 destinations). New writer entry points

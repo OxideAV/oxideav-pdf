@@ -1,0 +1,590 @@
+//! Round-26 — generic annotation reader (ISO 32000-1 §12.5).
+//!
+//! Walks every page's `/Annots` array and surfaces each entry as a
+//! [`PdfAnnotation`] carrying the union of common Table 164 fields
+//! (`/Rect`, `/Contents`, `/NM`, `/M`, `/F`, `/Border`, `/C` colour)
+//! plus the per-subtype Table 169..209 entries this round handles:
+//!
+//! * **`/Text`** (§12.5.6.4 Table 172) — sticky-note: `/Open`,
+//!   `/Name` icon, `/State`, `/StateModel`.
+//! * **`/FreeText`** (§12.5.6.6 Table 174) — in-page text box: `/DA`
+//!   default appearance string, `/Q` justification, `/RC` rich
+//!   content, `/IT` intent.
+//! * **`/Stamp`** (§12.5.6.13 Table 184) — rubber-stamp: `/Name` icon
+//!   identifier (`Approved`, `Confidential`, etc.).
+//! * **`/Highlight`** / **`/Underline`** / **`/Squiggly`** /
+//!   **`/StrikeOut`** (§12.5.6.10 Table 179) — text-markup: `/QuadPoints`.
+//! * **`/Square`** / **`/Circle`** (§12.5.6.8 Table 177) — geometry:
+//!   `/IC` interior colour, `/RD` rectangle differences.
+//! * **`/Link`** (§12.5.6.5 Table 173) — re-uses [`crate::reader::link`]'s
+//!   target decoder so callers get the same go-to / URI dispatch.
+//! * **`/Widget`** (§12.5.6.19 Table 188) — form-field hosting; field
+//!   metadata (FT, T, V) is surfaced when present.
+//!
+//! Unknown subtypes still come back as [`AnnotationKind::Other`] with
+//! the raw `/Subtype` name — callers walking forensic / archival PDFs
+//! get a complete enumeration even for the long tail (Movie, Sound,
+//! 3D, RichMedia, …).
+//!
+//! Pages without `/Annots` contribute zero entries; a malformed annot
+//! dict is skipped (best-effort enumeration matches the round-21
+//! `/Sig` reader's contract).
+
+use std::collections::HashMap;
+
+use crate::error::PdfError;
+use crate::objects::{Dict, Object, ObjectId};
+use crate::reader::document::DocumentReader;
+use crate::reader::link::PdfLinkTarget;
+use crate::reader::outline::build_page_index_map;
+
+/// One annotation entry surfaced by [`annotations`].
+///
+/// The fields are the cross-subtype intersection; per-subtype detail
+/// hangs off [`Self::kind`].
+#[derive(Debug, Clone)]
+pub struct PdfAnnotation {
+    /// 0-based page index — which page in DFS order carries this
+    /// annotation in its `/Annots` array.
+    pub source_page_index: usize,
+    /// `/Rect` — annotation rectangle in default user space (PDF
+    /// coordinates, origin bottom-left).
+    pub rect: [f32; 4],
+    /// `/Contents` — text content (description / title for sticky
+    /// notes, raw text for FreeText).
+    pub contents: Option<String>,
+    /// `/NM` — annotation name (UID per Table 164). Optional; many
+    /// authoring tools omit it.
+    pub name: Option<String>,
+    /// `/M` — last-modified date (raw PDF date string, no parse).
+    pub modified: Option<String>,
+    /// `/F` — annotation flag word (Table 167). Bit 0 = Invisible,
+    /// bit 1 = Hidden, bit 2 = Print, bit 3 = NoZoom, bit 4 = NoRotate,
+    /// bit 5 = NoView, bit 6 = ReadOnly, bit 7 = Locked, bit 8 =
+    /// ToggleNoView, bit 9 = LockedContents.
+    pub flags: u32,
+    /// `/C` — colour: 0/1/3/4 numbers (Transparent / Gray / RGB / CMYK).
+    pub colour: Option<Vec<f32>>,
+    /// `/Border` — `[hr vr w]` or `[hr vr w dash]`. Most PDFs ship the
+    /// 3-element variant; round-26 surfaces it untouched.
+    pub border: Option<Vec<f32>>,
+    /// Per-subtype payload.
+    pub kind: AnnotationKind,
+}
+
+/// Per-subtype annotation payload.
+///
+/// The `/Subtype` name from §12.5.6 maps to one of these variants;
+/// unknown subtypes fall through to [`Self::Other`].
+#[derive(Debug, Clone)]
+pub enum AnnotationKind {
+    /// `/Subtype /Text` — sticky-note (§12.5.6.4 Table 172).
+    Text {
+        /// `/Open` — true ⇒ pop-up displayed at document open.
+        open: bool,
+        /// `/Name` — icon identifier (`Comment`, `Note`, `Help`,
+        /// `NewParagraph`, `Paragraph`, `Insert`, plus authoring-tool
+        /// extensions). Defaults to `Note` per Table 172.
+        icon: String,
+        /// `/State` + `/StateModel` — review or marked state.
+        state: Option<String>,
+        state_model: Option<String>,
+    },
+    /// `/Subtype /FreeText` — in-page text box (§12.5.6.6 Table 174).
+    FreeText {
+        /// `/DA` default appearance string (a content-stream snippet
+        /// per §12.7.3.3 — `/Helv 12 Tf 0 g`-style).
+        default_appearance: Option<String>,
+        /// `/Q` — quadding (justification): 0 left-justified
+        /// (default), 1 centred, 2 right-justified.
+        quadding: u8,
+        /// `/RC` rich content (XHTML).
+        rich_content: Option<String>,
+        /// `/IT` intent — `FreeText`, `FreeTextCallout`, `FreeTextTypeWriter`.
+        intent: Option<String>,
+    },
+    /// `/Subtype /Stamp` — rubber-stamp (§12.5.6.13 Table 184).
+    Stamp {
+        /// `/Name` icon identifier — `Approved`, `Experimental`,
+        /// `NotApproved`, `AsIs`, `Expired`, `NotForPublicRelease`,
+        /// `Confidential`, `Final`, `Sold`, `Departmental`,
+        /// `ForComment`, `TopSecret`, `Draft`, `ForPublicRelease`.
+        /// Defaults to `Draft` per Table 184.
+        icon: String,
+    },
+    /// Text-markup family (§12.5.6.10 Table 179).
+    TextMarkup {
+        /// Which markup variant: `Highlight`, `Underline`, `Squiggly`,
+        /// `StrikeOut`.
+        variant: TextMarkupVariant,
+        /// `/QuadPoints` — 8N reals giving the quads of every region
+        /// covered by the markup. PDF 2.0 changed the legal vertex
+        /// order; round-26 surfaces the raw list untouched.
+        quad_points: Vec<f32>,
+    },
+    /// `/Subtype /Square` or `/Circle` (§12.5.6.8 Table 177).
+    Geometry {
+        /// `Square` ⇒ true; `Circle` ⇒ false.
+        is_square: bool,
+        /// `/IC` interior colour — same shape as outer `/C`.
+        interior_colour: Option<Vec<f32>>,
+        /// `/RD` rectangle differences — `[left top right bottom]`
+        /// inset of the geometric figure inside `/Rect`. Optional.
+        rect_diffs: Option<[f32; 4]>,
+    },
+    /// `/Subtype /Link` — go-to / URI link (§12.5.6.5 Table 173).
+    /// Target decoded the same way [`crate::reader::link`] does it.
+    Link { target: Option<PdfLinkTarget> },
+    /// `/Subtype /Widget` — interactive form widget (§12.5.6.19
+    /// Table 188 + §12.7.4 Table 220 field-shared keys). Round-26
+    /// surfaces the field-trio `(field_type, field_name, value)`
+    /// when the widget dictionary is the field dictionary itself
+    /// (the most common shape).
+    Widget {
+        /// `/FT` — field type Name (`Btn`, `Tx`, `Ch`, `Sig`).
+        field_type: Option<String>,
+        /// `/T` — partial field name.
+        field_name: Option<String>,
+        /// `/V` — current value text (Names + strings collapse to a
+        /// String form; `null` ⇒ `None`).
+        value: Option<String>,
+    },
+    /// Subtype this round doesn't decode — name surfaced verbatim.
+    Other { subtype: String },
+}
+
+/// Text-markup variant tag for [`AnnotationKind::TextMarkup`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextMarkupVariant {
+    Highlight,
+    Underline,
+    Squiggly,
+    StrikeOut,
+}
+
+/// Walk every page in DFS order, collecting every annotation.
+///
+/// Pages without `/Annots` contribute zero entries; malformed
+/// annotation dicts are skipped silently.
+pub fn annotations(reader: &mut DocumentReader<'_>) -> Result<Vec<PdfAnnotation>, PdfError> {
+    let page_index_map = build_page_index_map(reader)?;
+    let mut pages_by_index: Vec<ObjectId> = Vec::with_capacity(page_index_map.len());
+    pages_by_index.resize(page_index_map.len(), ObjectId::new(0));
+    for (n, idx) in &page_index_map {
+        pages_by_index[*idx] = ObjectId::new(*n);
+    }
+
+    let mut out = Vec::new();
+    for (idx, page_id) in pages_by_index.iter().enumerate() {
+        if page_id.number == 0 {
+            continue;
+        }
+        let page = match reader.resolve(*page_id)? {
+            Object::Dict(d) => d,
+            _ => continue,
+        };
+        let annots_obj = page
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Annots")
+            .map(|(_, v)| v.clone());
+        let Some(annots_obj) = annots_obj else {
+            continue;
+        };
+        let annots_obj = reader.deref(annots_obj)?;
+        let Object::Array(items) = annots_obj else {
+            continue;
+        };
+        for item in items {
+            let annot = match reader.deref(item)? {
+                Object::Dict(d) => d,
+                _ => continue,
+            };
+            if let Some(parsed) = decode_annotation(reader, &annot, idx, &page_index_map)? {
+                out.push(parsed);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn decode_annotation(
+    reader: &mut DocumentReader<'_>,
+    annot: &Dict,
+    page_index: usize,
+    page_index_map: &HashMap<u32, usize>,
+) -> Result<Option<PdfAnnotation>, PdfError> {
+    let rect = match find_entry(annot, "Rect") {
+        Some(Object::Array(items)) if items.len() == 4 => {
+            let mut out = [0f32; 4];
+            for (i, it) in items.iter().enumerate() {
+                out[i] = match it {
+                    Object::Real(f) => *f as f32,
+                    Object::Integer(n) => *n as f32,
+                    _ => return Ok(None),
+                };
+            }
+            out
+        }
+        _ => return Ok(None),
+    };
+
+    let subtype = match find_entry(annot, "Subtype") {
+        Some(Object::Name(s)) => s.clone(),
+        _ => return Ok(None),
+    };
+
+    let contents = decode_text_string(find_entry(annot, "Contents"));
+    let name = decode_text_string(find_entry(annot, "NM"));
+    let modified = decode_text_string(find_entry(annot, "M"));
+    let flags = match find_entry(annot, "F") {
+        Some(Object::Integer(n)) => *n as u32,
+        _ => 0,
+    };
+    let colour = decode_real_array(find_entry(annot, "C"));
+    let border = decode_real_array(find_entry(annot, "Border"));
+
+    let kind = match subtype.as_str() {
+        "Text" => AnnotationKind::Text {
+            open: matches!(find_entry(annot, "Open"), Some(Object::Bool(true))),
+            icon: match find_entry(annot, "Name") {
+                Some(Object::Name(s)) => s.clone(),
+                _ => "Note".into(),
+            },
+            state: decode_text_string(find_entry(annot, "State")),
+            state_model: decode_text_string(find_entry(annot, "StateModel")),
+        },
+        "FreeText" => AnnotationKind::FreeText {
+            default_appearance: decode_text_string(find_entry(annot, "DA")),
+            quadding: match find_entry(annot, "Q") {
+                Some(Object::Integer(n)) => (*n).clamp(0, 2) as u8,
+                _ => 0,
+            },
+            rich_content: decode_text_string(find_entry(annot, "RC")),
+            intent: match find_entry(annot, "IT") {
+                Some(Object::Name(s)) => Some(s.clone()),
+                _ => None,
+            },
+        },
+        "Stamp" => AnnotationKind::Stamp {
+            icon: match find_entry(annot, "Name") {
+                Some(Object::Name(s)) => s.clone(),
+                _ => "Draft".into(),
+            },
+        },
+        "Highlight" => AnnotationKind::TextMarkup {
+            variant: TextMarkupVariant::Highlight,
+            quad_points: decode_real_array(find_entry(annot, "QuadPoints")).unwrap_or_default(),
+        },
+        "Underline" => AnnotationKind::TextMarkup {
+            variant: TextMarkupVariant::Underline,
+            quad_points: decode_real_array(find_entry(annot, "QuadPoints")).unwrap_or_default(),
+        },
+        "Squiggly" => AnnotationKind::TextMarkup {
+            variant: TextMarkupVariant::Squiggly,
+            quad_points: decode_real_array(find_entry(annot, "QuadPoints")).unwrap_or_default(),
+        },
+        "StrikeOut" => AnnotationKind::TextMarkup {
+            variant: TextMarkupVariant::StrikeOut,
+            quad_points: decode_real_array(find_entry(annot, "QuadPoints")).unwrap_or_default(),
+        },
+        "Square" | "Circle" => AnnotationKind::Geometry {
+            is_square: subtype == "Square",
+            interior_colour: decode_real_array(find_entry(annot, "IC")),
+            rect_diffs: decode_rect_diffs(find_entry(annot, "RD")),
+        },
+        "Link" => AnnotationKind::Link {
+            target: decode_link_target(reader, annot, page_index_map)?,
+        },
+        "Widget" => AnnotationKind::Widget {
+            field_type: match find_entry(annot, "FT") {
+                Some(Object::Name(s)) => Some(s.clone()),
+                _ => None,
+            },
+            field_name: decode_text_string(find_entry(annot, "T")),
+            value: decode_field_value(find_entry(annot, "V")),
+        },
+        other => AnnotationKind::Other {
+            subtype: other.to_string(),
+        },
+    };
+
+    Ok(Some(PdfAnnotation {
+        source_page_index: page_index,
+        rect,
+        contents,
+        name,
+        modified,
+        flags,
+        colour,
+        border,
+        kind,
+    }))
+}
+
+/// Resolve `/Dest` or `/A << /S … >>` for a Link annotation. Mirrors
+/// the round-25 link reader exactly so the two surfaces stay in sync.
+fn decode_link_target(
+    reader: &mut DocumentReader<'_>,
+    annot: &Dict,
+    page_index_map: &HashMap<u32, usize>,
+) -> Result<Option<PdfLinkTarget>, PdfError> {
+    if let Some(dest) = find_entry(annot, "Dest").cloned() {
+        let dest = reader.deref(dest)?;
+        return Ok(decode_dest_value(dest, page_index_map));
+    }
+    if let Some(action) = find_entry(annot, "A").cloned() {
+        let action = reader.deref(action)?;
+        if let Object::Dict(adict) = action {
+            let s_kind = find_entry(&adict, "S").and_then(|v| match v {
+                Object::Name(s) => Some(s.clone()),
+                _ => None,
+            });
+            match s_kind.as_deref() {
+                Some("URI") => {
+                    let uri = find_entry(&adict, "URI").and_then(|v| match v {
+                        Object::LiteralString(b) | Object::HexString(b) => {
+                            Some(String::from_utf8_lossy(b).into_owned())
+                        }
+                        _ => None,
+                    });
+                    return Ok(uri.map(PdfLinkTarget::Uri));
+                }
+                Some("GoTo") => {
+                    if let Some(d) = find_entry(&adict, "D").cloned() {
+                        let d = reader.deref(d)?;
+                        return Ok(decode_dest_value(d, page_index_map));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn decode_dest_value(dest: Object, page_index_map: &HashMap<u32, usize>) -> Option<PdfLinkTarget> {
+    match dest {
+        Object::Array(items) => {
+            decode_explicit_dest(&items, page_index_map).map(PdfLinkTarget::Internal)
+        }
+        Object::Name(s) => Some(PdfLinkTarget::Named(s)),
+        Object::LiteralString(b) | Object::HexString(b) => Some(PdfLinkTarget::Named(
+            String::from_utf8_lossy(&b).into_owned(),
+        )),
+        _ => None,
+    }
+}
+
+fn decode_explicit_dest(
+    items: &[Object],
+    page_index_map: &HashMap<u32, usize>,
+) -> Option<crate::outline::OutlineDestination> {
+    use crate::outline::OutlineDestination;
+    if items.len() < 2 {
+        return None;
+    }
+    let page_index = match &items[0] {
+        Object::Reference(id) => *page_index_map.get(&id.number)?,
+        _ => return None,
+    };
+    let mode = match &items[1] {
+        Object::Name(n) => n.as_str(),
+        _ => return None,
+    };
+    let opt = |o: Option<&Object>| match o {
+        Some(Object::Real(f)) => Some(*f as f32),
+        Some(Object::Integer(n)) => Some(*n as f32),
+        Some(Object::Null) | None => None,
+        _ => None,
+    };
+    let req = |o: Option<&Object>| -> Option<f32> {
+        match o {
+            Some(Object::Real(f)) => Some(*f as f32),
+            Some(Object::Integer(n)) => Some(*n as f32),
+            _ => None,
+        }
+    };
+    match mode {
+        "XYZ" => Some(OutlineDestination::Xyz {
+            page_index,
+            left: opt(items.get(2)),
+            top: opt(items.get(3)),
+            zoom: opt(items.get(4)).filter(|z| *z != 0.0),
+        }),
+        "Fit" => Some(OutlineDestination::Fit { page_index }),
+        "FitH" => Some(OutlineDestination::FitH {
+            page_index,
+            top: opt(items.get(2)),
+        }),
+        "FitV" => Some(OutlineDestination::FitV {
+            page_index,
+            left: opt(items.get(2)),
+        }),
+        "FitR" => Some(OutlineDestination::FitR {
+            page_index,
+            left: req(items.get(2))?,
+            bottom: req(items.get(3))?,
+            right: req(items.get(4))?,
+            top: req(items.get(5))?,
+        }),
+        "FitB" => Some(OutlineDestination::FitB { page_index }),
+        "FitBH" => Some(OutlineDestination::FitBH {
+            page_index,
+            top: opt(items.get(2)),
+        }),
+        "FitBV" => Some(OutlineDestination::FitBV {
+            page_index,
+            left: opt(items.get(2)),
+        }),
+        _ => None,
+    }
+}
+
+fn find_entry<'d>(d: &'d Dict, key: &str) -> Option<&'d Object> {
+    d.entries().iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+fn decode_real_array(o: Option<&Object>) -> Option<Vec<f32>> {
+    match o? {
+        Object::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                match it {
+                    Object::Real(f) => out.push(*f as f32),
+                    Object::Integer(n) => out.push(*n as f32),
+                    _ => return None,
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+fn decode_rect_diffs(o: Option<&Object>) -> Option<[f32; 4]> {
+    let v = decode_real_array(o)?;
+    if v.len() == 4 {
+        Some([v[0], v[1], v[2], v[3]])
+    } else {
+        None
+    }
+}
+
+/// PDF "text string" decode — handles literal-PDFDocEncoding and
+/// hex-UTF-16BE-with-BOM per §7.9.2.2.
+fn decode_text_string(o: Option<&Object>) -> Option<String> {
+    match o? {
+        Object::LiteralString(b) => Some(String::from_utf8_lossy(b).into_owned()),
+        Object::HexString(b) => {
+            if b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF {
+                let utf16: Vec<u16> = b[2..]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                    .collect();
+                Some(String::from_utf16_lossy(&utf16))
+            } else {
+                Some(String::from_utf8_lossy(b).into_owned())
+            }
+        }
+        Object::Name(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Field value decode — `/V` may be a string, name, number, or array
+/// (multi-select choice fields). Round-26 collapses the common forms
+/// to a single String; richer field-value support is out of scope.
+fn decode_field_value(o: Option<&Object>) -> Option<String> {
+    match o? {
+        Object::LiteralString(b) | Object::HexString(b) => Some(decode_pdf_string_bytes(b)),
+        Object::Name(s) => Some(s.clone()),
+        Object::Integer(n) => Some(n.to_string()),
+        Object::Real(f) => Some(f.to_string()),
+        Object::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+fn decode_pdf_string_bytes(b: &[u8]) -> String {
+    if b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF {
+        let utf16: Vec<u16> = b[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&utf16)
+    } else {
+        String::from_utf8_lossy(b).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_text_string_handles_utf16be_bom() {
+        let o = Object::HexString(vec![0xFE, 0xFF, 0x4E, 0x2D, 0x65, 0x87]);
+        let s = decode_text_string(Some(&o)).unwrap();
+        // 中文 = U+4E2D U+6587
+        assert_eq!(s, "中文");
+    }
+
+    #[test]
+    fn decode_text_string_handles_literal_ascii() {
+        let o = Object::LiteralString(b"hello".to_vec());
+        let s = decode_text_string(Some(&o)).unwrap();
+        assert_eq!(s, "hello");
+    }
+
+    #[test]
+    fn decode_real_array_mixes_int_and_real() {
+        let o = Object::Array(vec![
+            Object::Integer(1),
+            Object::Real(2.5),
+            Object::Integer(3),
+        ]);
+        let v = decode_real_array(Some(&o)).unwrap();
+        assert_eq!(v, vec![1.0, 2.5, 3.0]);
+    }
+
+    #[test]
+    fn decode_real_array_rejects_non_numeric() {
+        let o = Object::Array(vec![Object::Integer(1), Object::Name("x".into())]);
+        assert!(decode_real_array(Some(&o)).is_none());
+    }
+
+    #[test]
+    fn decode_rect_diffs_requires_four_entries() {
+        let o = Object::Array(vec![
+            Object::Real(1.0),
+            Object::Real(2.0),
+            Object::Real(3.0),
+            Object::Real(4.0),
+        ]);
+        assert_eq!(decode_rect_diffs(Some(&o)), Some([1.0, 2.0, 3.0, 4.0]));
+        let bad = Object::Array(vec![Object::Real(1.0)]);
+        assert!(decode_rect_diffs(Some(&bad)).is_none());
+    }
+
+    #[test]
+    fn decode_field_value_collapses_primitives() {
+        assert_eq!(
+            decode_field_value(Some(&Object::Integer(42))),
+            Some("42".into())
+        );
+        assert_eq!(
+            decode_field_value(Some(&Object::Bool(true))),
+            Some("true".into())
+        );
+        assert_eq!(
+            decode_field_value(Some(&Object::Name("Yes".into()))),
+            Some("Yes".into())
+        );
+        assert_eq!(
+            decode_field_value(Some(&Object::LiteralString(b"abc".to_vec()))),
+            Some("abc".into())
+        );
+        assert_eq!(decode_field_value(Some(&Object::Null)), None);
+    }
+}

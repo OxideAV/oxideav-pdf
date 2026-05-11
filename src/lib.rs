@@ -67,12 +67,13 @@ pub use pubsec::{
     PubSecSubFilter, TrustStore,
 };
 pub use reader::{
-    extract_text as extract_pdf_text, image_xobjects as read_pdf_image_xobjects,
-    links as read_pdf_links, outline as read_pdf_outline, read_pdf_to_scene,
-    read_pdf_to_scene_with_certificate, read_pdf_to_scene_with_certificate_and_trust_store,
-    read_pdf_to_scene_with_password, signatures as read_pdf_signatures,
-    signed_bytes as pdf_signed_bytes, ColorSpace, OutlineNode, PdfImageXObject, PdfLink,
-    PdfLinkTarget, PdfOutline, PdfSignature, PdfTextExtraction, TextRun,
+    annotations as read_pdf_annotations, extract_text as extract_pdf_text,
+    image_xobjects as read_pdf_image_xobjects, links as read_pdf_links,
+    outline as read_pdf_outline, read_pdf_to_scene, read_pdf_to_scene_with_certificate,
+    read_pdf_to_scene_with_certificate_and_trust_store, read_pdf_to_scene_with_password,
+    signatures as read_pdf_signatures, signed_bytes as pdf_signed_bytes, AnnotationKind,
+    ColorSpace, OutlineNode, PdfAnnotation, PdfImageXObject, PdfLink, PdfLinkTarget, PdfOutline,
+    PdfSignature, PdfTextExtraction, TextMarkupVariant, TextRun, XmpPacket,
 };
 pub use writer::{
     write_pdf, write_pdf_from_scene, write_pdf_from_scene_encrypted,
