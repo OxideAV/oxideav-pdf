@@ -133,6 +133,13 @@ pub const OID_NAMED_CURVE_P521: [u64; 5] = [1, 3, 132, 0, 35];
 /// 1.2.840.113549.1.9.4 — id-messageDigest (RFC 5652 §11.2).
 pub const OID_ATTR_MESSAGE_DIGEST: [u64; 7] = [1, 2, 840, 113549, 1, 9, 4];
 
+/// OID 1.2.840.113549.1.9.3 — `contentType` signed-attribute (RFC 5652
+/// §11.1). Round-30 writer emits this in every SignerInfo's
+/// `signedAttrs` SET as required by §11.1 ("a contentType attribute,
+/// having as its value the content type of the EncapsulatedContentInfo
+/// value being signed").
+pub const OID_ATTR_CONTENT_TYPE: [u64; 7] = [1, 2, 840, 113549, 1, 9, 3];
+
 // ---------------------------------------------------------------------
 // Hash dispatch
 // ---------------------------------------------------------------------

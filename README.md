@@ -241,9 +241,38 @@ The reader is tolerant of unsigned slots (a Sig form field whose `/V`
 is absent — common for "approval line still pending" templates), of
 non-terminal parent fields without their own `/V`, and of malformed
 `/Contents` blobs (the dict surfaces but `signed_data` is `None`).
-Writer-side emission of `/Sig` annotations still deferred — round 21
-covers the reader path only; signing tools today produce the bytes
-oxideav-pdf now reads back.
+
+**Round 30** closes the symmetric writer half: the new
+`oxideav_pdf::sig` module emits signed PDFs with valid `/ByteRange`
++ PKCS#7 / CMS `SignedData` `/Contents` blobs (ISO 32000-1 §12.7.4.5 +
+§12.8.1 + §7.5.6 + RFC 5652 §5 + §5.4 + §11.2). The classic
+"ByteRange-placeholder fill-in" pattern is implemented end-to-end —
+build PDF with a fixed-width `/ByteRange` `[?? ?? ?? ??]` + a
+`/Contents <0…0>` placeholder (8192 hex chars = 4096 raw bytes,
+enough for any RSA-2048 / ECDSA-P256 SHA-256 SignedData with a single
+signer + cert), patch `/ByteRange` with the computed offsets, hash the
+bytes spanned by `/ByteRange`, wrap into a CAdES-BES-style CMS
+`SignedData` with `signedAttrs = { contentType, messageDigest }` per
+RFC 5652 §11.1+§11.2, hex-encode, overwrite the placeholder. A
+[`Signer`] trait decouples the crypto: bring your own `ring` / `rsa` /
+`p256` / HSM impl, or use the reference [`RsaPkcs1v15Sha256Signer`] /
+[`EcdsaP256Sha256Signer`] that wrap the in-crate deps.
+
+```rust,ignore
+use oxideav_pdf::{sign_pdf_from_scene, RsaPkcs1v15Sha256Signer, SignerIdentity};
+
+let private_key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048)?;
+let signer = RsaPkcs1v15Sha256Signer::new(private_key);
+let identity = SignerIdentity::from_signer_cert_der(cert_der)?;
+let signed_pdf = sign_pdf_from_scene(&scene, &signer, identity)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Round-30 ships RSA-PKCS#1 v1.5 + SHA-256 and ECDSA-P256 + SHA-256.
+RSA-PSS, ECDSA on P-384 / P-521, and Ed25519 plug in through the same
+[`Signer`] trait without touching the writer surface. The output is
+accepted by `qpdf --check` and verifies end-to-end against the
+round-27 PKCS#7 verify dispatch.
 
 ## Encryption encode (writer side)
 
@@ -554,11 +583,6 @@ StructTreeRoot — e.g. PDF/UA accessibility audits).
   VideoFrame so the writer can emit `/Filter /DCTDecode` instead of
   re-encoding every JPEG to FlateDecoded raw RGBA. The *reader-side*
   surface landed in round 23 (see above).
-- **PDF `/Sig` annotation writer** — round 21 lands the reader; the
-  writer-side path that lays out an `/AcroForm /Fields [.. Sig ..]`
-  + signature dict with reservable `/Contents` / `/ByteRange` slots
-  (so a downstream signing tool can fill them in place) is the
-  symmetric follow-up.
 - Extended generic hint tables (F.4.5) and embedded-file-stream
   hint tables (F.4.6) for linearized output — we generate no
   interactive forms / structure trees / embedded files, so the

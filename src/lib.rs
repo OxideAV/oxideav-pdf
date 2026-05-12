@@ -55,6 +55,7 @@ pub mod page;
 pub mod pubsec;
 pub mod reader;
 pub mod resources;
+pub mod sig;
 pub mod writer;
 
 pub use error::PdfError;
@@ -79,6 +80,10 @@ pub use reader::{
     PdfACatalogSignals, PdfAConformance, PdfAnnotation, PdfImageXObject, PdfLink, PdfLinkTarget,
     PdfMarkedTextExtraction, PdfOutline, PdfSignature, PdfTextExtraction, ReadingOrderText,
     TextMarkupVariant, TextRun, XmpPacket,
+};
+pub use sig::{
+    pkcs7_wrap_signed_data, sign_pdf_from_scene, EcdsaP256Sha256Signer, RsaPkcs1v15Sha256Signer,
+    SigWriter, Signer, SignerIdentity, SigningAlgorithm,
 };
 pub use writer::{
     write_pdf, write_pdf_from_scene, write_pdf_from_scene_encrypted,

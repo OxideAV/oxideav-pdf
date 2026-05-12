@@ -9,6 +9,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 30: **PDF `/Sig` annotation writer** (ISO 32000-1 §12.7.4.5 +
+  §12.8.1 + RFC 5652 §5 + §5.4 + §11.2). Symmetric encoder side of
+  the round-21 reader + round-27 verifier: given an
+  [`oxideav_scene::Scene`] + a [`Signer`] + a signer-cert chain, the
+  new writer emits a signed PDF whose AcroForm contains a `/FT /Sig`
+  terminal field whose `/V` points at a signature dictionary
+  (`/Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached`)
+  carrying valid `/ByteRange` placeholders + a hex-encoded CMS
+  `SignedData` `ContentInfo` blob. The classic "ByteRange-placeholder
+  fill-in" pattern of §12.8.1.1 is implemented end-to-end:
+
+  Step 1 — the base PDF is rendered via the existing
+  `write_pdf_from_scene`.
+
+  Step 2 — an incremental-update revision (§7.5.6) is appended that
+  overrides the Catalog with `/AcroForm <ref>`, plus an AcroForm
+  dict (`/Fields [<sig-field-ref>] /SigFlags 3`), a Sig form
+  field (`/FT /Sig /T (Signature1)`), and a Sig dictionary with
+  fixed-width `/ByteRange` (4 × 10-digit slots) +
+  `/Contents <0…0>` (8192 hex chars = 4096 raw bytes — enough
+  for any RSA-2048 / ECDSA-P256 SHA-256 SignedData with a single
+  signer + cert).
+
+  Step 3 — `/ByteRange` is patched in place with the actual offsets
+  (the four integers themselves are inside the signed range, so they
+  reach their final value BEFORE the hash is computed).
+
+  Step 4 — the bytes named by `/ByteRange` are SHA-256-hashed, the
+  hash is wrapped into a CAdES-BES-style `signedAttrs` SET
+  (`contentType` 1.2.840.113549.1.9.3 = id-data, `messageDigest`
+  1.2.840.113549.1.9.4 = SHA-256(signed) per RFC 5652 §11.2), the
+  SET is canonical-re-tagged from `[0] IMPLICIT` to the universal
+  SET tag per §5.4 and hashed, and the resulting digest is signed by
+  the `Signer`.
+
+  Step 5 — the signature is wrapped in a CMS `SignedData`
+  `ContentInfo` (version=1, single SignerInfo,
+  `IssuerAndSerialNumber` slot, full cert chain in the
+  SET-of-CertificateChoices field, detached `eContent`),
+  hex-encoded, and overwritten into the `/Contents` placeholder
+  (length-preserving — the bytes between `<` and `>` are the
+  EXCLUDED range under `/ByteRange`, so this write does not
+  invalidate the hash computed in step 4).
+
+  New public surface under `oxideav_pdf::sig`:
+
+  * `pub trait Signer { fn algorithm() -> SigningAlgorithm; fn
+    sign(&self, tbs_hash: &[u8]) -> Result<Vec<u8>, PdfError>; }`
+    — abstract signing primitive; user plugs in whatever crypto
+    stack they want (`ring`, hardware token, HSM, ...). The trait
+    receives a SHA-2 digest and returns wire-form signature octets
+    (PKCS#1 v1.5 padded big-endian for RSA, DER-encoded
+    `Ecdsa-Sig-Value` for ECDSA).
+  * `SigningAlgorithm { RsaPkcs1v15Sha256, EcdsaP256Sha256 }` —
+    enum of the two algorithm slots round 30 ships; the writer
+    picks the right CMS `digestAlgorithm` (SHA-256) +
+    `signatureAlgorithm` (rsaEncryption / ecdsa-with-SHA256) OIDs
+    based on the implementor's choice.
+  * `RsaPkcs1v15Sha256Signer` / `EcdsaP256Sha256Signer` —
+    reference `Signer` impls that wrap the in-crate `rsa` / `p256`
+    deps (no new crypto deps added for the writer).
+  * `SignerIdentity { issuer_der, serial, cert_chain }` —
+    decoupled identity bundle; `from_signer_cert_der(der)` is the
+    convenience constructor for the typical single-cert
+    self-signed deployment.
+  * `SigWriter::new(scene, signer, identity).sign() -> Vec<u8>` —
+    the builder.
+  * `sign_pdf_from_scene(scene, signer, identity) -> Vec<u8>` —
+    one-shot convenience wrapper.
+  * `pkcs7_wrap_signed_data(algorithm, issuer_der, serial,
+    cert_chain, signed_attrs_body, signature_bytes) -> Vec<u8>` —
+    standalone CMS DER builder; useful when stitching a signed PDF
+    together at a lower level than `SigWriter`.
+
+  Six integration tests under `tests/sig_writer_round30.rs` cover:
+
+  * RSA-PKCS#1 v1.5 + SHA-256 round-trip (writer → round-21
+    reader → round-20 `verify_signature` end-to-end).
+  * ECDSA-P256 + SHA-256 round-trip.
+  * `/ByteRange` placeholder filled correctly (start = 0, second
+    range starts at the `>` after a fixed 8192-byte-wide
+    `/Contents` gap, two ranges cover everything but the gap, last
+    byte of range 1 is `<`, first byte of range 2 is `>`).
+  * Tamper-detection (flipping a body byte fails the
+    `messageDigest` cross-check per RFC 5652 §11.2).
+  * `qpdf --check` accepts the RSA-signed PDF.
+  * `qpdf --check` accepts the ECDSA-signed PDF.
+
+  Provenance: ISO 32000-1 §12.7.4.5 + §12.8.1 + §7.5.6 (incremental
+  updates) + RFC 5652 §5 + §5.4 + §11.1 (`contentType` attribute) +
+  §11.2 (`messageDigest` attribute) + RFC 5754 §2 (SHA-256 with NULL
+  params in CMS) + RFC 5753 §2.1 (ECDSA `Ecdsa-Sig-Value` SEQUENCE).
+  No third-party PDF / CMS source consulted.
+
 - Round 29: **Reading-order layout pass over Tagged PDF
   StructTreeRoot** (ISO 32000-1 §14.6 + §14.7 + §14.8). New
   `oxideav_pdf::reader::layout::read_in_logical_order(reader)` — and

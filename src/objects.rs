@@ -1004,6 +1004,16 @@ fn write_dict(out: &mut Vec<u8>, d: &Dict) -> io::Result<()> {
     out.write_all(b" >>")
 }
 
+/// Round-30 sig-writer entry point — serialise one [`Dict`] into a
+/// caller-provided buffer using the same byte sequence the document
+/// writer emits. Used by the `/Sig` writer's incremental-update
+/// section so the appended-revision objects (Catalog override,
+/// AcroForm, Sig field) come out byte-stable with the rest of the
+/// file.
+pub fn write_dict_to(out: &mut Vec<u8>, d: &Dict) -> Result<(), PdfError> {
+    write_dict(out, d).map_err(PdfError::Io)
+}
+
 /// Format a PDF real number per §7.3.3: no scientific notation,
 /// trailing zeros trimmed, integer values written without a decimal
 /// point. Bounded fractional precision keeps the output compact.
