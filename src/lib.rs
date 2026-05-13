@@ -42,6 +42,7 @@
 //! so it can be selected via the standard codec-id lookup
 //! (`"pdf"`).
 
+pub mod acroform;
 pub mod arc;
 pub mod decrypt;
 pub mod encrypt;
@@ -58,6 +59,10 @@ pub mod resources;
 pub mod sig;
 pub mod writer;
 
+pub use acroform::{
+    write_pdf_with_form, FieldJustification, FormField, FormFieldCheckbox, FormFieldChoice,
+    FormFieldRadioGroup, FormFieldSignature, FormFieldText, RadioOption,
+};
 pub use error::PdfError;
 pub use outline::{LinkAnnotationSpec, LinkTarget, OutlineDestination, OutlineSpec};
 pub use pubsec::{

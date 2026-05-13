@@ -572,6 +572,68 @@ text run alongside the marked-content `/MCID` it was painted under
 (for callers that want to assemble a custom logical order outside the
 StructTreeRoot — e.g. PDF/UA accessibility audits).
 
+## AcroForm interactive-widget writer (round 31)
+
+[`write_pdf_with_form`] is the writer-side counterpart of the
+round-26 `AnnotationKind::Widget` reader. Given a `Scene` in pages
+mode plus a slice of `FormField` specs it emits a PDF whose Catalog
+carries `/AcroForm` and whose page `/Annots` arrays carry the matching
+`/Subtype /Widget` annotations (ISO 32000-1 §12.7).
+
+All four canonical field types per §12.7.4 land:
+
+- **Text** (`/FT /Tx`) — `FormFieldText` with optional default value,
+  `/MaxLen`, `/Q` justification (left/centre/right per Table 222),
+  and `/Ff` bit 12 (multi-line) per Table 228.
+- **Checkbox** (`/FT /Btn`) — `FormFieldCheckbox` keyed by `/Yes` and
+  `/Off` appearance states per Table 228. `/V`, `/DV`, and `/AS` stay
+  consistent.
+- **Radio group** (`/FT /Btn` with Radio + NoToggleToOff flags) —
+  `FormFieldRadioGroup` becomes one aggregate field with `/Kids`
+  referring to one widget per option; the selected option's `/AS`
+  carries its export-value Name, others carry `/Off`.
+- **Choice** (`/FT /Ch`) — `FormFieldChoice` with `/Opt` array and
+  optional `/V`. `/Ff` bit 18 selects combo-box vs. list-box.
+- **Signature** (`/FT /Sig`) — `FormFieldSignature` wraps a
+  `Box<dyn Signer>` + `SignerIdentity` and re-uses the round-30
+  `/Contents` placeholder pattern. Only one signature field per call.
+
+```rust,ignore
+use oxideav_pdf::{
+    write_pdf_with_form, FieldJustification, FormField, FormFieldText,
+    FormFieldCheckbox,
+};
+
+let fields = vec![
+    FormField::Text(FormFieldText {
+        name: "FullName".into(),
+        rect: [20.0, 150.0, 180.0, 170.0],
+        page_index: 0,
+        value: Some("Jane Doe".into()),
+        max_length: Some(64),
+        multi_line: false,
+        justification: FieldJustification::Left,
+        default_appearance: None,
+    }),
+    FormField::Checkbox(FormFieldCheckbox {
+        name: "Accept".into(),
+        rect: [20.0, 100.0, 40.0, 120.0],
+        page_index: 0,
+        checked: true,
+        default_appearance: None,
+    }),
+];
+let pdf = write_pdf_with_form(&scene, &fields)?;
+# Ok::<(), oxideav_pdf::PdfError>(())
+```
+
+The AcroForm dict gets `/DA "(/Helv 12 Tf 0 g)"` per §12.7.3.3 (the
+caller can override per field), `/NeedAppearances true` so viewers
+regenerate `/AP` at open time, and `/SigFlags 3` when a signature
+field is present. `qpdf --check` accepts the output; the round-26
+reader round-trips `field_type` / `field_name` / `value` for every
+widget.
+
 ## Deferred
 
 - **Text emission** — writer-side `BT … Tj … ET` for `Node::Text`

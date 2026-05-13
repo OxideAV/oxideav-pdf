@@ -9,6 +9,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 31: **AcroForm interactive-widget writer** (ISO 32000-1 §12.7).
+  Writer-side counterpart of the round-26 `AnnotationKind::Widget`
+  reader. Given a `Scene` in pages mode + a slice of `FormField`
+  specs, [`oxideav_pdf::write_pdf_with_form`] emits a PDF whose
+  Catalog carries `/AcroForm` and whose page-level `/Annots` arrays
+  carry the matching widget annotations.
+
+  All four canonical field types per §12.7.4 land:
+
+  * **Text field** (`/FT /Tx`, §12.7.4.3) — `FormFieldText` with
+    optional default value, `/MaxLen`, `/Q` justification
+    (`FieldJustification::{Left,Center,Right}` → 0/1/2 per Table 222),
+    and `/Ff` bit 12 (multi-line) per Table 228.
+  * **Checkbox** (`/FT /Btn`, §12.7.4.2.3) — `FormFieldCheckbox`
+    keyed by `/Yes` (checked) and `/Off` (unchecked) appearance states
+    per Table 228. `/V`, `/DV`, and `/AS` are kept consistent.
+  * **Radio group** (`/FT /Btn` with `/Ff` Radio + NoToggleToOff bits,
+    §12.7.4.2.2) — `FormFieldRadioGroup` becomes one aggregate field
+    with `/Kids` referring to one widget annotation per option; the
+    selected option's `/AS` carries its export-value Name, the others
+    carry `/Off`.
+  * **Choice** (`/FT /Ch`, §12.7.4.4) — `FormFieldChoice` with
+    `/Opt` array, optional `/V`, and `/Ff` bit 18 (Combo) per Table 230.
+  * **Signature** (`/FT /Sig`, §12.7.4.5) — `FormFieldSignature`
+    wraps a `Box<dyn Signer>` + `SignerIdentity`; re-uses the
+    round-30 `/Contents` placeholder pattern with a size-stable layout
+    (`Object::HexString` of `CONTENTS_HEX_LEN/2` bytes for the
+    placeholder, all four `/ByteRange` slots emitted as
+    `BYTE_RANGE_SLOT_MAX = 99_999_999` so the array body has a fixed
+    8-digit-per-slot byte width). One signature field per call.
+
+  The AcroForm dict carries `/Fields`, `/DA "(/Helv 12 Tf 0 g)"` per
+  §12.7.3.3 (caller can override per-field via `default_appearance`),
+  `/NeedAppearances true` (so viewers regenerate `/AP` from `/DA` at
+  open time — keeps the writer from having to draw glyph-perfect
+  appearance streams), and `/SigFlags 3` (SignaturesExist | AppendOnly)
+  when a signature field is present.
+
+  New public surface under `oxideav_pdf::acroform` (re-exported at
+  the crate root):
+
+  * `pub fn write_pdf_with_form(scene: &Scene, form_fields:
+    &[FormField]) -> Result<Vec<u8>, PdfError>`
+  * `pub enum FormField { Text, Checkbox, RadioGroup, Choice,
+    Signature }`
+  * `FormFieldText`, `FormFieldCheckbox`, `FormFieldRadioGroup`,
+    `RadioOption`, `FormFieldChoice`, `FormFieldSignature`
+  * `FieldJustification { Left, Center, Right }`
+
+  Tests under `tests/acroform_writer.rs`:
+
+  * `text_field_emits_valid_acroform` — `/AcroForm` + `/FT /Tx` +
+    value round-trip through the round-26 reader.
+  * `checkbox_in_checked_state_renders` — `/V /Yes` after roundtrip;
+    `checkbox_in_unchecked_state_renders` — `/V /Off`.
+  * `radio_group_emits_consistent_state` — exactly one `/AS` is the
+    selected export value, the others are `/Off`.
+  * `choice_field_round_trips` — `/Opt` array, `/V`, and combo `/Ff`
+    bit emit.
+  * `signature_field_combines_with_sig_writer` — full sign + verify
+    round-trip with RSA-PKCS#1 v1.5 + SHA-256.
+  * `qpdf_check_accepts_text_and_checkbox_form` — external
+    `qpdf --check` oracle.
+  * `rejects_field_on_out_of_range_page`,
+    `rejects_multiple_signature_fields` — error-path coverage.
+
 - Round 30: **PDF `/Sig` annotation writer** (ISO 32000-1 §12.7.4.5 +
   §12.8.1 + RFC 5652 §5 + §5.4 + §11.2). Symmetric encoder side of
   the round-21 reader + round-27 verifier: given an
