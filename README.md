@@ -634,6 +634,80 @@ field is present. `qpdf --check` accepts the output; the round-26
 reader round-trips `field_type` / `field_name` / `value` for every
 widget.
 
+## General annotations writer (round 32)
+
+[`write_pdf_with_annotations`] is the symmetric writer side of the
+round-26 generic annotation reader. Where round 25 emitted only
+`/Subtype /Link` and round 31 emitted `/Subtype /Widget`, round 32
+covers the rest of the §12.5.6 subtype taxonomy that authoring tools
+produce in the wild: Text, Link, FreeText, Highlight, Underline,
+Squiggly, StrikeOut, Stamp, Square, Circle, and Ink.
+
+Five most-common interactive PDF subtypes (Text/Link/FreeText/
+Highlight/Stamp) plus three markup ones (Square/Circle/Ink) are
+all wired into a single `Annotation` struct + `WriterAnnotationKind`
+enum, with cross-subtype Table 164 fields (`/T` author, `/M`
+modified-date, `/F` flags, `/C` colour, `/Border`) hanging off the
+struct itself:
+
+```rust,ignore
+use oxideav_pdf::{
+    write_pdf_with_annotations, Annotation, FreeTextQuadding,
+    WriterAnnotationKind,
+};
+
+let annots = vec![
+    Annotation {
+        source_page_index: 0,
+        rect: [10.0, 10.0, 30.0, 30.0],
+        author: Some("Jane Reviewer".into()),
+        modified: None,
+        flags: None,
+        colour: Some(vec![1.0, 1.0, 0.0]),
+        border: None,
+        kind: WriterAnnotationKind::Text {
+            contents: "Please clarify".into(),
+            icon: Some("Comment".into()),
+            open: true,
+        },
+    },
+    Annotation {
+        source_page_index: 0,
+        rect: [40.0, 60.0, 200.0, 80.0],
+        author: None,
+        modified: None,
+        flags: None,
+        colour: None,
+        border: None,
+        kind: WriterAnnotationKind::Link {
+            uri: "https://example.com".into(),
+        },
+    },
+    Annotation {
+        source_page_index: 0,
+        rect: [40.0, 100.0, 200.0, 130.0],
+        author: None,
+        modified: None,
+        flags: None,
+        colour: None,
+        border: None,
+        kind: WriterAnnotationKind::FreeText {
+            contents: "header".into(),
+            default_appearance: None,
+            quadding: FreeTextQuadding::Center,
+        },
+    },
+];
+let pdf = write_pdf_with_annotations(&scene, &annots)?;
+# Ok::<(), oxideav_pdf::PdfError>(())
+```
+
+Highlight/Underline/Squiggly/StrikeOut take a
+`Vec<[f32; 8]>` of quads (lowered to the spec's `8N`-real
+`/QuadPoints` array); Ink takes a `Vec<Vec<f32>>` of strokes
+(each `[x0, y0, x1, y1, …]`). `qpdf --check` accepts the output;
+the round-26 reader round-trips every subtype.
+
 ## Deferred
 
 - **Text emission** — writer-side `BT … Tj … ET` for `Node::Text`

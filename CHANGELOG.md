@@ -9,6 +9,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 32: **General annotations writer** (ISO 32000-1 §12.5.6).
+  Symmetric writer-side counterpart of the round-26 generic
+  annotation reader. Where round 25 emitted only `/Subtype /Link`
+  (in-document destinations) and round 31 emitted `/Subtype /Widget`
+  (interactive form fields), round 32 covers the rest of the
+  §12.5.6 subtype taxonomy that authoring tools produce in the wild:
+
+  * **`/Text`** sticky-note (§12.5.6.4, Table 172) —
+    `AnnotationKind::Text` with `/Contents`, `/Name` icon
+    (defaulting to `Note`), and `/Open`.
+  * **`/Link`** external-URI hyperlink (§12.5.6.5, Table 173) —
+    `AnnotationKind::Link` lowers to `/A << /S /URI /URI (uri) >>`.
+    (In-document goto-destination links keep the richer round-25
+    `LinkAnnotationSpec` surface.)
+  * **`/FreeText`** in-page text overlay (§12.5.6.6, Table 174) —
+    `AnnotationKind::FreeText` with `/Contents`, `/DA` default
+    appearance, and `/Q` quadding via `FreeTextQuadding {Left, Center,
+    Right}` (0/1/2 per Table 174).
+  * **`/Highlight`** / **`/Underline`** / **`/Squiggly`** /
+    **`/StrikeOut`** text-markup family (§12.5.6.10, Table 179) —
+    each variant carries `/QuadPoints` as `Vec<[f32; 8]>` (one quad
+    per region) flattened into the spec's `8N`-real array.
+  * **`/Stamp`** rubber-stamp (§12.5.6.13, Table 184) —
+    `AnnotationKind::Stamp` with `/Name` icon (defaulting to `Draft`)
+    + optional `/Contents` description.
+  * **`/Square`** / **`/Circle`** geometric markup (§12.5.6.8,
+    Table 177) — `/IC` interior colour + `/BS /W` line-width.
+  * **`/Ink`** freehand scribble (§12.5.6.13, Table 185) —
+    `AnnotationKind::Ink` with `/InkList` (each stroke is a flat
+    list of `[x0, y0, x1, y1, …]` reals).
+
+  Every annotation also carries the Table 164 cross-subtype fields:
+  `/T` author, `/M` modified-date string (raw PDF date form per
+  §7.9.4), `/F` flag word (defaulting to 4 = Print bit 3),
+  `/C` colour, and `/Border` (defaulting to `[0 0 0]`).
+
+  New public surface under `oxideav_pdf::annotations` (re-exported
+  at the crate root):
+
+  * `pub fn write_pdf_with_annotations(scene: &Scene, annotations:
+    &[Annotation]) -> Result<Vec<u8>, PdfError>`
+  * `pub struct Annotation { source_page_index, rect, author,
+    modified, flags, colour, border, kind }`
+  * `pub enum AnnotationKind` (re-exported as `WriterAnnotationKind`
+    at the crate root to avoid colliding with the reader's
+    `AnnotationKind`)
+  * `pub enum FreeTextQuadding { Left, Center, Right }`
+
+  Tests under `tests/annotations_writer_round32.rs`:
+
+  * `text_annotation_roundtrips_through_reader` — `/Text` +
+    `/Contents` + `/Open` + `/Name` round-trip via the round-26
+    reader.
+  * `link_uri_annotation_roundtrips_through_reader` — `/Link`
+    `/A /S /URI` decode by the round-25/26 link target decoder.
+  * `freetext_annotation_roundtrips_with_quadding` — `/FreeText`
+    `/DA` + `/Q` round-trip.
+  * `highlight_annotation_carries_quadpoints` — 8N `/QuadPoints`
+    array shape.
+  * `underline_squiggly_strikeout_all_round_trip` — every
+    text-markup variant.
+  * `stamp_annotation_carries_icon_name` +
+    `stamp_without_icon_defaults_to_draft` — Table 184 icon
+    behaviour.
+  * `square_and_circle_annotations_round_trip` — geometric markup
+    with interior colour + line width.
+  * `ink_annotation_emits_inklist` — `/Ink` survives round-trip
+    and surfaces via the reader's `Other("Ink")` fallthrough.
+  * `annotations_across_multiple_pages_land_on_correct_pages` —
+    `source_page_index` routes annotations to the right page's
+    `/Annots` array.
+  * `rejects_annotation_on_out_of_range_page`,
+    `rejects_ink_with_no_strokes`,
+    `rejects_ink_with_odd_coord_count`,
+    `rejects_empty_text_markup_quadpoints` — error-path coverage.
+  * `qpdf_check_accepts_mixed_annotation_pdf` — external `qpdf
+    --check` oracle accepts a PDF carrying Text + Link + FreeText
+    + Highlight + Stamp + Square + Ink in one document.
+
 - Round 31: **AcroForm interactive-widget writer** (ISO 32000-1 §12.7).
   Writer-side counterpart of the round-26 `AnnotationKind::Widget`
   reader. Given a `Scene` in pages mode + a slice of `FormField`

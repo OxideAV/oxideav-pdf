@@ -43,6 +43,7 @@
 //! (`"pdf"`).
 
 pub mod acroform;
+pub mod annotations;
 pub mod arc;
 pub mod decrypt;
 pub mod encrypt;
@@ -62,6 +63,10 @@ pub mod writer;
 pub use acroform::{
     write_pdf_with_form, FieldJustification, FormField, FormFieldCheckbox, FormFieldChoice,
     FormFieldRadioGroup, FormFieldSignature, FormFieldText, RadioOption,
+};
+pub use annotations::{
+    write_pdf_with_annotations, Annotation, AnnotationKind as WriterAnnotationKind,
+    FreeTextQuadding,
 };
 pub use error::PdfError;
 pub use outline::{LinkAnnotationSpec, LinkTarget, OutlineDestination, OutlineSpec};
