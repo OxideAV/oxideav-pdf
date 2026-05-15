@@ -20,6 +20,7 @@
 //! [`Transform2D`]: oxideav_core::vector::Transform2D
 
 pub mod annotation;
+pub mod attachments;
 pub mod content;
 pub mod document;
 pub mod encoding;
@@ -38,6 +39,7 @@ pub mod xmp;
 pub mod xref;
 
 pub use annotation::{annotations, AnnotationKind, PdfAnnotation, TextMarkupVariant};
+pub use attachments::{attachments, PdfAttachment};
 pub use document::{
     read_pdf_to_scene, read_pdf_to_scene_with_certificate,
     read_pdf_to_scene_with_certificate_and_trust_store, read_pdf_to_scene_with_password,

@@ -708,6 +708,44 @@ Highlight/Underline/Squiggly/StrikeOut take a
 (each `[x0, y0, x1, y1, …]`). `qpdf --check` accepts the output;
 the round-26 reader round-trips every subtype.
 
+## Embedded file attachments (round 33)
+
+`write_pdf_with_attachments(scene, &[Attachment])` embeds arbitrary
+files inside the PDF as `/Type /EmbeddedFile` streams, materialises
+one `/Type /Filespec` dictionary per attachment (ISO 32000-1 §7.11.3
+Table 44 + §7.11.4 Table 45 + §3.10), registers each filespec in the
+catalog's `/Names → /EmbeddedFiles` name tree (§7.7.4 Table 31 +
+§7.9.6 Name trees), and optionally drops a `/FileAttachment`
+annotation marker (§12.5.6.15 Table 187) on a chosen page. The
+embedded-file stream body is FlateDecode-compressed when that
+shrinks; otherwise stored cleartext.
+
+```rust,ignore
+use oxideav_pdf::{write_pdf_with_attachments, Attachment};
+
+let pdf = write_pdf_with_attachments(&scene, &[
+    Attachment::new("notes.txt", b"Hello PDF.\n".to_vec())
+        .with_mime_type("text/plain")
+        .with_modified("D:20260515120000Z"),
+    Attachment::new("logo.png", png_bytes)
+        .with_mime_type("image/png")
+        .with_annotation(0, [10.0, 10.0, 30.0, 30.0]),
+])?;
+# Ok::<(), oxideav_pdf::PdfError>(())
+```
+
+Each attachment's `/F` entry is the PDFDocEncoded name (literal
+string for ASCII; UTF-16BE-with-BOM hex string otherwise), the `/UF`
+entry is always UTF-16BE for full Unicode coverage (PDF 1.7+), and
+`/EF /F` and `/EF /UF` both point at the same embedded-file stream.
+Name-tree keys are emitted in byte-wise lexicographic order per
+§7.9.6.2.
+
+The reader-side counterpart [`read_pdf_attachments`] walks the same
+name tree back into `Vec<PdfAttachment { name, mime_type, bytes,
+modified }>`. `qpdf --check` and `qpdf --json` both accept the
+output; `qpdf --json` lists each embedded file by name.
+
 ## Deferred
 
 - **Text emission** — writer-side `BT … Tj … ET` for `Node::Text`

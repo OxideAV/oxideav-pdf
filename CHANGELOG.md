@@ -9,6 +9,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 33: **Embedded file attachment writer + reader** (ISO 32000-1
+  §7.11 + §3.10 + §12.5.6.15 + §7.7.4 + §7.9.6). Embeds arbitrary
+  files inside the PDF as `/Type /EmbeddedFile` streams, registers
+  each file in the catalog `/Names → /EmbeddedFiles` name tree, and
+  optionally drops a `/FileAttachment` annotation marker (paperclip /
+  push-pin) on a chosen page so a viewer can extract the file with a
+  click.
+
+  The embedded-file stream body is FlateDecode-compressed when that
+  shrinks the result; otherwise stored cleartext. Each filespec
+  carries `/F` (PDFDocEncoded name), `/UF` (UTF-16BE name — required
+  for non-ASCII names per §7.11.2 Table 43), and `/EF /F` + `/EF /UF`
+  pointing at the same embedded-file stream. The MIME type lowers to
+  `/Subtype` per §7.11.4 Table 45 (the `/` byte is `#2F`-escaped per
+  §7.3.5 Name encoding rules).
+
+  Name-tree keys are emitted in byte-wise lexicographic order per
+  §7.9.6.2. The writer uses a single leaf node — sufficient for the
+  realistic case (typical PDF has fewer than ~64 attachments); a
+  branching name tree would be needed only for very large
+  attachment tables.
+
+  New public surface (re-exported at the crate root):
+
+  * `pub fn write_pdf_with_attachments(scene: &Scene, attachments:
+    &[Attachment]) -> Result<Vec<u8>, PdfError>`
+  * `pub fn write_pdf_with_annotations_and_attachments(scene: &Scene,
+    annotations: &[Annotation], attachments: &[Attachment]) ->
+    Result<Vec<u8>, PdfError>` (combined entry point)
+  * `pub struct Attachment { name, bytes, mime_type, modified,
+    annotation_page, annotation_rect, annotation_icon }` with
+    builder-style `with_mime_type` / `with_modified` /
+    `with_annotation` methods.
+  * `pub fn read_pdf_attachments(reader: &mut DocumentReader) ->
+    Result<Vec<PdfAttachment>, PdfError>` — walks the catalog →
+    `/Names → /EmbeddedFiles` name tree (with bounded recursion for
+    intermediate-node `/Kids`), surfaces each entry as a
+    `PdfAttachment { name, mime_type, bytes, modified }` carrying
+    the byte-exact decoded payload.
+
+  Validation:
+
+  * Every test under `tests/attachments_round33.rs` round-trips
+    attachments through the writer + reader pair and asserts the
+    payload bytes are byte-exact.
+  * `qpdf --check` accepts the produced PDFs; `qpdf --json` lists
+    each embedded file by name.
+  * `pdfinfo` accepts the output.
+
+  Tests:
+
+  * `two_attachments_roundtrip_through_reader` — .txt + .png across
+    a 2-page document.
+  * `empty_attachments_list_emits_no_names_entry` — defensive: no
+    catalog `/Names` when nothing to attach.
+  * `file_attachment_annotation_lands_on_correct_page` — paperclip
+    marker emits on the requested page.
+  * `out_of_range_annotation_page_errors` — defensive page-index
+    bound check.
+  * `name_tree_keys_emitted_in_byte_sorted_order` — §7.9.6.2
+    name-tree key ordering invariant.
+  * `qpdf_check_accepts_attachments_pdf` /
+    `qpdf_json_lists_embedded_files` — external validation gated
+    on `qpdf` being on `PATH`.
+  * `pdfinfo_accepts_attachments_pdf` — external validation gated
+    on `pdfinfo` being on `PATH`.
+
 - Round 32: **General annotations writer** (ISO 32000-1 §12.5.6).
   Symmetric writer-side counterpart of the round-26 generic
   annotation reader. Where round 25 emitted only `/Subtype /Link`

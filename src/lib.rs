@@ -45,6 +45,7 @@
 pub mod acroform;
 pub mod annotations;
 pub mod arc;
+pub mod attachments;
 pub mod decrypt;
 pub mod encrypt;
 pub mod error;
@@ -68,6 +69,9 @@ pub use annotations::{
     write_pdf_with_annotations, Annotation, AnnotationKind as WriterAnnotationKind,
     FreeTextQuadding,
 };
+pub use attachments::{
+    write_pdf_with_annotations_and_attachments, write_pdf_with_attachments, Attachment,
+};
 pub use error::PdfError;
 pub use outline::{LinkAnnotationSpec, LinkTarget, OutlineDestination, OutlineSpec};
 pub use pubsec::{
@@ -78,18 +82,18 @@ pub use pubsec::{
     PubSecSubFilter, TrustStore,
 };
 pub use reader::{
-    annotations as read_pdf_annotations, extract_text as extract_pdf_text,
-    extract_text_marked as extract_pdf_text_marked, image_xobjects as read_pdf_image_xobjects,
-    links as read_pdf_links, outline as read_pdf_outline, parse_linearization_dict,
-    pdfa_signals as read_pdf_pdfa_signals, read_in_logical_order as read_pdf_in_logical_order,
-    read_pdf_to_scene, read_pdf_to_scene_with_certificate,
-    read_pdf_to_scene_with_certificate_and_trust_store, read_pdf_to_scene_with_password,
-    signatures as read_pdf_signatures, signed_bytes as pdf_signed_bytes,
-    verify_hierarchy as verify_pdf_hierarchy, AnnotationKind, ColorSpace, HierarchyIssue,
-    HierarchyReport, IssueSeverity, LayoutMode, LinearizationParams, MarkedTextRun, OutlineNode,
-    PdfACatalogSignals, PdfAConformance, PdfAnnotation, PdfImageXObject, PdfLink, PdfLinkTarget,
-    PdfMarkedTextExtraction, PdfOutline, PdfSignature, PdfTextExtraction, ReadingOrderText,
-    TextMarkupVariant, TextRun, XmpPacket,
+    annotations as read_pdf_annotations, attachments as read_pdf_attachments,
+    extract_text as extract_pdf_text, extract_text_marked as extract_pdf_text_marked,
+    image_xobjects as read_pdf_image_xobjects, links as read_pdf_links,
+    outline as read_pdf_outline, parse_linearization_dict, pdfa_signals as read_pdf_pdfa_signals,
+    read_in_logical_order as read_pdf_in_logical_order, read_pdf_to_scene,
+    read_pdf_to_scene_with_certificate, read_pdf_to_scene_with_certificate_and_trust_store,
+    read_pdf_to_scene_with_password, signatures as read_pdf_signatures,
+    signed_bytes as pdf_signed_bytes, verify_hierarchy as verify_pdf_hierarchy, AnnotationKind,
+    ColorSpace, HierarchyIssue, HierarchyReport, IssueSeverity, LayoutMode, LinearizationParams,
+    MarkedTextRun, OutlineNode, PdfACatalogSignals, PdfAConformance, PdfAnnotation, PdfAttachment,
+    PdfImageXObject, PdfLink, PdfLinkTarget, PdfMarkedTextExtraction, PdfOutline, PdfSignature,
+    PdfTextExtraction, ReadingOrderText, TextMarkupVariant, TextRun, XmpPacket,
 };
 pub use sig::{
     pkcs7_wrap_signed_data, sign_pdf_from_scene, EcdsaP256Sha256Signer, RsaPkcs1v15Sha256Signer,
