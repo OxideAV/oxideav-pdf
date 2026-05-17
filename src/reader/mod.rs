@@ -24,8 +24,10 @@ pub mod attachments;
 pub mod content;
 pub mod document;
 pub mod encoding;
+pub mod filters;
 pub mod hierarchy;
 pub mod images;
+pub mod inline_images;
 pub mod layout;
 pub mod lex;
 pub mod linearize;
@@ -51,6 +53,7 @@ pub use encoding::{
 };
 pub use hierarchy::{verify_hierarchy, HierarchyIssue, HierarchyReport, IssueSeverity};
 pub use images::{image_xobjects, ColorSpace, PdfImageXObject};
+pub use inline_images::{inline_images, InlineImageFilter, PdfInlineImage};
 pub use layout::{read_in_logical_order, LayoutMode, ReadingOrderText};
 pub use linearize::{parse_linearization_dict, LinearizationParams};
 pub use link::{links, PdfLink, PdfLinkTarget};

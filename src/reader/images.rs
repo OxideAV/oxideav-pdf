@@ -362,13 +362,14 @@ fn try_extract_jpeg(
     let mut payload = s.data.clone();
     for filter_name in &chain[..chain.len() - 1] {
         payload = match filter_name.as_str() {
-            "ASCII85Decode" | "A85" => decode_ascii85(&payload)?,
-            "ASCIIHexDecode" | "AHx" => decode_ascii_hex(&payload)?,
-            "FlateDecode" | "Fl" => flate_decompress(&payload)?,
-            // Other wrapping filters (LZWDecode, RunLengthDecode,
-            // CCITTFaxDecode, …) are not in scope for round 23 — surface
-            // the XObject as "not JPEG passthrough" so the caller
-            // doesn't get a corrupted stream.
+            "ASCII85Decode" | "A85" => crate::reader::filters::ascii85_decode(&payload)?,
+            "ASCIIHexDecode" | "AHx" => crate::reader::filters::ascii_hex_decode(&payload)?,
+            "FlateDecode" | "Fl" => crate::reader::filters::flate_decompress(&payload)?,
+            "RunLengthDecode" | "RL" => crate::reader::filters::run_length_decode(&payload)?,
+            // Other wrapping filters (LZWDecode, CCITTFaxDecode, …) are
+            // not in scope for round 35 — surface the XObject as "not
+            // JPEG passthrough" so the caller doesn't get a corrupted
+            // stream.
             _ => return Ok(None),
         };
     }
@@ -432,208 +433,9 @@ fn lookup_int(d: &Dict, key: &str) -> Option<i64> {
         })
 }
 
-// ────────────────────────── filter unwrappers ──────────────────────────
-
-fn flate_decompress(input: &[u8]) -> Result<Vec<u8>, PdfError> {
-    use flate2::read::ZlibDecoder;
-    use std::io::Read;
-    let mut out = Vec::new();
-    let mut dec = ZlibDecoder::new(input);
-    dec.read_to_end(&mut out)
-        .map_err(|e| PdfError::other(format!("PDF image extraction: FlateDecode failed: {e}")))?;
-    Ok(out)
-}
-
-/// ASCII85Decode (ISO 32000-1 §7.4.3) — five base-85 ASCII characters
-/// in the range `!`..`u` encode four bytes. `z` is a shorthand for
-/// four zero bytes. Whitespace is ignored. The stream ends at `~>`.
-/// Partial groups are padded with `u` (84) on encode and truncated to
-/// the equivalent number of bytes on decode (1..=4 bytes per
-/// `n`-character partial group, where `n` ∈ {2, 3, 4, 5}).
-fn decode_ascii85(input: &[u8]) -> Result<Vec<u8>, PdfError> {
-    let mut out = Vec::with_capacity(input.len() * 4 / 5);
-    let mut group: [u8; 5] = [0; 5];
-    let mut filled: usize = 0;
-    let mut i = 0;
-    while i < input.len() {
-        let b = input[i];
-        i += 1;
-        // EOD marker `~>` per §7.4.3.
-        if b == b'~' {
-            if i < input.len() && input[i] == b'>' {
-                break;
-            }
-            return Err(PdfError::other(
-                "PDF image extraction: ASCII85 stray '~' (expected '~>')",
-            ));
-        }
-        // Whitespace (space, \t, \n, \r, FF, NUL) — ignore.
-        if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0C | 0x00) {
-            continue;
-        }
-        // 'z' shorthand for four zero bytes — only valid when the
-        // group is empty.
-        if b == b'z' {
-            if filled != 0 {
-                return Err(PdfError::other(
-                    "PDF image extraction: ASCII85 'z' shorthand mid-group",
-                ));
-            }
-            out.extend_from_slice(&[0, 0, 0, 0]);
-            continue;
-        }
-        if !(b'!'..=b'u').contains(&b) {
-            return Err(PdfError::other(format!(
-                "PDF image extraction: ASCII85 illegal byte {b:#x}"
-            )));
-        }
-        group[filled] = b - b'!';
-        filled += 1;
-        if filled == 5 {
-            decode_ascii85_group_full(&group, &mut out);
-            filled = 0;
-        }
-    }
-    if filled == 1 {
-        return Err(PdfError::other(
-            "PDF image extraction: ASCII85 trailing 1-character group is illegal",
-        ));
-    }
-    if filled > 1 {
-        // Pad to 5 with the highest digit (84 = 'u' - '!') and emit
-        // (filled - 1) bytes — see §7.4.3.
-        for slot in group.iter_mut().skip(filled) {
-            *slot = 84;
-        }
-        let mut tmp = Vec::with_capacity(4);
-        decode_ascii85_group_full(&group, &mut tmp);
-        out.extend_from_slice(&tmp[..filled - 1]);
-    }
-    Ok(out)
-}
-
-fn decode_ascii85_group_full(group: &[u8; 5], out: &mut Vec<u8>) {
-    let value: u64 = group.iter().fold(0u64, |acc, &d| acc * 85 + d as u64);
-    out.push(((value >> 24) & 0xFF) as u8);
-    out.push(((value >> 16) & 0xFF) as u8);
-    out.push(((value >> 8) & 0xFF) as u8);
-    out.push((value & 0xFF) as u8);
-}
-
-/// ASCIIHexDecode (ISO 32000-1 §7.4.2) — pairs of hex digits, with
-/// whitespace ignored, terminated by `>`. An odd trailing nibble
-/// is treated as if followed by a `0` per §7.4.2.
-fn decode_ascii_hex(input: &[u8]) -> Result<Vec<u8>, PdfError> {
-    let mut out = Vec::with_capacity(input.len() / 2);
-    let mut high: Option<u8> = None;
-    for &b in input {
-        if b == b'>' {
-            break;
-        }
-        if matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0C | 0x00) {
-            continue;
-        }
-        let nibble = match b {
-            b'0'..=b'9' => b - b'0',
-            b'a'..=b'f' => b - b'a' + 10,
-            b'A'..=b'F' => b - b'A' + 10,
-            _ => {
-                return Err(PdfError::other(format!(
-                    "PDF image extraction: ASCIIHex illegal byte {b:#x}"
-                )))
-            }
-        };
-        match high.take() {
-            None => high = Some(nibble),
-            Some(h) => out.push((h << 4) | nibble),
-        }
-    }
-    if let Some(h) = high {
-        out.push(h << 4);
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn ascii85_decodes_canonical_man_example() {
-        // The canonical "easy as ABC" example from §7.4.3 / Adobe
-        // PostScript Language Reference Manual: encoding "Man " (4
-        // bytes 0x4D 0x61 0x6E 0x20 = 0x4D616E20 = 1296127776) as
-        // five base-85 digits 9 jqo^ ... actually `9jqo^` → decode
-        // back to "Man ".
-        let encoded = b"9jqo^~>";
-        let out = decode_ascii85(encoded).unwrap();
-        assert_eq!(out, b"Man ");
-    }
-
-    #[test]
-    fn ascii85_z_shorthand_decodes_four_zero_bytes() {
-        let out = decode_ascii85(b"z~>").unwrap();
-        assert_eq!(out, [0u8, 0, 0, 0]);
-    }
-
-    #[test]
-    fn ascii85_full_group_decodes_four_bytes() {
-        // "Hell" — base-85 of 0x48656C6C = "87cUR" per the canonical
-        // Adobe PostScript Language Reference Manual encoding.
-        let encoded = b"87cUR~>";
-        let out = decode_ascii85(encoded).unwrap();
-        assert_eq!(out, b"Hell");
-    }
-
-    #[test]
-    fn ascii85_partial_group_decodes_three_bytes_from_four_chars() {
-        // "Hel" (3 bytes) → ASCII85 partial group "87cT" (4 chars,
-        // the 5th char is implicit / synthesised on decode).
-        let encoded = b"87cT~>";
-        let out = decode_ascii85(encoded).unwrap();
-        assert_eq!(out, b"Hel");
-    }
-
-    #[test]
-    fn ascii85_partial_group_decodes_two_bytes_from_three_chars() {
-        // "He" (2 bytes) → ASCII85 partial group "87_" (3 chars).
-        let encoded = b"87_~>";
-        let out = decode_ascii85(encoded).unwrap();
-        assert_eq!(out, b"He");
-    }
-
-    #[test]
-    fn ascii85_skips_whitespace_in_group() {
-        let out = decode_ascii85(b"9j\nqo^~>").unwrap();
-        assert_eq!(out, b"Man ");
-    }
-
-    #[test]
-    fn ascii85_rejects_lone_trailing_char() {
-        assert!(decode_ascii85(b"9j!~>").is_err() || decode_ascii85(b"9~>").is_err());
-        // The single trailing char path is the second case — make
-        // sure it surfaces an error.
-        assert!(decode_ascii85(b"9~>").is_err());
-    }
-
-    #[test]
-    fn ascii_hex_basic() {
-        let out = decode_ascii_hex(b"48656C6C6F>").unwrap();
-        assert_eq!(out, b"Hello");
-    }
-
-    #[test]
-    fn ascii_hex_skips_whitespace() {
-        let out = decode_ascii_hex(b"48 65 6C\n6C 6F>").unwrap();
-        assert_eq!(out, b"Hello");
-    }
-
-    #[test]
-    fn ascii_hex_odd_nibble_pads_zero() {
-        // "414" → 0x41, 0x40 (last nibble padded with zero per §7.4.2).
-        let out = decode_ascii_hex(b"414>").unwrap();
-        assert_eq!(out, [0x41u8, 0x40]);
-    }
 
     #[test]
     fn color_space_from_name_recognises_devicergb() {

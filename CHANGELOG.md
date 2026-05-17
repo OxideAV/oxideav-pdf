@@ -9,6 +9,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 35: **Inline-image extraction from PDF content streams** (ISO
+  32000-1 §7.4 + §7.4.5 + §8.9.7 + Tables 92+93). Walks every page's
+  content stream and surfaces every `BI … ID … EI` triplet as a
+  [`PdfInlineImage`], byte-equivalent to what `pdfimages -all` extracts
+  for the same construct. Complements the round-23 Image XObject
+  walker (`/DCTDecode` XObjects) — the two paths together cover every
+  raster shape PDFs ship.
+
+  Why inline images need their own walker: §8.9.7 changes the lexer
+  rules between `ID` and `EI` — the bytes are literal raw, with no
+  delimiter / string / comment interpretation, terminated by the
+  *first* occurrence of `EI` that's preceded by whitespace and
+  followed by whitespace or EOF. The round-3 / round-22 content-
+  stream tokenisers can't reach inside this region without
+  mis-framing the data, so round 35 ships a dedicated parser.
+
+  New public surface (re-exported at the crate root):
+
+  * `pub struct PdfInlineImage { data, width, height, color_space,
+    bits_per_component, filter, image_mask, source_page_index,
+    source_page_obj }` — `data` is the raw payload after wrapping
+    non-codec filters (`/A85` / `/AHx` / `/Fl` / `/RL`) are peeled;
+    the terminal codec filter is left in place and reported through
+    `filter`.
+  * `pub enum InlineImageFilter { Raw, DctDecode, JpxDecode,
+    Jbig2Decode, CcittFaxDecode }` — terminal codec filter tag.
+  * `pub fn DocumentReader::inline_images(&mut self) ->
+    Result<Vec<PdfInlineImage>, PdfError>` — entry point.
+  * Free fn `oxideav_pdf::reader::inline_images(reader)` for callers
+    that prefer the standalone surface.
+  * Crate-root alias `oxideav_pdf::read_pdf_inline_images`.
+
+  Filter coverage mirrors the round-23 XObject walker exactly:
+  wrapping `/A85`, `/AHx`, `/Fl`, `/RL` are peeled before the
+  payload reaches the caller; `/DCT`, `/JPX`, `/JBIG2`, `/CCF`
+  remain in place and surface as `InlineImageFilter` tags. Both
+  abbreviated (Table 93: `/G`, `/RGB`, `/CMYK`, `/I`, `/A85`, …)
+  and long-form (`/DeviceGray`, `/DeviceRGB`, `/ASCII85Decode`, …)
+  names are accepted on input per §8.9.7 paragraph 4.
+
+  Internal refactor: hoisted the small set of byte-level filter
+  decoders the round-23 image-XObject walker carried inline into a
+  new shared `oxideav_pdf::reader::filters` module
+  (`flate_decompress`, `ascii85_decode`, `ascii_hex_decode`,
+  `run_length_decode`). Both the round-23 XObject path and the new
+  round-35 inline path call into the same decoders, so adding a
+  filter (`/LZW`, `/CCF`) in a future round gives both walkers the
+  new coverage at once. Existing tests for the moved code remain in
+  the new module, preserving coverage.
+
+  Validation:
+
+  * `tests/inline_images_round35.rs` — 13 integration tests:
+    raw payload roundtrip, `/DCT` terminal-filter passthrough,
+    `/A85` wrapping unwrapped to "Man " (canonical ISO 32000-1
+    §7.4.3 example), `/RL` wrapping unwrapped, multi-page page-index
+    tracking, embedded-`EI`-substring tolerance, `/IM true` image-
+    mask defaults (1 bpc / DeviceGray), long-form key acceptance,
+    no-inline-image and empty-document edge cases, comment-before-BI
+    framing.
+  * 13 module-level unit tests under
+    `src/reader/inline_images.rs::tests`: keyword finder boundary
+    rules (preceded / followed by whitespace), `EI`-locator framing,
+    minimal extractor, DCT-payload preservation, image-mask
+    defaults, long-form keys, `/A85` peel, multi-image stream,
+    embedded-`EI`, unterminated-image error, missing-`/W` error.
+  * 4 new unit tests under `src/reader/filters.rs::tests` cover the
+    `RunLengthDecode` paths (literal run, repeat run, mixed runs,
+    implicit EOF) that the round-23 walker didn't previously
+    exercise.
+
+  Provenance: ISO 32000-1:2008 §7.4 (Filters), §7.4.2 (ASCII Hex),
+  §7.4.3 (ASCII85), §7.4.4 (Flate), §7.4.5 (RunLength), §7.4.8
+  (DCT), §7.4.9 (CCITT Fax), §7.4.10 (JBIG2 / JPX), §8.9.7 (Inline
+  Images, Tables 92 abbreviated keys + 93 abbreviated filter
+  names). No third-party PDF library was consulted.
+
 - Round 34: **RFC 3161 Document Time-Stamp writer + reader** (ISO
   32000-1 §12.8.5 + RFC 3161 §2.4 + RFC 5652 §5). Appends an
   incremental-update revision whose new `/FT /Sig` field carries a

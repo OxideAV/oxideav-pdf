@@ -180,6 +180,46 @@ pub fn extract_text_marked(
 /// Walk catalog → /Pages tree and collect every leaf page's
 /// [`ObjectId`] in document order. Shared between [`extract_text`] and
 /// [`extract_text_marked`].
+/// Concatenate the `/Contents` stream(s) of a page leaf into a single
+/// byte buffer (an inter-stream separator is added so a stream that
+/// ends without a trailing newline can't accidentally fuse the start
+/// of the next stream's first operator into the end of its own last).
+/// Returns `Ok(None)` when the page has no `/Contents` (a perfectly
+/// valid blank page).
+///
+/// Exposed `pub` for sibling reader modules that need the same content
+/// stream view (e.g. inline-image extraction) without rebuilding the
+/// `/Resources /Font` walker the round-22 text extractor needs.
+pub fn concatenate_page_contents(
+    reader: &mut DocumentReader<'_>,
+    page_id: ObjectId,
+) -> Result<Option<Vec<u8>>, PdfError> {
+    let page_obj = reader.resolve(page_id)?;
+    let Object::Dict(page_dict) = page_obj else {
+        return Ok(None);
+    };
+    let contents_obj = page_dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Contents")
+        .map(|(_, v)| v.clone());
+    let bytes = match contents_obj {
+        Some(Object::Reference(id)) => extract_stream_data(reader, id)?,
+        Some(Object::Array(items)) => {
+            let mut all = Vec::new();
+            for item in items {
+                if let Object::Reference(id) = item {
+                    all.extend_from_slice(&extract_stream_data(reader, id)?);
+                    all.push(b'\n');
+                }
+            }
+            all
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(bytes))
+}
+
 pub(crate) fn collect_page_leaves(
     reader: &mut DocumentReader<'_>,
 ) -> Result<Vec<ObjectId>, PdfError> {

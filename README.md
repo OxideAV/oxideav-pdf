@@ -441,6 +441,49 @@ filters (`FlateDecode`-only raster XObjects, `JBIG2Decode`, `JPXDecode`,
 JPEG-only. Cross-checked against `pdfimages -all` (poppler-utils):
 the bytes are byte-identical.
 
+## Inline-image extraction (round 35)
+
+[`DocumentReader::inline_images`] walks every page's content stream and
+surfaces every `BI … ID … EI` triplet (ISO 32000-1 §8.9.7) as a
+[`PdfInlineImage`] — the content-stream-level counterpart of the
+round-23 Image XObject walker. Both abbreviated (Table 93 — `/W`,
+`/H`, `/CS /RGB`, `/F /DCT`) and long-form (`/Width`, `/ColorSpace
+/DeviceRGB`, `/Filter /DCTDecode`) keys are accepted on input.
+
+Filter coverage mirrors the round-23 XObject walker: wrapping `/A85`,
+`/AHx`, `/Fl`, `/RL` are peeled before the payload reaches the
+caller; terminal codec filters (`/DCT`, `/JPX`, `/JBIG2`, `/CCF`) are
+left in place and surface as an [`InlineImageFilter`] tag so a
+downstream JPEG / JPEG2000 / JBIG2 / CCITT-Fax decoder can take
+over.
+
+The `/IM true` image-mask flag is preserved (1-bit stencil that takes
+its colour from the current path-paint state); `source_page_index`
+and `source_page_obj` are filled in so callers can locate where in
+the document the inline image was painted.
+
+```rust,ignore
+use oxideav_pdf::reader::{DocumentReader, InlineImageFilter};
+
+let pdf = std::fs::read("scan.pdf")?;
+let mut reader = DocumentReader::open(&pdf)?;
+for img in reader.inline_images()? {
+    println!("page {} {}x{} bpc={} filter={:?} {} bytes",
+        img.source_page_index, img.width, img.height,
+        img.bits_per_component, img.filter, img.data.len());
+    if matches!(img.filter, InlineImageFilter::DctDecode) {
+        std::fs::write(format!("inline-p{}.jpg", img.source_page_index),
+                       &img.data)?;
+    }
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+§8.9.7 framing detail: the `EI` terminator must be preceded by a
+whitespace byte and followed by whitespace or EOF — embedded `EI`
+sequences inside the payload (with no surrounding whitespace) are
+preserved as data, matching `pdfimages -all`'s extraction behaviour.
+
 ## Annotations beyond Link + XMP packet fields (round 26)
 
 [`DocumentReader::annotations`] walks every page's `/Annots` array and
