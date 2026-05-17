@@ -41,8 +41,13 @@
 //! computed in step 4 — the byte-stable property is what makes this
 //! pattern work.
 
+pub mod timestamp;
 pub mod writer;
 
+pub use timestamp::{
+    add_document_timestamp, build_tst_info, wrap_tst_in_signed_data, MessageImprint, MockTsaSigner,
+    TsaSigner, OID_CT_TST_INFO,
+};
 pub use writer::{
     pkcs7_wrap_signed_data, sign_pdf_from_scene, EcdsaP256Sha256Signer, RsaPkcs1v15Sha256Signer,
     SigWriter, Signer, SignerIdentity, SigningAlgorithm,

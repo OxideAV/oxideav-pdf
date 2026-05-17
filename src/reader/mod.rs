@@ -56,7 +56,7 @@ pub use linearize::{parse_linearization_dict, LinearizationParams};
 pub use link::{links, PdfLink, PdfLinkTarget};
 pub use outline::{outline, OutlineNode, PdfOutline};
 pub use pdfa::{pdfa_signals, PdfACatalogSignals, PdfAConformance};
-pub use sig::{signatures, signed_bytes, PdfSignature};
+pub use sig::{doc_timestamps, signatures, signed_bytes, PdfDocTimestamp, PdfSignature};
 pub use text::{
     extract_text, extract_text_marked, MarkedTextRun, PdfMarkedTextExtraction, PdfTextExtraction,
     TextRun,

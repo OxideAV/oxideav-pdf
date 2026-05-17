@@ -118,6 +118,78 @@ impl PdfSignature {
             Some("adbe.pkcs7.detached") | Some("ETSI.CAdES.detached")
         )
     }
+
+    /// `true` when this entry is a *document time-stamp* signature per
+    /// ISO 32000-1 §12.8.5 — i.e. the dict's `/Type` is `DocTimeStamp`
+    /// or its `/SubFilter` is `ETSI.RFC3161`. Either marker
+    /// independently identifies a DocTimeStamp (the spec allows both
+    /// `/Type /DocTimeStamp` *and* `/SubFilter /ETSI.RFC3161` —
+    /// real-world files frequently set both, but only one is required).
+    pub fn is_doc_timestamp(&self) -> bool {
+        self.sig_type.as_deref() == Some("DocTimeStamp")
+            || self.sub_filter.as_deref() == Some("ETSI.RFC3161")
+    }
+}
+
+/// One PDF `/DocTimeStamp` signature, surfaced separately from regular
+/// signatures so callers don't have to filter the [`PdfSignature`] list.
+///
+/// A DocTimeStamp's `/Contents` is an RFC 3161 `TimeStampToken` — a DER
+/// `ContentInfo` of type `id-signedData` whose `eContentType` is
+/// `id-ct-TSTInfo` (1.2.840.113549.1.9.16.1.4). The TST embeds the
+/// hash of the byte-ranged PDF content; callers who want to verify the
+/// stamp re-hash `pdf[a..a+b] ‖ pdf[c..c+d]` with the imprint's
+/// algorithm and compare with the `messageImprint.hashedMessage` field
+/// of the inner TSTInfo.
+///
+/// Round 34 surfaces the timestamp structurally; full RFC 3161
+/// verification dispatch (cert chain + GenTime ordering) lives in a
+/// follow-up round.
+#[derive(Debug, Clone)]
+pub struct PdfDocTimestamp {
+    /// `/ByteRange [a b c d]` — same shape as [`PdfSignature::byte_range`].
+    pub byte_range: [i64; 4],
+    /// `/Contents` hex-decoded — the raw RFC 3161 TimeStampToken bytes.
+    pub contents: Vec<u8>,
+    /// `/SubFilter` — `ETSI.RFC3161` for a conformant DocTimeStamp.
+    pub sub_filter: Option<String>,
+    /// `/Filter` — typically `Adobe.PPKLite`.
+    pub filter: Option<String>,
+}
+
+impl PdfDocTimestamp {
+    /// The bytes the time-stamp covers: `pdf[a..a+b] ‖ pdf[c..c+d]`.
+    pub fn signed_message(&self, pdf: &[u8]) -> Result<Vec<u8>, PdfError> {
+        signed_bytes(pdf, &self.byte_range)
+    }
+}
+
+/// Promote a [`PdfSignature`] to a [`PdfDocTimestamp`] when the entry's
+/// `/SubFilter` is `ETSI.RFC3161` (or the `/Type` is `DocTimeStamp`).
+/// Returns `None` for entries that aren't a doc-timestamp.
+fn promote_doc_timestamp(sig: &PdfSignature) -> Option<PdfDocTimestamp> {
+    if !sig.is_doc_timestamp() {
+        return None;
+    }
+    Some(PdfDocTimestamp {
+        byte_range: sig.byte_range,
+        contents: sig.contents.clone(),
+        sub_filter: sig.sub_filter.clone(),
+        filter: sig.filter.clone(),
+    })
+}
+
+/// Walk a [`DocumentReader`] and return only the document time-stamp
+/// signatures — the entries whose `/SubFilter` is `ETSI.RFC3161` or
+/// whose `/Type` is `DocTimeStamp` (ISO 32000-1 §12.8.5).
+///
+/// This is sugar over [`signatures`] + [`PdfSignature::is_doc_timestamp`].
+/// Callers that want both regular signatures and timestamps in one walk
+/// should call [`signatures`] directly and filter via `is_doc_timestamp`
+/// themselves.
+pub fn doc_timestamps(reader: &mut DocumentReader<'_>) -> Result<Vec<PdfDocTimestamp>, PdfError> {
+    let sigs = signatures(reader)?;
+    Ok(sigs.iter().filter_map(promote_doc_timestamp).collect())
 }
 
 /// Concatenate the two byte ranges `[a b c d]` describes, returning

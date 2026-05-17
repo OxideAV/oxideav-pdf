@@ -746,6 +746,35 @@ name tree back into `Vec<PdfAttachment { name, mime_type, bytes,
 modified }>`. `qpdf --check` and `qpdf --json` both accept the
 output; `qpdf --json` lists each embedded file by name.
 
+## Document time-stamp signatures (round 34)
+
+`add_document_timestamp(pdf, tsa)` appends an RFC 3161
+**Document Time-Stamp** revision (ISO 32000-1 §12.8.5) to an existing
+(signed-or-unsigned) PDF. The new revision adds a `/FT /Sig` field
+whose `/V` is a sig dictionary with `/Type /DocTimeStamp` +
+`/SubFilter /ETSI.RFC3161`, and whose `/Contents <…hex…>` holds a
+full RFC 3161 `TimeStampToken` (a CMS `SignedData` ContentInfo over
+a `TSTInfo` SEQUENCE). The byte-range placeholder pattern of round
+30 is reused, so a doc-timestamp can coexist with one or more
+regular signatures in the same document — each is its own
+incremental update per ISO 32000-1 §7.5.6.
+
+```rust,ignore
+use oxideav_pdf::{add_document_timestamp, MockTsaSigner, SignerIdentity};
+let tsa = MockTsaSigner::new(rsa_priv, identity, b"20260517000000Z".to_vec())?;
+let stamped = add_document_timestamp(&signed_pdf, &tsa)?;
+```
+
+The [`TsaSigner`] trait is the integration seam for production TSAs
+(RFC 3161 §3 HTTP transport, RFC 5816 ESSCertIDv2 — both out of
+scope for round 34). The in-tree [`MockTsaSigner`] short-circuits the
+network round-trip with a self-signed RSA-2048 / SHA-256 token —
+handy for tests and for self-contained roundtrips. The reader side
+surfaces timestamps separately via `DocumentReader::doc_timestamps()`
+(or the free fn [`read_pdf_doc_timestamps`]). `qpdf --check` accepts
+the output; when `openssl ts -verify` is on PATH, it accepts the
+embedded TST.
+
 ## Deferred
 
 - **Text emission** — writer-side `BT … Tj … ET` for `Node::Text`

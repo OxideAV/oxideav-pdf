@@ -156,6 +156,13 @@ impl<'a> DocumentReader<'a> {
         crate::reader::sig::signatures(self)
     }
 
+    /// Round-34: surface only the document time-stamp signatures (ISO
+    /// 32000-1 §12.8.5 — `/Type /DocTimeStamp` or `/SubFilter
+    /// /ETSI.RFC3161`).
+    pub fn doc_timestamps(&mut self) -> Result<Vec<crate::reader::sig::PdfDocTimestamp>, PdfError> {
+        crate::reader::sig::doc_timestamps(self)
+    }
+
     /// Round-19: surface the document-level XMP `/Metadata` packet
     /// per ISO 32000-1 §14.3.2 + Adobe XMP Spec 2012. Returns
     /// `Ok(None)` when the catalog has no `/Metadata` entry; otherwise

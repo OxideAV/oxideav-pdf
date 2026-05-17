@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 34: **RFC 3161 Document Time-Stamp writer + reader** (ISO
+  32000-1 §12.8.5 + RFC 3161 §2.4 + RFC 5652 §5). Appends an
+  incremental-update revision whose new `/FT /Sig` field carries a
+  signature dictionary with `/Type /DocTimeStamp`, `/SubFilter
+  /ETSI.RFC3161`, and a `/Contents <…hex…>` blob holding a full RFC
+  3161 `TimeStampToken` (a CMS `SignedData` ContentInfo wrapping a
+  `TSTInfo` SEQUENCE).
+
+  The async TSA flow surfaces as a `TsaSigner` trait — implementations
+  send a `MessageImprint { hash_alg, hashed_message }` to a remote
+  TSA over HTTP and return the embedded `timeStampToken`. The in-tree
+  `MockTsaSigner` short-circuits the network round-trip with a
+  self-signed RSA-2048 / SHA-256 token — handy for tests and for
+  self-contained roundtrips.
+
+  New public surface:
+
+  * `pub fn add_document_timestamp<T: TsaSigner>(pdf: &[u8], tsa: &T)
+    -> Result<Vec<u8>, PdfError>` — entry point; uses the round-30
+    byte-range placeholder pattern so a doc-timestamp coexists with
+    one or more regular signatures (ISO 32000-1 §7.5.6).
+  * `pub trait TsaSigner { fn timestamp(&self, imprint:
+    &MessageImprint) -> Result<Vec<u8>, PdfError>; }`.
+  * `pub struct MessageImprint { hash_alg, hashed_message }` per RFC
+    3161 §2.4.1.
+  * `pub struct MockTsaSigner` — reference impl that builds a self-
+    signed RFC 3161 TST around a fresh RSA-2048 / SHA-256 SignerInfo.
+  * `pub fn build_tst_info(imprint, policy_oid, serial, gen_time)
+    -> Vec<u8>` — DER builder for the `TSTInfo` SEQUENCE.
+  * `pub fn wrap_tst_in_signed_data(tst_info_der, signer_issuer_der,
+    signer_serial, cert_chain, signed_attrs_body, signature_bytes)
+    -> Vec<u8>` — RFC 5652 §5 CMS wrapper for the TST.
+  * `pub struct PdfDocTimestamp` + `pub fn doc_timestamps(reader)
+    -> Result<Vec<PdfDocTimestamp>, PdfError>` — reader-side surface
+    that separates doc-timestamps from regular signatures.
+  * `pub fn PdfSignature::is_doc_timestamp(&self) -> bool`.
+
+  Validation:
+
+  * `tests/doc_timestamp_round34.rs` builds a doubly-signed PDF
+    (one round-30 regular signature + one round-34 doc-timestamp),
+    re-opens the bytes, and asserts the reader surfaces each
+    separately. The embedded TST's `messageImprint.hashedMessage`
+    is byte-equal to SHA-256 of `pdf[a..a+b] ‖ pdf[c..c+d]`.
+  * `qpdf --check` accepts the output (incremental-update revision
+    is well-formed per ISO 32000-1 §7.5.6).
+  * `openssl ts -verify` accepts the TST when present on PATH
+    (with the self-signed-chain caveat — `messageImprint` matches
+    in every observed run).
+
 - Round 33: **Embedded file attachment writer + reader** (ISO 32000-1
   §7.11 + §3.10 + §12.5.6.15 + §7.7.4 + §7.9.6). Embeds arbitrary
   files inside the PDF as `/Type /EmbeddedFile` streams, registers

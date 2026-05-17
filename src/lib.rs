@@ -81,6 +81,7 @@ pub use pubsec::{
     PubSecEncryptionState, PubSecKariConfig, PubSecMatch, PubSecMultiCfConfig, PubSecRecipient,
     PubSecSubFilter, TrustStore,
 };
+pub use reader::doc_timestamps as read_pdf_doc_timestamps;
 pub use reader::{
     annotations as read_pdf_annotations, attachments as read_pdf_attachments,
     extract_text as extract_pdf_text, extract_text_marked as extract_pdf_text_marked,
@@ -92,12 +93,14 @@ pub use reader::{
     signed_bytes as pdf_signed_bytes, verify_hierarchy as verify_pdf_hierarchy, AnnotationKind,
     ColorSpace, HierarchyIssue, HierarchyReport, IssueSeverity, LayoutMode, LinearizationParams,
     MarkedTextRun, OutlineNode, PdfACatalogSignals, PdfAConformance, PdfAnnotation, PdfAttachment,
-    PdfImageXObject, PdfLink, PdfLinkTarget, PdfMarkedTextExtraction, PdfOutline, PdfSignature,
-    PdfTextExtraction, ReadingOrderText, TextMarkupVariant, TextRun, XmpPacket,
+    PdfDocTimestamp, PdfImageXObject, PdfLink, PdfLinkTarget, PdfMarkedTextExtraction, PdfOutline,
+    PdfSignature, PdfTextExtraction, ReadingOrderText, TextMarkupVariant, TextRun, XmpPacket,
 };
 pub use sig::{
-    pkcs7_wrap_signed_data, sign_pdf_from_scene, EcdsaP256Sha256Signer, RsaPkcs1v15Sha256Signer,
-    SigWriter, Signer, SignerIdentity, SigningAlgorithm,
+    add_document_timestamp, build_tst_info, pkcs7_wrap_signed_data, sign_pdf_from_scene,
+    wrap_tst_in_signed_data, EcdsaP256Sha256Signer, MessageImprint, MockTsaSigner,
+    RsaPkcs1v15Sha256Signer, SigWriter, Signer, SignerIdentity, SigningAlgorithm, TsaSigner,
+    OID_CT_TST_INFO,
 };
 pub use writer::{
     write_pdf, write_pdf_from_scene, write_pdf_from_scene_encrypted,
