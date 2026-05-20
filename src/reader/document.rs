@@ -187,6 +187,17 @@ impl<'a> DocumentReader<'a> {
         crate::reader::annotation::annotations(self)
     }
 
+    /// Round-36: enumerate every action attached to the document (ISO
+    /// 32000-1 §12.6). Walks the catalog `/OpenAction` + `/AA`,
+    /// per-page `/AA`, per-annotation `/A` + `/AA`, per-form-field
+    /// `/A` + `/AA`, and the `/Names /JavaScript` name tree, surfacing
+    /// each as a [`crate::reader::actions::PdfAction`] with the
+    /// trigger location, the typed [`crate::reader::actions::ActionKind`]
+    /// payload, and the `/Next` chain depth.
+    pub fn actions(&mut self) -> Result<Vec<crate::reader::actions::PdfAction>, PdfError> {
+        crate::reader::actions::actions(self)
+    }
+
     /// Round-27: parse the Linearization Parameter Dictionary at the
     /// head of the file (ISO 32000-1 §F.2 + Annex F.3). Returns
     /// `Ok(None)` for non-linearized files (the common case);

@@ -9,6 +9,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 36: **Document-action enumeration** (ISO 32000-1 §12.6 + §12.7.5
+  + §7.7.4 + §7.9.6). New `oxideav_pdf::reader::actions` module +
+  `DocumentReader::actions()` accessor walk every place an action can
+  hide in a PDF and surface each as a `PdfAction` with a typed
+  `ActionTrigger` (where it lives) + `ActionKind` (what it does) +
+  `chain_depth` (position in any `/Next` chain).
+
+  Sources walked, in order: Catalog `/OpenAction` (single action — the
+  destination-array form is purely navigation and is skipped), Catalog
+  `/AA` (Table 197 — `WC`/`WS`/`DS`/`WP`/`DP`), per-page `/AA` (Table
+  196 — `O`/`C`), per-annotation `/A` + `/AA` (Table 165 — `E`/`X`/`D`/
+  `U`/`Fo`/`Bl`/`PO`/`PC`/`PV`/`PI`), per-form-field `/A` + `/AA` via
+  the `/AcroForm /Fields` tree with `/Kids` recursion bounded at depth
+  32, and finally the Catalog `/Names /JavaScript` name tree (Tables
+  31 + §7.9.6.2 — depth-32 + 100k-leaf-cap safeguards).
+
+  Each action's `/Next` chain (Table 198) is followed recursively to a
+  depth bound of 32, with the carrier + every chained-`/Next` action
+  surfacing as its own entry with progressively-higher `chain_depth`.
+  An indirect-reference `visited` set cuts malformed cycles.
+
+  Per-type payload decode covers Table 198's 18 action types:
+
+  * `GoTo` (§12.6.4.2 Table 199) — page-index resolved for explicit
+    `[<page-ref> mode args]` destinations through the round-25 outline
+    page-index map; named-destination shape preserved verbatim.
+  * `GoToR` (§12.6.4.3 Table 200), `GoToE` (§12.6.4.4 Table 201) —
+    Filespec `/F` decoded (string OR `/UF`/`/F` from a `/Filespec` dict)
+    + raw `/D` destination.
+  * `Launch` (§12.6.4.5 Table 202) — `/F` filename + `/NewWindow`.
+  * `URI` (§12.6.4.7 Table 206) — URI text + `/IsMap` flag.
+  * `JavaScript` (§12.6.4.16 Table 217) — `/JS` source recovered from
+    literal-string, hex-string, or stream form with multi-encoding BOM
+    detection (UTF-8 `EF BB BF`, UTF-16BE `FE FF`, UTF-16LE `FF FE`,
+    PDFDocEncoding fallback).
+  * `SubmitForm` (§12.7.5.2 Tables 236+237) — `/F` URL + `/Flags`
+    bitfield.
+  * `ResetForm` (§12.7.5.3 Table 239), `ImportData` (§12.7.5.4 Table 240),
+    `Hide` (§12.6.4.10 Table 209) — H flag default true, `/T` target,
+    `Named` (§12.6.4.11 Table 211) — `/N` predefined-action name,
+    `SetOCGState` (§12.6.4.12 Table 212) — On/Off/Toggle counter
+    extracted from the state-array's flat `[mode ocg-ref … mode ocg-ref
+    …]` form.
+  * Unit variants for the remaining types (`Thread`, `Sound`, `Movie`,
+    `Rendition`, `Trans`, `GoTo3DView`).
+  * `Other { kind }` for unknown `/S` values — the raw action-type name
+    surfaces verbatim so callers walking forensic / future-spec PDFs
+    still get a complete enumeration.
+
+  Why this surface matters: PDFs in the wild can trigger JavaScript on
+  open (`/OpenAction`), navigate to a remote file (`/GoToR`), launch a
+  binary (`/Launch`), or submit a form to a URL (`/SubmitForm`) — all
+  forensic / sandbox-review indicators. Until this round, callers had
+  to thread the round-25 `links()` (Link annots only) + round-26
+  `annotations()` (annotation slots only) APIs together by hand. The
+  round-36 walker unifies them into a single "what can this PDF *do*?"
+  surface.
+
+  New public surface (re-exported at the crate root):
+
+  * `pub struct PdfAction { trigger: ActionTrigger, kind: ActionKind,
+    chain_depth: u32 }` — one decoded action.
+  * `pub enum ActionTrigger { CatalogOpen, Catalog { event },
+    Page { page_index, event }, Annotation { page_index, subtype,
+    event }, FormField { field_name, event }, NamedJavaScript { name } }`.
+  * `pub enum ActionKind { GoTo, GoToR, GoToE, Launch, Thread, Uri,
+    Sound, Movie, Hide, Named, SubmitForm, ResetForm, ImportData,
+    JavaScript, SetOcgState, Rendition, Trans, GoTo3DView, Other }` —
+    18 typed variants + the catch-all.
+  * `pub fn DocumentReader::actions(&mut self) ->
+    Result<Vec<PdfAction>, PdfError>` — entry point.
+  * Free fn `oxideav_pdf::reader::actions(reader)` for callers that
+    prefer the standalone surface.
+  * Crate-root alias `oxideav_pdf::read_pdf_actions`.
+
+  16 new integration tests in `tests/actions_round36.rs` covering
+  every trigger source (Catalog OpenAction + AA, Page AA, Annotation A
+  + AA, FormField A + AA, Names/JavaScript name tree), `/Next` chain
+  expansion + cycle detection, JavaScript multi-encoding (literal +
+  UTF-16BE-BOM hex), explicit `/GoTo` page-index resolution, `/Hide`
+  flag default, `/SetOCGState` counter, unknown `/S` fall-through,
+  and the empty-actions case. All pass.
+
 - Round 35: **Inline-image extraction from PDF content streams** (ISO
   32000-1 §7.4 + §7.4.5 + §8.9.7 + Tables 92+93). Walks every page's
   content stream and surfaces every `BI … ID … EI` triplet as a

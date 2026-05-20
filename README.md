@@ -484,6 +484,85 @@ whitespace byte and followed by whitespace or EOF — embedded `EI`
 sequences inside the payload (with no surrounding whitespace) are
 preserved as data, matching `pdfimages -all`'s extraction behaviour.
 
+## Action enumeration (round 36)
+
+[`DocumentReader::actions`] walks every place an action can hide in
+a PDF and surfaces each as a [`PdfAction`] — the audit-grade
+counterpart to the round-25 link reader (links only) and the round-26
+annotation reader (annotations only). Sources walked (ISO 32000-1
+§12.6):
+
+- **Catalog `/OpenAction`** (§7.7.2 Table 28) — fires on document
+  open. Action-dict form lands; destination-array form is purely
+  navigation and is skipped.
+- **Catalog `/AA`** additional actions (§12.6.3 Table 197) — `WC`,
+  `WS`, `DS`, `WP`, `DP`.
+- **Page `/AA`** (§12.6.3 Table 196) — `O` (page open), `C` (page
+  close).
+- **Annotation `/A` + `/AA`** (§12.5.3 Table 165) — `E`/`X`/`D`/`U`/
+  `Fo`/`Bl`/`PO`/`PC`/`PV`/`PI` plus the primary `/A`.
+- **Form-field `/A` + `/AA`** (§12.7.4 Table 220 + Table 196 events
+  `K`/`F`/`V`/`C`) walked through the `/AcroForm /Fields` tree, with
+  `/Kids` recursion bounded at depth 32.
+- **Catalog `/Names /JavaScript`** name tree (§7.7.4 Table 31 +
+  §7.9.6) — every JavaScript function the document defines.
+
+Each action's `/Next` chain (§12.6.3) is followed recursively up to
+depth 32, with indirect-reference dedup to break malformed cycles.
+The carrier action and every chained-`/Next` action surface as their
+own [`PdfAction`] with progressively-higher `chain_depth`.
+
+Per-type payload decodes the high-signal entries Table 198 calls
+out:
+
+- **`/URI`** (§12.6.4.7 Table 206) — URI text + `/IsMap`.
+- **`/JavaScript`** (§12.6.4.16 Table 217) — `/JS` is decoded from
+  literal-string / hex-string / stream form, recognising UTF-8 BOM
+  (`EF BB BF`), UTF-16BE BOM (`FE FF`), UTF-16LE BOM (`FF FE`), or
+  PDFDocEncoding fallback.
+- **`/Launch`** (§12.6.4.5 Table 202) — `/F` filename + `/NewWindow`.
+- **`/GoToR`** (§12.6.4.3 Table 200) / **`/GoToE`** (§12.6.4.4
+  Table 201) — `/F` filespec + raw `/D` destination.
+- **`/SubmitForm`** (§12.7.5.2 Tables 236+237) — `/F` URL + `/Flags`
+  bitfield (Include/Exclude / IncludeNoValueFields / ExportFormat /
+  GetMethod / SubmitCoordinates / XFDF …).
+- **`/ResetForm`** (§12.7.5.3 Table 239), **`/ImportData`**
+  (§12.7.5.4 Table 240), **`/Hide`** (§12.6.4.10 Table 209),
+  **`/Named`** (§12.6.4.11 Table 211), **`/SetOCGState`** (§12.6.4.12
+  Table 212 — On/Off/Toggle counts), **`/GoTo`** (§12.6.4.2 — page
+  index resolved when `/D` is an explicit array).
+- The remaining Table 198 types (`/Thread`, `/Sound`, `/Movie`,
+  `/Rendition`, `/Trans`, `/GoTo3DView`) surface as their unit
+  variants; unknown `/S` values fall through to
+  `ActionKind::Other { kind }` with the raw name preserved.
+
+```rust,ignore
+use oxideav_pdf::reader::{ActionKind, ActionTrigger, DocumentReader};
+
+let mut r = DocumentReader::open(&pdf_bytes)?;
+for action in r.actions()? {
+    match (&action.trigger, &action.kind) {
+        (ActionTrigger::CatalogOpen, ActionKind::JavaScript { script }) => {
+            println!("OPEN-JS (auto-fires!): {script}");
+        }
+        (_, ActionKind::Launch { file, .. }) => {
+            println!("launches binary: {:?}", file);
+        }
+        (_, ActionKind::SubmitForm { url, flags }) => {
+            println!("submits form to {:?} (flags {flags:#x})", url);
+        }
+        (trg, kind) => println!("[{trg:?}] {kind:?}"),
+    }
+}
+# Ok::<(), oxideav_pdf::PdfError>(())
+```
+
+The walker is tolerant of malformed action dicts (skipped silently),
+of `/Next` chains that loop back on themselves (the indirect-ref
+visited-set cuts the loop), and of action types this round doesn't
+decode (`ActionKind::Other` preserves the raw `/S` name so callers
+walking a forensic / unknown PDF still get a complete enumeration).
+
 ## Annotations beyond Link + XMP packet fields (round 26)
 
 [`DocumentReader::annotations`] walks every page's `/Annots` array and

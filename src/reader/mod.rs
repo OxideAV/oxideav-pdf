@@ -19,6 +19,7 @@
 //! [`PathCommand`]: oxideav_core::vector::PathCommand
 //! [`Transform2D`]: oxideav_core::vector::Transform2D
 
+pub mod actions;
 pub mod annotation;
 pub mod attachments;
 pub mod content;
@@ -40,6 +41,7 @@ pub mod text;
 pub mod xmp;
 pub mod xref;
 
+pub use actions::{actions, ActionKind, ActionTrigger, PdfAction};
 pub use annotation::{annotations, AnnotationKind, PdfAnnotation, TextMarkupVariant};
 pub use attachments::{attachments, PdfAttachment};
 pub use document::{
