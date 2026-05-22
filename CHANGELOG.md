@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 91: **Indirect `/Length` resolution on stream objects** (ISO
+  32000-1 §7.3.8.2 + §7.3.10 Example 3). The reader can now open PDFs
+  whose stream dictionaries express `/Length` as an indirect reference
+  (`<< /Length 8 0 R >>`) — the spec-blessed one-pass-writer shape
+  used by every PDF whose encoder doesn't know the compressed body
+  size before deflating it. `Parser::parse_indirect_with_length_resolver`
+  takes a `&mut dyn LengthResolver` (blanket-impl'd for closures); the
+  no-op `NoLengthResolver` keeps the resolver-less path (used by the
+  xref-stream parser, where the xref table isn't built yet) rejecting
+  the indirect form per §7.5.8's effective direct-integer requirement.
+  `DocumentReader::resolve` wires a closure that looks up the
+  length-carrying integer object via the xref table and patches the
+  resolved direct integer back into the stream dictionary so
+  downstream consumers (`decode_stream`, encryption length tracking)
+  never see the stale `Reference`. Round-91 motivator:
+  `docs/video/mpeg1/ISO_IEC_11172-2-MPEG1-Video-1993.pdf` (cited in
+  the round-90 cli-convert smoke as failing to open) now reads
+  end-to-end. `tests/indirect_length_round91.rs` covers (1) a
+  hand-rolled minimal PDF with an indirect-length stream, (2) the
+  same shape with `/Filter /FlateDecode` (the real-world combination),
+  and (3) the MPEG-1 spec PDF — `verify_hierarchy` walks every page
+  without error.
+
 - Round 36: **Document-action enumeration** (ISO 32000-1 §12.6 + §12.7.5
   + §7.7.4 + §7.9.6). New `oxideav_pdf::reader::actions` module +
   `DocumentReader::actions()` accessor walk every place an action can

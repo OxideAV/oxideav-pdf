@@ -332,7 +332,19 @@ impl<'a> DocumentReader<'a> {
             .ok_or_else(|| PdfError::other(format!("PDF reader: object {id:?} not in xref")))?;
         let mut p = Parser::new(self.input);
         p.lexer_mut().seek(off as usize);
-        let (parsed_id, mut body) = p.parse_indirect()?;
+        // ISO 32000-1 §7.3.10 Example 3: a stream's `/Length` may be
+        // an indirect reference, deferring the size until after the
+        // body for one-pass writers. Resolve the reference against
+        // the xref table — the target must be an in-use integer
+        // object at a known byte offset (Compressed targets are
+        // currently rejected; see docs-gap note in the resolver).
+        let input = self.input;
+        let xref_snapshot = &self.xref;
+        let id_being_parsed = id;
+        let mut resolver = move |length_ref_id: ObjectId| -> Result<i64, PdfError> {
+            resolve_indirect_length(input, xref_snapshot, length_ref_id, id_being_parsed)
+        };
+        let (parsed_id, mut body) = p.parse_indirect_with_length_resolver(&mut resolver)?;
         if parsed_id != id {
             return Err(PdfError::other(format!(
                 "PDF reader: xref points to wrong object — wanted {id:?}, got {parsed_id:?}"
@@ -474,6 +486,77 @@ impl<'a> DocumentReader<'a> {
             }
         }
         Ok(cur)
+    }
+}
+
+/// Round-91: resolve a stream's indirect `/Length` (ISO 32000-1
+/// §7.3.10 Example 3 — `<< /Length 8 0 R >> stream … endstream`).
+///
+/// The length-carrying object lives at a byte offset given by the
+/// xref table. Spec-conforming PDFs put a small `n 0 obj N endobj`
+/// integer there, so we re-enter the resolver-less parse path
+/// (deliberately — the length object is never itself a stream).
+///
+/// `containing_stream` is the object currently being read; passed in
+/// only to make the error message useful when an indirect reference
+/// is malformed (otherwise the caller has no breadcrumb back to the
+/// stream that triggered the lookup).
+///
+/// Cycle protection: an indirect reference whose target is itself an
+/// indirect-length stream pointing back at us is not a meaningful PDF
+/// shape — the length-carrying object is required to be a direct
+/// integer per §7.3.8.2 Table 5, so any chain longer than one hop is
+/// already malformed. We reject deeper chains with a clear message.
+fn resolve_indirect_length(
+    input: &[u8],
+    xref: &XrefTable,
+    length_ref: ObjectId,
+    containing_stream: ObjectId,
+) -> Result<i64, PdfError> {
+    if length_ref == containing_stream {
+        return Err(PdfError::other(format!(
+            "PDF reader: stream {containing_stream:?} /Length refers to itself"
+        )));
+    }
+    // Compressed entries (PDF 1.5+ object-stream-resident integers)
+    // would require fetching the container ObjStm first, which itself
+    // needs an xref walk. The mainstream encoders we've seen never put
+    // a length-carrying integer inside an ObjStm — they're tiny and
+    // the writer wants them resolvable without paying ObjStm decoding
+    // cost. If we hit one in the wild, surface a clear error rather
+    // than silently mis-resolving.
+    if let Some(XrefEntry::Compressed { .. }) = xref.entries.get(&length_ref.number) {
+        return Err(PdfError::other(format!(
+            "PDF reader: indirect /Length {length_ref:?} lives in an object stream \
+             — not supported (ISO 32000-1 §7.5.7); the length object should be a \
+             direct uncompressed integer"
+        )));
+    }
+    let off = xref.offset_of(length_ref).ok_or_else(|| {
+        PdfError::other(format!(
+            "PDF reader: indirect /Length {length_ref:?} (for stream \
+             {containing_stream:?}) is not in the xref table"
+        ))
+    })?;
+    let mut p = Parser::new(input);
+    p.lexer_mut().seek(off as usize);
+    // No resolver here — the length-carrying object must be a direct
+    // integer per §7.3.8.2 (Length is an `integer`, not a value-may-
+    // be-indirect entry). A stream-of-streams cycle is therefore
+    // statically impossible.
+    let (parsed_id, body) = p.parse_indirect()?;
+    if parsed_id != length_ref {
+        return Err(PdfError::other(format!(
+            "PDF reader: xref points to wrong object for indirect /Length — \
+             wanted {length_ref:?}, got {parsed_id:?}"
+        )));
+    }
+    match body {
+        Object::Integer(n) => Ok(n),
+        other => Err(PdfError::other(format!(
+            "PDF reader: indirect /Length {length_ref:?} target must be an \
+             integer (got {other:?})"
+        ))),
     }
 }
 

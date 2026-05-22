@@ -18,6 +18,61 @@ use crate::error::PdfError;
 use crate::objects::{Dict, Object, ObjectId, Stream};
 use crate::reader::lex::{Lexer, Token, TokenKind};
 
+/// Caller-supplied hook that resolves an indirect `/Length` reference
+/// on a stream dictionary to the underlying integer.
+///
+/// ISO 32000-1 §7.3.10 Example 3 makes indirect `/Length` normative on
+/// stream objects: a one-pass writer that doesn't know the encoded
+/// stream size up front emits `<< /Length 8 0 R >>` and writes the
+/// length-carrying integer object after the stream. A reader walking
+/// such a PDF needs the xref table to fetch the integer.
+///
+/// The trait receives the [`ObjectId`] from the reference and is
+/// expected to return the resolved integer (or a [`PdfError`] when the
+/// target is missing / not an integer / a cycle is detected). Using a
+/// trait (rather than a free `FnMut`) sidesteps the lifetime
+/// gymnastics needed to thread an `Option<&mut dyn FnMut>` through
+/// multiple recursive parse helpers — implementers just write a tiny
+/// struct holding the borrowed state they need.
+///
+/// When the resolver is the unit no-op [`NoLengthResolver`] (the
+/// [`Parser::parse_indirect`] / [`Parser::parse_object`] entry
+/// points), an indirect `/Length` is rejected — that path is reserved
+/// for xref-stream parsing, where the xref isn't built yet and the
+/// spec (§7.5.8) effectively requires the direct-integer form anyway.
+pub trait LengthResolver {
+    /// Resolve the integer carried by the indirect object at
+    /// `length_ref`. Returning `Err(_)` flows up the parse stack and
+    /// aborts the stream-object decode.
+    fn resolve_length(&mut self, length_ref: ObjectId) -> Result<i64, PdfError>;
+}
+
+/// No-op [`LengthResolver`] — every indirect `/Length` is rejected.
+/// Used by [`Parser::parse_indirect`] and [`Parser::parse_object`] on
+/// code paths where the xref table isn't built yet (the xref-stream
+/// parser, the `parse_xref_stream_at` helper).
+pub struct NoLengthResolver;
+
+impl LengthResolver for NoLengthResolver {
+    fn resolve_length(&mut self, _length_ref: ObjectId) -> Result<i64, PdfError> {
+        Err(PdfError::other(
+            "PDF parser: stream /Length is an indirect reference but no resolver \
+             was supplied (call parse_indirect_with_length_resolver)",
+        ))
+    }
+}
+
+/// Blanket impl so closures with the same signature work as
+/// [`LengthResolver`]s without writing a struct.
+impl<F> LengthResolver for F
+where
+    F: FnMut(ObjectId) -> Result<i64, PdfError>,
+{
+    fn resolve_length(&mut self, length_ref: ObjectId) -> Result<i64, PdfError> {
+        (self)(length_ref)
+    }
+}
+
 /// Recursive-descent parser over a [`Lexer`].
 pub struct Parser<'a> {
     lex: Lexer<'a>,
@@ -76,14 +131,34 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse one [`Object`]. Returns `None` if the input is exhausted.
+    ///
+    /// Streams encountered with an indirect `/Length` (a `Reference`
+    /// value rather than a direct integer) are rejected — call
+    /// [`Self::parse_object_with_length_resolver`] from a context that
+    /// can resolve the reference (typically the top-level
+    /// [`crate::reader::document::DocumentReader::resolve`]).
     pub fn parse_object(&mut self) -> Result<Option<Object>, PdfError> {
+        self.parse_object_with_length_resolver(&mut NoLengthResolver)
+    }
+
+    /// Variant of [`Self::parse_object`] that accepts a
+    /// [`LengthResolver`] to resolve indirect `/Length` references on
+    /// stream-object dictionaries per ISO 32000-1 §7.3.10 Example 3.
+    pub fn parse_object_with_length_resolver(
+        &mut self,
+        resolver: &mut dyn LengthResolver,
+    ) -> Result<Option<Object>, PdfError> {
         let Some(tok) = self.next()? else {
             return Ok(None);
         };
-        Ok(Some(self.object_from_token(tok)?))
+        Ok(Some(self.object_from_token(tok, resolver)?))
     }
 
-    fn object_from_token(&mut self, tok: Token<'a>) -> Result<Object, PdfError> {
+    fn object_from_token(
+        &mut self,
+        tok: Token<'a>,
+        resolver: &mut dyn LengthResolver,
+    ) -> Result<Object, PdfError> {
         match tok.kind {
             TokenKind::Integer(n) => self.maybe_indirect_ref(n, tok.end),
             TokenKind::Real(f) => Ok(Object::Real(f)),
@@ -92,8 +167,8 @@ impl<'a> Parser<'a> {
             })?)),
             TokenKind::LiteralString(bytes) => Ok(Object::LiteralString(bytes)),
             TokenKind::HexString(bytes) => Ok(Object::HexString(bytes)),
-            TokenKind::ArrayStart => self.parse_array(),
-            TokenKind::DictStart => self.parse_dict_or_stream(tok.start),
+            TokenKind::ArrayStart => self.parse_array(resolver),
+            TokenKind::DictStart => self.parse_dict_or_stream(tok.start, resolver),
             TokenKind::Keyword(kw) => match kw {
                 b"true" => Ok(Object::Bool(true)),
                 b"false" => Ok(Object::Bool(false)),
@@ -166,7 +241,7 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    fn parse_array(&mut self) -> Result<Object, PdfError> {
+    fn parse_array(&mut self, resolver: &mut dyn LengthResolver) -> Result<Object, PdfError> {
         let mut items = Vec::new();
         loop {
             let tok = self.next()?.ok_or_else(|| {
@@ -175,11 +250,15 @@ impl<'a> Parser<'a> {
             if let TokenKind::ArrayEnd = tok.kind {
                 return Ok(Object::Array(items));
             }
-            items.push(self.object_from_token(tok)?);
+            items.push(self.object_from_token(tok, resolver)?);
         }
     }
 
-    fn parse_dict_or_stream(&mut self, start: usize) -> Result<Object, PdfError> {
+    fn parse_dict_or_stream(
+        &mut self,
+        start: usize,
+        resolver: &mut dyn LengthResolver,
+    ) -> Result<Object, PdfError> {
         let mut dict = Dict::new();
         loop {
             let tok = self.next()?.ok_or_else(|| {
@@ -203,7 +282,11 @@ impl<'a> Parser<'a> {
                     tok.start
                 ))
             })?;
-            // Value.
+            // Value. Note: nested dict / array values inside a stream
+            // dictionary are themselves direct objects (§7.3.8.1 — the
+            // stream dict shall be a direct object). The resolver only
+            // applies to the top-level /Length lookup, so nested calls
+            // pass `None`.
             let val = self.parse_object()?.ok_or_else(|| {
                 PdfError::other(format!(
                     "PDF parser: dict key `{key}` at byte {} has no value",
@@ -231,11 +314,14 @@ impl<'a> Parser<'a> {
                     data_start += 1;
                 }
                 // /Length is required per §7.3.8.2 — use it to find
-                // the body's end. Round-3 commit-2 only handles
-                // direct integers; an indirect /Length (Reference)
-                // is supported by deferring the slice extraction to
-                // the caller (returns the dict + the start position;
-                // round-3 commit-3 builds the cross-resolved version).
+                // the body's end. ISO 32000-1 §7.3.10 Example 3
+                // makes indirect /Length normative on stream objects
+                // (`<< /Length 8 0 R >>` for one-pass writers). When a
+                // resolver is supplied (the top-level
+                // `DocumentReader::resolve` path), call it to fetch the
+                // referenced integer; when no resolver is supplied
+                // (the xref-stream parsing path, where the xref isn't
+                // yet built) the indirect form is rejected.
                 let length_obj = dict.entries().iter().find_map(|(k, v)| {
                     if k == "Length" {
                         Some(v.clone())
@@ -245,12 +331,20 @@ impl<'a> Parser<'a> {
                 });
                 let len: usize = match length_obj {
                     Some(Object::Integer(n)) if n >= 0 => n as usize,
-                    Some(Object::Reference(_)) => {
-                        return Err(PdfError::other(
-                            "PDF parser: stream /Length is an indirect reference — \
-                             round-3 commit-2 only handles direct integers; \
-                             cross-reference resolution lands in the next commit",
-                        ));
+                    Some(Object::Reference(id)) => {
+                        let resolved = resolver.resolve_length(id)?;
+                        if resolved < 0 {
+                            return Err(PdfError::other(format!(
+                                "PDF parser: indirect /Length {id:?} resolved to \
+                                 negative integer {resolved}"
+                            )));
+                        }
+                        // Patch the dict so downstream consumers (e.g.
+                        // `decode_stream`, encryption length tracking)
+                        // see the resolved direct integer rather than
+                        // the now-stale `Reference`.
+                        dict.set("Length", Object::Integer(resolved));
+                        resolved as usize
                     }
                     Some(other) => {
                         return Err(PdfError::other(format!(
@@ -289,7 +383,21 @@ impl<'a> Parser<'a> {
     /// Parse one indirect object (`<n> <gen> obj … endobj`). Returns
     /// `(ObjectId, Object)`. The caller is responsible for positioning
     /// the parser at the first byte of the indirect object header.
+    ///
+    /// Streams with an indirect `/Length` are rejected — use
+    /// [`Self::parse_indirect_with_length_resolver`] from a context
+    /// that has a built xref table.
     pub fn parse_indirect(&mut self) -> Result<(ObjectId, Object), PdfError> {
+        self.parse_indirect_with_length_resolver(&mut NoLengthResolver)
+    }
+
+    /// Variant of [`Self::parse_indirect`] that accepts a
+    /// [`LengthResolver`] to resolve indirect `/Length` references on
+    /// stream-object dictionaries (ISO 32000-1 §7.3.10 Example 3).
+    pub fn parse_indirect_with_length_resolver(
+        &mut self,
+        resolver: &mut dyn LengthResolver,
+    ) -> Result<(ObjectId, Object), PdfError> {
         let n = self.expect_integer("indirect-object number")?;
         let gen = self.expect_integer("indirect-object generation")?;
         let obj_kw = self
@@ -302,7 +410,7 @@ impl<'a> Parser<'a> {
             )));
         };
         let body = self
-            .parse_object()?
+            .parse_object_with_length_resolver(resolver)?
             .ok_or_else(|| PdfError::other("PDF parser: indirect object missing body"))?;
         let endobj = self
             .next()?
@@ -460,13 +568,73 @@ mod tests {
     }
 
     #[test]
-    fn stream_indirect_length_is_rejected() {
-        // /Length 7 0 R — an indirect reference; round-3 commit-2 doesn't
-        // resolve cross-references yet.
+    fn stream_indirect_length_without_resolver_is_rejected() {
+        // /Length 7 0 R — an indirect reference; the resolver-less
+        // entry point (used by the xref-stream parser, before any
+        // xref table exists) must still reject this so a malformed
+        // xref-stream object doesn't silently read past EOF.
         let input = b"4 0 obj\n<< /Length 7 0 R >>\nstream\nXYZ\nendstream\nendobj\n";
         let mut p = Parser::new(input);
         let err = p.parse_indirect().unwrap_err();
         assert!(format!("{err}").contains("indirect reference"));
+    }
+
+    #[test]
+    fn stream_indirect_length_with_resolver_resolves() {
+        // Round-91: ISO 32000-1 §7.3.10 Example 3 — stream's /Length
+        // is an indirect reference; with a resolver, the parser
+        // fetches the target integer and slices the body accordingly.
+        let input = b"4 0 obj\n<< /Length 7 0 R >>\nstream\nXYZ\nendstream\nendobj\n";
+        let mut p = Parser::new(input);
+        let mut resolver = |id: ObjectId| -> Result<i64, PdfError> {
+            assert_eq!(id, ObjectId::new(7));
+            Ok(3)
+        };
+        let (id, body) = p
+            .parse_indirect_with_length_resolver(&mut resolver)
+            .unwrap();
+        assert_eq!(id, ObjectId::new(4));
+        let Object::Stream(s) = body else {
+            panic!("expected stream, got {body:?}")
+        };
+        assert_eq!(s.data, b"XYZ".to_vec());
+        // The dict should now carry the resolved direct integer so
+        // downstream consumers (decoders, encryption) don't see the
+        // stale Reference.
+        let length = s
+            .dict
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Length")
+            .map(|(_, v)| v.clone());
+        assert!(matches!(length, Some(Object::Integer(3))));
+    }
+
+    #[test]
+    fn stream_indirect_length_negative_resolution_errors() {
+        // A resolver that returns a negative integer must be flagged
+        // (a real PDF should never do this, but we don't trust input).
+        let input = b"4 0 obj\n<< /Length 7 0 R >>\nstream\nXYZ\nendstream\nendobj\n";
+        let mut p = Parser::new(input);
+        let mut resolver = |_id: ObjectId| -> Result<i64, PdfError> { Ok(-1) };
+        let err = p
+            .parse_indirect_with_length_resolver(&mut resolver)
+            .unwrap_err();
+        assert!(format!("{err}").contains("negative"));
+    }
+
+    #[test]
+    fn stream_indirect_length_resolver_error_propagates() {
+        // The resolver may legitimately fail (missing xref entry,
+        // wrong-typed target object). Errors flow up the parser.
+        let input = b"4 0 obj\n<< /Length 7 0 R >>\nstream\nXYZ\nendstream\nendobj\n";
+        let mut p = Parser::new(input);
+        let mut resolver =
+            |_id: ObjectId| -> Result<i64, PdfError> { Err(PdfError::other("test: not found")) };
+        let err = p
+            .parse_indirect_with_length_resolver(&mut resolver)
+            .unwrap_err();
+        assert!(format!("{err}").contains("not found"));
     }
 
     #[test]

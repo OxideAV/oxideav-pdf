@@ -318,6 +318,46 @@ Catalog) into one ObjStm container — opt in via
 (content streams, image XObjects, the xref stream itself) cannot be
 compressed per §7.5.7 and remain at their own byte offsets.
 
+## Indirect stream `/Length` (round 91)
+
+The reader resolves stream-object `/Length` entries that are
+**indirect references** rather than direct integers, per ISO 32000-1
+§7.3.10 Example 3:
+
+```
+7 0 obj
+    << /Length 8 0 R >>
+stream
+    BT /F1 12 Tf 72 712 Td ( ... ) Tj ET
+endstream
+endobj
+
+8 0 obj
+    77
+endobj
+```
+
+This shape is what every one-pass PDF writer produces — the encoder
+doesn't know the compressed body length until after deflating it, so
+the dict carries a forward reference to an integer object written
+*after* the stream. Real-world spec PDFs (e.g.
+`docs/video/mpeg1/ISO_IEC_11172-2-MPEG1-Video-1993.pdf`) use this on
+**every** content stream. Before round 91 the reader rejected them
+outright; now it consults the xref table, fetches the
+length-carrying integer, and patches the resolved direct value into
+the stream dictionary so downstream consumers (`decode_stream`,
+encryption length tracking) never see the stale `Reference`.
+
+The resolver is exposed at the parser level as
+`Parser::parse_indirect_with_length_resolver(&mut dyn LengthResolver)`
+— callers that already have an xref table provide a closure,
+callers that don't (the xref-stream parser itself, before any xref
+has been built) pass `NoLengthResolver` and indirect `/Length` is
+rejected per §7.5.8's effective direct-integer requirement.
+Compressed-target lookups (length integer stored inside an ObjStm)
+surface a clear error rather than mis-resolving; not yet seen in the
+wild.
+
 ## Incremental updates
 
 [`oxideav_pdf::write_pdf_incremental_update`] appends new revisions
