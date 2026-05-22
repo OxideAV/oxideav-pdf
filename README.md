@@ -524,6 +524,51 @@ whitespace byte and followed by whitespace or EOF — embedded `EI`
 sequences inside the payload (with no surrounding whitespace) are
 preserved as data, matching `pdfimages -all`'s extraction behaviour.
 
+## Optional Content / OCG layers (round 95)
+
+[`DocumentReader::optional_content`] walks the catalog's
+`/OCProperties` entry and surfaces every Optional Content Group +
+configuration (ISO 32000-1 §8.11 + §7.7.2 Table 28). PDFs with
+toggleable "layers" — CAD drawings, multi-language alternates,
+watermark / content separations — store one [`OptionalContentGroup`]
+per `/Type /OCG` indirect object, with `/Name` UI label, optional
+`/Intent` (`View` / `Design`), and optional `/Usage` filters
+(language / zoom / print / view / export / page-element).
+
+The configuration dictionary's `/BaseState` (`ON` / `OFF` /
+`Unchanged`) + `/ON` + `/OFF` arrays apply per §8.11.4.5 algorithm
+steps (a)+(b)+(c), giving each group a resolved boolean state.
+`OptionalContent::is_visible(group_id)` is the lookup;
+`states_for_config(&alt)` re-resolves under any of the `/Configs`
+alternate configurations.
+
+```rust,ignore
+use oxideav_pdf::reader::DocumentReader;
+let mut r = DocumentReader::open(&pdf_bytes)?;
+if let Some(oc) = r.optional_content()? {
+    println!("{} layers, default cfg = {:?}",
+        oc.groups.len(), oc.default_config.name);
+    for g in &oc.groups {
+        println!("  {:?} {} ({})", g.id, g.name,
+            if oc.is_visible(g.id) { "ON" } else { "OFF" });
+    }
+}
+# Ok::<(), oxideav_pdf::PdfError>(())
+```
+
+Optional Content Membership Dictionaries (OCMDs, Table 99) are also
+covered — `parse_membership(reader, dict)` decodes the `/OCGs`
+reference list, the `/P` policy (`AllOn` / `AnyOn` / `AnyOff` /
+`AllOff`), and the `/VE` visibility expression (PDF 1.6 — `[/And …]`
+/ `[/Or …]` / `[/Not e]`, recursively nested). `OptionalContent::evaluate_membership(&mem)`
+plugs an OCMD into the current state map and returns the boolean
+visibility per §8.11.2.2's NOTE 2 (when `/VE` is present, the
+expression wins over `/P`). The configuration's `/Order` array
+parses into a tree of [`OcOrderItem::Group`] leaves and
+[`OcOrderItem::Subtree { label, items }`] nodes — both the labelled-
+collection form (`[(Frog Anatomy) g1 g2]`) and the sublayer-nesting
+form (`[g1 [g2 g3]]`).
+
 ## Action enumeration (round 36)
 
 [`DocumentReader::actions`] walks every place an action can hide in

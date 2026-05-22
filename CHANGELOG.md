@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 95: **Optional Content (OCG / OCMD) reader** (ISO 32000-1
+  §8.11 + §7.7.2 Table 28). New `oxideav_pdf::reader::ocg` module +
+  `DocumentReader::optional_content()` accessor walk the catalog's
+  `/OCProperties` entry and surface every Optional Content Group (the
+  toggleable "layers" PDFs use for CAD drawings, multi-language
+  alternates, watermark / content separations) along with the default
+  configuration dictionary and any alternate `/Configs`. Each group
+  carries its indirect-object id, `/Name` UI label, optional
+  `/Intent` (`View` / `Design`), and decoded `/Usage` subkeys
+  (language / zoom / print / view / export / page-element). The
+  configuration's `/BaseState` (`ON` / `OFF` / `Unchanged`) + `/ON` +
+  `/OFF` arrays apply per §8.11.4.5 algorithm steps (a)+(b)+(c),
+  yielding a `HashMap<ObjectId, bool>` of resolved visibility states.
+  `OptionalContent::states_for_config(&alt)` re-resolves under an
+  alternate configuration so callers can switch.
+  Optional Content Membership Dictionaries (OCMDs, Table 99) are also
+  covered — `parse_membership(reader, dict)` decodes the `/OCGs`
+  reference list, the `/P` visibility policy (`AllOn` / `AnyOn` /
+  `AnyOff` / `AllOff` — default `AnyOn`), and the `/VE` visibility
+  expression (PDF 1.6 — `[/And e…]` / `[/Or e…]` / `[/Not e]`,
+  recursively nested, 32-deep cycle guard).
+  `OptionalContent::evaluate_membership(&mem)` plugs an OCMD into the
+  current state map and returns the boolean visibility per
+  §8.11.2.2's NOTE 2 (when `/VE` is present, the expression wins over
+  `/P`). The configuration's `/Order` array parses into a tree of
+  `OcOrderItem::Group` leaves and `OcOrderItem::Subtree { label,
+  items }` nodes — both the labelled-collection form (Table 101
+  EXAMPLE 1 — `[(Frog Anatomy) g1 g2]`) and the sublayer-nesting form
+  (EXAMPLE 2 — `[g1 [g2 g3]]`) are recognised. PDFs without
+  `/OCProperties` surface as `Ok(None)` so callers branch cleanly on
+  "this document is not layered".  Verified against the §8.11 spec
+  examples + hand-rolled minimal PDFs covering every state-resolution
+  branch; 17 unit tests + 10 integration tests, all green.
+
 - Round 91: **Indirect `/Length` resolution on stream objects** (ISO
   32000-1 §7.3.8.2 + §7.3.10 Example 3). The reader can now open PDFs
   whose stream dictionaries express `/Length` as an indirect reference

@@ -33,6 +33,7 @@ pub mod layout;
 pub mod lex;
 pub mod linearize;
 pub mod link;
+pub mod ocg;
 pub mod outline;
 pub mod parse;
 pub mod pdfa;
@@ -59,6 +60,11 @@ pub use inline_images::{inline_images, InlineImageFilter, PdfInlineImage};
 pub use layout::{read_in_logical_order, LayoutMode, ReadingOrderText};
 pub use linearize::{parse_linearization_dict, LinearizationParams};
 pub use link::{links, PdfLink, PdfLinkTarget};
+pub use ocg::{
+    optional_content, parse_membership, OcBaseState, OcConfig, OcListMode, OcMembership,
+    OcOrderItem, OcUsage, OcVisibilityExpression, OcVisibilityPolicy, OptionalContent,
+    OptionalContentGroup,
+};
 pub use outline::{outline, OutlineNode, PdfOutline};
 pub use pdfa::{pdfa_signals, PdfACatalogSignals, PdfAConformance};
 pub use sig::{doc_timestamps, signatures, signed_bytes, PdfDocTimestamp, PdfSignature};

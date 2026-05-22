@@ -198,6 +198,19 @@ impl<'a> DocumentReader<'a> {
         crate::reader::actions::actions(self)
     }
 
+    /// Round-95: surface the catalog's `/OCProperties` Optional Content
+    /// configuration (ISO 32000-1 §8.11 + §7.7.2 Table 28). Returns
+    /// `Ok(None)` when the document has no optional content (the
+    /// common case); returns `Ok(Some(_))` carrying every OCG, the
+    /// default configuration dict, any alternate configurations, and
+    /// the resolved on/off state per group after applying the default
+    /// configuration's `BaseState` / `ON` / `OFF` per §8.11.4.5.
+    pub fn optional_content(
+        &mut self,
+    ) -> Result<Option<crate::reader::ocg::OptionalContent>, PdfError> {
+        crate::reader::ocg::optional_content(self)
+    }
+
     /// Round-27: parse the Linearization Parameter Dictionary at the
     /// head of the file (ISO 32000-1 §F.2 + Annex F.3). Returns
     /// `Ok(None)` for non-linearized files (the common case);
