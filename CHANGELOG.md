@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 98: **`LZWDecode` stream filter** (ISO 32000-1:2008 §7.4.4.2).
+  New `oxideav_pdf::reader::filters::lzw_decode` /
+  `lzw_decode_with_early_change` implement variable-width
+  (9..=12-bit) MSB-first LZW — the TIFF 6.0 flavour — with the
+  clear-table (256) / EOD (257) control codes, the KwKwK
+  self-reference special case, the §7.4.4.3 `/EarlyChange` parameter
+  (default `1`), and graceful partial decode on a truncated stream.
+  The central `decode_stream` dispatch is reworked to apply all
+  generic decompression filters (`FlateDecode` / `LZWDecode` /
+  `ASCII85Decode` / `ASCIIHexDecode` / `RunLengthDecode`) in `/Filter`
+  array order, so chains like `[/ASCII85Decode /LZWDecode]` (§7.4.4
+  Example 2) round-trip, reading the per-slot `/DecodeParms`. The
+  round-23 image-XObject and round-35 inline-image filter peels gain
+  LZW too. Terminal image-codec filters (DCT / JPX / JBIG2 / CCITTFax)
+  still route to the dedicated image walkers. Validated against the
+  §7.4.4.2 Example 2 packed vector.
+
 - Round 95: **Optional Content (OCG / OCMD) reader** (ISO 32000-1
   §8.11 + §7.7.2 Table 28). New `oxideav_pdf::reader::ocg` module +
   `DocumentReader::optional_content()` accessor walk the catalog's

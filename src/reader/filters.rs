@@ -5,6 +5,7 @@
 //! the round-35 inline-image walker can reuse the byte-identical
 //! implementations. Adding more filters (`/LZW`, `/CCITTFax`, etc.)
 //! in future rounds gives both walkers the new coverage at once.
+//! Round 98 adds `LZWDecode` (§7.4.4.2).
 //!
 //! All decoders consume `&[u8]` input and return `Result<Vec<u8>,
 //! PdfError>` — there is no state-machine surface, so each call is
@@ -13,8 +14,10 @@
 //! ## Provenance
 //!
 //! ISO 32000-1:2008 §7.4 (Filters), §7.4.2 (ASCIIHexDecode), §7.4.3
-//! (ASCII85Decode), §7.4.4 (FlateDecode), §7.4.5 (RunLengthDecode).
-//! No third-party PDF library was consulted.
+//! (ASCII85Decode), §7.4.4 (LZWDecode + FlateDecode), §7.4.4.2
+//! (Details of LZW Encoding), §7.4.4.3 (`/EarlyChange` parameter),
+//! §7.4.5 (RunLengthDecode). No third-party PDF library was
+//! consulted.
 
 use crate::error::PdfError;
 
@@ -191,6 +194,145 @@ pub fn run_length_decode(input: &[u8]) -> Result<Vec<u8>, PdfError> {
     Ok(out)
 }
 
+/// LZWDecode (§7.4.4.2) — variable-length (9..=12-bit) adaptive
+/// Lempel-Ziv-Welch, the same flavour TIFF 6.0 uses.
+///
+/// Codes are packed MSB-first into a continuous bit stream that is
+/// then split into bytes MSB-first, so a code may straddle a byte
+/// boundary. The string table starts at 258 fixed entries (0..=255
+/// single bytes, 256 = clear-table, 257 = EOD); each emitted code
+/// appends one new entry (the previous output followed by the first
+/// byte of the current output), and the code length grows by one bit
+/// the moment the table is about to overflow the current width.
+///
+/// `early_change` mirrors the `/EarlyChange` optional parameter
+/// (§7.4.4.3 Table 8): the default value `1` bumps the code length
+/// one code *early* — i.e. the width grows when the next table entry
+/// to be assigned is `2^width - 1` rather than `2^width`. Some
+/// encoders set `0` to postpone the bump as long as possible. PDF's
+/// default (and TIFF's behaviour) is `1`.
+///
+/// Convenience [`lzw_decode`] wraps this with the default
+/// `early_change = 1`.
+pub fn lzw_decode_with_early_change(input: &[u8], early_change: bool) -> Result<Vec<u8>, PdfError> {
+    const CLEAR: u32 = 256;
+    const EOD: u32 = 257;
+    const FIRST_FREE: u32 = 258;
+    const MAX_WIDTH: u32 = 12;
+
+    // The table maps a code >= 258 to the byte sequence it expands to.
+    // Codes 0..=255 are implicit single bytes; 256 / 257 are control.
+    // We store only the dynamic (>= 258) entries, indexed by
+    // `code - FIRST_FREE`.
+    let mut table: Vec<Vec<u8>> = Vec::new();
+    let early = if early_change { 1 } else { 0 };
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut bit_buf: u32 = 0;
+    let mut bit_cnt: u32 = 0;
+    let mut byte_pos: usize = 0;
+    let mut code_width: u32 = 9;
+    // `previous`: the byte sequence emitted for the prior code, used
+    // to synthesize the next dictionary entry. `None` right after a
+    // clear / at the very start.
+    let mut previous: Option<Vec<u8>> = None;
+
+    // Expand `code` into the byte sequence it represents, given the
+    // current table. Returns `None` for an out-of-range code that is
+    // not the legal "next code" KwKwK special case (handled by the
+    // caller).
+    let expand = |code: u32, table: &[Vec<u8>]| -> Option<Vec<u8>> {
+        if code < 256 {
+            Some(vec![code as u8])
+        } else if code >= FIRST_FREE {
+            table.get((code - FIRST_FREE) as usize).cloned()
+        } else {
+            None // 256 / 257 are control codes, never expanded.
+        }
+    };
+
+    loop {
+        // Refill the bit buffer (MSB-first) until we have a full code
+        // or run out of input.
+        while bit_cnt < code_width {
+            if byte_pos >= input.len() {
+                // Ran out of bits before an explicit EOD. Spec says a
+                // conformant stream ends with code 257, but real-world
+                // writers sometimes truncate; accept what we have.
+                return Ok(out);
+            }
+            bit_buf = (bit_buf << 8) | input[byte_pos] as u32;
+            byte_pos += 1;
+            bit_cnt += 8;
+        }
+        bit_cnt -= code_width;
+        let code = (bit_buf >> bit_cnt) & ((1 << code_width) - 1);
+
+        if code == EOD {
+            break;
+        }
+        if code == CLEAR {
+            table.clear();
+            code_width = 9;
+            previous = None;
+            continue;
+        }
+
+        // Resolve the current code to its byte sequence. The classic
+        // "KwKwK" case: the code is exactly the entry we are about to
+        // create, valid only when it equals the next free code and a
+        // previous sequence exists.
+        let next_code = FIRST_FREE + table.len() as u32;
+        let entry = match expand(code, &table) {
+            Some(seq) => seq,
+            None if code == next_code => {
+                let prev = previous.as_ref().ok_or_else(|| {
+                    PdfError::other("PDF filter: LZW first code references empty table")
+                })?;
+                let mut seq = prev.clone();
+                seq.push(prev[0]);
+                seq
+            }
+            None => {
+                return Err(PdfError::other(format!(
+                    "PDF filter: LZW code {code} out of range (next free {next_code})"
+                )));
+            }
+        };
+
+        out.extend_from_slice(&entry);
+
+        // Append a new table entry: previous sequence + first byte of
+        // the current entry. The very first code after a clear has no
+        // previous, so it creates no entry.
+        if let Some(prev) = previous.as_ref() {
+            if next_code <= 4095 {
+                let mut new_entry = prev.clone();
+                new_entry.push(entry[0]);
+                table.push(new_entry);
+            }
+        }
+        previous = Some(entry);
+
+        // Grow the code width once the table is about to need a wider
+        // code. With `early_change = 1` (default) this happens one
+        // entry early, matching TIFF / PDF default behaviour.
+        let assigned = FIRST_FREE + table.len() as u32;
+        if code_width < MAX_WIDTH && assigned + early >= (1 << code_width) {
+            code_width += 1;
+        }
+    }
+
+    Ok(out)
+}
+
+/// LZWDecode with the default `/EarlyChange` of `1` (§7.4.4.3) — the
+/// flavour every PDF writer that uses LZW emits and the one TIFF 6.0
+/// mandates. See [`lzw_decode_with_early_change`] for the parameter.
+pub fn lzw_decode(input: &[u8]) -> Result<Vec<u8>, PdfError> {
+    lzw_decode_with_early_change(input, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +393,71 @@ mod tests {
         let input = [4u8, b'h', b'e', b'l', b'l', b'o'];
         let out = run_length_decode(&input).unwrap();
         assert_eq!(out, b"hello");
+    }
+
+    #[test]
+    fn lzw_decodes_spec_example_2() {
+        // ISO 32000-1:2008 §7.4.4.2 Example 2 — the packed stream
+        // `80 0B 60 50 22 0C 0C 85 01` decodes to the §7.4.4.2
+        // Example 1 input `45 45 45 45 45 65 45 45 45 66`.
+        let encoded = [0x80u8, 0x0B, 0x60, 0x50, 0x22, 0x0C, 0x0C, 0x85, 0x01];
+        let out = lzw_decode(&encoded).unwrap();
+        assert_eq!(out, [45u8, 45, 45, 45, 45, 65, 45, 45, 45, 66]);
+    }
+
+    #[test]
+    fn lzw_handles_clear_then_eod_only() {
+        // A bare clear-table (256) immediately followed by EOD (257),
+        // packed 9-bit MSB-first: 100000000 100000001
+        //   = 1 0000 0000 1 0000 0001 → 0x80 0x80 0x80 (24 bits used,
+        //   18 significant, padded with 0). Decodes to empty output.
+        // 256 = 0b1_0000_0000, 257 = 0b1_0000_0001.
+        let bits: u32 = (256 << 9) | 257; // 18 bits.
+        let packed = [
+            ((bits >> 10) & 0xFF) as u8,
+            ((bits >> 2) & 0xFF) as u8,
+            ((bits << 6) & 0xFF) as u8,
+        ];
+        let out = lzw_decode(&packed).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn lzw_truncated_stream_returns_partial_not_error() {
+        // First three bytes of Example 2 (`80 0B 60`) carry codes
+        // 256 (clear) + 45 ('-') with 6 leftover bits — no EOD. A
+        // reader that runs out of bits returns what it decoded so far
+        // rather than erroring (real-world writers truncate).
+        let out = lzw_decode(&[0x80u8, 0x0B, 0x60]).unwrap();
+        assert_eq!(out, [45u8]);
+    }
+
+    #[test]
+    fn lzw_round_trips_a_longer_payload() {
+        // No encoder in-crate, so build a stream by hand that exercises
+        // the KwKwK self-reference path. Hand-running the §7.4.4.2
+        // encoder on input "aaaaaaaa" (8 'a's) yields the code stream:
+        //   256 (clear), 97 ('a'), 258 ("aa"), 259 ("aaa"), 258 ("aa"),
+        //   257 (EOD)
+        // where 258="aa" is reached via the KwKwK special case on the
+        // decoder's very next code. All codes are 9-bit (the table
+        // never grows past 260, well under 511). Pack MSB-first.
+        let codes = [256u32, 97, 258, 259, 258, 257];
+        let mut bit_buf: u64 = 0;
+        let mut bit_cnt = 0u32;
+        let mut packed = Vec::new();
+        for c in codes {
+            bit_buf = (bit_buf << 9) | c as u64;
+            bit_cnt += 9;
+            while bit_cnt >= 8 {
+                bit_cnt -= 8;
+                packed.push(((bit_buf >> bit_cnt) & 0xFF) as u8);
+            }
+        }
+        if bit_cnt > 0 {
+            packed.push(((bit_buf << (8 - bit_cnt)) & 0xFF) as u8);
+        }
+        let out = lzw_decode(&packed).unwrap();
+        assert_eq!(out, b"aaaaaaaa");
     }
 }

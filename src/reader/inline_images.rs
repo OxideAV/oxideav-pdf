@@ -44,6 +44,7 @@
 //! * `/AHx` (`/ASCIIHexDecode`)
 //! * `/Fl`  (`/FlateDecode`)
 //! * `/RL`  (`/RunLengthDecode`)
+//! * `/LZW` (`/LZWDecode`)
 //!
 //! The terminal filter (the *last* entry in the chain) is *not*
 //! applied — `/DCT` / `/JPX` / `/JBIG2` / `/CCF` are codec filters
@@ -716,6 +717,8 @@ fn peel_inline_filters(
             "AHx" | "ASCIIHexDecode" => crate::reader::filters::ascii_hex_decode(&payload)?,
             "Fl" | "FlateDecode" => crate::reader::filters::flate_decompress(&payload)?,
             "RL" | "RunLengthDecode" => crate::reader::filters::run_length_decode(&payload)?,
+            // LZWDecode (§7.4.4.2) — round 98, default `/EarlyChange` 1.
+            "LZW" | "LZWDecode" => crate::reader::filters::lzw_decode(&payload)?,
             other => {
                 return Err(PdfError::other(format!(
                     "PDF inline image: unsupported wrapping filter `{other}`"

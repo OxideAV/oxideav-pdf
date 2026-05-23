@@ -22,7 +22,6 @@
 //! 1.5+) and encryption are deferred to round 4+.
 
 use std::collections::HashMap;
-use std::io::Read;
 
 use oxideav_core::vector::{
     FillRule, Group, Node, Paint, Path, PathCommand, PathNode, Rgba, VectorFrame,
@@ -1077,8 +1076,19 @@ fn extract_stream_data(reader: &mut DocumentReader<'_>, id: ObjectId) -> Result<
 }
 
 /// Apply the stream's `/Filter` (if any) to recover the raw payload.
-/// Round 3 supports `FlateDecode` only — the only filter the writer
-/// emits (DCTDecode, CCITTFaxDecode, etc. land in round 4+).
+///
+/// Generic decompression filters land here: `FlateDecode` (§7.4.4),
+/// `LZWDecode` (§7.4.4.2 — round 98), `ASCII85Decode` (§7.4.3),
+/// `ASCIIHexDecode` (§7.4.2), and `RunLengthDecode` (§7.4.5), in both
+/// the single-`Name` and the `Array` (filter-chain) forms (§7.4.1).
+/// Filters are applied in array order so a chain such as
+/// `[/ASCII85Decode /LZWDecode]` (§7.4.4 Example 2) round-trips.
+///
+/// Terminal image codec filters (`DCTDecode`, `JPXDecode`,
+/// `JBIG2Decode`, `CCITTFaxDecode`) are *not* decoded here — they
+/// surface to the dedicated round-23 / round-35 image walkers that
+/// hand their opaque payload to a codec crate. A `/Filter` naming one
+/// of those is reported as unsupported rather than silently mangled.
 pub fn decode_stream(stream: &Stream) -> Result<Vec<u8>, PdfError> {
     let filter = stream
         .dict
@@ -1086,44 +1096,76 @@ pub fn decode_stream(stream: &Stream) -> Result<Vec<u8>, PdfError> {
         .iter()
         .find(|(k, _)| k == "Filter")
         .map(|(_, v)| v.clone());
+    // The matching `/DecodeParms` slot (or `/DP` abbreviation): a dict
+    // for a single filter, or a (possibly null-padded) array parallel
+    // to the `/Filter` array. Used to read LZW's `/EarlyChange`.
+    let parms = stream
+        .dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "DecodeParms" || k == "DP")
+        .map(|(_, v)| v.clone());
     match filter {
         None => Ok(stream.data.clone()),
-        Some(Object::Name(name)) if name == "FlateDecode" => flate_decompress(&stream.data),
+        Some(Object::Name(name)) => apply_filter(&name, &stream.data, parms_for_index(&parms, 0)),
         Some(Object::Array(items)) => {
-            // Filter chain — apply in order. Round-3 only handles
-            // FlateDecode in this position.
             let mut data = stream.data.clone();
-            for item in items {
+            for (idx, item) in items.iter().enumerate() {
                 let Object::Name(name) = item else {
                     return Err(PdfError::other(format!(
                         "PDF reader: /Filter chain item must be a Name (got {item:?})"
                     )));
                 };
-                if name != "FlateDecode" {
-                    return Err(PdfError::other(format!(
-                        "PDF reader: filter `{name}` not yet supported (round-3 = FlateDecode only)"
-                    )));
-                }
-                data = flate_decompress(&data)?;
+                data = apply_filter(name, &data, parms_for_index(&parms, idx))?;
             }
             Ok(data)
         }
-        Some(Object::Name(name)) => Err(PdfError::other(format!(
-            "PDF reader: filter `{name}` not yet supported (round-3 = FlateDecode only)"
-        ))),
         Some(other) => Err(PdfError::other(format!(
             "PDF reader: /Filter must be a Name or array of Names (got {other:?})"
         ))),
     }
 }
 
-fn flate_decompress(input: &[u8]) -> Result<Vec<u8>, PdfError> {
-    use flate2::read::ZlibDecoder;
-    let mut out = Vec::new();
-    let mut dec = ZlibDecoder::new(input);
-    dec.read_to_end(&mut out)
-        .map_err(|e| PdfError::other(format!("PDF reader: FlateDecode failed: {e}")))?;
-    Ok(out)
+/// Pull the `/DecodeParms` dictionary that lines up with filter slot
+/// `idx`. A bare dict applies to the (single) filter at index 0; an
+/// array is indexed positionally, treating `null` and out-of-range
+/// slots as "no parameters" per §7.4.1.
+fn parms_for_index(parms: &Option<Object>, idx: usize) -> Option<&Dict> {
+    match parms {
+        Some(Object::Dict(d)) if idx == 0 => Some(d),
+        Some(Object::Array(items)) => match items.get(idx) {
+            Some(Object::Dict(d)) => Some(d),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Apply one named generic filter to `data`.
+fn apply_filter(name: &str, data: &[u8], parms: Option<&Dict>) -> Result<Vec<u8>, PdfError> {
+    use crate::reader::filters;
+    match name {
+        "FlateDecode" | "Fl" => filters::flate_decompress(data),
+        "LZWDecode" | "LZW" => {
+            // `/EarlyChange` defaults to 1 (§7.4.4.3 Table 8); only 0
+            // postpones the width bump.
+            let early = parms
+                .and_then(|d| d.entries().iter().find(|(k, _)| k == "EarlyChange"))
+                .and_then(|(_, v)| match v {
+                    Object::Integer(n) => Some(*n != 0),
+                    _ => None,
+                })
+                .unwrap_or(true);
+            filters::lzw_decode_with_early_change(data, early)
+        }
+        "ASCII85Decode" | "A85" => filters::ascii85_decode(data),
+        "ASCIIHexDecode" | "AHx" => filters::ascii_hex_decode(data),
+        "RunLengthDecode" | "RL" => filters::run_length_decode(data),
+        other => Err(PdfError::other(format!(
+            "PDF reader: filter `{other}` not yet supported by decode_stream \
+             (image codec filters DCT/JPX/JBIG2/CCITTFax route through the image walkers)"
+        ))),
+    }
 }
 
 fn decode_metadata(info: Object) -> Result<Metadata, PdfError> {

@@ -366,10 +366,13 @@ fn try_extract_jpeg(
             "ASCIIHexDecode" | "AHx" => crate::reader::filters::ascii_hex_decode(&payload)?,
             "FlateDecode" | "Fl" => crate::reader::filters::flate_decompress(&payload)?,
             "RunLengthDecode" | "RL" => crate::reader::filters::run_length_decode(&payload)?,
-            // Other wrapping filters (LZWDecode, CCITTFaxDecode, …) are
-            // not in scope for round 35 — surface the XObject as "not
-            // JPEG passthrough" so the caller doesn't get a corrupted
-            // stream.
+            // LZWDecode (§7.4.4.2) — round 98. `/EarlyChange` defaults
+            // to 1; a wrapping LZW layer ahead of DCTDecode is rare but
+            // legal, so peel it like the other generic filters.
+            "LZWDecode" | "LZW" => crate::reader::filters::lzw_decode(&payload)?,
+            // Other wrapping filters (CCITTFaxDecode, …) are not in
+            // scope — surface the XObject as "not JPEG passthrough" so
+            // the caller doesn't get a corrupted stream.
             _ => return Ok(None),
         };
     }

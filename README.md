@@ -318,6 +318,36 @@ Catalog) into one ObjStm container — opt in via
 (content streams, image XObjects, the xref stream itself) cannot be
 compressed per §7.5.7 and remain at their own byte offsets.
 
+## Stream filters (round 98 adds LZWDecode)
+
+`decode_stream` recovers a stream's raw payload by applying its
+`/Filter` (single `Name` or `Array` chain, §7.4.1). The generic
+decompression filters are all handled in array order, so chains like
+`[/ASCII85Decode /LZWDecode]` (§7.4.4 Example 2) round-trip:
+
+- **`/FlateDecode`** (§7.4.4) — zlib DEFLATE; the writer's default.
+- **`/LZWDecode`** (§7.4.4.2) — variable-width (9..=12-bit) MSB-first
+  LZW, the TIFF flavour. Round 98 wires this through `decode_stream`
+  plus the round-23 image-XObject and round-35 inline-image filter
+  peels. The `/EarlyChange` parameter (§7.4.4.3 Table 8) is honoured
+  from `/DecodeParms`, defaulting to `1` (TIFF/PDF default); the
+  KwKwK self-reference and clear-table (256) / EOD (257) codes are
+  handled, and a truncated stream returns its partial decode.
+- **`/ASCII85Decode`** (§7.4.3), **`/ASCIIHexDecode`** (§7.4.2),
+  **`/RunLengthDecode`** (§7.4.5) — also accepted in single + chain
+  position, including the inline-image abbreviations (`/Fl`, `/LZW`,
+  `/A85`, `/AHx`, `/RL`).
+
+Terminal image-codec filters (`/DCTDecode`, `/JPXDecode`,
+`/JBIG2Decode`, `/CCITTFaxDecode`) are *not* decoded here — they keep
+routing to the dedicated image walkers that hand the opaque payload to
+a codec crate. The `/DecodeParms /Predictor` post-filter (§7.4.4.4)
+is still only applied by the xref-stream path; LZW/Flate streams that
+carry an image `/Predictor` land in a follow-up round.
+
+Validated against ISO 32000-1:2008 §7.4.4.2 Example 2's packed vector
+(`80 0B 60 50 22 0C 0C 85 01` → `45 45 45 45 45 65 45 45 45 66`).
+
 ## Indirect stream `/Length` (round 91)
 
 The reader resolves stream-object `/Length` entries that are
