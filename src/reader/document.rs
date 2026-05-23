@@ -1142,10 +1142,17 @@ fn parms_for_index(parms: &Option<Object>, idx: usize) -> Option<&Dict> {
 }
 
 /// Apply one named generic filter to `data`.
+///
+/// For `FlateDecode` / `LZWDecode`, the `/DecodeParms /Predictor`
+/// post-filter (§7.4.4.4) is applied to the decompressed bytes when
+/// present — a stream whose `/DecodeParms` carries `/Predictor` > 1
+/// (PNG predictors 10..=15 or TIFF Predictor 2) is un-differenced
+/// before being returned. `/Colors`, `/BitsPerComponent`, and
+/// `/Columns` come from the same dict (Table 8 defaults: 1 / 8 / 1).
 fn apply_filter(name: &str, data: &[u8], parms: Option<&Dict>) -> Result<Vec<u8>, PdfError> {
     use crate::reader::filters;
     match name {
-        "FlateDecode" | "Fl" => filters::flate_decompress(data),
+        "FlateDecode" | "Fl" => apply_predictor_post(filters::flate_decompress(data)?, parms),
         "LZWDecode" | "LZW" => {
             // `/EarlyChange` defaults to 1 (§7.4.4.3 Table 8); only 0
             // postpones the width bump.
@@ -1156,7 +1163,7 @@ fn apply_filter(name: &str, data: &[u8], parms: Option<&Dict>) -> Result<Vec<u8>
                     _ => None,
                 })
                 .unwrap_or(true);
-            filters::lzw_decode_with_early_change(data, early)
+            apply_predictor_post(filters::lzw_decode_with_early_change(data, early)?, parms)
         }
         "ASCII85Decode" | "A85" => filters::ascii85_decode(data),
         "ASCIIHexDecode" | "AHx" => filters::ascii_hex_decode(data),
@@ -1166,6 +1173,45 @@ fn apply_filter(name: &str, data: &[u8], parms: Option<&Dict>) -> Result<Vec<u8>
              (image codec filters DCT/JPX/JBIG2/CCITTFax route through the image walkers)"
         ))),
     }
+}
+
+/// Apply the `/DecodeParms /Predictor` post-filter to `LZWDecode` /
+/// `FlateDecode` output if the slot's parameter dict requests one
+/// (§7.4.4.4 Table 8 / Table 10). When `/Predictor` is absent or `1`
+/// the bytes pass through unchanged.
+fn apply_predictor_post(data: Vec<u8>, parms: Option<&Dict>) -> Result<Vec<u8>, PdfError> {
+    use crate::reader::filters::{apply_predictor, PredictorParams};
+    let Some(parms) = parms else {
+        return Ok(data);
+    };
+    let int = |key: &str| -> Option<i64> {
+        parms
+            .entries()
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| match v {
+                Object::Integer(n) => Some(*n),
+                _ => None,
+            })
+    };
+    let predictor = int("Predictor").unwrap_or(1);
+    if predictor <= 1 {
+        return Ok(data);
+    }
+    let def = PredictorParams::default();
+    let params = PredictorParams {
+        predictor,
+        colors: int("Colors")
+            .map(|n| n.max(0) as usize)
+            .unwrap_or(def.colors),
+        bits_per_component: int("BitsPerComponent")
+            .map(|n| n.max(0) as usize)
+            .unwrap_or(def.bits_per_component),
+        columns: int("Columns")
+            .map(|n| n.max(0) as usize)
+            .unwrap_or(def.columns),
+    };
+    apply_predictor(&data, &params)
 }
 
 fn decode_metadata(info: Object) -> Result<Metadata, PdfError> {
@@ -1511,5 +1557,60 @@ mod tests {
         let parsed = read_pdf_to_scene(&pdf).unwrap();
         assert!(parsed.metadata.title.is_none());
         assert!(parsed.metadata.custom.is_empty());
+    }
+
+    /// `decode_stream` on a `/FlateDecode` stream that also carries a
+    /// `/DecodeParms /Predictor 12` (PNG-Up) un-differences the body
+    /// after inflating (§7.4.4.4). The expected output is the original
+    /// pre-predictor sample bytes.
+    #[test]
+    fn decode_stream_applies_flate_png_predictor() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Two rows of 3 single-byte samples (Colors=1, BPC=8,
+        // Columns=3): [10,20,30] and [11,22,33]. PNG-encoded with a
+        // None tag on row 0 and an Up tag (deltas) on row 1.
+        let predicted: &[u8] = &[
+            0, 10, 20, 30, // row 0: tag None
+            2, 1, 2, 3, // row 1: tag Up
+        ];
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(predicted).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        let dict = Dict::new()
+            .with("Filter", Object::Name("FlateDecode".into()))
+            .with(
+                "DecodeParms",
+                Object::Dict(
+                    Dict::new()
+                        .with("Predictor", Object::Integer(12))
+                        .with("Columns", Object::Integer(3)),
+                ),
+            );
+        let stream = Stream::new(dict, compressed);
+        let out = decode_stream(&stream).unwrap();
+        assert_eq!(out, [10u8, 20, 30, 11, 22, 33]);
+    }
+
+    /// A `/FlateDecode` stream with no `/DecodeParms` (or `/Predictor 1`)
+    /// returns the inflated bytes unchanged — the predictor path is a
+    /// no-op there.
+    #[test]
+    fn decode_stream_flate_without_predictor_is_passthrough() {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let raw = b"hello predictor-free world";
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(raw).unwrap();
+        let compressed = enc.finish().unwrap();
+
+        let dict = Dict::new().with("Filter", Object::Name("FlateDecode".into()));
+        let stream = Stream::new(dict, compressed);
+        assert_eq!(decode_stream(&stream).unwrap(), raw);
     }
 }

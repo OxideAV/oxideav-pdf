@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 104: **`/DecodeParms /Predictor` post-filter** (ISO 32000-1:2008
+  §7.4.4.4) is now applied by the central `decode_stream` dispatch for
+  `FlateDecode` / `LZWDecode` streams, not just the xref-stream path.
+  New `oxideav_pdf::reader::filters::apply_predictor` + `PredictorParams`
+  reverse the pre-compression differencing: PNG predictors
+  (`/Predictor 10..=15`, Table 10 — the per-row tag chooses None / Sub /
+  Up / Average / Paeth per Table 9, with neighbours taken
+  `bpp = ceil(Colors * BitsPerComponent / 8)` bytes back) and TIFF
+  Predictor 2 (`/Predictor 2` — per-component left differencing with
+  sub-byte 1/2/4-bit components unpacked, summed modulo `2^bpc`, and
+  repacked; 8- and 16-bit run byte/word-wise). `/Colors`,
+  `/BitsPerComponent`, and `/Columns` come from the matching
+  `/DecodeParms` slot (Table 8 defaults 1 / 8 / 1); `/Predictor 1` (or a
+  stream with no `/DecodeParms`) is an unchanged passthrough. This
+  un-mangles real-world Flate/LZW image XObjects and content streams
+  that PDF writers difference before compressing. Verified with PNG
+  (Sub / Up / Average / Paeth) and TIFF-2 (8-bit / RGB-interleaved /
+  4-bit) round-trips plus an end-to-end `decode_stream` Flate+PNG-Up
+  test.
+
 - Round 98: **`LZWDecode` stream filter** (ISO 32000-1:2008 §7.4.4.2).
   New `oxideav_pdf::reader::filters::lzw_decode` /
   `lzw_decode_with_early_change` implement variable-width

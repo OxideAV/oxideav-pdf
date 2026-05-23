@@ -5,7 +5,9 @@
 //! the round-35 inline-image walker can reuse the byte-identical
 //! implementations. Adding more filters (`/LZW`, `/CCITTFax`, etc.)
 //! in future rounds gives both walkers the new coverage at once.
-//! Round 98 adds `LZWDecode` (§7.4.4.2).
+//! Round 98 adds `LZWDecode` (§7.4.4.2). Round 104 adds the
+//! `/DecodeParms /Predictor` post-filter ([`apply_predictor`],
+//! §7.4.4.4) shared by every Flate / LZW stream.
 //!
 //! All decoders consume `&[u8]` input and return `Result<Vec<u8>,
 //! PdfError>` — there is no state-machine surface, so each call is
@@ -16,18 +18,19 @@
 //! ISO 32000-1:2008 §7.4 (Filters), §7.4.2 (ASCIIHexDecode), §7.4.3
 //! (ASCII85Decode), §7.4.4 (LZWDecode + FlateDecode), §7.4.4.2
 //! (Details of LZW Encoding), §7.4.4.3 (`/EarlyChange` parameter),
-//! §7.4.5 (RunLengthDecode). No third-party PDF library was
-//! consulted.
+//! §7.4.4.4 (LZW and Flate Predictor Functions, Tables 8/9/10),
+//! §7.4.5 (RunLengthDecode). PNG predictor algorithms per RFC 2083
+//! §6 (the WWW Consortium recommendation the spec references). No
+//! third-party PDF library was consulted.
 
 use crate::error::PdfError;
 
 /// FlateDecode — zlib-wrapped DEFLATE per §7.4.4 / RFC 1950 + RFC
-/// 1951. The `/Predictor` post-filter (§7.4.4.4 PNG-Up etc.) is
-/// **not** applied here — the caller decides whether to walk the
-/// per-row predictor (xref streams + Image XObjects with
-/// `/DecodeParms /Predictor n`); the round-35 image walkers don't
-/// invoke it because Image XObject payloads carry their own
-/// per-row predictor unwrapping inside the codec (DCT/JPX/...).
+/// 1951. This routine returns the inflated bytes only; the
+/// `/DecodeParms /Predictor` post-filter (§7.4.4.4) is run separately
+/// by [`apply_predictor`] when the caller's filter dispatch sees
+/// `/Predictor` > 1 in the parameter dict (`decode_stream` chains the
+/// two automatically as of round 104).
 pub fn flate_decompress(input: &[u8]) -> Result<Vec<u8>, PdfError> {
     use flate2::read::ZlibDecoder;
     use std::io::Read;
@@ -333,6 +336,233 @@ pub fn lzw_decode(input: &[u8]) -> Result<Vec<u8>, PdfError> {
     lzw_decode_with_early_change(input, true)
 }
 
+/// The `/DecodeParms` predictor configuration for an `LZWDecode` /
+/// `FlateDecode` stream (§7.4.4.4, Table 8). All four fields take the
+/// spec defaults when the parameter dictionary omits them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PredictorParams {
+    /// `/Predictor` (Table 10): `1` = none, `2` = TIFF Predictor 2,
+    /// `10..=15` = PNG predictors (the row tag chooses which per row).
+    pub predictor: i64,
+    /// `/Colors` — interleaved colour components per sample (default 1).
+    pub colors: usize,
+    /// `/BitsPerComponent` — bits per colour component (default 8).
+    pub bits_per_component: usize,
+    /// `/Columns` — samples per row (default 1).
+    pub columns: usize,
+}
+
+impl Default for PredictorParams {
+    fn default() -> Self {
+        // §7.4.4.4 Table 8 defaults.
+        PredictorParams {
+            predictor: 1,
+            colors: 1,
+            bits_per_component: 8,
+            columns: 1,
+        }
+    }
+}
+
+/// Reverse the `/Predictor` post-filter that `LZWDecode` /
+/// `FlateDecode` streams may apply before compression (§7.4.4.4).
+///
+/// Prediction replaces each sample with the difference from a
+/// predictor function over earlier neighbouring samples so the
+/// pre-compression data clusters toward 0; this routine undoes that
+/// differencing on the decompressed bytes.
+///
+/// Two predictor groups are defined (Table 10):
+///
+/// * **TIFF Predictor 2** (`/Predictor 2`) — each colour component is
+///   predicted to equal the corresponding component of the sample
+///   immediately to its left. Operates at component granularity, so
+///   sub-byte `/BitsPerComponent` (1 / 2 / 4) is unpacked per
+///   component, differenced modulo `2^bpc`, and repacked.
+/// * **PNG predictors** (`/Predictor 10..=15`) — each row carries a
+///   one-byte algorithm tag (Table 9: 0 None / 1 Sub / 2 Up /
+///   3 Average / 4 Paeth); the `/Predictor` value only signals "a PNG
+///   predictor is in use" and the per-row tag is authoritative
+///   (§7.4.4.4 ¶ "the specific predictor function used shall be
+///   explicitly encoded in the incoming data"). PNG "left"/"upper-left"
+///   neighbours are the bytes `bpp` positions back, where
+///   `bpp = ceil(Colors * BitsPerComponent / 8)`.
+///
+/// `/Predictor 1` (the default) returns the input unchanged. Per the
+/// shared assumptions, a row occupies a whole number of bytes (rounded
+/// up) and samples outside the image contribute 0.
+pub fn apply_predictor(data: &[u8], params: &PredictorParams) -> Result<Vec<u8>, PdfError> {
+    if params.predictor <= 1 {
+        // No prediction — pass through unchanged.
+        return Ok(data.to_vec());
+    }
+    if params.colors == 0 || params.bits_per_component == 0 || params.columns == 0 {
+        return Err(PdfError::other(
+            "PDF filter: predictor /Colors, /BitsPerComponent, /Columns must be positive",
+        ));
+    }
+    if !matches!(params.bits_per_component, 1 | 2 | 4 | 8 | 16) {
+        return Err(PdfError::other(format!(
+            "PDF filter: predictor /BitsPerComponent {} invalid (1, 2, 4, 8, 16)",
+            params.bits_per_component
+        )));
+    }
+    // Bits per pixel (sample) and the byte-rounded row width
+    // (§7.4.4.4: "A row shall occupy a whole number of bytes").
+    let bits_per_pixel = params.colors * params.bits_per_component;
+    let row_bytes = bits_per_pixel
+        .checked_mul(params.columns)
+        .map(|b| b.div_ceil(8))
+        .ok_or_else(|| PdfError::other("PDF filter: predictor row width overflow"))?;
+    if row_bytes == 0 {
+        return Ok(Vec::new());
+    }
+
+    match params.predictor {
+        2 => tiff_predictor_2(data, params, row_bytes),
+        10..=15 => png_predictor(data, bits_per_pixel.div_ceil(8).max(1), row_bytes),
+        other => Err(PdfError::other(format!(
+            "PDF filter: /Predictor {other} not supported (1, 2, 10..=15)"
+        ))),
+    }
+}
+
+/// TIFF Predictor 2 (§7.4.4.4 NOTE 1) — every component equals the
+/// component `Colors` positions (one sample) to its left, modulo
+/// `2^BitsPerComponent`. For the common 8-bit case this is a per-byte
+/// running sum; sub-byte components are unpacked, summed, and repacked.
+fn tiff_predictor_2(
+    data: &[u8],
+    params: &PredictorParams,
+    row_bytes: usize,
+) -> Result<Vec<u8>, PdfError> {
+    if data.len() % row_bytes != 0 {
+        return Err(PdfError::other(format!(
+            "PDF filter: TIFF predictor row width {row_bytes} does not divide data length {}",
+            data.len()
+        )));
+    }
+    let mut out = data.to_vec();
+    let bpc = params.bits_per_component;
+    let comps_per_row = params.colors * params.columns;
+    for row in out.chunks_mut(row_bytes) {
+        if bpc == 8 {
+            // Each byte is one component; predict from the component
+            // `colors` bytes back (the same colour in the prior sample).
+            for i in params.colors..row.len() {
+                row[i] = row[i].wrapping_add(row[i - params.colors]);
+            }
+        } else if bpc == 16 {
+            // Two bytes per component, big-endian; component i predicts
+            // from component i - colors.
+            let total = row.len() / 2;
+            for i in params.colors..total {
+                let prev = u16::from_be_bytes([
+                    row[2 * (i - params.colors)],
+                    row[2 * (i - params.colors) + 1],
+                ]);
+                let cur = u16::from_be_bytes([row[2 * i], row[2 * i + 1]]);
+                let sum = cur.wrapping_add(prev).to_be_bytes();
+                row[2 * i] = sum[0];
+                row[2 * i + 1] = sum[1];
+            }
+        } else {
+            // Sub-byte components (1 / 2 / 4 bits): unpack big-end
+            // first, run the per-component sum, repack.
+            let mask = (1u16 << bpc) - 1;
+            let mut comps: Vec<u16> = Vec::with_capacity(comps_per_row);
+            let mut bit = 0usize;
+            for _ in 0..comps_per_row {
+                let byte = row[bit / 8];
+                let shift = 8 - bpc - (bit % 8);
+                comps.push(((byte as u16) >> shift) & mask);
+                bit += bpc;
+            }
+            for i in params.colors..comps.len() {
+                comps[i] = (comps[i] + comps[i - params.colors]) & mask;
+            }
+            // Repack (clearing the data region first; trailing pad bits
+            // stay 0 per the whole-byte-row rule).
+            for b in row.iter_mut() {
+                *b = 0;
+            }
+            let mut bit = 0usize;
+            for c in comps {
+                let shift = 8 - bpc - (bit % 8);
+                row[bit / 8] |= ((c & mask) << shift) as u8;
+                bit += bpc;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// PNG predictor group (§7.4.4.4, Table 9) — each input row is
+/// `1 + row_bytes` long: a leading algorithm tag then the row data.
+/// `bpp` is the byte distance to the "left"/"upper-left" neighbours.
+fn png_predictor(data: &[u8], bpp: usize, row_bytes: usize) -> Result<Vec<u8>, PdfError> {
+    let stride = row_bytes + 1;
+    if data.len() % stride != 0 {
+        return Err(PdfError::other(format!(
+            "PDF filter: PNG predictor row stride {stride} does not divide data length {}",
+            data.len()
+        )));
+    }
+    let rows = data.len() / stride;
+    let mut out = vec![0u8; rows * row_bytes];
+    let mut prev = vec![0u8; row_bytes];
+    for r in 0..rows {
+        let tag = data[r * stride];
+        let src = &data[r * stride + 1..r * stride + stride];
+        let dst_start = r * row_bytes;
+        for i in 0..row_bytes {
+            let raw = src[i];
+            let left = if i >= bpp {
+                out[dst_start + i - bpp]
+            } else {
+                0
+            };
+            let up = prev[i];
+            let up_left = if i >= bpp { prev[i - bpp] } else { 0 };
+            let recon = match tag {
+                0 => raw,                    // None
+                1 => raw.wrapping_add(left), // Sub
+                2 => raw.wrapping_add(up),   // Up
+                3 => {
+                    // Average — floor((left + up) / 2).
+                    let avg = ((left as u16 + up as u16) / 2) as u8;
+                    raw.wrapping_add(avg)
+                }
+                4 => raw.wrapping_add(paeth(left, up, up_left)), // Paeth
+                other => {
+                    return Err(PdfError::other(format!(
+                        "PDF filter: PNG predictor row tag {other} unknown (0..=4)"
+                    )))
+                }
+            };
+            out[dst_start + i] = recon;
+        }
+        prev.copy_from_slice(&out[dst_start..dst_start + row_bytes]);
+    }
+    Ok(out)
+}
+
+/// PNG Paeth predictor (RFC 2083 §6.6) over the three byte neighbours.
+fn paeth(a: u8, b: u8, c: u8) -> u8 {
+    let (a, b, c) = (a as i16, b as i16, c as i16);
+    let p = a + b - c;
+    let pa = (p - a).abs();
+    let pb = (p - b).abs();
+    let pc = (p - c).abs();
+    if pa <= pb && pa <= pc {
+        a as u8
+    } else if pb <= pc {
+        b as u8
+    } else {
+        c as u8
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,5 +689,131 @@ mod tests {
         }
         let out = lzw_decode(&packed).unwrap();
         assert_eq!(out, b"aaaaaaaa");
+    }
+
+    #[test]
+    fn predictor_1_passes_through() {
+        let data = [1u8, 2, 3, 4, 5];
+        let p = PredictorParams {
+            predictor: 1,
+            ..Default::default()
+        };
+        assert_eq!(apply_predictor(&data, &p).unwrap(), data);
+    }
+
+    #[test]
+    fn png_up_predictor_round_trip() {
+        // Two rows of 3 single-byte samples, Colors=1, BPC=8, bpp=1.
+        // Original rows: [10,20,30] and [11,22,33].
+        // PNG-Up encode (tag 2): row0 has no prior → stored as itself
+        // (tag 0); row1 = row1 - row0 = [1,2,3] with tag 2.
+        let encoded = [
+            0u8, 10, 20, 30, // row 0: tag None, raw values
+            2, 1, 2, 3, // row 1: tag Up, deltas from row 0
+        ];
+        let p = PredictorParams {
+            predictor: 12, // PNG-Up signalled (per-row tag authoritative)
+            colors: 1,
+            bits_per_component: 8,
+            columns: 3,
+        };
+        let out = apply_predictor(&encoded, &p).unwrap();
+        assert_eq!(out, [10u8, 20, 30, 11, 22, 33]);
+    }
+
+    #[test]
+    fn png_sub_predictor_respects_bpp() {
+        // One row, Colors=3 (RGB), BPC=8 → bpp=3, columns=2 → 6 bytes.
+        // Original: [R0=50,G0=60,B0=70, R1=55,G1=66,B1=77].
+        // PNG-Sub (tag 1): each byte minus the byte bpp(=3) back; the
+        // first sample has no left neighbour (treated as 0).
+        // Encoded data = [50,60,70, 5,6,7].
+        let encoded = [1u8, 50, 60, 70, 5, 6, 7];
+        let p = PredictorParams {
+            predictor: 11,
+            colors: 3,
+            bits_per_component: 8,
+            columns: 2,
+        };
+        let out = apply_predictor(&encoded, &p).unwrap();
+        assert_eq!(out, [50u8, 60, 70, 55, 66, 77]);
+    }
+
+    #[test]
+    fn png_average_and_paeth_match_definitions() {
+        // Single 1-byte-sample row exercising Average then Paeth.
+        // Row 0 (tag None): [100]. Row 1 (tag Average): predict
+        // floor((left=0 + up=100)/2)=50, raw stored = 30 → recon 80.
+        // Row 2 (tag Paeth): left=0, up=80, up_left=0 → paeth=80; raw
+        // stored 5 → recon 85.
+        let encoded = [0u8, 100, 3, 30, 4, 5];
+        let p = PredictorParams {
+            predictor: 15,
+            colors: 1,
+            bits_per_component: 8,
+            columns: 1,
+        };
+        let out = apply_predictor(&encoded, &p).unwrap();
+        assert_eq!(out, [100u8, 80, 85]);
+    }
+
+    #[test]
+    fn tiff_predictor_2_eight_bit() {
+        // Colors=1, BPC=8, columns=4. Original row [5,10,15,20] encoded
+        // as left-differences [5,5,5,5]; decode sums them back.
+        let encoded = [5u8, 5, 5, 5];
+        let p = PredictorParams {
+            predictor: 2,
+            colors: 1,
+            bits_per_component: 8,
+            columns: 4,
+        };
+        let out = apply_predictor(&encoded, &p).unwrap();
+        assert_eq!(out, [5u8, 10, 15, 20]);
+    }
+
+    #[test]
+    fn tiff_predictor_2_rgb_interleaved() {
+        // Colors=3, BPC=8, columns=2 → 6 bytes. Original
+        // [10,20,30, 40,60,80]; left-diff per component is
+        // [10,20,30, 30,40,50] (sample 1 minus sample 0 per channel).
+        let encoded = [10u8, 20, 30, 30, 40, 50];
+        let p = PredictorParams {
+            predictor: 2,
+            colors: 3,
+            bits_per_component: 8,
+            columns: 2,
+        };
+        let out = apply_predictor(&encoded, &p).unwrap();
+        assert_eq!(out, [10u8, 20, 30, 40, 60, 80]);
+    }
+
+    #[test]
+    fn tiff_predictor_2_four_bit_components() {
+        // Colors=1, BPC=4, columns=4 → 4 components in 2 bytes.
+        // Original components [3,5,8,12]; left-diffs [3,2,3,4] modulo
+        // 16. Packed big-end-first: byte0 = 0x32, byte1 = 0x34.
+        let encoded = [0x32u8, 0x34];
+        let p = PredictorParams {
+            predictor: 2,
+            colors: 1,
+            bits_per_component: 4,
+            columns: 4,
+        };
+        let out = apply_predictor(&encoded, &p).unwrap();
+        // Reconstructed components [3,5,8,12] → packed 0x35, 0x8C.
+        assert_eq!(out, [0x35u8, 0x8C]);
+    }
+
+    #[test]
+    fn png_predictor_rejects_misaligned_data() {
+        // 3-byte data with stride 4 (columns=3 + tag) does not divide.
+        let p = PredictorParams {
+            predictor: 12,
+            colors: 1,
+            bits_per_component: 8,
+            columns: 3,
+        };
+        assert!(apply_predictor(&[2u8, 1, 2], &p).is_err());
     }
 }

@@ -318,7 +318,7 @@ Catalog) into one ObjStm container — opt in via
 (content streams, image XObjects, the xref stream itself) cannot be
 compressed per §7.5.7 and remain at their own byte offsets.
 
-## Stream filters (round 98 adds LZWDecode)
+## Stream filters (round 104 adds the `/Predictor` post-filter)
 
 `decode_stream` recovers a stream's raw payload by applying its
 `/Filter` (single `Name` or `Array` chain, §7.4.1). The generic
@@ -338,15 +338,34 @@ decompression filters are all handled in array order, so chains like
   position, including the inline-image abbreviations (`/Fl`, `/LZW`,
   `/A85`, `/AHx`, `/RL`).
 
+Round 104 wires the **`/DecodeParms /Predictor` post-filter**
+(§7.4.4.4) into `decode_stream`, so a `/FlateDecode` or `/LZWDecode`
+stream whose `/DecodeParms` carries `/Predictor` > 1 is un-differenced
+after inflating — the same path the xref-stream walker already used,
+now reaching every generic stream:
+
+- **PNG predictors** (`/Predictor 10..=15`, Table 10) — each row's
+  leading algorithm tag (Table 9: None / Sub / Up / Average / Paeth)
+  is authoritative, with the "left"/"upper-left" neighbours taken
+  `bpp = ceil(Colors * BitsPerComponent / 8)` bytes back.
+- **TIFF Predictor 2** (`/Predictor 2`) — per-component left
+  differencing, with sub-byte `/BitsPerComponent` (1 / 2 / 4) unpacked,
+  summed modulo `2^bpc`, and repacked; 8- and 16-bit components run
+  byte/word-wise.
+
+`/Colors`, `/BitsPerComponent`, and `/Columns` are read from the same
+parameter dict (Table 8 defaults 1 / 8 / 1). `/Predictor 1` (or no
+`/DecodeParms`) is a no-op passthrough.
+
 Terminal image-codec filters (`/DCTDecode`, `/JPXDecode`,
 `/JBIG2Decode`, `/CCITTFaxDecode`) are *not* decoded here — they keep
 routing to the dedicated image walkers that hand the opaque payload to
-a codec crate. The `/DecodeParms /Predictor` post-filter (§7.4.4.4)
-is still only applied by the xref-stream path; LZW/Flate streams that
-carry an image `/Predictor` land in a follow-up round.
+a codec crate.
 
 Validated against ISO 32000-1:2008 §7.4.4.2 Example 2's packed vector
-(`80 0B 60 50 22 0C 0C 85 01` → `45 45 45 45 45 65 45 45 45 66`).
+(`80 0B 60 50 22 0C 0C 85 01` → `45 45 45 45 45 65 45 45 45 66`), plus
+PNG (Sub / Up / Average / Paeth) and TIFF-2 (8-bit, RGB-interleaved,
+4-bit) predictor round-trips.
 
 ## Indirect stream `/Length` (round 91)
 
