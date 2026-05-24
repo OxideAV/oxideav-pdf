@@ -305,6 +305,19 @@ The classical `xref`-keyword form (PDF 1.0..1.4) is also accepted
 on input and remains the writer's default; opt into the stream form
 via [`oxideav_pdf::write_pdf_from_scene_xref_stream`].
 
+**Hybrid-reference files** (§7.5.8.4) are also accepted on the read
+path. A hybrid PDF carries a classical `xref` subsection (so
+pre-PDF-1.5 tools can still find the catalog and page tree) plus an
+`/XRefStm offset` entry in the same update trailer that points at a
+supplementary `/Type /XRef` stream. The supplementary stream surfaces
+the compressed-object slots the classical subsection marks `free`.
+The reader follows the §7.5.8.4 resolution order — current section's
+classical entries first, then its `/XRefStm` entries, then walk
+`/Prev` — and applies a newer-wins merge so hidden compressed slots
+override the classical `free` markers they shadow. Chained `/XRefStm`
+references are bounded at 32 hops and short-circuit on cycles, the
+same guards the `/Prev`-section walker already enforces.
+
 ## Object streams
 
 Both reader and writer support PDF 1.5+ object streams

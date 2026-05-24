@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- reader: §7.5.8.4 hybrid-reference (`/XRefStm`) merge in `parse_xref`
+
 ## [0.1.2](https://github.com/OxideAV/oxideav-pdf/compare/v0.1.1...v0.1.2) - 2026-05-24
 
 ### Other

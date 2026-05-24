@@ -16,6 +16,18 @@
 //!   stream's dict carries the same trailer-dict slots as the plain
 //!   variant (`/Size`, `/Root`, `/Info`, `/Prev`, `/Encrypt`, `/ID`).
 //!
+//! **Hybrid-reference files** (§7.5.8.4) — a PDF whose `/Prev`-chained
+//! update trailer carries an `/XRefStm offset` entry alongside the
+//! classical `xref` subsections. PDF 1.5+ writers emit this shape to
+//! stay readable by pre-PDF-1.5 tools (which ignore `/XRefStm` and
+//! see only the classical entries) while letting modern readers find
+//! the compressed-object slots that are marked `free` in the
+//! classical table. The reader follows the spec's resolution order:
+//! the current section's classical entries first, then its `/XRefStm`
+//! entries, then `/Prev`. Newest wins on overlap, so a compressed-
+//! object slot that the classical table marks `free` is overridden
+//! by the corresponding `Compressed` entry from the `/XRefStm`.
+//!
 //! [`XrefTable`] turns into a [`Document`] of resolved indirect
 //! objects via the top-level walker — the intermediate type lets the
 //! reader resolve indirect references on demand without re-parsing
@@ -263,6 +275,24 @@ pub fn parse_xref(input: &[u8]) -> Result<XrefTable, PdfError> {
     // re-declare.
     let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
     visited.insert(current_off);
+    // Hybrid-reference file (§7.5.8.4): if the newest revision's
+    // trailer carries an `/XRefStm offset`, merge the entries from
+    // that supplementary xref stream BEFORE walking `/Prev`. Per
+    // §7.5.8.4, the resolution order is "classical entries → XRefStm
+    // entries → older sections via /Prev" with the newer winning, so
+    // the merge uses `or_insert` to leave already-declared slots
+    // untouched. The XRefStm-stream's own trailer-shaped dict slots
+    // (/Root, /Size, /Encrypt, …) are intentionally NOT merged: the
+    // §7.5.8.4 spec exists precisely so pre-PDF-1.5 readers can rely
+    // on the classical trailer alone, and a hybrid file is only
+    // well-formed when both halves agree on those keys.
+    let xrefstm_visited = &mut visited.clone();
+    merge_xrefstm_if_present(
+        input,
+        &newest.trailer.clone(),
+        &mut newest.entries,
+        xrefstm_visited,
+    )?;
     loop {
         let prev_off = newest
             .trailer
@@ -292,6 +322,11 @@ pub fn parse_xref(input: &[u8]) -> Result<XrefTable, PdfError> {
         for (id, entry) in older.entries {
             newest.entries.entry(id).or_insert(entry);
         }
+        // Hybrid-reference (§7.5.8.4) — older sections may also carry
+        // `/XRefStm` (the spec only bars it from the *main* section);
+        // resolve before stepping further back via /Prev. Newer-wins
+        // still applies, so the XRefStm only fills gaps.
+        merge_xrefstm_if_present(input, &older.trailer, &mut newest.entries, xrefstm_visited)?;
         // Move /Prev into the in-progress trailer so the next loop
         // iteration sees the older section's /Prev (chains can be
         // longer than one hop).
@@ -328,6 +363,63 @@ pub fn parse_xref(input: &[u8]) -> Result<XrefTable, PdfError> {
     }
     let _ = current_off;
     Ok(newest)
+}
+
+/// Resolve the `/XRefStm` entry of `trailer` (if any), parse the
+/// supplementary xref stream at that offset, and merge its entries
+/// into `into` using `or_insert` (newer-wins). `visited` records
+/// already-consulted offsets so a malicious `/XRefStm` cycle can't
+/// loop forever; the visited set is shared with the `/Prev` walker
+/// so cross-cycles are also caught.
+///
+/// ISO 32000-1 §7.5.8.4 ("Compatibility with Applications That Do
+/// Not Support Compressed Reference Streams"): hybrid-reference files
+/// place compressed-object slots in an XRef stream while keeping a
+/// classical xref subsection visible to pre-1.5 readers. The classical
+/// entries mark the compressed objects as `free` (so old readers
+/// resolve them to null), and the XRefStm carries the actual
+/// `Compressed` slots that a modern reader needs to look up.
+fn merge_xrefstm_if_present(
+    input: &[u8],
+    trailer: &Dict,
+    into: &mut HashMap<u32, XrefEntry>,
+    visited: &mut std::collections::HashSet<u64>,
+) -> Result<(), PdfError> {
+    let xrefstm_off = trailer
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "XRefStm")
+        .and_then(|(_, v)| match v {
+            Object::Integer(n) if *n >= 0 => Some(*n as u64),
+            _ => None,
+        });
+    let Some(off) = xrefstm_off else {
+        return Ok(());
+    };
+    // Refuse cycles (an /XRefStm that points back at an already-
+    // visited classical section or another XRefStm we've already
+    // merged would loop forever).
+    if !visited.insert(off) {
+        return Err(PdfError::other(
+            "PDF reader: /XRefStm offset already visited (cycle in hybrid-reference chain)",
+        ));
+    }
+    if visited.len() > 32 {
+        return Err(PdfError::other(
+            "PDF reader: /XRefStm chain exceeds 32 hops — refusing",
+        ));
+    }
+    if off as usize >= input.len() {
+        return Err(PdfError::other(format!(
+            "PDF reader: /XRefStm offset {off} past end of file ({} bytes)",
+            input.len()
+        )));
+    }
+    let supp = parse_xref_stream_at(input, off as usize)?;
+    for (id, entry) in supp.entries {
+        into.entry(id).or_insert(entry);
+    }
+    Ok(())
 }
 
 fn skip_whitespace(input: &[u8], lex: &mut Lexer<'_>) {
