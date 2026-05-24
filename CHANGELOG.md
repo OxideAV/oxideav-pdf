@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 115: **DeviceCMYK content-stream colour** (`k` / `K`
+  operators, ISO 32000-1:2008 §8.6.4.4 + §10.3.5). The content-stream
+  parser previously discarded the four CMYK operands and fell back to
+  opaque black for both fill (`k`) and stroke (`K`). It now converts
+  the colour to the IR's DeviceRGB via the spec's §10.3.5
+  ("Conversion from DeviceCMYK to DeviceRGB") formula — a simple
+  operation that involves no black generation or undercolour removal:
+  `red = 1 − min(1, cyan + black)`, `green = 1 − min(1, magenta +
+  black)`, `blue = 1 − min(1, yellow + black)`. The new
+  `rgb_from_cmyk` helper clamps each operand into `0.0..=1.0` first so
+  an out-of-range value is substituted with the nearest valid one
+  without error (§10.3.4 NOTE 4), and the `min(1.0, …)` ceiling caps
+  ink+black so the sum cannot wrap past full saturation. Pure cyan
+  now reconstructs as `(0,255,255)`, magenta `(255,0,255)`, yellow
+  `(255,255,0)`, and `0 0 0 1 k` as black — instead of every CMYK
+  colour collapsing to black. Verified with the pure-ink cases, the
+  ink+black clamp, out-of-range clamping, and an end-to-end `k`/`K`
+  content-stream round-trip.
+
 - Round 104: **`/DecodeParms /Predictor` post-filter** (ISO 32000-1:2008
   §7.4.4.4) is now applied by the central `decode_stream` dispatch for
   `FlateDecode` / `LZWDecode` streams, not just the xref-stream path.

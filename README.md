@@ -1031,6 +1031,19 @@ surfaces timestamps separately via `DocumentReader::doc_timestamps()`
 the output; when `openssl ts -verify` is on PATH, it accepts the
 embedded TST.
 
+## Content-stream DeviceCMYK colour (round 115)
+
+The content-stream parser now honours the `k` (fill) and `K` (stroke)
+**DeviceCMYK** colour operators (ISO 32000-1 §8.6.4.4). Because the
+vector IR carries only DeviceRGB, each CMYK colour is converted via
+§10.3.5 ("Conversion from DeviceCMYK to DeviceRGB") — `red = 1 −
+min(1, cyan + black)` and the magenta/yellow counterparts, no black
+generation or undercolour removal. Pure cyan/magenta/yellow inks
+reconstruct as `(0,255,255)` / `(255,0,255)` / `(255,255,0)` and
+`0 0 0 1 k` as black, where the parser previously collapsed every
+CMYK colour to opaque black. Out-of-range operands are clamped to
+`0.0..=1.0` first (§10.3.4 NOTE 4).
+
 ## Deferred
 
 - **Text emission** — writer-side `BT … Tj … ET` for `Node::Text`

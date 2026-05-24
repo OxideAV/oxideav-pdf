@@ -20,7 +20,7 @@
 //! | `W` / `W*`           | clip — assigns to the current group's `clip` |
 //! | `rg` / `RG`          | fill / stroke colour (DeviceRGB)         |
 //! | `g` / `G`            | grayscale fill / stroke (round-3 maps to RGB triplet) |
-//! | `k` / `K`            | CMYK fill / stroke — round-3 ignores (no IR slot) |
+//! | `k` / `K`            | DeviceCMYK fill / stroke — converted to RGB per §10.3.5 |
 //! | `w` / `J` / `j` / `M`| stroke width / cap / join / miter limit  |
 //! | `d`                  | dash array + offset                      |
 //! | `gs` / `cs` / `CS` / `scn` / `SCN` | resource references — round-3 records names but doesn't resolve |
@@ -335,9 +335,14 @@ impl State {
                 self.stroke_paint = Some(Paint::Solid(rgb_from_unit(nums[0], nums[0], nums[0])));
             }
             b"k" | b"K" => {
-                // CMYK — IR has no slot, fall back to black for now.
-                let _ = self.take_numbers(4);
-                let p = Some(Paint::Solid(Rgba::opaque(0, 0, 0)));
+                // DeviceCMYK fill (`k`) / stroke (`K`). The IR carries
+                // only RGB, so convert per ISO 32000-1 §10.3.5
+                // (DeviceCMYK → DeviceRGB): a simple operation that does
+                // not involve black generation or undercolour removal.
+                let nums = self.take_numbers(4)?;
+                let p = Some(Paint::Solid(rgb_from_cmyk(
+                    nums[0], nums[1], nums[2], nums[3],
+                )));
                 if op == b"K" {
                     self.stroke_paint = p;
                 } else {
@@ -642,6 +647,32 @@ fn rgb_from_unit(r: f32, g: f32, b: f32) -> Rgba {
     Rgba::opaque(unit_to_byte(r), unit_to_byte(g), unit_to_byte(b))
 }
 
+/// Convert a DeviceCMYK colour value to DeviceRGB per ISO 32000-1
+/// §10.3.5 ("Conversion from DeviceCMYK to DeviceRGB"):
+///
+/// ```text
+/// red   = 1.0 − min(1.0, cyan    + black)
+/// green = 1.0 − min(1.0, magenta + black)
+/// blue  = 1.0 − min(1.0, yellow  + black)
+/// ```
+///
+/// The black component is added to each of the other components, which
+/// are then converted to their complementary colours by subtracting
+/// each from 1.0. No black generation or undercolour removal is
+/// involved. Components are clamped into 0.0..=1.0 first so an
+/// out-of-range operand cannot escape the 1.0 ceiling (§10.3.4 NOTE 4
+/// applies the same nearest-valid-value substitution without error).
+fn rgb_from_cmyk(cyan: f32, magenta: f32, yellow: f32, black: f32) -> Rgba {
+    let c = cyan.clamp(0.0, 1.0);
+    let m = magenta.clamp(0.0, 1.0);
+    let y = yellow.clamp(0.0, 1.0);
+    let k = black.clamp(0.0, 1.0);
+    let red = 1.0 - (c + k).min(1.0);
+    let green = 1.0 - (m + k).min(1.0);
+    let blue = 1.0 - (y + k).min(1.0);
+    rgb_from_unit(red, green, blue)
+}
+
 fn unit_to_byte(f: f32) -> u8 {
     (f.clamp(0.0, 1.0) * 255.0).round() as u8
 }
@@ -911,5 +942,70 @@ mod tests {
         assert!(g.clip.is_some());
         // The triangle painted afterwards lives as a child node.
         assert_eq!(g.children.len(), 1);
+    }
+
+    /// §10.3.5 fundamental cases: pure inks convert to their RGB
+    /// complements, and pure black yields RGB black.
+    #[test]
+    fn cmyk_pure_inks_convert_per_10_3_5() {
+        // cyan=1 → red=1−min(1,1+0)=0, green=blue=1 → (0,255,255).
+        assert_eq!(rgb_from_cmyk(1.0, 0.0, 0.0, 0.0), Rgba::opaque(0, 255, 255));
+        // magenta=1 → (255,0,255).
+        assert_eq!(rgb_from_cmyk(0.0, 1.0, 0.0, 0.0), Rgba::opaque(255, 0, 255));
+        // yellow=1 → (255,255,0).
+        assert_eq!(rgb_from_cmyk(0.0, 0.0, 1.0, 0.0), Rgba::opaque(255, 255, 0));
+        // black=1 → every channel 1−min(1,0+1)=0 → (0,0,0).
+        assert_eq!(rgb_from_cmyk(0.0, 0.0, 0.0, 1.0), Rgba::opaque(0, 0, 0));
+        // all zero → white.
+        assert_eq!(
+            rgb_from_cmyk(0.0, 0.0, 0.0, 0.0),
+            Rgba::opaque(255, 255, 255)
+        );
+    }
+
+    /// The `min(1.0, comp + black)` ceiling caps the sum so an ink
+    /// plus black never wraps past full saturation.
+    #[test]
+    fn cmyk_component_plus_black_clamps_at_one() {
+        // cyan=0.7 black=0.7 → red=1−min(1,1.4)=0; green/blue=1−0.7=0.3.
+        let r = rgb_from_cmyk(0.7, 0.0, 0.0, 0.7);
+        assert_eq!(r.r, 0);
+        assert_eq!(r.g, (0.3f32 * 255.0).round() as u8);
+        assert_eq!(r.b, (0.3f32 * 255.0).round() as u8);
+    }
+
+    /// Out-of-range operands are clamped before the formula (§10.3.4
+    /// NOTE 4 nearest-valid-value substitution).
+    #[test]
+    fn cmyk_out_of_range_operands_clamp() {
+        // Negative and >1 operands behave as 0.0 / 1.0.
+        assert_eq!(
+            rgb_from_cmyk(-0.5, 2.0, 0.0, 0.0),
+            rgb_from_cmyk(0.0, 1.0, 0.0, 0.0)
+        );
+    }
+
+    /// End-to-end through the content parser: `k` sets the fill paint,
+    /// `K` sets the stroke paint, both via the §10.3.5 conversion.
+    #[test]
+    fn k_and_upper_k_operators_apply_cmyk_conversion() {
+        // Fill = pure cyan (0,255,255); stroke = pure magenta (255,0,255).
+        let bytes = b"q 1 0 0 0 k 0 1 0 0 K 0 0 m 10 10 l 10 0 l h B Q\n";
+        let root = parse(bytes);
+        let Node::Group(g) = &root.children[0] else {
+            panic!("expected group")
+        };
+        let Node::Path(p) = &g.children[0] else {
+            panic!("expected path")
+        };
+        match &p.fill {
+            Some(Paint::Solid(c)) => assert_eq!((c.r, c.g, c.b), (0, 255, 255)),
+            other => panic!("unexpected fill: {other:?}"),
+        }
+        let s = p.stroke.as_ref().expect("stroke set");
+        match &s.paint {
+            Paint::Solid(c) => assert_eq!((c.r, c.g, c.b), (255, 0, 255)),
+            other => panic!("unexpected stroke paint: {other:?}"),
+        }
     }
 }
