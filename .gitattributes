@@ -1,0 +1,10 @@
+# Hand-built test fixtures under tests/fixtures/ are byte-exact PDF
+# bytestreams — git's text/binary autodetect occasionally classifies
+# the smaller ones (mostly-ASCII bodies with a token binary marker)
+# as text, and the resulting CRLF normalisation on Windows checkout
+# breaks the round-trip byte equality the round-122 / round-125
+# `fixture_round_trips_in_memory_and_on_disk` tests enforce.
+#
+# Force every fixture under tests/fixtures/ to binary so checkouts
+# preserve the exact bytes on every platform.
+tests/fixtures/* binary
