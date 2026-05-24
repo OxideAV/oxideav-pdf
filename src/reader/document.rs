@@ -35,7 +35,7 @@ use crate::objects::{Dict, Object, ObjectId, Stream};
 use crate::pubsec::{
     open_with_certificate, open_with_certificate_and_trust_store, PubSecCredential, TrustStore,
 };
-use crate::reader::content::parse_content_stream;
+use crate::reader::content::parse_content_stream_with_resources;
 use crate::reader::parse::Parser;
 use crate::reader::xref::{parse_xref, XrefEntry, XrefTable};
 
@@ -1052,7 +1052,30 @@ fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Pag
         None => Vec::new(),
     };
 
-    let root = parse_content_stream(&content_bytes)?;
+    // /Resources is a dictionary or an indirect reference to one
+    // (§7.8.3 Table 33). Inheritance through `/Parent` is round-4+
+    // (matching the round-3 /MediaBox stance) — directly-attached
+    // entries only.
+    let resources_obj = page_dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Resources")
+        .map(|(_, v)| v.clone());
+    let resources_dict = match resources_obj {
+        Some(Object::Reference(id)) => match reader.resolve(id)? {
+            Object::Dict(d) => Some(d),
+            _ => None,
+        },
+        Some(Object::Dict(d)) => Some(d),
+        _ => None,
+    };
+    let ext_gstate_dict = if let Some(rdict) = resources_dict.as_ref() {
+        resolve_ext_gstate(reader, rdict)?
+    } else {
+        None
+    };
+
+    let root = parse_content_stream_with_resources(&content_bytes, ext_gstate_dict.as_ref())?;
     let mut page = Page::new(width, height);
     page.content = VectorFrame {
         width,
@@ -1063,6 +1086,50 @@ fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Pag
         time_base: TimeBase::new(1, 1),
     };
     Ok(page)
+}
+
+/// Resolve a page's `/Resources /ExtGState` subdictionary into a
+/// fully-dereferenced [`Dict`] (each per-name `/GSx` value is itself
+/// resolved into a direct `Dict` if it was an indirect reference).
+/// Returns `Ok(None)` when the resources dict carries no `/ExtGState`
+/// entry — the most common case for documents that don't use the
+/// `gs` operator.
+///
+/// Only direct + single-hop indirect dicts are surfaced. A malformed
+/// entry (non-dict resolved value, deeply nested indirection beyond a
+/// single hop) is silently dropped so a `gs` against that name
+/// behaves as a tolerated no-op, matching the round-3 fallback.
+fn resolve_ext_gstate(
+    reader: &mut DocumentReader<'_>,
+    resources: &Dict,
+) -> Result<Option<Dict>, PdfError> {
+    let ext_obj = resources
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "ExtGState")
+        .map(|(_, v)| v.clone());
+    let ext_obj = match ext_obj {
+        Some(Object::Reference(id)) => reader.resolve(id)?,
+        Some(other) => other,
+        None => return Ok(None),
+    };
+    let Object::Dict(ext_dict) = ext_obj else {
+        return Ok(None);
+    };
+    // Walk each per-name entry; resolve a one-hop indirect reference
+    // into its target dict so the content-stream parser can read entry
+    // keys directly without touching the reader.
+    let mut out = Dict::new();
+    for (name, value) in ext_dict.entries() {
+        let resolved = match value {
+            Object::Reference(id) => reader.resolve(*id)?,
+            other => other.clone(),
+        };
+        if let Object::Dict(d) = resolved {
+            out.set(name, Object::Dict(d));
+        }
+    }
+    Ok(Some(out))
 }
 
 fn extract_stream_data(reader: &mut DocumentReader<'_>, id: ObjectId) -> Result<Vec<u8>, PdfError> {

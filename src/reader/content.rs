@@ -25,7 +25,22 @@
 //! | `d`                  | dash array + offset                      |
 //! | `cs` / `CS`          | select nonstroking / stroking colour space (device families resolved; resource keys → Unknown) |
 //! | `sc` / `scn` / `SC` / `SCN` | colour value in the current space — DeviceGray / DeviceRGB / DeviceCMYK components honoured (§8.6.8) |
-//! | `gs`                 | ExtGState resource reference — round-3 records the name but doesn't resolve |
+//! | `gs`                 | ExtGState resource lookup — round 125 resolves `LW` / `LC` / `LJ` / `ML` / `D` / `CA` / `ca` from the page's `/Resources /ExtGState` dict |
+//!
+//! ExtGState lookup (round 125): when a page's `/Resources /ExtGState`
+//! dictionary is plumbed in via [`parse_content_stream_with_resources`],
+//! a `/GSx gs` operator looks the named subdict up against Table 58
+//! (ISO 32000-1 §8.4.5) and applies the cumulative-merge subset that
+//! the IR can carry: line width (`LW`), line cap (`LC`), line join
+//! (`LJ`), miter limit (`ML`), dash pattern (`D`), and the stroking /
+//! nonstroking alpha constants (`CA` / `ca`) per §11.6.4.4. Soft mask
+//! (`SMask`), blend mode (`BM`), overprint (`OP` / `op` / `OPM`),
+//! transfer / halftone / black-generation, font (`Font`), and rendering
+//! intent (`RI`) are silently ignored — they require IR plumbing that
+//! the round-3 vector model doesn't carry yet. Unknown keys are tolerated
+//! per §8.4.5 ("any combination of parameter entries"). Without the
+//! resource-aware entry point, `gs` is still treated as a tolerated
+//! no-op so legacy `parse_content_stream` callers don't regress.
 //!
 //! Colour-space tracking (round 118): `cs` / `CS` record which device
 //! colour family is active so a following `sc` / `scn` (or `SC` /
@@ -51,14 +66,42 @@ use oxideav_core::vector::{
 };
 
 use crate::error::PdfError;
+use crate::objects::{Dict, Object};
 
 /// Parse a content-stream byte sequence into a single [`Group`]
 /// containing every shape painted by the stream. Nested `q`/`Q`
 /// brackets become nested `Node::Group` children. The returned root
 /// group has identity transform; per-`q` transforms live on the
 /// child groups.
+///
+/// `gs` operators are tolerated (operands dropped) since this entry
+/// point has no view of the page's `/Resources` dictionary. Callers
+/// that have already resolved the page resources should use
+/// [`parse_content_stream_with_resources`] so a `/GSx gs` can apply
+/// the named graphics-state parameter dictionary's entries to the
+/// current state per ISO 32000-1 §8.4.5.
 pub fn parse_content_stream(input: &[u8]) -> Result<Group, PdfError> {
-    let mut state = State::new();
+    let mut state = State::new(None);
+    state.parse(input)?;
+    Ok(state.finish())
+}
+
+/// Parse a content-stream with the page's resolved `/Resources
+/// /ExtGState` subdictionary attached. A `/Name gs` operator looks
+/// `Name` up in `ext_gstate` and applies the entries Table 58 defines
+/// that map cleanly onto the round-3 vector IR (`LW`, `LC`, `LJ`,
+/// `ML`, `D`, `CA`, `ca`).
+///
+/// The dictionary is read-only — keys are resolved by name lookup, no
+/// indirect-reference following is attempted (the caller is expected
+/// to have already resolved every child dict). When `ext_gstate` is
+/// `None` or doesn't contain the named entry, the `gs` operator
+/// silently no-ops, matching the round-3 fallback behaviour.
+pub fn parse_content_stream_with_resources(
+    input: &[u8],
+    ext_gstate: Option<&Dict>,
+) -> Result<Group, PdfError> {
+    let mut state = State::new(ext_gstate);
     state.parse(input)?;
     Ok(state.finish())
 }
@@ -69,7 +112,7 @@ pub fn parse_content_stream(input: &[u8]) -> Result<Group, PdfError> {
 /// active state is `stack.last_mut().unwrap()`; the always-present
 /// root frame collects whatever the input emits before any explicit
 /// `q`/`Q`.
-struct State {
+struct State<'a> {
     /// Argument stack — operands are pushed as the parser scans
     /// numbers, names, arrays; an operator keyword consumes them.
     operands: Vec<Operand>,
@@ -99,6 +142,18 @@ struct State {
     line_join: LineJoin,
     miter_limit: f32,
     dash: Option<DashPattern>,
+    /// Current nonstroking alpha constant (`ca`, §11.6.4.4 + Table
+    /// 58). Multiplied into the fill paint's per-channel alpha at
+    /// `commit_path`. Initial value 1.0 per the table.
+    fill_alpha: f32,
+    /// Current stroking alpha constant (`CA`, §11.6.4.4 + Table 58).
+    /// Mirror of `fill_alpha` for the stroke side.
+    stroke_alpha: f32,
+    /// Page's `/Resources /ExtGState` subdictionary, if the caller
+    /// went through [`parse_content_stream_with_resources`] — `None`
+    /// for the legacy entry point. Used by the `gs` dispatcher to
+    /// look up the named parameter dict per §8.4.5.
+    ext_gstate: Option<&'a Dict>,
 }
 
 struct Frame {
@@ -172,8 +227,8 @@ impl ColorSpaceKind {
     }
 }
 
-impl State {
-    fn new() -> Self {
+impl<'a> State<'a> {
+    fn new(ext_gstate: Option<&'a Dict>) -> Self {
         Self {
             operands: Vec::new(),
             stack: vec![Frame::new()],
@@ -188,6 +243,9 @@ impl State {
             line_join: LineJoin::Miter,
             miter_limit: 10.0,
             dash: None,
+            fill_alpha: 1.0,
+            stroke_alpha: 1.0,
+            ext_gstate,
         }
     }
 
@@ -265,11 +323,24 @@ impl State {
                 frame.transform = compose(frame.transform, t);
             }
             b"gs" => {
-                // /GSx gs — references an ExtGState. Round-3 doesn't
-                // resolve resources, so we drop the operand. (The
-                // top-level walker — round-3 commit 5 — will look up
-                // the gradient / opacity from /Resources.)
+                // `/Name gs` — Table 57 sets graphics-state parameters
+                // from the named dict in `/Resources /ExtGState`
+                // (§8.4.5). When the resource map is available we apply
+                // the Table 58 entries that map cleanly onto the
+                // round-3 vector IR (LW / LC / LJ / ML / D / CA / ca);
+                // every other key (SMask, BM, OP / op / OPM, BG / UCR /
+                // TR / HT, Font, RI, SA, AIS, TK, FL, SM) is silently
+                // tolerated per "any combination of parameter entries".
+                let name = match self.operands.last() {
+                    Some(Operand::Name(n)) => Some(n.clone()),
+                    _ => None,
+                };
                 self.operands.clear();
+                if let (Some(name), Some(ext_gstate)) = (name, self.ext_gstate) {
+                    if let Some(dict) = lookup_dict(ext_gstate, &name) {
+                        self.apply_ext_gstate(dict);
+                    }
+                }
             }
 
             // Path construction ----------------------------------
@@ -542,19 +613,22 @@ impl State {
             return;
         };
         let fill_paint = if fill {
-            self.fill_paint
+            let base = self
+                .fill_paint
                 .clone()
-                .or(Some(Paint::Solid(Rgba::opaque(0, 0, 0))))
+                .unwrap_or(Paint::Solid(Rgba::opaque(0, 0, 0)));
+            Some(apply_alpha(base, self.fill_alpha))
         } else {
             None
         };
         let stroke_obj = if stroke {
+            let stroke_paint = self
+                .stroke_paint
+                .clone()
+                .unwrap_or(Paint::Solid(Rgba::opaque(0, 0, 0)));
             Some(Stroke {
                 width: self.stroke_width,
-                paint: self
-                    .stroke_paint
-                    .clone()
-                    .unwrap_or(Paint::Solid(Rgba::opaque(0, 0, 0))),
+                paint: apply_alpha(stroke_paint, self.stroke_alpha),
                 cap: self.line_cap,
                 join: self.line_join,
                 miter_limit: self.miter_limit,
@@ -571,6 +645,75 @@ impl State {
         });
         self.current().children.push(node);
         self.operands.clear();
+    }
+
+    /// Apply the entries of a `/Type /ExtGState` parameter dictionary
+    /// to the current state (Table 58). Only the keys whose effect
+    /// fits the round-3 vector IR are honoured; the rest are silently
+    /// ignored — the spec explicitly allows partial dicts ("any
+    /// combination of parameter entries"). Values are cumulative —
+    /// previous settings persist until explicitly overridden, matching
+    /// the §8.4.5 "results of gs shall be cumulative" rule.
+    fn apply_ext_gstate(&mut self, dict: &Dict) {
+        for (k, v) in dict.entries() {
+            match k.as_str() {
+                "LW" => {
+                    if let Some(n) = number_as_f32(v) {
+                        self.stroke_width = n;
+                    }
+                }
+                "LC" => {
+                    if let Some(i) = number_as_i64(v) {
+                        self.line_cap = match i {
+                            0 => LineCap::Butt,
+                            1 => LineCap::Round,
+                            2 => LineCap::Square,
+                            _ => self.line_cap,
+                        };
+                    }
+                }
+                "LJ" => {
+                    if let Some(i) = number_as_i64(v) {
+                        self.line_join = match i {
+                            0 => LineJoin::Miter,
+                            1 => LineJoin::Round,
+                            2 => LineJoin::Bevel,
+                            _ => self.line_join,
+                        };
+                    }
+                }
+                "ML" => {
+                    if let Some(n) = number_as_f32(v) {
+                        self.miter_limit = n;
+                    }
+                }
+                "D" => {
+                    // `[dashArray dashPhase]` two-element array — Table
+                    // 58. Matches the `d` operator's pair shape.
+                    if let Some((array, offset)) = parse_dash_pair(v) {
+                        self.dash = if array.is_empty() {
+                            None
+                        } else {
+                            Some(DashPattern { array, offset })
+                        };
+                    }
+                }
+                "CA" => {
+                    if let Some(n) = number_as_f32(v) {
+                        self.stroke_alpha = n.clamp(0.0, 1.0);
+                    }
+                }
+                "ca" => {
+                    if let Some(n) = number_as_f32(v) {
+                        self.fill_alpha = n.clamp(0.0, 1.0);
+                    }
+                }
+                // Tolerated-but-unhandled keys (Table 58):
+                //   Type, RI, OP, op, OPM, Font, BG, BG2, UCR, UCR2,
+                //   TR, TR2, HT, FL, SM, SA, BM, SMask, AIS, TK.
+                _ => {}
+            }
+        }
     }
 
     fn path_mut(&mut self) -> &mut Path {
@@ -906,6 +1049,92 @@ fn read_hex_string(input: &[u8], start: usize) -> Result<usize, PdfError> {
     Err(PdfError::other(
         "PDF content parser: unterminated hex string",
     ))
+}
+
+/// Look up a name key in a dictionary and unwrap it as a nested
+/// [`Dict`]. Returns `None` for missing keys or non-dict values. The
+/// `gs` resolver uses this against `/Resources /ExtGState`. Indirect
+/// references are not followed — the caller is expected to have
+/// already resolved each subdict (the wiring in
+/// `reader::document::page_resource_dict` does this).
+fn lookup_dict<'a>(dict: &'a Dict, key: &str) -> Option<&'a Dict> {
+    dict.entries()
+        .iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| match v {
+            Object::Dict(d) => Some(d),
+            _ => None,
+        })
+}
+
+/// Multiply a [`Paint`]'s carried alpha by a Table 58 alpha constant
+/// (`CA` / `ca`, §11.6.4.4). For `Paint::Solid` the multiplication
+/// lands on the `Rgba::a` channel directly; other paint variants
+/// (gradients, the writer's pattern shading) pass through unchanged
+/// because the round-3 IR has no per-stop alpha field — partial
+/// gradient transparency would need a transparency-group XObject
+/// hand-off the reader doesn't yet emit.
+fn apply_alpha(paint: Paint, alpha: f32) -> Paint {
+    if (alpha - 1.0).abs() < f32::EPSILON {
+        return paint;
+    }
+    match paint {
+        Paint::Solid(rgba) => {
+            let base = rgba.a as f32 / 255.0;
+            let combined = (base * alpha).clamp(0.0, 1.0);
+            Paint::Solid(Rgba::new(
+                rgba.r,
+                rgba.g,
+                rgba.b,
+                (combined * 255.0).round() as u8,
+            ))
+        }
+        other => other,
+    }
+}
+
+/// Read an [`Object`] as an `f32`, accepting either `Integer` or
+/// `Real`. Returns `None` for other variants.
+fn number_as_f32(obj: &Object) -> Option<f32> {
+    match obj {
+        Object::Integer(i) => Some(*i as f32),
+        Object::Real(r) => Some(*r as f32),
+        _ => None,
+    }
+}
+
+/// Read an [`Object`] as an `i64`, accepting `Integer` or `Real`
+/// (truncating the fractional part — Table 58 `LC` / `LJ` are spec'd
+/// as integers but tolerating real-typed encoders matches the
+/// "force into valid range" tolerance §8.4 NOTE 1 calls out).
+fn number_as_i64(obj: &Object) -> Option<i64> {
+    match obj {
+        Object::Integer(i) => Some(*i),
+        Object::Real(r) => Some(*r as i64),
+        _ => None,
+    }
+}
+
+/// Parse a Table 58 `D` value: `[dashArray dashPhase]` two-element
+/// array, where `dashArray` is itself an array of numbers and
+/// `dashPhase` is a single integer (treated as a number for parity
+/// with the `d` operator).
+fn parse_dash_pair(obj: &Object) -> Option<(Vec<f32>, f32)> {
+    let Object::Array(items) = obj else {
+        return None;
+    };
+    if items.len() != 2 {
+        return None;
+    }
+    let Object::Array(arr_items) = &items[0] else {
+        return None;
+    };
+    let mut array = Vec::with_capacity(arr_items.len());
+    for it in arr_items {
+        array.push(number_as_f32(it)?);
+    }
+    let offset = number_as_f32(&items[1])?;
+    Some((array, offset))
 }
 
 fn read_number_array(input: &[u8], start: usize) -> (usize, Vec<f32>) {
@@ -1296,5 +1525,267 @@ mod tests {
             ColorSpaceKind::Unknown
         );
         assert_eq!(ColorSpaceKind::from_name("CS0"), ColorSpaceKind::Unknown);
+    }
+
+    // ── ExtGState `gs` resolution (round 125, ISO 32000-1 §8.4.5) ──
+
+    /// Helper: build a `/Resources /ExtGState` dictionary with a
+    /// single named graphics-state parameter dict.
+    fn ext_gstate_with(name: &str, dict: Dict) -> Dict {
+        Dict::new().with(name, Object::Dict(dict))
+    }
+
+    fn parse_with(input: &[u8], ext: &Dict) -> Group {
+        parse_content_stream_with_resources(input, Some(ext)).unwrap()
+    }
+
+    /// `LW` (line width) — Table 58.
+    #[test]
+    fn gs_applies_line_width_lw() {
+        let ext = ext_gstate_with(
+            "GS1",
+            Dict::new()
+                .with("Type", Object::Name("ExtGState".into()))
+                .with("LW", Object::Real(3.5)),
+        );
+        let bytes = b"q /GS1 gs 0 0 m 10 10 l S Q\n";
+        let root = parse_with(bytes, &ext);
+        let Node::Group(g) = &root.children[0] else {
+            panic!()
+        };
+        let Node::Path(p) = &g.children[0] else {
+            panic!()
+        };
+        let s = p.stroke.as_ref().expect("stroke set");
+        assert!((s.width - 3.5).abs() < 1e-3);
+    }
+
+    /// `LC` + `LJ` + `ML` — cap, join, miter limit.
+    #[test]
+    fn gs_applies_lc_lj_ml() {
+        let ext = ext_gstate_with(
+            "GS1",
+            Dict::new()
+                .with("LC", Object::Integer(1)) // Round
+                .with("LJ", Object::Integer(2)) // Bevel
+                .with("ML", Object::Real(7.5)),
+        );
+        let bytes = b"q /GS1 gs 0 0 m 10 10 l S Q\n";
+        let root = parse_with(bytes, &ext);
+        let Node::Group(g) = &root.children[0] else {
+            panic!()
+        };
+        let Node::Path(p) = &g.children[0] else {
+            panic!()
+        };
+        let s = p.stroke.as_ref().expect("stroke set");
+        assert!(matches!(s.cap, LineCap::Round));
+        assert!(matches!(s.join, LineJoin::Bevel));
+        assert!((s.miter_limit - 7.5).abs() < 1e-3);
+    }
+
+    /// `D` — dash pattern as `[ [dashArray] dashPhase ]`.
+    #[test]
+    fn gs_applies_d_dash_pattern() {
+        let ext = ext_gstate_with(
+            "GS1",
+            Dict::new().with(
+                "D",
+                Object::Array(vec![
+                    Object::Array(vec![Object::Real(4.0), Object::Real(2.0)]),
+                    Object::Real(1.0),
+                ]),
+            ),
+        );
+        let bytes = b"q /GS1 gs 0 0 m 10 10 l S Q\n";
+        let root = parse_with(bytes, &ext);
+        let Node::Group(g) = &root.children[0] else {
+            panic!()
+        };
+        let Node::Path(p) = &g.children[0] else {
+            panic!()
+        };
+        let s = p.stroke.as_ref().expect("stroke set");
+        let dash = s.dash.as_ref().expect("dash set");
+        assert_eq!(dash.array, vec![4.0, 2.0]);
+        assert!((dash.offset - 1.0).abs() < 1e-3);
+    }
+
+    /// `ca` — nonstroking alpha constant multiplies into the fill
+    /// colour's alpha (§11.6.4.4).
+    #[test]
+    fn gs_applies_ca_to_fill_alpha() {
+        let ext = ext_gstate_with("GS1", Dict::new().with("ca", Object::Real(0.5)));
+        // 1 0 0 rg paints opaque red — gs ca=0.5 → final alpha 128.
+        let bytes = b"q 1 0 0 rg /GS1 gs 0 0 m 10 10 l 10 0 l h f Q\n";
+        let root = parse_with(bytes, &ext);
+        let Node::Group(g) = &root.children[0] else {
+            panic!()
+        };
+        let Node::Path(p) = &g.children[0] else {
+            panic!()
+        };
+        let Some(Paint::Solid(c)) = &p.fill else {
+            panic!("fill")
+        };
+        assert_eq!((c.r, c.g, c.b), (255, 0, 0));
+        // 1.0 * 0.5 * 255 = 127.5 → rounds to 128.
+        assert_eq!(c.a, 128);
+    }
+
+    /// `CA` — stroking alpha constant lands on the stroke's paint.
+    #[test]
+    fn gs_applies_cap_ca_to_stroke_alpha() {
+        let ext = ext_gstate_with("GS1", Dict::new().with("CA", Object::Real(0.25)));
+        let bytes = b"q 0 1 0 RG /GS1 gs 0 0 m 10 10 l S Q\n";
+        let root = parse_with(bytes, &ext);
+        let Node::Group(g) = &root.children[0] else {
+            panic!()
+        };
+        let Node::Path(p) = &g.children[0] else {
+            panic!()
+        };
+        let s = p.stroke.as_ref().expect("stroke set");
+        let Paint::Solid(c) = &s.paint else { panic!() };
+        assert_eq!((c.r, c.g, c.b), (0, 255, 0));
+        // 1.0 * 0.25 * 255 = 63.75 → rounds to 64.
+        assert_eq!(c.a, 64);
+    }
+
+    /// A `gs` against an undefined ExtGState name is a tolerated no-op
+    /// — the existing stroke/colour state passes through unchanged.
+    #[test]
+    fn gs_unknown_name_is_no_op() {
+        let ext = ext_gstate_with("GS1", Dict::new().with("LW", Object::Real(9.0)));
+        let bytes = b"q 2.5 w /GS_OTHER gs 0 0 m 10 10 l S Q\n";
+        let root = parse_with(bytes, &ext);
+        let Node::Group(g) = &root.children[0] else {
+            panic!()
+        };
+        let Node::Path(p) = &g.children[0] else {
+            panic!()
+        };
+        let s = p.stroke.as_ref().expect("stroke");
+        // The earlier `2.5 w` still wins — GS_OTHER isn't in the dict.
+        assert!((s.width - 2.5).abs() < 1e-3);
+    }
+
+    /// Multiple `gs` invocations cumulate (Table 58 — "results of gs
+    /// shall be cumulative") so an earlier `LW` survives a later `gs`
+    /// that touches only `CA`.
+    #[test]
+    fn multiple_gs_invocations_cumulate() {
+        let mut ext = Dict::new();
+        ext.set(
+            "GW",
+            Object::Dict(Dict::new().with("LW", Object::Real(4.0))),
+        );
+        ext.set(
+            "GA",
+            Object::Dict(Dict::new().with("CA", Object::Real(0.5))),
+        );
+        let bytes = b"q /GW gs /GA gs 1 0 0 RG 0 0 m 10 10 l S Q\n";
+        let root = parse_with(bytes, &ext);
+        let Node::Group(g) = &root.children[0] else {
+            panic!()
+        };
+        let Node::Path(p) = &g.children[0] else {
+            panic!()
+        };
+        let s = p.stroke.as_ref().expect("stroke");
+        assert!((s.width - 4.0).abs() < 1e-3);
+        let Paint::Solid(c) = &s.paint else { panic!() };
+        assert_eq!(c.a, 128);
+    }
+
+    /// Without the resource-aware entry point, `gs` is a tolerated
+    /// no-op — the legacy `parse_content_stream` path must not change.
+    #[test]
+    fn legacy_parse_content_stream_drops_gs_operands() {
+        let bytes = b"q 2.5 w /GS1 gs 0 0 m 10 10 l S Q\n";
+        let root = parse_content_stream(bytes).unwrap();
+        let Node::Group(g) = &root.children[0] else {
+            panic!()
+        };
+        let Node::Path(p) = &g.children[0] else {
+            panic!()
+        };
+        let s = p.stroke.as_ref().expect("stroke");
+        assert!((s.width - 2.5).abs() < 1e-3);
+    }
+
+    /// Unhandled Table 58 keys (BM, OP, SMask, RI, …) are tolerated
+    /// silently — the spec explicitly allows "any combination of
+    /// parameter entries" including ones a reader can't honour.
+    #[test]
+    fn gs_unknown_table_58_keys_are_tolerated() {
+        let ext = ext_gstate_with(
+            "GS1",
+            Dict::new()
+                .with("BM", Object::Name("Multiply".into()))
+                .with("OP", Object::Bool(true))
+                .with("RI", Object::Name("Perceptual".into()))
+                .with("LW", Object::Real(2.0)),
+        );
+        let bytes = b"q /GS1 gs 0 0 m 10 10 l S Q\n";
+        let root = parse_with(bytes, &ext);
+        let Node::Group(g) = &root.children[0] else {
+            panic!()
+        };
+        let Node::Path(p) = &g.children[0] else {
+            panic!()
+        };
+        let s = p.stroke.as_ref().expect("stroke set");
+        // The honoured LW reaches the stroke even though BM / OP / RI
+        // were also present.
+        assert!((s.width - 2.0).abs() < 1e-3);
+    }
+
+    /// `apply_alpha` on a solid keeps RGB and scales the existing
+    /// alpha — composes with any pre-set alpha rather than overwriting
+    /// it.
+    #[test]
+    fn apply_alpha_composes_with_existing_alpha() {
+        let base = Paint::Solid(Rgba::new(100, 200, 50, 200));
+        let out = apply_alpha(base, 0.5);
+        let Paint::Solid(c) = out else { panic!() };
+        // 200/255 * 0.5 * 255 = 100.
+        assert_eq!((c.r, c.g, c.b), (100, 200, 50));
+        assert_eq!(c.a, 100);
+    }
+
+    /// `apply_alpha` short-circuits at α=1.0 (no-op).
+    #[test]
+    fn apply_alpha_unit_is_identity() {
+        let base = Paint::Solid(Rgba::new(10, 20, 30, 200));
+        let out = apply_alpha(base, 1.0);
+        let Paint::Solid(c) = out else { panic!() };
+        assert_eq!(c.a, 200);
+    }
+
+    /// `parse_dash_pair` decodes the `[ [dashArray] dashPhase ]`
+    /// two-element shape Table 58 specifies.
+    #[test]
+    fn parse_dash_pair_two_element_array() {
+        let obj = Object::Array(vec![
+            Object::Array(vec![Object::Real(2.0), Object::Real(1.0)]),
+            Object::Integer(3),
+        ]);
+        let (arr, off) = parse_dash_pair(&obj).expect("parses");
+        assert_eq!(arr, vec![2.0, 1.0]);
+        assert!((off - 3.0).abs() < 1e-3);
+    }
+
+    /// `parse_dash_pair` rejects malformed shapes.
+    #[test]
+    fn parse_dash_pair_rejects_malformed() {
+        // Not an array.
+        assert!(parse_dash_pair(&Object::Integer(0)).is_none());
+        // Wrong arity.
+        assert!(parse_dash_pair(&Object::Array(vec![Object::Integer(0)])).is_none());
+        // First element isn't an array.
+        assert!(
+            parse_dash_pair(&Object::Array(vec![Object::Integer(0), Object::Integer(0)])).is_none()
+        );
     }
 }

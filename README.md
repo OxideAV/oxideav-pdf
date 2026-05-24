@@ -1078,6 +1078,32 @@ Indexed / Separation / DeviceN spaces, and any unresolved `/Resources
 non-device spaces needs the page's `/Resources` dict, which this layer
 doesn't yet reach.
 
+## Content-stream `gs` ExtGState resolution (round 125)
+
+The content-stream parser now honours the `gs` graphics-state operator
+(ISO 32000-1 §8.4.5 + Table 57). Each page's `/Resources /ExtGState`
+subdictionary is plumbed through to the parser; a `/GSx gs` looks
+`/GSx` up there and applies the Table-58 entries that map onto the
+round-3 vector IR:
+
+- **`LW`** — line width (overrides the `w` operator).
+- **`LC`** — line cap (`Butt` / `Round` / `Square`).
+- **`LJ`** — line join (`Miter` / `Round` / `Bevel`).
+- **`ML`** — miter limit.
+- **`D`** — `[dashArray dashPhase]` pair (the same shape `d` takes).
+- **`CA`** — stroking alpha constant (§11.6.4.4); multiplies into the
+  current stroke paint's alpha channel.
+- **`ca`** — nonstroking alpha constant; multiplies into the current
+  fill paint's alpha.
+
+Multiple `gs` invocations cumulate — an earlier `/GW gs` carrying only
+`LW` survives a later `/GA gs` carrying only `CA`, matching the
+§8.4.5 "results of gs shall be cumulative" rule. Other Table-58 keys
+(`BM`, `OP` / `op` / `OPM`, `SMask`, `Font`, `BG` / `UCR` / `TR` / `HT`,
+`RI`, `SA`, `AIS`, `TK`, `FL`, `SM`) are tolerated as silent no-ops —
+they need IR plumbing the vector model doesn't yet carry, so honouring
+them now would be misleading rather than additive.
+
 ## Deferred
 
 - **Text emission** — writer-side `BT … Tj … ET` for `Node::Text`
