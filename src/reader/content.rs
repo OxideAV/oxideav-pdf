@@ -23,14 +23,22 @@
 //! | `k` / `K`            | DeviceCMYK fill / stroke — converted to RGB per §10.3.5 |
 //! | `w` / `J` / `j` / `M`| stroke width / cap / join / miter limit  |
 //! | `d`                  | dash array + offset                      |
-//! | `gs` / `cs` / `CS` / `scn` / `SCN` | resource references — round-3 records names but doesn't resolve |
+//! | `cs` / `CS`          | select nonstroking / stroking colour space (device families resolved; resource keys → Unknown) |
+//! | `sc` / `scn` / `SC` / `SCN` | colour value in the current space — DeviceGray / DeviceRGB / DeviceCMYK components honoured (§8.6.8) |
+//! | `gs`                 | ExtGState resource reference — round-3 records the name but doesn't resolve |
 //!
-//! The parser does not reach into the page's `/Resources` dict for
-//! gradient / pattern lookups in this commit — those land in round-3
-//! commit 5 (the top-level walker that has the resolved Document).
-//! For now, a `/Pat0 scn` pair produces a black solid fill (matches
-//! the writer's "unknown-paint fallback" behaviour, so the
-//! roundtrip remains semantically conservative).
+//! Colour-space tracking (round 118): `cs` / `CS` record which device
+//! colour family is active so a following `sc` / `scn` (or `SC` /
+//! `SCN`) interprets its operands correctly — `/DeviceRGB cs 1 0 0 sc`
+//! now produces red, where the round-3 parser collapsed every
+//! `sc`/`scn` to black. The parser still does not reach into the
+//! page's `/Resources /ColorSpace` dict for non-device colour-space
+//! keys, nor for gradient / pattern lookups — those land later (the
+//! top-level walker that has the resolved Document). A `/Pat0 scn`
+//! pair, a CIE-based / Indexed / Separation / DeviceN space, or any
+//! unresolved resource key produces a black solid fill (matches the
+//! writer's "unknown-paint fallback", so the roundtrip stays
+//! semantically conservative).
 //!
 //! Text-showing operators (`BT` / `ET` / `Tj` / `TJ`) are skipped
 //! silently — text rendering is round-4+.
@@ -79,6 +87,13 @@ struct State {
     /// stroke state and `Q` restores it.
     fill_paint: Option<Paint>,
     stroke_paint: Option<Paint>,
+    /// Current nonstroking colour space, selected by `cs` (§8.6.8
+    /// Table 74). `sc`/`scn` interpret their numeric operands against
+    /// it. Defaults to `DeviceGray` per §8.6.3 Table 73 (the initial
+    /// colour space for nonstroking operations).
+    fill_cs: ColorSpaceKind,
+    /// Current stroking colour space, selected by `CS`.
+    stroke_cs: ColorSpaceKind,
     stroke_width: f32,
     line_cap: LineCap,
     line_join: LineJoin,
@@ -99,14 +114,62 @@ struct Frame {
 enum Operand {
     Number(f32),
     Array(Vec<f32>),
-    /// Name operand — the inner string is unused by the round-3
-    /// commit-4 dispatcher (resource references like `/Pat0 scn`
-    /// land in round-3 commit 5, when the page's `/Resources` dict
-    /// is available). The variant is kept so the operand stack stays
-    /// well-typed; future commits switch the inner string from `_`
-    /// to a proper lookup key.
-    #[allow(dead_code)]
+    /// Name operand. Read by `cs` / `CS` (to pick the colour space)
+    /// and by `sc` / `scn` (a trailing `/Name` marks a Pattern fill,
+    /// §8.7.3.3). Resource lookups against `/Resources` for non-device
+    /// colour spaces / gradients / patterns still land later, when the
+    /// page's resolved Document is available.
     Name(String),
+}
+
+/// Which colour space the current `sc`/`scn` (or `SC`/`SCN`) operands
+/// are interpreted in, as established by the most recent `cs` / `CS`
+/// operator (ISO 32000-1 §8.6.8 Table 74). Only the device families
+/// — whose component counts are fixed and whose component → RGB
+/// mapping needs no `/Resources` lookup — are tracked; every other
+/// space (Pattern, CIE-based, Indexed, Separation, DeviceN, or a
+/// `/Resources /ColorSpace` key the round-3 parser can't resolve)
+/// collapses to `Unknown`, for which `sc`/`scn` keep the conservative
+/// black fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColorSpaceKind {
+    /// `/DeviceGray` — one component (§8.6.4.2).
+    DeviceGray,
+    /// `/DeviceRGB` — three components (§8.6.4.3).
+    DeviceRgb,
+    /// `/DeviceCMYK` — four components (§8.6.4.4).
+    DeviceCmyk,
+    /// Any space the parser doesn't resolve to a device family — a
+    /// `/Resources /ColorSpace` key, `/Pattern`, or a CIE-based /
+    /// Indexed / Separation / DeviceN name.
+    Unknown,
+}
+
+impl ColorSpaceKind {
+    /// Map a `cs` / `CS` name operand to a tracked colour space. The
+    /// three device-family names are recognised directly (§8.6.4.1);
+    /// everything else — including `/Pattern` and any resource key —
+    /// is `Unknown`.
+    fn from_name(name: &str) -> Self {
+        match name {
+            "DeviceGray" | "G" => ColorSpaceKind::DeviceGray,
+            "DeviceRGB" | "RGB" => ColorSpaceKind::DeviceRgb,
+            "DeviceCMYK" | "CMYK" => ColorSpaceKind::DeviceCmyk,
+            _ => ColorSpaceKind::Unknown,
+        }
+    }
+
+    /// Number of numeric components an `sc`/`scn` carries in this
+    /// space, or `None` for `Unknown` (where the count is unknowable
+    /// without resolving the resource definition).
+    fn components(self) -> Option<usize> {
+        match self {
+            ColorSpaceKind::DeviceGray => Some(1),
+            ColorSpaceKind::DeviceRgb => Some(3),
+            ColorSpaceKind::DeviceCmyk => Some(4),
+            ColorSpaceKind::Unknown => None,
+        }
+    }
 }
 
 impl State {
@@ -118,6 +181,8 @@ impl State {
             current_point: Point::default(),
             fill_paint: None,
             stroke_paint: None,
+            fill_cs: ColorSpaceKind::DeviceGray,
+            stroke_cs: ColorSpaceKind::DeviceGray,
             stroke_width: 1.0,
             line_cap: LineCap::Butt,
             line_join: LineJoin::Miter,
@@ -319,19 +384,26 @@ impl State {
 
             // Colour ----------------------------------------------
             b"rg" => {
+                // `rg` implicitly sets DeviceRGB nonstroking space
+                // (§8.6.8 Table 74) — track it so a later bare `sc`
+                // resolves in RGB.
                 let nums = self.take_numbers(3)?;
+                self.fill_cs = ColorSpaceKind::DeviceRgb;
                 self.fill_paint = Some(Paint::Solid(rgb_from_unit(nums[0], nums[1], nums[2])));
             }
             b"RG" => {
                 let nums = self.take_numbers(3)?;
+                self.stroke_cs = ColorSpaceKind::DeviceRgb;
                 self.stroke_paint = Some(Paint::Solid(rgb_from_unit(nums[0], nums[1], nums[2])));
             }
             b"g" => {
                 let nums = self.take_numbers(1)?;
+                self.fill_cs = ColorSpaceKind::DeviceGray;
                 self.fill_paint = Some(Paint::Solid(rgb_from_unit(nums[0], nums[0], nums[0])));
             }
             b"G" => {
                 let nums = self.take_numbers(1)?;
+                self.stroke_cs = ColorSpaceKind::DeviceGray;
                 self.stroke_paint = Some(Paint::Solid(rgb_from_unit(nums[0], nums[0], nums[0])));
             }
             b"k" | b"K" => {
@@ -339,33 +411,58 @@ impl State {
                 // only RGB, so convert per ISO 32000-1 §10.3.5
                 // (DeviceCMYK → DeviceRGB): a simple operation that does
                 // not involve black generation or undercolour removal.
+                // The operator also sets the implicit colour space.
                 let nums = self.take_numbers(4)?;
                 let p = Some(Paint::Solid(rgb_from_cmyk(
                     nums[0], nums[1], nums[2], nums[3],
                 )));
                 if op == b"K" {
+                    self.stroke_cs = ColorSpaceKind::DeviceCmyk;
                     self.stroke_paint = p;
                 } else {
+                    self.fill_cs = ColorSpaceKind::DeviceCmyk;
                     self.fill_paint = p;
                 }
             }
             b"sc" | b"scn" => {
-                // Pattern / multi-component colour — round-3 fallback.
-                self.fill_paint = self
-                    .fill_paint
-                    .clone()
-                    .or(Some(Paint::Solid(Rgba::opaque(0, 0, 0))));
+                // `sc`/`scn` set the nonstroking colour in whatever
+                // space the most-recent `cs` selected (§8.6.8). When
+                // that's a device family with a fixed component count,
+                // interpret the numeric operands directly; otherwise
+                // (Pattern, an unresolved resource colour space, or a
+                // trailing `/Name` pattern operand) keep the round-3
+                // conservative black fallback.
+                let paint = self.color_from_components(self.fill_cs);
+                self.fill_paint = paint.or_else(|| {
+                    self.fill_paint
+                        .clone()
+                        .or(Some(Paint::Solid(Rgba::opaque(0, 0, 0))))
+                });
                 self.operands.clear();
             }
             b"SC" | b"SCN" => {
-                self.stroke_paint = self
-                    .stroke_paint
-                    .clone()
-                    .or(Some(Paint::Solid(Rgba::opaque(0, 0, 0))));
+                let paint = self.color_from_components(self.stroke_cs);
+                self.stroke_paint = paint.or_else(|| {
+                    self.stroke_paint
+                        .clone()
+                        .or(Some(Paint::Solid(Rgba::opaque(0, 0, 0))))
+                });
                 self.operands.clear();
             }
-            b"cs" | b"CS" => {
-                // Colour-space switch — operand is /Name. Drop it.
+            b"cs" => {
+                // Nonstroking colour-space switch — last operand is a
+                // /Name. Record the space so a following `sc`/`scn`
+                // knows how to read its components. Setting a device
+                // colour space initialises the current colour to its
+                // black/zero value per §8.6.4.2..4 ("Setting … shall
+                // initialize the corresponding current colour to 0.0").
+                self.fill_cs = self.take_color_space_name();
+                self.fill_paint = initial_color_for(self.fill_cs);
+                self.operands.clear();
+            }
+            b"CS" => {
+                self.stroke_cs = self.take_color_space_name();
+                self.stroke_paint = initial_color_for(self.stroke_cs);
                 self.operands.clear();
             }
 
@@ -511,6 +608,57 @@ impl State {
         Ok(Point::new(nums[0], nums[1]))
     }
 
+    /// Resolve an `sc`/`scn` (or `SC`/`SCN`) operand list into a
+    /// [`Paint`] for the given colour space. Returns `None` when the
+    /// space is `Unknown`, when a trailing `/Name` pattern operand is
+    /// present (Pattern colour space, §8.7.3.3 — `c1 … cn /name scn`),
+    /// or when the numeric-operand count doesn't match the device
+    /// family's component count. In those cases the caller falls back
+    /// to the conservative black behaviour.
+    fn color_from_components(&self, cs: ColorSpaceKind) -> Option<Paint> {
+        let want = cs.components()?;
+        // A trailing `/Name` operand marks a Pattern fill — no device
+        // colour to read.
+        if matches!(self.operands.last(), Some(Operand::Name(_))) {
+            return None;
+        }
+        // Count the trailing numeric operands.
+        let nums: Vec<f32> = self
+            .operands
+            .iter()
+            .rev()
+            .take_while(|o| matches!(o, Operand::Number(_)))
+            .filter_map(|o| match o {
+                Operand::Number(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        if nums.len() < want {
+            return None;
+        }
+        // `nums` was collected reversed; take the last `want` of them
+        // in stream order.
+        let comps: Vec<f32> = nums.iter().take(want).rev().copied().collect();
+        Some(match cs {
+            ColorSpaceKind::DeviceGray => Paint::Solid(rgb_from_unit(comps[0], comps[0], comps[0])),
+            ColorSpaceKind::DeviceRgb => Paint::Solid(rgb_from_unit(comps[0], comps[1], comps[2])),
+            ColorSpaceKind::DeviceCmyk => {
+                Paint::Solid(rgb_from_cmyk(comps[0], comps[1], comps[2], comps[3]))
+            }
+            ColorSpaceKind::Unknown => unreachable!("components() returned Some"),
+        })
+    }
+
+    /// Pop the trailing `/Name` operand of a `cs` / `CS` operator and
+    /// map it to a tracked colour space. A `cs` with no name operand
+    /// (malformed) leaves the space `Unknown`.
+    fn take_color_space_name(&mut self) -> ColorSpaceKind {
+        match self.operands.last() {
+            Some(Operand::Name(n)) => ColorSpaceKind::from_name(n),
+            _ => ColorSpaceKind::Unknown,
+        }
+    }
+
     fn parse(&mut self, input: &[u8]) -> Result<(), PdfError> {
         let mut i = 0;
         while i < input.len() {
@@ -645,6 +793,21 @@ fn is_delimiter(b: u8) -> bool {
 
 fn rgb_from_unit(r: f32, g: f32, b: f32) -> Rgba {
     Rgba::opaque(unit_to_byte(r), unit_to_byte(g), unit_to_byte(b))
+}
+
+/// The current colour established by a bare `cs` / `CS` before any
+/// `sc`/`scn`. Per §8.6.4.2..4 setting a device colour space
+/// initialises the colour to its 0.0 value (black for Gray/RGB,
+/// `0 0 0 1`-equivalent — also black — for CMYK). For an unresolved
+/// space we leave the paint cleared so the existing black fallback in
+/// `commit_path` applies if nothing further is set.
+fn initial_color_for(cs: ColorSpaceKind) -> Option<Paint> {
+    match cs {
+        ColorSpaceKind::DeviceGray | ColorSpaceKind::DeviceRgb | ColorSpaceKind::DeviceCmyk => {
+            Some(Paint::Solid(Rgba::opaque(0, 0, 0)))
+        }
+        ColorSpaceKind::Unknown => None,
+    }
 }
 
 /// Convert a DeviceCMYK colour value to DeviceRGB per ISO 32000-1
@@ -1007,5 +1170,131 @@ mod tests {
             Paint::Solid(c) => assert_eq!((c.r, c.g, c.b), (255, 0, 255)),
             other => panic!("unexpected stroke paint: {other:?}"),
         }
+    }
+
+    // ── Colour-space selection: `cs` / `CS` + `sc` / `scn` (round 118) ──
+
+    /// Helper: parse a stream and return the first painted path node.
+    fn first_path(bytes: &[u8]) -> PathNode {
+        let root = parse(bytes);
+        let Node::Group(g) = &root.children[0] else {
+            panic!("expected group");
+        };
+        let Node::Path(p) = &g.children[0] else {
+            panic!("expected path");
+        };
+        p.clone()
+    }
+
+    fn fill_rgb(p: &PathNode) -> (u8, u8, u8) {
+        match &p.fill {
+            Some(Paint::Solid(c)) => (c.r, c.g, c.b),
+            other => panic!("unexpected fill: {other:?}"),
+        }
+    }
+
+    /// `/DeviceRGB cs 1 0 0 sc` selects DeviceRGB then sets a red fill
+    /// (§8.6.8). Before round 118 the parser collapsed every `sc` to
+    /// black; the spec example `/DeviceRGB CS  red green blue SC`
+    /// (§8.6.4.3) is the stroking analogue.
+    #[test]
+    fn cs_devicergb_then_sc_sets_rgb_fill() {
+        let bytes = b"q /DeviceRGB cs 1 0 0 sc 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(fill_rgb(&first_path(bytes)), (255, 0, 0));
+    }
+
+    /// `/DeviceGray cs 0.5 sc` — one-component grey (§8.6.4.2).
+    #[test]
+    fn cs_devicegray_then_sc_sets_gray_fill() {
+        let bytes = b"q /DeviceGray cs 0.5 sc 0 0 m 10 10 l 10 0 l h f Q\n";
+        let (r, g, b) = fill_rgb(&first_path(bytes));
+        let expect = (0.5f32 * 255.0).round() as u8;
+        assert_eq!((r, g, b), (expect, expect, expect));
+    }
+
+    /// `/DeviceCMYK cs 1 0 0 0 scn` — pure cyan via the §10.3.5
+    /// conversion, matching the `1 0 0 0 k` operator's result.
+    #[test]
+    fn cs_devicecmyk_then_scn_sets_cmyk_fill() {
+        let bytes = b"q /DeviceCMYK cs 1 0 0 0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(fill_rgb(&first_path(bytes)), (0, 255, 255));
+    }
+
+    /// Stroking side: `/DeviceRGB CS 0 1 0 SC` sets a green stroke.
+    #[test]
+    fn upper_cs_and_upper_sc_set_stroke_color() {
+        let bytes = b"q /DeviceRGB CS 0 1 0 SC 0 0 m 10 10 l S Q\n";
+        let p = first_path(bytes);
+        let s = p.stroke.as_ref().expect("stroke set");
+        match &s.paint {
+            Paint::Solid(c) => assert_eq!((c.r, c.g, c.b), (0, 255, 0)),
+            other => panic!("unexpected stroke paint: {other:?}"),
+        }
+    }
+
+    /// A `/Pattern cs … /P0 scn` pair carries a `/Name` operand and an
+    /// unknown space — the parser keeps the conservative black fallback
+    /// rather than misreading the pattern name as colour components.
+    #[test]
+    fn pattern_scn_keeps_black_fallback() {
+        let bytes = b"q /Pattern cs /P0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(fill_rgb(&first_path(bytes)), (0, 0, 0));
+    }
+
+    /// A `cs` naming an unresolved `/Resources /ColorSpace` key (here a
+    /// CIE-based `/CS0`) is `Unknown`: a following `sc` can't be
+    /// interpreted without the resource definition, so the fill stays
+    /// black.
+    #[test]
+    fn unknown_resource_colorspace_sc_keeps_black_fallback() {
+        let bytes = b"q /CS0 cs 0.2 0.4 0.6 sc 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(fill_rgb(&first_path(bytes)), (0, 0, 0));
+    }
+
+    /// Setting a device colour space with a bare `cs` (no following
+    /// `sc`) initialises the colour to black per §8.6.4.2..4.
+    #[test]
+    fn bare_cs_initialises_color_to_black() {
+        let bytes = b"q /DeviceRGB cs 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(fill_rgb(&first_path(bytes)), (0, 0, 0));
+    }
+
+    /// `sc`/`scn` interpret operands in whatever the *last* `cs`
+    /// selected — switching spaces mid-stream re-routes the next colour.
+    #[test]
+    fn switching_colorspace_reroutes_following_sc() {
+        let bytes = b"q /DeviceGray cs 1 sc /DeviceRGB cs 0 0 1 sc \
+                      0 0 m 10 10 l 10 0 l h f Q\n";
+        // Final colour is the DeviceRGB blue, not the grey white.
+        assert_eq!(fill_rgb(&first_path(bytes)), (0, 0, 255));
+    }
+
+    /// `from_name` maps the three device families (long + abbreviated
+    /// inline-image spellings) and routes everything else to `Unknown`.
+    #[test]
+    fn color_space_from_name_table() {
+        assert_eq!(
+            ColorSpaceKind::from_name("DeviceGray"),
+            ColorSpaceKind::DeviceGray
+        );
+        assert_eq!(ColorSpaceKind::from_name("G"), ColorSpaceKind::DeviceGray);
+        assert_eq!(
+            ColorSpaceKind::from_name("DeviceRGB"),
+            ColorSpaceKind::DeviceRgb
+        );
+        assert_eq!(ColorSpaceKind::from_name("RGB"), ColorSpaceKind::DeviceRgb);
+        assert_eq!(
+            ColorSpaceKind::from_name("DeviceCMYK"),
+            ColorSpaceKind::DeviceCmyk
+        );
+        assert_eq!(
+            ColorSpaceKind::from_name("CMYK"),
+            ColorSpaceKind::DeviceCmyk
+        );
+        assert_eq!(
+            ColorSpaceKind::from_name("Pattern"),
+            ColorSpaceKind::Unknown
+        );
+        assert_eq!(ColorSpaceKind::from_name("CS0"), ColorSpaceKind::Unknown);
     }
 }

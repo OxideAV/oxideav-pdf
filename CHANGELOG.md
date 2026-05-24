@@ -35,6 +35,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Round 118: **Colour-space selection for `sc` / `scn` content-stream
+  operators** (ISO 32000-1:2008 §8.6.8 Table 74 + §8.6.4). The
+  content-stream parser now tracks the nonstroking / stroking colour
+  space established by the `cs` / `CS` operator and interprets the
+  following `sc` / `scn` (or `SC` / `SCN`) operands against it.
+  Previously every `sc`/`scn` collapsed to opaque black regardless of
+  operands, so a document that set colour via `/DeviceRGB cs 1 0 0 sc`
+  (rather than the `1 0 0 rg` shorthand) rendered black. The three
+  device families are resolved by name — `/DeviceGray` (1 component),
+  `/DeviceRGB` (3), `/DeviceCMYK` (4, via the §10.3.5 conversion) —
+  including their abbreviated inline-image spellings (`G` / `RGB` /
+  `CMYK`). The implicit-space operators (`g`/`rg`/`k` and `G`/`RG`/`K`)
+  now also record their colour space so a subsequent bare `sc`/`scn`
+  resolves correctly (§8.6.8: "g, rg, and k … set the … colour space
+  implicitly"), and a bare `cs`/`CS` initialises the current colour to
+  black per §8.6.4.2..4. The `/Pattern` colour space, a trailing
+  `/Name` pattern operand (§8.7.3.3), CIE-based / Indexed / Separation
+  / DeviceN spaces, and any unresolved `/Resources /ColorSpace` key all
+  keep the conservative black fallback — resolving non-device spaces
+  needs the page's `/Resources` dict, which this layer doesn't yet have.
+  Verified with per-family `cs`+`sc` round-trips, the stroking `CS`+`SC`
+  path, mid-stream colour-space switching, the Pattern `/P0 scn`
+  fallback, an unresolved-resource-key fallback, the bare-`cs`
+  initialisation, and the name-table mapping (10 new unit tests).
+
 - Round 115: **DeviceCMYK content-stream colour** (`k` / `K`
   operators, ISO 32000-1:2008 §8.6.4.4 + §10.3.5). The content-stream
   parser previously discarded the four CMYK operands and fell back to

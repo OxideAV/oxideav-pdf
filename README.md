@@ -1044,6 +1044,27 @@ reconstruct as `(0,255,255)` / `(255,0,255)` / `(255,255,0)` and
 CMYK colour to opaque black. Out-of-range operands are clamped to
 `0.0..=1.0` first (§10.3.4 NOTE 4).
 
+## Content-stream colour-space selection (round 118)
+
+The content-stream parser now honours the `cs` / `CS` colour-space
+operators and interprets the following `sc` / `scn` / `SC` / `SCN`
+colour values against the selected space (ISO 32000-1 §8.6.8 Table 74
++ §8.6.4). Where the round-3 parser collapsed every `sc`/`scn` to
+opaque black, a document setting colour via `/DeviceRGB cs 1 0 0 sc`
+(instead of the `1 0 0 rg` shorthand) now reconstructs red. The three
+device families resolve by name — `/DeviceGray` (1 component),
+`/DeviceRGB` (3), `/DeviceCMYK` (4, via the §10.3.5 conversion), plus
+the abbreviated inline-image spellings `G` / `RGB` / `CMYK`. The
+implicit-space operators (`g`/`rg`/`k`, `G`/`RG`/`K`) also record
+their space so a subsequent bare `sc`/`scn` resolves correctly, and a
+bare `cs`/`CS` initialises the colour to black per §8.6.4.2..4.
+
+`/Pattern`, a trailing `/Name` pattern operand (§8.7.3.3), CIE-based /
+Indexed / Separation / DeviceN spaces, and any unresolved `/Resources
+/ColorSpace` key keep the conservative black fallback — resolving
+non-device spaces needs the page's `/Resources` dict, which this layer
+doesn't yet reach.
+
 ## Deferred
 
 - **Text emission** — writer-side `BT … Tj … ET` for `Node::Text`
