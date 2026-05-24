@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/OxideAV/oxideav-pdf/compare/v0.1.1...v0.1.2) - 2026-05-24
+
+### Other
+
+- convert DeviceCMYK k/K content-stream colour to RGB (§10.3.5)
+- round 104: /DecodeParms /Predictor post-filter in decode_stream (§7.4.4.4)
+- round 98: §7.4.4.2 LZWDecode stream filter
+- round 95: §8.11 Optional Content (OCG / OCMD) reader
+- resolve indirect stream /Length on the reader path
+- document-action enumeration (ISO 32000-1 §12.6 + §12.7.5 + §7.7.4 + §7.9.6)
+- inline-image extraction from PDF content streams (ISO 32000-1 §8.9.7 + §7.4)
+- RFC 3161 Document Time-Stamp writer + reader (ISO 32000-1 §12.8.5 + RFC 3161 §2.4 + RFC 5652 §5)
+- embedded file attachment writer + reader (ISO 32000-1 §7.11 + §3.10 + §12.5.6.15 + §7.7.4 + §7.9.6)
+- general annotations writer (ISO 32000-1 §12.5.6)
+- AcroForm interactive-widget writer (ISO 32000-1 §12.7)
+- PDF /Sig annotation writer (ISO 32000-1 §12.7.4.5 + §12.8.1 + RFC 5652 §5 + §5.4 + §11.2)
+- reading-order layout pass over Tagged PDF StructTreeRoot (ISO 32000-1 §14.6 + §14.7 + §14.8)
+- simple-font /Encoding /Differences resolver wired into text extraction (ISO 32000-1 §9.6.6.1 + §D.2 + AGL v2.0)
+- linearization param dict + hierarchy validator + PDF/A signals
+- annotations beyond Link (Text/FreeText/Stamp/markup/geometry/Widget) + XMP packet field extraction (DC/XMP/PDF/PDF-A)
+- PDF outline (bookmarks) tree + Link annotations
+- CMS KARI X448 ECDH (RFC 7748 §5 + RFC 8410 §3 + RFC 8418 §2.1+§2.2)
+- JPEG passthrough on /DCTDecode Image XObjects (ISO 32000-1 §7.4.8 + §8.9)
+- PDF text extraction (ISO 32000-1 §9 + §9.10)
+- PDF /Sig annotation reader (ISO 32000-1 §12.7.4.5 + §12.8.1)
+
 ### Added
 
 - Round 115: **DeviceCMYK content-stream colour** (`k` / `K`
