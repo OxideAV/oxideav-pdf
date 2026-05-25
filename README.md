@@ -1078,6 +1078,44 @@ Indexed / Separation / DeviceN spaces, and any unresolved `/Resources
 non-device spaces needs the page's `/Resources` dict, which this layer
 doesn't yet reach.
 
+## Content-stream `Tj` / `TJ` text-show with `/Resources /Font` (round 128)
+
+The content-stream parser now resolves text-show operators against the
+page's `/Resources /Font` subdictionary (ISO 32000-1 §9.4 + Table 105 +
+Table 108 + Table 109). A new
+[`parse_content_stream_full(input, ext_gstate, fonts)`] entry point
+returns a [`ParsedContent { root, text_shows }`] carrying one
+[`ContentTextShow`] per `Tj` / `TJ` / `'` / `"` show, each with the
+resolved font dictionary, the `Tf`-recorded font name + size, the
+decoded operand bytes (literal-string escapes + hex-pair decoding both
+handled per §7.3.4), the text-matrix origin at the moment of the show,
+and a [`TextShowOp`] discriminator naming the originating operator.
+
+Text-state operators (`BT` / `ET` / `Tf` / `Tm` / `Td` / `TD` / `T*` /
+`TL`) are honoured per §9.4.2 Table 108 — the text matrix resets to
+identity on every `BT`, advances by the explicit displacement on
+`Td`/`TD`/`Tm`, and steps down by the current leading on `T*` /
+implicit-`T*` from `'` and `"`. `TJ`'s per-element numeric kerning
+displacements are dropped because they affect only glyph positioning,
+not the decoded text payload — the strings are concatenated in array
+order.
+
+The page walker plumbs the page's `/Resources /Font` through a new
+single-hop indirect-dereference helper (`resolve_font_resources`)
+mirroring the round-125 `resolve_ext_gstate` shape. A `Tf` against a
+font name that isn't present in the resources dict still emits the
+show — the consumer learns the font wasn't resolved via
+`font_dict = None` rather than the show silently disappearing. The
+round-22 [`DocumentReader::text_extraction`] walker still owns the
+byte→Unicode mapping (encoding / `/ToUnicode` CMap resolution); this
+round-128 surface is the narrower path a consumer that already has
+the page resources resolved can use.
+
+The legacy [`parse_content_stream`] and
+[`parse_content_stream_with_resources`] entry points keep their
+round-3 / round-125 no-op behaviour — text-show operands are dropped
+silently so existing callers don't see new events appear.
+
 ## Content-stream `gs` ExtGState resolution (round 125)
 
 The content-stream parser now honours the `gs` graphics-state operator

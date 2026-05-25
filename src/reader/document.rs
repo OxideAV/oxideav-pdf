@@ -35,7 +35,7 @@ use crate::objects::{Dict, Object, ObjectId, Stream};
 use crate::pubsec::{
     open_with_certificate, open_with_certificate_and_trust_store, PubSecCredential, TrustStore,
 };
-use crate::reader::content::parse_content_stream_with_resources;
+use crate::reader::content::parse_content_stream_full;
 use crate::reader::parse::Parser;
 use crate::reader::xref::{parse_xref, XrefEntry, XrefTable};
 
@@ -1074,8 +1074,18 @@ fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Pag
     } else {
         None
     };
+    let fonts_dict = if let Some(rdict) = resources_dict.as_ref() {
+        resolve_font_resources(reader, rdict)?
+    } else {
+        None
+    };
 
-    let root = parse_content_stream_with_resources(&content_bytes, ext_gstate_dict.as_ref())?;
+    let parsed = parse_content_stream_full(
+        &content_bytes,
+        ext_gstate_dict.as_ref(),
+        fonts_dict.as_ref(),
+    )?;
+    let root = parsed.root;
     let mut page = Page::new(width, height);
     page.content = VectorFrame {
         width,
@@ -1121,6 +1131,54 @@ fn resolve_ext_gstate(
     // keys directly without touching the reader.
     let mut out = Dict::new();
     for (name, value) in ext_dict.entries() {
+        let resolved = match value {
+            Object::Reference(id) => reader.resolve(*id)?,
+            other => other.clone(),
+        };
+        if let Object::Dict(d) = resolved {
+            out.set(name, Object::Dict(d));
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Resolve a page's `/Resources /Font` subdictionary into a
+/// fully-dereferenced [`Dict`] (each per-name `/Fx` value is itself
+/// resolved into a direct `Dict` if it was an indirect reference).
+/// Returns `Ok(None)` when the resources dict carries no `/Font`
+/// entry — the most common case for documents that don't use any
+/// text-showing operator (`Tj` / `TJ` / `'` / `"`).
+///
+/// Mirrors [`resolve_ext_gstate`]'s shape so the round-128 `Tj` /
+/// `TJ` plumbing slots into the same single-hop indirect dereference
+/// path the round-125 `gs` resolver uses (ISO 32000-1 §7.8.3 + Table 33
+/// for the `/Resources` shape, §9.5 + §9.6 + §9.7 for fonts).
+///
+/// Only direct + single-hop indirect dicts are surfaced. A malformed
+/// entry (non-dict resolved value, deeply nested indirection beyond a
+/// single hop) is silently dropped so a `Tj` against that font name
+/// behaves as a "font unresolved" event (the show still fires with
+/// `font_dict = None` so the consumer knows what happened), matching
+/// the round-3 tolerance stance.
+fn resolve_font_resources(
+    reader: &mut DocumentReader<'_>,
+    resources: &Dict,
+) -> Result<Option<Dict>, PdfError> {
+    let font_obj = resources
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Font")
+        .map(|(_, v)| v.clone());
+    let font_obj = match font_obj {
+        Some(Object::Reference(id)) => reader.resolve(id)?,
+        Some(other) => other,
+        None => return Ok(None),
+    };
+    let Object::Dict(font_dict) = font_obj else {
+        return Ok(None);
+    };
+    let mut out = Dict::new();
+    for (name, value) in font_dict.entries() {
         let resolved = match value {
             Object::Reference(id) => reader.resolve(*id)?,
             other => other.clone(),

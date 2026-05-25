@@ -45,6 +45,10 @@ pub mod xref;
 pub use actions::{actions, ActionKind, ActionTrigger, PdfAction};
 pub use annotation::{annotations, AnnotationKind, PdfAnnotation, TextMarkupVariant};
 pub use attachments::{attachments, PdfAttachment};
+pub use content::{
+    parse_content_stream, parse_content_stream_full, parse_content_stream_with_resources,
+    ContentTextShow, ParsedContent, TextShowOp,
+};
 pub use document::{
     read_pdf_to_scene, read_pdf_to_scene_with_certificate,
     read_pdf_to_scene_with_certificate_and_trust_store, read_pdf_to_scene_with_password,

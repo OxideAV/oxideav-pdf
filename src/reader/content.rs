@@ -42,6 +42,23 @@
 //! resource-aware entry point, `gs` is still treated as a tolerated
 //! no-op so legacy `parse_content_stream` callers don't regress.
 //!
+//! Text-show resolution (round 128): when the page's `/Resources /Font`
+//! subdictionary is also plumbed in via [`parse_content_stream_full`], the
+//! `BT … ET` text-object operators (ISO 32000-1 §9.4 + Table 105) are
+//! parsed: a `Tf` (`/Fx 12 Tf`) records the active font + size, `Tm` /
+//! `Td` / `TD` / `T*` update the text matrix per §9.4.4 Table 108, and
+//! every `Tj` / `TJ` / `'` / `"` show operator emits one [`ContentTextShow`]
+//! event carrying the raw operand bytes, font resource name (with the
+//! resolved font dictionary handed back via `font_dict`), font size, and
+//! text-matrix origin at the moment of the show. The events come back
+//! alongside the painted `root` group in a [`ParsedContent`] struct; the
+//! reader's higher-level text-extraction walker (round 22) still owns the
+//! byte→Unicode decoding, but the new entry point lets a consumer that
+//! already has the page's `/Resources /Font` resolved get a font-aware
+//! show stream straight from the vector-content parser. Without the
+//! resource-aware entry point, `Tj` / `TJ` / `Tf` / … keep their
+//! round-3 no-op behaviour so existing callers don't regress.
+//!
 //! Colour-space tracking (round 118): `cs` / `CS` record which device
 //! colour family is active so a following `sc` / `scn` (or `SC` /
 //! `SCN`) interprets its operands correctly — `/DeviceRGB cs 1 0 0 sc`
@@ -55,8 +72,13 @@
 //! writer's "unknown-paint fallback", so the roundtrip stays
 //! semantically conservative).
 //!
-//! Text-showing operators (`BT` / `ET` / `Tj` / `TJ`) are skipped
-//! silently — text rendering is round-4+.
+//! Text-showing operators (`BT` / `ET` / `Tj` / `TJ` / `'` / `"`) are
+//! parsed when the page's `/Resources /Font` dictionary is plumbed in
+//! via [`parse_content_stream_full`] and surface as
+//! [`ContentTextShow`] events on the returned [`ParsedContent`]. The
+//! legacy [`parse_content_stream`] and
+//! [`parse_content_stream_with_resources`] entry points drop them
+//! silently to preserve round-3 / round-125 callers' behaviour.
 
 use std::str;
 
@@ -80,10 +102,15 @@ use crate::objects::{Dict, Object};
 /// [`parse_content_stream_with_resources`] so a `/GSx gs` can apply
 /// the named graphics-state parameter dictionary's entries to the
 /// current state per ISO 32000-1 §8.4.5.
+///
+/// Text-show operators (`BT … Tj/TJ/'/'" … ET`) are skipped silently;
+/// callers that need them should route through
+/// [`parse_content_stream_full`] with a resolved `/Resources /Font`
+/// dictionary attached.
 pub fn parse_content_stream(input: &[u8]) -> Result<Group, PdfError> {
-    let mut state = State::new(None);
+    let mut state = State::new(None, None);
     state.parse(input)?;
-    Ok(state.finish())
+    Ok(state.finish().root)
 }
 
 /// Parse a content-stream with the page's resolved `/Resources
@@ -97,13 +124,110 @@ pub fn parse_content_stream(input: &[u8]) -> Result<Group, PdfError> {
 /// to have already resolved every child dict). When `ext_gstate` is
 /// `None` or doesn't contain the named entry, the `gs` operator
 /// silently no-ops, matching the round-3 fallback behaviour.
+///
+/// Text-show events are still skipped — see [`parse_content_stream_full`]
+/// for the entry point that also plumbs `/Resources /Font`.
 pub fn parse_content_stream_with_resources(
     input: &[u8],
     ext_gstate: Option<&Dict>,
 ) -> Result<Group, PdfError> {
-    let mut state = State::new(ext_gstate);
+    let mut state = State::new(ext_gstate, None);
+    state.parse(input)?;
+    Ok(state.finish().root)
+}
+
+/// Parse a content-stream with both the page's resolved `/Resources
+/// /ExtGState` and `/Resources /Font` subdictionaries attached. In
+/// addition to the round-125 `gs` resolution path, every text-object
+/// operator inside a `BT … ET` block (ISO 32000-1 §9.4 + Table 105)
+/// is honoured: `Tf` records the active font name + size,
+/// `Tm`/`Td`/`TD`/`T*` update the text matrix per §9.4.4 Table 108,
+/// and each `Tj`/`TJ`/`'`/`"` show operator emits one
+/// [`ContentTextShow`] event into the returned [`ParsedContent`].
+///
+/// Both resource dictionaries are read-only — keys are resolved by
+/// name lookup, no indirect-reference following is attempted (the
+/// caller is expected to have already resolved every child dict via
+/// the helpers in [`crate::reader::document`]). When `font_resources`
+/// is `None` or doesn't contain the `Tf`-named font, the show event
+/// still fires but its `font_dict` is `None` so the consumer knows
+/// the font wasn't resolved.
+pub fn parse_content_stream_full(
+    input: &[u8],
+    ext_gstate: Option<&Dict>,
+    font_resources: Option<&Dict>,
+) -> Result<ParsedContent, PdfError> {
+    let mut state = State::new(ext_gstate, font_resources);
     state.parse(input)?;
     Ok(state.finish())
+}
+
+/// Output of [`parse_content_stream_full`] — the painted-shapes group
+/// (same as the round-3 / round-125 entry points return) plus the
+/// stream-order list of text-show events the round-128 walker
+/// surfaces when `/Resources /Font` is plumbed in.
+#[derive(Clone, Debug, Default)]
+pub struct ParsedContent {
+    /// Painted-shapes group — identical to the `Group` returned by
+    /// [`parse_content_stream`] / [`parse_content_stream_with_resources`].
+    pub root: Group,
+    /// Every `Tj`/`TJ`/`'`/`"` show, in stream order. Decoding the
+    /// raw bytes to Unicode is the caller's responsibility (the
+    /// round-22 [`crate::reader::text::extract_text`] walker owns that
+    /// path); this surface gives a resource-resolved view of the show
+    /// operators for tooling that wants something narrower than the
+    /// full text-extraction pipeline.
+    pub text_shows: Vec<ContentTextShow>,
+}
+
+/// One `Tj`/`TJ`/`'`/`"` text-show event surfaced by
+/// [`parse_content_stream_full`]. The raw operand bytes are preserved
+/// verbatim — escape-decoded for literal strings and hex-pair-decoded
+/// for hex strings — so a consumer that wants byte→Unicode mapping can
+/// route them through whatever decoder its `font_dict` calls for.
+#[derive(Clone, Debug)]
+pub struct ContentTextShow {
+    /// Font resource name as named by the most recent `Tf`, with the
+    /// leading `/` stripped (e.g. `"F1"`). Empty when the content
+    /// stream issued a show without a preceding `Tf` (malformed but
+    /// tolerated).
+    pub font_name: String,
+    /// Font size from the most recent `Tf`. `0.0` if no `Tf` was seen.
+    pub font_size: f32,
+    /// Resolved font dictionary from `/Resources /Font /<font_name>`,
+    /// or `None` when the font wasn't found in the supplied
+    /// `font_resources` (or no `font_resources` was supplied).
+    pub font_dict: Option<Dict>,
+    /// Concatenated payload bytes — for `Tj` and `'` the single
+    /// operand; for `"` the trailing string operand; for `TJ` the
+    /// strings inside the array, concatenated in array order (the
+    /// per-element numeric displacements aren't applied because they
+    /// only affect glyph kerning, not the decoded text).
+    pub bytes: Vec<u8>,
+    /// Text-matrix origin `(e, f)` in user space at the moment the
+    /// show fired — the position the first glyph would have been
+    /// painted at. Reflects every `Tm`/`Td`/`TD`/`T*` update issued
+    /// inside the enclosing `BT … ET` (the matrix resets to identity
+    /// at every `BT`).
+    pub position: (f32, f32),
+    /// Which show operator produced this event (`Tj` / `TJ` / `'` /
+    /// `"`). Lets a downstream consumer reconstruct the original
+    /// operator stream verbatim.
+    pub operator: TextShowOp,
+}
+
+/// Discriminator for [`ContentTextShow::operator`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextShowOp {
+    /// `string Tj` — show one string.
+    Tj,
+    /// `[(s1) num1 (s2) num2 …] TJ` — show with per-element kerning.
+    TJ,
+    /// `' string` — move to the next line, then show (`T* Tj`).
+    SingleQuote,
+    /// `"`a_w a_c string"`` — set word + char spacing, move to next
+    /// line, then show.
+    DoubleQuote,
 }
 
 // ───────────────────────── parser state ─────────────────────────
@@ -154,6 +278,41 @@ struct State<'a> {
     /// for the legacy entry point. Used by the `gs` dispatcher to
     /// look up the named parameter dict per §8.4.5.
     ext_gstate: Option<&'a Dict>,
+    /// Page's `/Resources /Font` subdictionary, if the caller went
+    /// through [`parse_content_stream_full`] — `None` otherwise. Each
+    /// per-name entry should already be a direct `Object::Dict`
+    /// (single-hop indirect references dereferenced by
+    /// `reader::document::resolve_font_resources`). When this is
+    /// `Some`, `Tj`/`TJ`/`'`/`"` operators emit
+    /// [`ContentTextShow`] events; when it's `None`, text-show
+    /// operators stay round-3-no-op.
+    font_resources: Option<&'a Dict>,
+    /// Currently-selected font: name (Tf operand, leading `/`
+    /// stripped) + size. Reset on each `Tf`. Cleared when no `Tf`
+    /// has been seen yet — `Tj` then emits with an empty `font_name`
+    /// and `font_size = 0.0`.
+    current_font: Option<(String, f32)>,
+    /// Text matrix `Tm` (§9.4.4 — six-element matrix
+    /// `[ a b c d e f ]`). Reset to identity by every `BT`; updated
+    /// by `Tm`, `Td`, `TD`, `T*`, and the implicit `T*` inside `'`
+    /// and `"`.
+    text_matrix: Transform2D,
+    /// Text line matrix `Tlm` — duplicated from `Tm` by every
+    /// `BT`/`Td`/`TD`/`Tm`, advanced (combined with leading) by
+    /// `T*`/`'`/`"` to give the next line's origin (§9.4.4 "the text
+    /// line matrix … records the start of the next line").
+    text_line_matrix: Transform2D,
+    /// Text leading `TL` (§9.3.5) — the y-step `T*` uses. Defaults
+    /// to 0.0 per Table 105. Set by `TL` and by the implicit `TL` a
+    /// `"` operator emits.
+    text_leading: f32,
+    /// Whether the parser is currently inside a `BT … ET` text
+    /// object (§9.4 — operators outside a `BT` are silently ignored
+    /// per Table 105). Toggled by `BT` (`true`) and `ET` (`false`).
+    in_text_object: bool,
+    /// Stream-order text-show events accumulated for the round-128
+    /// [`ParsedContent::text_shows`] return slot.
+    text_shows: Vec<ContentTextShow>,
 }
 
 struct Frame {
@@ -168,13 +327,33 @@ struct Frame {
 #[derive(Clone, Debug)]
 enum Operand {
     Number(f32),
-    Array(Vec<f32>),
+    /// Heterogeneous PDF array `[ ... ]`. The `d` operator filters
+    /// out non-`Number` elements; `TJ` walks the mix of strings +
+    /// numbers in array order.
+    Array(Vec<ArrayElem>),
     /// Name operand. Read by `cs` / `CS` (to pick the colour space)
     /// and by `sc` / `scn` (a trailing `/Name` marks a Pattern fill,
-    /// §8.7.3.3). Resource lookups against `/Resources` for non-device
-    /// colour spaces / gradients / patterns still land later, when the
-    /// page's resolved Document is available.
+    /// §8.7.3.3) and by `Tf` (font resource name). Resource lookups
+    /// against `/Resources` for non-device colour spaces / gradients
+    /// / patterns still land later, when the page's resolved
+    /// Document is available.
     Name(String),
+    /// Literal-or-hex PDF string `(...)` / `<...>`. Held as raw
+    /// bytes (escape-decoded for literal strings, hex-pair-decoded
+    /// for hex strings); consumed by `Tj` / `'` / `"`.
+    String(Vec<u8>),
+}
+
+/// One element of a PDF content-stream array operand `[ ... ]`. PDF
+/// arrays inside content streams carry either numbers (the `d`
+/// operator's dash-array) or a mix of numbers + strings (the `TJ`
+/// operator's per-element kerning displacements). We keep both shapes
+/// in a single enum so the parser can stay agnostic until the
+/// consuming operator dispatches.
+#[derive(Clone, Debug)]
+enum ArrayElem {
+    Number(f32),
+    String(Vec<u8>),
 }
 
 /// Which colour space the current `sc`/`scn` (or `SC`/`SCN`) operands
@@ -228,7 +407,7 @@ impl ColorSpaceKind {
 }
 
 impl<'a> State<'a> {
-    fn new(ext_gstate: Option<&'a Dict>) -> Self {
+    fn new(ext_gstate: Option<&'a Dict>, font_resources: Option<&'a Dict>) -> Self {
         Self {
             operands: Vec::new(),
             stack: vec![Frame::new()],
@@ -246,10 +425,17 @@ impl<'a> State<'a> {
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
             ext_gstate,
+            font_resources,
+            current_font: None,
+            text_matrix: Transform2D::identity(),
+            text_line_matrix: Transform2D::identity(),
+            text_leading: 0.0,
+            in_text_object: false,
+            text_shows: Vec::new(),
         }
     }
 
-    fn finish(mut self) -> Group {
+    fn finish(mut self) -> ParsedContent {
         // Unwind any unmatched `q` frames by promoting them in order
         // — the input was malformed but we'd rather salvage what we
         // can than refuse the whole document.
@@ -257,12 +443,15 @@ impl<'a> State<'a> {
             self.pop_q();
         }
         let root = self.stack.pop().expect("root frame present");
-        Group {
-            transform: root.transform,
-            opacity: 1.0,
-            clip: root.clip,
-            children: root.children,
-            ..Group::default()
+        ParsedContent {
+            root: Group {
+                transform: root.transform,
+                opacity: 1.0,
+                clip: root.clip,
+                children: root.children,
+                ..Group::default()
+            },
+            text_shows: self.text_shows,
         }
     }
 
@@ -565,7 +754,9 @@ impl<'a> State<'a> {
                 self.miter_limit = nums[0];
             }
             b"d" => {
-                // [array] offset d
+                // [array] offset d. The array carries numbers only
+                // — strings inside a `d`-array are malformed PDF and
+                // are dropped (rather than refused) for tolerance.
                 if self.operands.len() < 2 {
                     self.operands.clear();
                     return Ok(());
@@ -575,7 +766,13 @@ impl<'a> State<'a> {
                     _ => 0.0,
                 };
                 let array = match self.operands.pop().unwrap() {
-                    Operand::Array(v) => v,
+                    Operand::Array(v) => v
+                        .into_iter()
+                        .filter_map(|el| match el {
+                            ArrayElem::Number(n) => Some(n),
+                            ArrayElem::String(_) => None,
+                        })
+                        .collect::<Vec<f32>>(),
                     _ => Vec::new(),
                 };
                 self.dash = if array.is_empty() {
@@ -586,9 +783,190 @@ impl<'a> State<'a> {
                 self.operands.clear();
             }
 
-            // Text — silently skip the operands. Round-4+.
-            b"BT" | b"ET" | b"Tj" | b"TJ" | b"Tf" | b"Tc" | b"Tw" | b"Tz" | b"TL" | b"Tr"
-            | b"Ts" | b"Td" | b"TD" | b"Tm" | b"T*" | b"'" | b"\"" => {
+            // Text-object brackets (§9.4 + Table 105) -------------
+            b"BT" => {
+                // §9.4 — every BT resets the text matrix + text line
+                // matrix to identity. Leading + font carry across BT
+                // boundaries per §9.3 Table 105 NOTE 1.
+                self.text_matrix = Transform2D::identity();
+                self.text_line_matrix = Transform2D::identity();
+                self.in_text_object = true;
+                self.operands.clear();
+            }
+            b"ET" => {
+                self.in_text_object = false;
+                self.operands.clear();
+            }
+
+            // Text state — §9.3 + Table 105 ------------------------
+            b"Tf" => {
+                // /Fx size Tf — last two operands are the font
+                // resource name + the size.
+                let size = match self.operands.last() {
+                    Some(Operand::Number(n)) => *n,
+                    _ => 0.0,
+                };
+                let name = match self.operands.iter().rev().nth(1) {
+                    Some(Operand::Name(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                self.current_font = Some((name, size));
+                self.operands.clear();
+            }
+            b"TL" => {
+                // single-number text leading.
+                if let Some(Operand::Number(n)) = self.operands.last() {
+                    self.text_leading = *n;
+                }
+                self.operands.clear();
+            }
+            b"Tc" | b"Tw" | b"Tz" | b"Tr" | b"Ts" => {
+                // Char-spacing / word-spacing / horizontal scale /
+                // rendering mode / rise — round-128 doesn't track
+                // these (they only affect glyph positioning, not the
+                // decoded text or the run origin). Drop operands.
+                self.operands.clear();
+            }
+
+            // Text positioning — §9.4.2 + Table 108 ---------------
+            b"Td" => {
+                // tx ty Td — text-line-matrix moves by (tx, ty);
+                // text matrix copies from it.
+                if let Ok(nums) = self.take_numbers(2) {
+                    let (tx, ty) = (nums[0], nums[1]);
+                    let m = Transform2D {
+                        a: 1.0,
+                        b: 0.0,
+                        c: 0.0,
+                        d: 1.0,
+                        e: tx,
+                        f: ty,
+                    };
+                    self.text_line_matrix = compose(self.text_line_matrix, m);
+                    self.text_matrix = self.text_line_matrix;
+                }
+                self.operands.clear();
+            }
+            b"TD" => {
+                // tx ty TD — equivalent to "-ty TL tx ty Td".
+                if let Ok(nums) = self.take_numbers(2) {
+                    let (tx, ty) = (nums[0], nums[1]);
+                    self.text_leading = -ty;
+                    let m = Transform2D {
+                        a: 1.0,
+                        b: 0.0,
+                        c: 0.0,
+                        d: 1.0,
+                        e: tx,
+                        f: ty,
+                    };
+                    self.text_line_matrix = compose(self.text_line_matrix, m);
+                    self.text_matrix = self.text_line_matrix;
+                }
+                self.operands.clear();
+            }
+            b"Tm" => {
+                // a b c d e f Tm — set text matrix + text line matrix
+                // to the six-element matrix verbatim.
+                if let Ok(nums) = self.take_numbers(6) {
+                    let m = Transform2D {
+                        a: nums[0],
+                        b: nums[1],
+                        c: nums[2],
+                        d: nums[3],
+                        e: nums[4],
+                        f: nums[5],
+                    };
+                    self.text_matrix = m;
+                    self.text_line_matrix = m;
+                }
+                self.operands.clear();
+            }
+            b"T*" => {
+                // Move to the next line — `0 -Tl Td`. (Note the sign:
+                // §9.4.2 Table 108 says `0 -Tl Td`; `text_leading` is
+                // already the positive y-step, so the displacement is
+                // `(0, -Tl)`.)
+                let leading = self.text_leading;
+                let m = Transform2D {
+                    a: 1.0,
+                    b: 0.0,
+                    c: 0.0,
+                    d: 1.0,
+                    e: 0.0,
+                    f: -leading,
+                };
+                self.text_line_matrix = compose(self.text_line_matrix, m);
+                self.text_matrix = self.text_line_matrix;
+                self.operands.clear();
+            }
+
+            // Text showing — §9.4.3 + Table 109 -------------------
+            b"Tj" => {
+                // string Tj
+                let bytes = match self.operands.last() {
+                    Some(Operand::String(s)) => s.clone(),
+                    _ => Vec::new(),
+                };
+                self.emit_text_show(bytes, TextShowOp::Tj);
+                self.operands.clear();
+            }
+            b"TJ" => {
+                // [(s1) num1 (s2) num2 …] TJ — concatenate the
+                // strings in array order. Per-element numeric
+                // displacements affect glyph kerning but not the
+                // decoded payload.
+                let mut bytes = Vec::new();
+                if let Some(Operand::Array(items)) = self.operands.last() {
+                    for el in items {
+                        if let ArrayElem::String(s) = el {
+                            bytes.extend_from_slice(s);
+                        }
+                    }
+                }
+                self.emit_text_show(bytes, TextShowOp::TJ);
+                self.operands.clear();
+            }
+            b"'" => {
+                // ' string — T* then Tj. Implicit line-advance per
+                // Table 109.
+                let leading = self.text_leading;
+                let m = Transform2D {
+                    a: 1.0,
+                    b: 0.0,
+                    c: 0.0,
+                    d: 1.0,
+                    e: 0.0,
+                    f: -leading,
+                };
+                self.text_line_matrix = compose(self.text_line_matrix, m);
+                self.text_matrix = self.text_line_matrix;
+                let bytes = match self.operands.last() {
+                    Some(Operand::String(s)) => s.clone(),
+                    _ => Vec::new(),
+                };
+                self.emit_text_show(bytes, TextShowOp::SingleQuote);
+                self.operands.clear();
+            }
+            b"\"" => {
+                // aw ac string " — set word + char spacing (which we
+                // don't track), implicit T*, then Tj.
+                let leading = self.text_leading;
+                let m = Transform2D {
+                    a: 1.0,
+                    b: 0.0,
+                    c: 0.0,
+                    d: 1.0,
+                    e: 0.0,
+                    f: -leading,
+                };
+                self.text_line_matrix = compose(self.text_line_matrix, m);
+                self.text_matrix = self.text_line_matrix;
+                let bytes = match self.operands.last() {
+                    Some(Operand::String(s)) => s.clone(),
+                    _ => Vec::new(),
+                };
+                self.emit_text_show(bytes, TextShowOp::DoubleQuote);
                 self.operands.clear();
             }
 
@@ -645,6 +1023,38 @@ impl<'a> State<'a> {
         });
         self.current().children.push(node);
         self.operands.clear();
+    }
+
+    /// Emit one [`ContentTextShow`] event for the current state. Only
+    /// fired when `in_text_object` is `true` and the caller plumbed
+    /// in `/Resources /Font` (so we have a meaningful font_dict to
+    /// hand back); outside a `BT` or without font resources the show
+    /// silently drops so the legacy `parse_content_stream` /
+    /// `parse_content_stream_with_resources` callers don't see new
+    /// behaviour.
+    ///
+    /// The position is the text-matrix origin `(e, f)` at the moment
+    /// of the show — §9.4.4 Table 108's `Tm = [a b c d e f]`.
+    fn emit_text_show(&mut self, bytes: Vec<u8>, operator: TextShowOp) {
+        if !self.in_text_object || self.font_resources.is_none() {
+            return;
+        }
+        let (font_name, font_size) = match &self.current_font {
+            Some((n, s)) => (n.clone(), *s),
+            None => (String::new(), 0.0),
+        };
+        let font_dict = match self.font_resources {
+            Some(fr) if !font_name.is_empty() => lookup_dict(fr, &font_name).cloned(),
+            _ => None,
+        };
+        self.text_shows.push(ContentTextShow {
+            font_name,
+            font_size,
+            font_dict,
+            bytes,
+            position: (self.text_matrix.e, self.text_matrix.f),
+            operator,
+        });
     }
 
     /// Apply the entries of a `/Type /ExtGState` parameter dictionary
@@ -818,22 +1228,26 @@ impl<'a> State<'a> {
                 continue;
             }
             if b == b'(' {
-                // Skip a literal string operand (text-show argument
-                // for `Tj` etc). Track depth + escape.
-                let (end, _bytes) = read_literal_string(input, i)?;
+                // Literal-string operand — keep the escape-decoded
+                // bytes (`Tj` / `'` / `"` consume them).
+                let (end, bytes) = read_literal_string(input, i)?;
+                self.operands.push(Operand::String(bytes));
                 i = end;
                 continue;
             }
             if b == b'<' && input.get(i + 1) != Some(&b'<') {
-                // Hex string — also a text-show operand.
-                let end = read_hex_string(input, i)?;
+                // Hex-string operand — decode pairs into bytes.
+                let (end, bytes) = read_hex_string(input, i)?;
+                self.operands.push(Operand::String(bytes));
                 i = end;
                 continue;
             }
             if b == b'[' {
-                // Array operand — for the dash array `[5 3] 0 d`.
-                let (end, nums) = read_number_array(input, i);
-                self.operands.push(Operand::Array(nums));
+                // Array operand — for the dash array `[5 3] 0 d`
+                // (numbers only), the `TJ` operator `[(s1) num1 …]`
+                // (strings + numbers), and any other inline array.
+                let (end, items) = read_array(input, i)?;
+                self.operands.push(Operand::Array(items));
                 i = end;
                 continue;
             }
@@ -1007,6 +1421,14 @@ fn scan_keyword_end(input: &[u8], start: usize) -> usize {
     end
 }
 
+/// Decode a PDF literal string `( … )` per ISO 32000-1 §7.3.4.2 —
+/// nested parentheses balance; the escape sequences `\n \r \t \b \f
+/// \( \) \\` produce their familiar byte, an octal escape `\ddd`
+/// (1..3 digits) produces that byte, a line-continuation `\<EOL>` is
+/// dropped, and any other `\c` falls through to the literal `c`. The
+/// returned `Vec<u8>` is the raw bytes the operator should see; the
+/// byte→Unicode mapping (per the active font's encoding) is the
+/// caller's job.
 fn read_literal_string(input: &[u8], start: usize) -> Result<(usize, Vec<u8>), PdfError> {
     let mut end = start + 1;
     let mut depth = 1u32;
@@ -1015,8 +1437,65 @@ fn read_literal_string(input: &[u8], start: usize) -> Result<(usize, Vec<u8>), P
         let b = input[end];
         if b == b'\\' {
             end += 1;
-            if end < input.len() {
-                end += 1;
+            if end >= input.len() {
+                break;
+            }
+            let esc = input[end];
+            match esc {
+                b'n' => {
+                    decoded.push(b'\n');
+                    end += 1;
+                }
+                b'r' => {
+                    decoded.push(b'\r');
+                    end += 1;
+                }
+                b't' => {
+                    decoded.push(b'\t');
+                    end += 1;
+                }
+                b'b' => {
+                    decoded.push(0x08);
+                    end += 1;
+                }
+                b'f' => {
+                    decoded.push(0x0C);
+                    end += 1;
+                }
+                b'(' | b')' | b'\\' => {
+                    decoded.push(esc);
+                    end += 1;
+                }
+                b'\n' => {
+                    end += 1;
+                }
+                b'\r' => {
+                    end += 1;
+                    if end < input.len() && input[end] == b'\n' {
+                        end += 1;
+                    }
+                }
+                d if d.is_ascii_digit() => {
+                    // Octal escape \ddd — up to three octal digits.
+                    let mut val: u16 = 0;
+                    let mut n = 0;
+                    while n < 3 && end < input.len() {
+                        let c = input[end];
+                        if !(b'0'..=b'7').contains(&c) {
+                            break;
+                        }
+                        val = val * 8 + (c - b'0') as u16;
+                        end += 1;
+                        n += 1;
+                    }
+                    decoded.push((val & 0xFF) as u8);
+                }
+                other => {
+                    // Unknown escape — the spec says the backslash is
+                    // dropped and the following byte is taken as is.
+                    decoded.push(other);
+                    end += 1;
+                }
             }
             continue;
         }
@@ -1038,17 +1517,45 @@ fn read_literal_string(input: &[u8], start: usize) -> Result<(usize, Vec<u8>), P
     ))
 }
 
-fn read_hex_string(input: &[u8], start: usize) -> Result<usize, PdfError> {
+/// Decode a PDF hex string `< … >` per ISO 32000-1 §7.3.4.3 —
+/// whitespace inside the angle brackets is skipped; a trailing odd
+/// digit is implicitly padded with `0`. The returned `Vec<u8>` holds
+/// one byte per hex pair.
+fn read_hex_string(input: &[u8], start: usize) -> Result<(usize, Vec<u8>), PdfError> {
     let mut end = start + 1;
+    let mut nibbles: Vec<u8> = Vec::new();
     while end < input.len() {
-        if input[end] == b'>' {
-            return Ok(end + 1);
+        let c = input[end];
+        if c == b'>' {
+            // Pad a trailing odd nibble per §7.3.4.3.
+            if nibbles.len() % 2 == 1 {
+                nibbles.push(0);
+            }
+            let mut out = Vec::with_capacity(nibbles.len() / 2);
+            for pair in nibbles.chunks(2) {
+                out.push((pair[0] << 4) | pair[1]);
+            }
+            return Ok((end + 1, out));
         }
+        if let Some(v) = hex_nibble(c) {
+            nibbles.push(v);
+        }
+        // else: any other byte (including whitespace) is silently
+        // skipped per §7.3.4.3.
         end += 1;
     }
     Err(PdfError::other(
         "PDF content parser: unterminated hex string",
     ))
+}
+
+fn hex_nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(10 + c - b'a'),
+        b'A'..=b'F' => Some(10 + c - b'A'),
+        _ => None,
+    }
 }
 
 /// Look up a name key in a dictionary and unwrap it as a nested
@@ -1137,17 +1644,37 @@ fn parse_dash_pair(obj: &Object) -> Option<(Vec<f32>, f32)> {
     Some((array, offset))
 }
 
-fn read_number_array(input: &[u8], start: usize) -> (usize, Vec<f32>) {
+/// Read a heterogeneous PDF array `[ … ]` starting at the `[` byte.
+/// Items may be numbers (the `d` operator's dash-array shape) or
+/// strings (the `TJ` operator's mix of `(s) num (s) num`). Other
+/// nested values (sub-arrays, dicts, names) inside a content-stream
+/// array are not produced by the writer and we don't try to surface
+/// them; bytes that aren't whitespace, a number lead, a `(`/`<`, or a
+/// `]` are skipped to keep tolerant of hand-laid streams.
+fn read_array(input: &[u8], start: usize) -> Result<(usize, Vec<ArrayElem>), PdfError> {
     let mut end = start + 1;
-    let mut nums = Vec::new();
+    let mut items: Vec<ArrayElem> = Vec::new();
     while end < input.len() && input[end] != b']' {
-        if is_whitespace(input[end]) {
+        let b = input[end];
+        if is_whitespace(b) {
             end += 1;
             continue;
         }
-        if matches!(input[end], b'+' | b'-' | b'.' | b'0'..=b'9') {
+        if b == b'(' {
+            let (next, bytes) = read_literal_string(input, end)?;
+            items.push(ArrayElem::String(bytes));
+            end = next;
+            continue;
+        }
+        if b == b'<' && input.get(end + 1) != Some(&b'<') {
+            let (next, bytes) = read_hex_string(input, end)?;
+            items.push(ArrayElem::String(bytes));
+            end = next;
+            continue;
+        }
+        if matches!(b, b'+' | b'-' | b'.' | b'0'..=b'9') {
             let nstart = end;
-            if matches!(input[end], b'+' | b'-') {
+            if matches!(b, b'+' | b'-') {
                 end += 1;
             }
             let mut saw_dot = false;
@@ -1161,17 +1688,18 @@ fn read_number_array(input: &[u8], start: usize) -> (usize, Vec<f32>) {
             }
             if let Ok(s) = str::from_utf8(&input[nstart..end]) {
                 if let Ok(f) = s.parse::<f32>() {
-                    nums.push(f);
+                    items.push(ArrayElem::Number(f));
                 }
             }
-        } else {
-            end += 1;
+            continue;
         }
+        // Tolerant skip for anything else.
+        end += 1;
     }
     if end < input.len() {
         end += 1;
     } // skip `]`
-    (end, nums)
+    Ok((end, items))
 }
 
 #[cfg(test)]
@@ -1787,5 +2315,211 @@ mod tests {
         assert!(
             parse_dash_pair(&Object::Array(vec![Object::Integer(0), Object::Integer(0)])).is_none()
         );
+    }
+
+    // ── Font resource plumbing + text show (round 128, ISO 32000-1 §9.4) ──
+
+    /// Helper: build a `/Resources /Font` dictionary with one named
+    /// simple-font descriptor. The dict shape mirrors what
+    /// `resolve_font_resources` hands back from the document walker.
+    fn font_res_with(name: &str, dict: Dict) -> Dict {
+        Dict::new().with(name, Object::Dict(dict))
+    }
+
+    fn parse_full(input: &[u8], ext: Option<&Dict>, fonts: Option<&Dict>) -> ParsedContent {
+        parse_content_stream_full(input, ext, fonts).unwrap()
+    }
+
+    /// A plain `BT … Tj … ET` with `/F1 12 Tf` surfaces one
+    /// [`ContentTextShow`] with the font name + size + decoded
+    /// literal-string bytes attached.
+    #[test]
+    fn tj_emits_one_text_show_with_font_and_size() {
+        let f1 = Dict::new()
+            .with("Type", Object::Name("Font".into()))
+            .with("Subtype", Object::Name("Type1".into()))
+            .with("BaseFont", Object::Name("Helvetica".into()));
+        let fonts = font_res_with("F1", f1);
+        let bytes = b"BT /F1 12 Tf 72 712 Td (Hello) Tj ET\n";
+        let p = parse_full(bytes, None, Some(&fonts));
+        assert_eq!(p.text_shows.len(), 1);
+        let show = &p.text_shows[0];
+        assert_eq!(show.font_name, "F1");
+        assert!((show.font_size - 12.0).abs() < 1e-3);
+        assert_eq!(show.bytes, b"Hello");
+        assert!((show.position.0 - 72.0).abs() < 1e-3);
+        assert!((show.position.1 - 712.0).abs() < 1e-3);
+        assert!(matches!(show.operator, TextShowOp::Tj));
+        assert!(show.font_dict.is_some());
+    }
+
+    /// `TJ` accepts `[ (s1) num1 (s2) num2 … ]`; the strings are
+    /// concatenated in array order, numeric kerns dropped.
+    #[test]
+    fn tj_array_concatenates_strings_and_drops_kerns() {
+        let fonts = font_res_with("F1", Dict::new());
+        let bytes = b"BT /F1 10 Tf 0 0 Td [(Hel) -250 (lo) -120 (!)] TJ ET\n";
+        let p = parse_full(bytes, None, Some(&fonts));
+        assert_eq!(p.text_shows.len(), 1);
+        let show = &p.text_shows[0];
+        assert_eq!(show.bytes, b"Hello!");
+        assert!(matches!(show.operator, TextShowOp::TJ));
+    }
+
+    /// `'` (single-quote) does the implicit `T*` line-advance first.
+    /// With `TL = 14` the y-step is `-14`. Form: `string '`.
+    #[test]
+    fn single_quote_does_implicit_t_star_then_show() {
+        let fonts = font_res_with("F1", Dict::new());
+        let bytes = b"BT /F1 12 Tf 14 TL 0 100 Td (first) Tj (second) ' ET\n";
+        let p = parse_full(bytes, None, Some(&fonts));
+        assert_eq!(p.text_shows.len(), 2);
+        assert_eq!(p.text_shows[0].bytes, b"first");
+        assert!((p.text_shows[0].position.1 - 100.0).abs() < 1e-3);
+        assert_eq!(p.text_shows[1].bytes, b"second");
+        // T* moves down by TL: y = 100 - 14 = 86.
+        assert!((p.text_shows[1].position.1 - 86.0).abs() < 1e-3);
+        assert!(matches!(p.text_shows[1].operator, TextShowOp::SingleQuote));
+    }
+
+    /// `"` (double-quote) consumes its leading `aw ac` numbers then
+    /// does the implicit `T*` + show. We don't track aw/ac but the
+    /// line-advance must still fire. Form: `aw ac string "`.
+    #[test]
+    fn double_quote_does_implicit_t_star_then_show() {
+        let fonts = font_res_with("F1", Dict::new());
+        let bytes = b"BT /F1 12 Tf 10 TL 0 100 Td (first) Tj 1 2 (second) \" ET\n";
+        let p = parse_full(bytes, None, Some(&fonts));
+        assert_eq!(p.text_shows.len(), 2);
+        assert_eq!(p.text_shows[1].bytes, b"second");
+        assert!((p.text_shows[1].position.1 - 90.0).abs() < 1e-3);
+        assert!(matches!(p.text_shows[1].operator, TextShowOp::DoubleQuote));
+    }
+
+    /// `Tm` sets the text matrix verbatim — origin = (e, f).
+    #[test]
+    fn tm_sets_text_matrix_directly() {
+        let fonts = font_res_with("F1", Dict::new());
+        let bytes = b"BT /F1 10 Tf 1 0 0 1 50 600 Tm (P) Tj ET\n";
+        let p = parse_full(bytes, None, Some(&fonts));
+        assert_eq!(p.text_shows.len(), 1);
+        assert!((p.text_shows[0].position.0 - 50.0).abs() < 1e-3);
+        assert!((p.text_shows[0].position.1 - 600.0).abs() < 1e-3);
+    }
+
+    /// `BT` resets the text matrix — runs from a prior `BT … ET`
+    /// don't bleed into the next text object's position.
+    #[test]
+    fn bt_resets_text_matrix() {
+        let fonts = font_res_with("F1", Dict::new());
+        let bytes = b"BT /F1 12 Tf 100 200 Td (A) Tj ET BT /F1 12 Tf 0 0 Td (B) Tj ET\n";
+        let p = parse_full(bytes, None, Some(&fonts));
+        assert_eq!(p.text_shows.len(), 2);
+        assert!((p.text_shows[0].position.0 - 100.0).abs() < 1e-3);
+        // The second BT zeros out the matrix, then 0 0 Td adds (0,0).
+        assert!(p.text_shows[1].position.0.abs() < 1e-3);
+        assert!(p.text_shows[1].position.1.abs() < 1e-3);
+    }
+
+    /// `Tj` against a font *name* that isn't in the resources dict
+    /// still surfaces the show — `font_dict` is `None` so the
+    /// consumer knows the font wasn't resolved.
+    #[test]
+    fn tj_with_unknown_font_name_still_emits_show_with_none_dict() {
+        let fonts = font_res_with("F1", Dict::new());
+        let bytes = b"BT /F_OTHER 12 Tf 0 0 Td (Hi) Tj ET\n";
+        let p = parse_full(bytes, None, Some(&fonts));
+        assert_eq!(p.text_shows.len(), 1);
+        assert_eq!(p.text_shows[0].font_name, "F_OTHER");
+        assert_eq!(p.text_shows[0].bytes, b"Hi");
+        assert!(p.text_shows[0].font_dict.is_none());
+    }
+
+    /// Without `font_resources` (the round-3 / round-125 entry
+    /// points), text shows never emit — backward compatibility.
+    #[test]
+    fn legacy_entry_points_drop_tj_silently() {
+        let bytes = b"BT /F1 12 Tf 0 0 Td (Hello) Tj ET\n";
+        let r1 = parse_content_stream(bytes).unwrap();
+        // No painted geometry — text doesn't reach the IR.
+        assert!(r1.children.is_empty());
+        let r2 = parse_content_stream_with_resources(bytes, None).unwrap();
+        assert!(r2.children.is_empty());
+    }
+
+    /// `Tj` *outside* a `BT … ET` block is silently ignored — §9.4 +
+    /// Table 105 says text-state operators are only valid inside a
+    /// text object.
+    #[test]
+    fn tj_outside_text_object_is_dropped() {
+        let fonts = font_res_with("F1", Dict::new());
+        // No BT — stray Tj must not emit.
+        let bytes = b"(stray) Tj\n";
+        let p = parse_full(bytes, None, Some(&fonts));
+        assert_eq!(p.text_shows.len(), 0);
+    }
+
+    /// Hex-string operands (`<48656C6C6F>` = `Hello`) decode through
+    /// the same path as literal strings.
+    #[test]
+    fn hex_string_operand_decodes_for_tj() {
+        let fonts = font_res_with("F1", Dict::new());
+        let bytes = b"BT /F1 12 Tf 0 0 Td <48656C6C6F> Tj ET\n";
+        let p = parse_full(bytes, None, Some(&fonts));
+        assert_eq!(p.text_shows.len(), 1);
+        assert_eq!(p.text_shows[0].bytes, b"Hello");
+    }
+
+    /// Octal escape sequence `\101` = `'A'` (=0o101) in a literal
+    /// string operand decodes to the right byte.
+    #[test]
+    fn literal_string_octal_escape() {
+        let fonts = font_res_with("F1", Dict::new());
+        let bytes = b"BT /F1 12 Tf 0 0 Td (\\101\\102\\103) Tj ET\n";
+        let p = parse_full(bytes, None, Some(&fonts));
+        assert_eq!(p.text_shows[0].bytes, b"ABC");
+    }
+
+    /// Newline + tab + paren escapes round-trip.
+    #[test]
+    fn literal_string_named_escapes() {
+        let fonts = font_res_with("F1", Dict::new());
+        let bytes = b"BT /F1 12 Tf 0 0 Td (a\\nb\\tc\\(d\\)) Tj ET\n";
+        let p = parse_full(bytes, None, Some(&fonts));
+        assert_eq!(p.text_shows[0].bytes, b"a\nb\tc(d)");
+    }
+
+    /// Painted geometry still lands in the IR even when a `BT … ET`
+    /// runs in the same stream — text + paths coexist cleanly.
+    #[test]
+    fn text_and_path_coexist_in_one_stream() {
+        let fonts = font_res_with("F1", Dict::new());
+        let bytes = b"q 0 0 m 10 10 l 10 0 l h f BT /F1 12 Tf 0 0 Td (X) Tj ET Q\n";
+        let p = parse_full(bytes, None, Some(&fonts));
+        // One painted group with one path child.
+        assert_eq!(p.root.children.len(), 1);
+        let Node::Group(g) = &p.root.children[0] else {
+            panic!()
+        };
+        assert!(matches!(g.children[0], Node::Path(_)));
+        assert_eq!(p.text_shows.len(), 1);
+        assert_eq!(p.text_shows[0].bytes, b"X");
+    }
+
+    /// `read_hex_string` pads a trailing odd nibble with 0 per
+    /// §7.3.4.3.
+    #[test]
+    fn hex_string_pads_trailing_odd_nibble() {
+        let (end, bytes) = read_hex_string(b"<4>x", 0).unwrap();
+        assert_eq!(end, 3);
+        assert_eq!(bytes, vec![0x40]);
+    }
+
+    /// `read_hex_string` skips whitespace and is case-insensitive
+    /// on letters.
+    #[test]
+    fn hex_string_skips_whitespace_and_is_case_insensitive() {
+        let (_end, bytes) = read_hex_string(b"<4a 5C>", 0).unwrap();
+        assert_eq!(bytes, vec![0x4A, 0x5C]);
     }
 }
