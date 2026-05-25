@@ -318,6 +318,15 @@ override the classical `free` markers they shadow. Chained `/XRefStm`
 references are bounded at 32 hops and short-circuit on cycles, the
 same guards the `/Prev`-section walker already enforces.
 
+**§7.5.8.3 forward-compat.** Unknown entry types (≥ 3) are resolved
+as references to the null object per spec — "any other value shall be
+interpreted as a reference to the null object, thus permitting new
+entry types to be defined in the future." The `/W` array's
+zero-width defaults are honoured (`w[0] == 0` ⇒ type field defaults
+to 1; `w[2] == 0` ⇒ generation defaults to 0 per Table 18 Type 1
+field 3). Multi-subsection `/Index` arrays walk per-subsection
+starting object numbers rather than implicitly numbering from zero.
+
 ## Object streams
 
 Both reader and writer support PDF 1.5+ object streams

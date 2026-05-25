@@ -601,7 +601,9 @@ fn parse_xref_stream_at(input: &[u8], xref_pos: usize) -> Result<XrefTable, PdfE
             let chunk = &table_bytes[cursor..cursor + entry_size];
             cursor += entry_size;
             let (f1, f2, f3) = split_fields(chunk, w[0], w[1], w[2]);
-            // f1 default = 1 when w[0] == 0 (§7.5.8.3).
+            // f1 default = 1 when w[0] == 0 (§7.5.8.3 W array note:
+            // "If the first element is zero, the type field shall not
+            // be present, and shall default to type 1").
             let kind = if w[0] == 0 { 1 } else { f1 };
             let id = start + offset_in_section;
             let entry = match kind {
@@ -613,17 +615,27 @@ fn parse_xref_stream_at(input: &[u8], xref_pos: usize) -> Result<XrefTable, PdfE
                 1 => XrefEntry::InUse {
                     offset: f2,
                     // /W default for w[2] is 0, in which case the spec
-                    // says "0" generation.
+                    // says "0" generation (Table 18 Type 1 field 3
+                    // "Default value: 0").
                     generation: f3 as u16,
                 },
                 2 => XrefEntry::Compressed {
                     obj_stream_id: f2 as u32,
                     index_within_stream: f3 as u32,
                 },
-                other => {
-                    return Err(PdfError::other(format!(
-                        "PDF reader: XRef stream entry has unknown type {other} at id {id}"
-                    )));
+                _ => {
+                    // §7.5.8.3: "In PDF 1.5 through PDF 1.7, only types
+                    // 0, 1, and 2 are allowed. Any other value shall be
+                    // interpreted as a reference to the null object,
+                    // thus permitting new entry types to be defined in
+                    // the future." A null reference resolves like a free
+                    // slot — the resolver returns no offset for it — so
+                    // we record the entry as Free with the head-of-list
+                    // "never reusable" generation 65535.
+                    XrefEntry::Free {
+                        next: 0,
+                        generation: 65535,
+                    }
                 }
             };
             entries.insert(id, entry);

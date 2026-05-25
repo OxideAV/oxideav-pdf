@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- reader: §7.5.8.3 XRef-stream forward-compat — unknown entry types (≥3) now resolve as null-object references per spec instead of erroring out, and the W-array zero-width defaults (w[0]=0 ⇒ type 1, w[2]=0 ⇒ generation 0) get explicit coverage in `tests/xref_stream_round131.rs` alongside multi-subsection `/Index` and predictor-1 (default) Flate paths
 - reader: §9.4 `Tj` / `TJ` / `'` / `"` text-show operators resolve fonts through `/Resources /Font` (round-128); a new `parse_content_stream_full(input, ext_gstate, fonts)` entry returns a `ParsedContent { root, text_shows }` carrying one `ContentTextShow` per show with the resolved font dict, font size, decoded operand bytes, text-matrix origin, and originating operator. Mirrors the round-125 `gs` plumbing shape; `BT`/`ET`/`Tf`/`Tm`/`Td`/`TD`/`T*`/`TL` text-state operators are honoured per §9.4.2 + Table 108. Legacy `parse_content_stream` / `parse_content_stream_with_resources` entry points keep their round-3 / round-125 no-op behaviour
 - reader: §8.4.5 `gs` operator resolves named ExtGState dicts from `/Resources /ExtGState` and applies the Table-58 subset that maps onto the round-3 vector IR (LW / LC / LJ / ML / D / CA / ca); other Table-58 keys (BM, OP, SMask, RI, Font, …) are tolerated as no-ops per "any combination of parameter entries"
 - reader: §7.5.8.4 hybrid-reference (`/XRefStm`) merge in `parse_xref`
