@@ -53,6 +53,29 @@ pub struct DocumentReader<'a> {
     xref: XrefTable,
     cache: HashMap<ObjectId, Object>,
     crypt: Option<StandardHandler>,
+    /// §7.5.7 compressed-object resolver memo. Each entry holds the
+    /// FlateDecode-decompressed body of one ObjStm container plus the
+    /// parsed `(obj_num, byte_offset_inside_payload)` header pairs.
+    /// Without this cache, resolving N compressed objects whose xref
+    /// type-2 entries all point at one container costs O(N²) — every
+    /// `resolve(compressed)` call re-decompresses the whole stream
+    /// and re-parses the `n` header pairs from scratch. Keyed by the
+    /// container object number (not [`ObjectId`] — the generation of
+    /// an ObjStm is always 0 per §7.5.7).
+    objstm_cache: HashMap<u32, ObjStmDecoded>,
+}
+
+/// Cached decoded ObjStm: the Flate-expanded payload + the parsed
+/// header table mapping each slot index to `(obj_num, body_offset)`
+/// inside the payload. `first` is `pairs[0].1 + the base` — but the
+/// resolver only needs to add the per-slot body_offset to the
+/// absolute payload base, which we precompute here so the hot path
+/// is a single `HashMap` lookup + `Parser::new(&payload[abs..])`.
+struct ObjStmDecoded {
+    payload: Vec<u8>,
+    /// Absolute byte offset from `payload[0]` for slot `i`'s body.
+    /// `(obj_num, abs_offset_into_payload)`.
+    slots: Vec<(u32, usize)>,
 }
 
 impl<'a> DocumentReader<'a> {
@@ -78,6 +101,7 @@ impl<'a> DocumentReader<'a> {
             input,
             xref,
             cache: HashMap::new(),
+            objstm_cache: HashMap::new(),
             crypt,
         })
     }
@@ -98,6 +122,7 @@ impl<'a> DocumentReader<'a> {
             input,
             xref,
             cache: HashMap::new(),
+            objstm_cache: HashMap::new(),
             crypt,
         })
     }
@@ -117,6 +142,7 @@ impl<'a> DocumentReader<'a> {
             input,
             xref,
             cache: HashMap::new(),
+            objstm_cache: HashMap::new(),
             crypt,
         })
     }
@@ -373,12 +399,40 @@ impl<'a> DocumentReader<'a> {
     /// object stream (PDF 1.5+ `/Type /ObjStm`), slice the body whose
     /// header matches `wanted.number`, and parse it with the standard
     /// object parser.
+    ///
+    /// The decoded payload + header slot table are memoised in
+    /// [`Self::objstm_cache`] so the second-and-subsequent compressed
+    /// object resolved against the same container skip Flate
+    /// decompression + header re-parse. Without the cache the cost of
+    /// resolving the M compressed objects packed into one ObjStm
+    /// container is O(M²) (every call decompresses the full payload
+    /// and re-parses every header pair); with it the cost is
+    /// O(M) for the first call + O(1) per subsequent slot lookup.
     fn resolve_compressed(
         &mut self,
         wanted: ObjectId,
         obj_stream_num: u32,
         index_within_stream: u32,
     ) -> Result<Object, PdfError> {
+        // Fast path: container already decoded.
+        if let Some(decoded) = self.objstm_cache.get(&obj_stream_num) {
+            return Self::slot_from_decoded(decoded, wanted, index_within_stream);
+        }
+        let decoded = self.decode_objstm_container(wanted, obj_stream_num)?;
+        let body = Self::slot_from_decoded(&decoded, wanted, index_within_stream)?;
+        self.objstm_cache.insert(obj_stream_num, decoded);
+        Ok(body)
+    }
+
+    /// Fetch the container ObjStm object, validate its dict, Flate-
+    /// decompress the body, and parse the §7.5.7 header table into a
+    /// flat `[(obj_num, abs_payload_offset); N]` slice. Cached by
+    /// [`Self::resolve_compressed`].
+    fn decode_objstm_container(
+        &mut self,
+        wanted: ObjectId,
+        obj_stream_num: u32,
+    ) -> Result<ObjStmDecoded, PdfError> {
         let container_id = ObjectId::new(obj_stream_num);
         let container = self.resolve(container_id)?;
         let Object::Stream(s) = container else {
@@ -415,11 +469,6 @@ impl<'a> DocumentReader<'a> {
                 )))
             }
         };
-        if index_within_stream >= n {
-            return Err(PdfError::other(format!(
-                "PDF reader: ObjStm index {index_within_stream} out of range (N={n})"
-            )));
-        }
         let payload = decode_stream(&s)?;
         if first > payload.len() {
             return Err(PdfError::other(format!(
@@ -432,7 +481,7 @@ impl<'a> DocumentReader<'a> {
         // whitespace separators per §7.5.7. Re-use the standard
         // parser's integer machinery rather than re-implementing it.
         let mut hp = Parser::new(header_bytes);
-        let mut pairs: Vec<(u32, usize)> = Vec::with_capacity(n as usize);
+        let mut slots: Vec<(u32, usize)> = Vec::with_capacity(n as usize);
         for i in 0..n {
             let on = hp.parse_object()?.ok_or_else(|| {
                 PdfError::other(format!(
@@ -454,9 +503,37 @@ impl<'a> DocumentReader<'a> {
                     "PDF reader: ObjStm header pair {i} out of range ({num}, {o})"
                 )));
             }
-            pairs.push((num as u32, o as usize));
+            let abs_off = first
+                .checked_add(o as usize)
+                .ok_or_else(|| PdfError::other("PDF reader: ObjStm offset overflow"))?;
+            if abs_off > payload.len() {
+                return Err(PdfError::other(format!(
+                    "PDF reader: ObjStm body offset {abs_off} past payload length {}",
+                    payload.len()
+                )));
+            }
+            slots.push((num as u32, abs_off));
         }
-        let (header_num, body_off) = pairs[index_within_stream as usize];
+        Ok(ObjStmDecoded { payload, slots })
+    }
+
+    /// Per-slot extraction against a cached [`ObjStmDecoded`].
+    /// Validates `index_within_stream` against the header table,
+    /// confirms the declared object number matches what the xref
+    /// promised, then parses one object out of the payload starting
+    /// at the precomputed absolute offset.
+    fn slot_from_decoded(
+        decoded: &ObjStmDecoded,
+        wanted: ObjectId,
+        index_within_stream: u32,
+    ) -> Result<Object, PdfError> {
+        let n = decoded.slots.len() as u32;
+        if index_within_stream >= n {
+            return Err(PdfError::other(format!(
+                "PDF reader: ObjStm index {index_within_stream} out of range (N={n})"
+            )));
+        }
+        let (header_num, abs_off) = decoded.slots[index_within_stream as usize];
         if header_num != wanted.number {
             return Err(PdfError::other(format!(
                 "PDF reader: ObjStm slot {index_within_stream} declares object {header_num},\
@@ -464,19 +541,10 @@ impl<'a> DocumentReader<'a> {
                 wanted.number
             )));
         }
-        let abs_off = first
-            .checked_add(body_off)
-            .ok_or_else(|| PdfError::other("PDF reader: ObjStm offset overflow"))?;
-        if abs_off > payload.len() {
-            return Err(PdfError::other(format!(
-                "PDF reader: ObjStm body offset {abs_off} past payload length {}",
-                payload.len()
-            )));
-        }
         // Compressed objects in an ObjStm cannot themselves be
         // streams (§7.5.7), and have no `n gen obj` wrapper — we
         // parse a single object starting at `abs_off`.
-        let mut bp = Parser::new(&payload[abs_off..]);
+        let mut bp = Parser::new(&decoded.payload[abs_off..]);
         let body = bp
             .parse_object()?
             .ok_or_else(|| PdfError::other("PDF reader: ObjStm body parse returned EOF"))?;

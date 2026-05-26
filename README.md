@@ -1224,7 +1224,7 @@ Local headline numbers on the round-148 host
 | `read_pdf_to_scene/open_single_page_classic_xref`   | 581 B   | 138 MiB/s |
 | `read_pdf_to_scene/open_ten_page_classic_xref`      | 5993 B  | 209 MiB/s |
 | `read_pdf_to_scene/open_fifty_page_xref_stream`     | 25105 B | 175 MiB/s |
-| `read_pdf_to_scene/open_fifty_page_object_stream`   | 9463 B  | 3.1 MiB/s |
+| `read_pdf_to_scene/open_fifty_page_object_stream`   | 9463 B  | 54.6 MiB/s |
 | `parse_xref/parse_xref_classic_table_10p`           | 3716 B  | 1.90 GiB/s |
 | `parse_xref/parse_xref_classic_table_50p`           | 17729 B | 2.68 GiB/s |
 | `parse_xref/parse_xref_stream_50p`                  | 14951 B | 1.13 GiB/s |
@@ -1234,10 +1234,20 @@ Local headline numbers on the round-148 host
 | `parse_content_stream/content_groups_and_clips`     | 5939 B  | 154 MiB/s |
 | `parse_content_stream/content_mixed_realistic`      | 48473 B | 181 MiB/s |
 
-The 50-page ObjStm open scenario is an outlier at ~3 MiB/s. The
-compressed-object resolver is currently the dominant cost in that
-path; an optimisation pass on the §7.5.7 walker is a natural
-follow-up.
+Round-151 closed the §7.5.7 compressed-object resolver hot path:
+[`DocumentReader`] now memoises each ObjStm container's
+Flate-decompressed payload + parsed `(obj_num,
+abs_payload_offset)` header slot table on first access. Resolving
+M compressed objects against the same container drops from O(M²)
+(every `resolve(compressed)` call re-decompressed the full payload
++ re-parsed every header pair) to O(M) for the first call + O(1)
+per subsequent slot. The 50-page ObjStm bench moved from 3.10 MiB/s
+to 54.6 MiB/s (≈ 17.6× wall-clock, -94% time) on the round-148
+host; classic-xref + xref-stream paths unchanged within ±3%
+noise. The remaining ~3× gap to the classic-xref scenario is the
+per-call decode-stream cost (one decompression for the container
+shared across all M slots) which is irreducible without
+cross-`DocumentReader` caching (out of scope).
 
 Run a single bench with:
 
