@@ -1151,6 +1151,44 @@ Multiple `gs` invocations cumulate — an earlier `/GW gs` carrying only
 they need IR plumbing the vector model doesn't yet carry, so honouring
 them now would be misleading rather than additive.
 
+## Fuzz harness (round 145)
+
+The crate ships a cargo-fuzz harness under `fuzz/` with three
+panic-free decode-side targets. PDF has no external library worth
+pulling in as a cross-decode oracle (and the clean-room wall bars
+qpdf / pdfium / poppler / mupdf source anyway), so this is a
+decode-only contract: feed arbitrary bytes to the public reader
+entry points and assert they always return a `Result` rather than
+panicking, aborting, or OOMing.
+
+- **`parse`** — drives `read_pdf_to_scene` end-to-end (§7.5 file
+  structure + §7.8 page tree + §8/§9 content streams + §7.4 stream
+  filters) plus the three standalone reader entry points
+  `parse_linearization_dict` (§7.5.2), `extract_inline_images_from_stream`
+  (§8.9.7), and `parse_content_stream` (§8/§9).
+- **`xref`** — drives the §7.5.4 classic xref-table parser, the
+  §7.5.8 cross-reference-stream parser, and the §7.5.8.4
+  hybrid-reference merge directly: both the one-shot `parse_xref`
+  entry point and the two-step `find_startxref_offset` +
+  `parse_xref_at` split, the latter with a fuzz-derived
+  out-of-range offset pulled from the input.
+- **`decrypt`** — drives `read_pdf_to_scene_with_password` with an
+  arbitrary password split out of the fuzzer input. Exercises §7.6
+  standard-handler dispatch (R=2 RC4-40, R=3 RC4-128, R=4 AES-128 /
+  RC4-128 with crypt filters, R=5 / R=6 AES-256 with SHA-256/384/512
+  key derivation per ISO 32000-2:2020 §7.6.4.4.3 Algorithm 2.B).
+
+The corpus is seeded with the existing in-tree fixtures
+(`tests/fixtures/{font_resources,gs_ext_gstate,hybrid_xrefstm}.pdf`)
+plus minimal scaffolds. Round 1 of the harness ran ~5 M execs per
+target locally and surfaced two reader-side panics (a §7.7.3.2
+/Pages-tree cycle that recursed forever, and a §7.3.4.2 literal
+string with a trailing `\` that overran the slice index), both
+fixed in this round with regression coverage under
+`tests/fuzz_regressions.rs`. CI runs the suite daily under
+`.github/workflows/fuzz.yml` with a 30-minute total budget split
+across the three targets.
+
 ## Deferred
 
 - **Text emission** — writer-side `BT … Tj … ET` for `Node::Text`

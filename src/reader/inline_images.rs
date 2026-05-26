@@ -569,7 +569,7 @@ fn read_dict_value(bytes: &[u8], from: usize) -> Result<(DictValue, usize), PdfE
         let mut depth = 1i32;
         while end < bytes.len() && depth > 0 {
             match bytes[end] {
-                b'\\' => end += 2,
+                b'\\' => end = end.saturating_add(2),
                 b'(' => {
                     depth += 1;
                     end += 1;
@@ -581,6 +581,12 @@ fn read_dict_value(bytes: &[u8], from: usize) -> Result<(DictValue, usize), PdfE
                 _ => end += 1,
             }
         }
+        // §7.3.4.2: a `\` at the last byte of the input would push
+        // `end` past `bytes.len()` via the `end += 2` above, which
+        // would then trip a slice-index panic on the return below.
+        // Clamp so a malformed-but-truncated escape is reported as
+        // an open string rather than a panic.
+        let end = end.min(bytes.len());
         return Ok((DictValue::Raw(bytes[from..end].to_vec()), end));
     }
     if matches!(b, b'+' | b'-' | b'.' | b'0'..=b'9') {

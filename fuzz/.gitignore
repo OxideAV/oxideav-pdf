@@ -1,0 +1,12 @@
+target
+artifacts
+coverage
+fuzz-*.log
+
+# libFuzzer auto-discovered corpus entries are 40-hex-character file
+# names (SHA-1 of the input). They balloon to hundreds of MB in
+# minutes and aren't worth committing — only the hand-curated seed
+# corpus stays in-tree. Match exactly 40 hex digits per file so the
+# named seeds (empty.bin, font_resources.pdf, startxref_only.bin, …)
+# are preserved.
+corpus/*/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]

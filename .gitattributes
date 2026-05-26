@@ -8,3 +8,9 @@
 # Force every fixture under tests/fixtures/ to binary so checkouts
 # preserve the exact bytes on every platform.
 tests/fixtures/* binary
+
+# Same reasoning for the cargo-fuzz seed corpus under fuzz/corpus/:
+# byte-exact PDF bytestreams that libFuzzer reads with no encoding
+# normalisation, so any CRLF rewrite on a Windows checkout would
+# change the input and skew the corpus.
+fuzz/corpus/**/* binary

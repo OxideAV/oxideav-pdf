@@ -21,7 +21,7 @@
 //! reader symmetric with the writer's output. Object streams (PDF
 //! 1.5+) and encryption are deferred to round 4+.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use oxideav_core::vector::{
     FillRule, Group, Node, Paint, Path, PathCommand, PathNode, Rgba, VectorFrame,
@@ -939,11 +939,45 @@ fn decode_to_scene(mut reader: DocumentReader<'_>) -> Result<Scene, PdfError> {
     })
 }
 
+/// Maximum nesting depth of a §7.7.3.2 /Pages tree the reader will
+/// follow. ISO 32000-1 does not specify a hard bound — but a
+/// well-formed pages tree is balanced at most logarithmically in page
+/// count, so a 256-level deep tree would map to more pages than any
+/// sane consumer would attempt. Anything past this bound is treated
+/// as a malformed tree (likely an attacker-shaped chain) and the
+/// walker returns Err rather than blowing the call stack.
+const MAX_PAGES_TREE_DEPTH: u32 = 256;
+
 fn walk_pages_tree(
     reader: &mut DocumentReader<'_>,
     node_id: ObjectId,
     out: &mut Vec<ObjectId>,
 ) -> Result<(), PdfError> {
+    let mut visited = HashSet::new();
+    walk_pages_tree_inner(reader, node_id, out, &mut visited, 0)
+}
+
+fn walk_pages_tree_inner(
+    reader: &mut DocumentReader<'_>,
+    node_id: ObjectId,
+    out: &mut Vec<ObjectId>,
+    visited: &mut HashSet<ObjectId>,
+    depth: u32,
+) -> Result<(), PdfError> {
+    if depth > MAX_PAGES_TREE_DEPTH {
+        return Err(PdfError::other(format!(
+            "PDF reader: /Pages tree exceeds maximum depth ({MAX_PAGES_TREE_DEPTH})"
+        )));
+    }
+    // §7.7.3.2 says a /Pages node's /Kids array MUST NOT reference
+    // an ancestor — but in malformed (or hostile) input it can, which
+    // would loop the walker forever. Track every visited node and
+    // refuse to re-enter one.
+    if !visited.insert(node_id) {
+        return Err(PdfError::other(format!(
+            "PDF reader: /Pages tree contains a cycle at {node_id:?}"
+        )));
+    }
     let node = reader.resolve(node_id)?;
     let Object::Dict(d) = node else {
         return Err(PdfError::other(format!(
@@ -979,7 +1013,7 @@ fn walk_pages_tree(
             };
             for item in items {
                 if let Object::Reference(id) = item {
-                    walk_pages_tree(reader, id, out)?;
+                    walk_pages_tree_inner(reader, id, out, visited, depth + 1)?;
                 }
             }
             Ok(())

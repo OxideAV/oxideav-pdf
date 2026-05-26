@@ -1,0 +1,86 @@
+[package]
+name = "oxideav-pdf-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# PDF's reader is the rich fuzz surface — ISO 32000-1 §7.5 file
+# structure (header / body / cross-reference table / trailer) plus the
+# §7.5.8 cross-reference *streams* (a compressed alternative xref
+# layout introduced in PDF 1.5) and the §7.5.8.4 hybrid-reference
+# layout that lets a single file carry both. Every offset, generation
+# number, and object identifier read out of those structures is
+# attacker-controlled and feeds the indirect-object dereference path
+# inside `read_pdf_to_scene` (ISO 32000-1 §7.3.10) — a stray offset
+# can point at anything in the file, including pre-arranged loops, so
+# the harness contract is purely that the call returns a `Result`.
+#
+# Three independent decode entry points are fuzzed because they map
+# to distinct §-sections with distinct parsing state machines:
+#
+#   * `read_pdf_to_scene` — end-to-end §7.5 + §7.8 page tree +
+#     §8/§9 content streams + §7.4 stream filters + §7.6 encryption
+#     dispatch (None on the bare path).
+#   * `parse_xref` — §7.5.4 classic xref-table parser + §7.5.8
+#     cross-reference-stream parser + §7.5.8.4 hybrid-reference
+#     merge. Driven directly so a single-byte mutation that wouldn't
+#     survive end-to-end decode still gets exercised at the parser.
+#   * `read_pdf_to_scene_with_password` — §7.6 standard-handler
+#     decrypt dispatch (R=2..R=6) layered on top of the above. The
+#     password is split off the fuzzer-provided input.
+#
+# There is no external library worth pulling in as a cross-decode
+# oracle (and the clean-room wall bars qpdf / pdfium / poppler /
+# mupdf source anyway), so this fuzz crate is **decode-only**: feed
+# arbitrary bytes to the public reader entry points and assert they
+# always return a `Result` rather than panicking / aborting / OOMing.
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-pdf]
+path = ".."
+
+# Prevent this fuzz package from being pulled into the umbrella
+# workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# End-to-end parse — drives the full reader on arbitrary bytes,
+# including the lexer (§7.2), object parser (§7.3), xref walker
+# (§7.5), stream-filter chain (§7.4), and content-stream evaluator
+# (§8 / §9). Also exercises the standalone §7.5.2 linearization-dict
+# parser, the §8.9.7 inline-image scanner, and the §7.8 content-stream
+# parser, all on the same input bytes.
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+
+# Xref-only — drives the §7.5.4 classic xref-table parser and the
+# §7.5.8 cross-reference-stream parser (incl. §7.5.8.4 hybrid
+# reference). A second pair of public entry points (`find_startxref_offset`
+# + `parse_xref_at`) is also driven so the byte-precision offset
+# arithmetic is fuzzed in isolation from the rest of the reader.
+[[bin]]
+name = "xref"
+path = "fuzz_targets/xref.rs"
+test = false
+doc = false
+
+# Password decrypt — drives `read_pdf_to_scene_with_password` on
+# arbitrary bytes with an arbitrary password split out of the fuzzer
+# input. Exercises §7.6 standard-handler dispatch (R=2..R=6) layered
+# on the full reader, so any panic in the R=4 AES-128 / R=5/R=6
+# AES-256 key-derivation or CBC-decrypt paths surfaces here.
+[[bin]]
+name = "decrypt"
+path = "fuzz_targets/decrypt.rs"
+test = false
+doc = false
