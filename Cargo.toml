@@ -137,3 +137,25 @@ rc2 = { version = "0.8", default-features = false }
 # per RFC 3211 / RFC 5652 §12.4. PDF 2.0 deprecates 3DES — we accept on
 # decode only. The `cbc` wrapper crate is shared with the AES path.
 des = { version = "0.8", default-features = false }
+
+[dev-dependencies]
+# Round 148 (depth-mode benchmarks): Criterion drives the three
+# reader bench harnesses (`reader_open`, `xref`, `content_stream`)
+# that measure the cost of the §7.5 file-structure walker, the §7.5.4
+# / §7.5.8 cross-reference parsers, and the §8/§9 content-stream
+# walker against representative writer-emitted PDFs. Same 0.5 line
+# the workspace's other bench-bearing crates (flac, cinepak, tta,
+# magicyuv, h264, pixfmt) already track.
+criterion = "0.5"
+
+[[bench]]
+name = "reader_open"
+harness = false
+
+[[bench]]
+name = "xref"
+harness = false
+
+[[bench]]
+name = "content_stream"
+harness = false

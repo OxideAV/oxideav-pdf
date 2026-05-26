@@ -1189,6 +1189,64 @@ fixed in this round with regression coverage under
 `.github/workflows/fuzz.yml` with a 30-minute total budget split
 across the three targets.
 
+## Criterion bench harness (round 148)
+
+The crate ships three Criterion bench binaries under `benches/` that
+measure the reader hot paths against writer-emitted PDFs. The
+writer-side cost is paid in the per-bench setup step (outside the
+timed region) so each iteration measures only the reader. Per the
+workspace "saturated → fuzz/bench/profile" memo this round adds the
+bench surface so future reader / writer rounds can A/B their parser
+tweaks against a stable baseline.
+
+- **`reader_open`** — drives `read_pdf_to_scene` end-to-end on
+  single-page / 10-page / 50-page documents emitted via the three
+  top-level writer entry points (`write_pdf_from_scene` for the
+  classic §7.5.4 xref table, `write_pdf_from_scene_xref_stream` for
+  the §7.5.8 cross-reference stream, and
+  `write_pdf_from_scene_object_stream` for the §7.5.7 ObjStm
+  container).
+- **`xref`** — drives `parse_xref` directly on the same three
+  document families, isolating the §7.5.4 / §7.5.8 cross-reference
+  parser cost from the rest of the open path.
+- **`content_stream`** — drives `parse_content_stream` on four
+  synthetic operator-stream bodies covering the §8 / §9 hot paths:
+  a short single-rectangle path, 100 small polygons, 50 nested
+  `q ... Q` save/restore brackets with `W n` clip paths, and a
+  500-group "mixed-realistic" mix of `cm` / `q` / `Q` / `m` / `l` /
+  `c` / `h` / `f` / `B` / `S` / `rg` / `RG`.
+
+Local headline numbers on the round-148 host
+(macOS-aarch64, `cargo bench`, smoke-quick mode):
+
+| bench                                         | size      | throughput  |
+|-----------------------------------------------|-----------|-------------|
+| `read_pdf_to_scene/open_single_page_classic_xref`   | 581 B   | 138 MiB/s |
+| `read_pdf_to_scene/open_ten_page_classic_xref`      | 5993 B  | 209 MiB/s |
+| `read_pdf_to_scene/open_fifty_page_xref_stream`     | 25105 B | 175 MiB/s |
+| `read_pdf_to_scene/open_fifty_page_object_stream`   | 9463 B  | 3.1 MiB/s |
+| `parse_xref/parse_xref_classic_table_10p`           | 3716 B  | 1.90 GiB/s |
+| `parse_xref/parse_xref_classic_table_50p`           | 17729 B | 2.68 GiB/s |
+| `parse_xref/parse_xref_stream_50p`                  | 14951 B | 1.13 GiB/s |
+| `parse_xref/parse_xref_stream_with_objstm_50p`      | 8203 B  | 560 MiB/s |
+| `parse_content_stream/content_short_path_only`      | 88 B    | 130 MiB/s |
+| `parse_content_stream/content_long_path_100`        | 5282 B  | 161 MiB/s |
+| `parse_content_stream/content_groups_and_clips`     | 5939 B  | 154 MiB/s |
+| `parse_content_stream/content_mixed_realistic`      | 48473 B | 181 MiB/s |
+
+The 50-page ObjStm open scenario is an outlier at ~3 MiB/s. The
+compressed-object resolver is currently the dominant cost in that
+path; an optimisation pass on the §7.5.7 walker is a natural
+follow-up.
+
+Run a single bench with:
+
+```sh
+cargo bench -p oxideav-pdf --bench reader_open
+cargo bench -p oxideav-pdf --bench xref
+cargo bench -p oxideav-pdf --bench content_stream
+```
+
 ## Deferred
 
 - **Text emission** — writer-side `BT … Tj … ET` for `Node::Text`
