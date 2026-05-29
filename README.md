@@ -810,6 +810,22 @@ base encodings are recognised: `WinAnsi` / `MacRoman` / `MacExpert` /
 `Standard` / `Symbol` / `ZapfDingbats`. Full AGL coverage (CJK,
 Cyrillic, Devanagari) is round-29+.
 
+Round 175 closes the AGL Public Implementation Notes §3
+`uniXXXX...` / `uXXXXXXXX` Unicode-by-name escape gap. A
+`/Differences` entry of the form `/uni201C` resolves to U+201C and
+`/u1F600` resolves to U+1F600 GRINNING FACE — supplementary-plane
+codepoints are reachable through the same path that AGL-aliased
+names use. The `uni` prefix accepts one or more consecutive 4-digit
+hex groups (each a BMP code point) and concatenates them into a
+single glyph expansion; the `u` prefix accepts a single 4-, 5-, or
+6-digit hex code point including supplementary planes. Surrogate
+halves (U+D800..=U+DFFF) and the U+FFFF noncharacter are rejected
+per the AGL PIN. Lowercase hex is rejected (canonical AGL is
+uppercase). Producers that emit the escape directly instead of the
+AGL alias now resolve through this path; the static AGL subset is
+still preferred when both forms collide so the common case stays
+allocation-free.
+
 ## Reading-order layout pass (round 29)
 
 [`DocumentReader::read_in_logical_order`] walks the catalog's

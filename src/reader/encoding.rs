@@ -25,6 +25,7 @@
 
 use crate::error::PdfError;
 use crate::objects::Object;
+use std::borrow::Cow;
 
 /// One `/Differences` array override: at code point `code`, the
 /// rendering glyph is `glyph_name`.
@@ -220,7 +221,7 @@ pub fn apply_encoding_differences(
     let mut out = base.clone();
     for ov in &differences.overrides {
         if let Some(s) = glyph_name_to_unicode(&ov.glyph_name) {
-            out.set_string(ov.code, s);
+            out.set_string(ov.code, s.as_ref());
         } else {
             // Unknown glyph — leave the slot empty so the decoder emits
             // U+FFFD. We do NOT propagate the raw glyph name as text —
@@ -244,46 +245,109 @@ pub fn apply_encoding_differences(
 /// defines a fixed Latin repertoire that the four named encodings draw
 /// from; that's what we ship. Extending the table for non-Latin glyphs
 /// (CJK, Cyrillic, Devanagari) is a future-round followup.
-pub fn glyph_name_to_unicode(name: &str) -> Option<&'static str> {
+///
+/// In addition to the static AGL subset, this resolver honours the
+/// Adobe Glyph List Public Implementation Notes §3 `uniXXXX...` /
+/// `uXXXXXXXX` Unicode-by-name escape forms (round 175). Producers
+/// occasionally emit these escapes directly in a `/Differences` array
+/// rather than the AGL-aliased name (e.g. `/uni201C` instead of
+/// `/quotedblleft`), and the spec mandates we honour them.
+pub fn glyph_name_to_unicode(name: &str) -> Option<Cow<'static, str>> {
     // Special PDF-spec aliases — `.notdef` is rendered as nothing, the
     // `uniXXXX` / `uXXXXXXXX` forms are Unicode-by-name escapes that the
     // AGL Public Implementation Notes (§3) mandates we honour first.
     if name == ".notdef" || name.is_empty() {
-        return Some("");
+        return Some(Cow::Borrowed(""));
     }
-    if let Some(s) = uni_prefix_decode(name) {
-        return Some(s);
-    }
-    // Linear scan of the AGL subset. The table is small enough that a
-    // hash map's setup cost outweighs the savings for the typical
+    // Linear scan of the AGL subset first — the AGL alias is preferred
+    // when both forms resolve (a producer that emits `/A` and the
+    // AGL-aliased `/uni0041` should reach the same result, but the
+    // static-table hit avoids an allocation). The table is small enough
+    // that a hash map's setup cost outweighs the savings for the typical
     // `/Differences` array (≤ 32 entries).
     for (n, s) in AGL_SUBSET {
         if *n == name {
-            return Some(*s);
+            return Some(Cow::Borrowed(*s));
         }
     }
-    None
+    // Fall through to the `uniXXXX` / `uXXXXXXXX` decoder.
+    uni_prefix_decode(name).map(Cow::Owned)
 }
 
-/// Adobe Glyph List Public Implementation Notes §3 — `uniXXXX` (4 hex
-/// digits, BMP only) and `uXXXXXXXX` (4..6 hex digits, any plane).
+/// Adobe Glyph List Public Implementation Notes §3 — `uniXXXX...`
+/// (one or more consecutive 4-hex-digit BMP code points) and
+/// `uXXXXXXXX` (a single 4-to-6-hex-digit code point, including
+/// supplementary planes).
 ///
-/// We can't return owned `String`s from a `&'static str` API, and a
-/// dynamic `uniXXXX` escape would need allocation. We side-step that by
-/// hard-coding the small fixed set that fixture PDFs are observed to
-/// use; the general dynamic path is a TODO and would require flipping
-/// the return type to `Cow<'static, str>`.
-fn uni_prefix_decode(name: &str) -> Option<&'static str> {
-    // The `uniXXXX` escapes that show up in practice are the
-    // smart-quote / dash / fraction set that also have AGL aliases.
-    // The AGL aliases are preferred and resolve via the main scan, so
-    // this stub is only here to short-circuit them when a producer
-    // emits the escape directly.
-    if !(name.starts_with("uni") || name.starts_with('u')) {
-        return None;
+/// The two forms differ in their hex-digit count discipline:
+///
+/// 1. **`uni` prefix** — the remainder is split into consecutive
+///    4-character groups. Each group is a BMP code point (one of
+///    `U+0000..=U+D7FF` or `U+E000..=U+FFFD`). Surrogate halves
+///    (`U+D800..=U+DFFF`) are rejected. The decoded characters are
+///    concatenated (this is how a producer encodes a multi-character
+///    ligature without an AGL alias).
+/// 2. **`u` prefix** — the remainder is exactly 4, 5, or 6
+///    uppercase hex digits, denoting one Unicode scalar value. The
+///    value must be a valid `char` (`<= 0x10FFFF`, not a surrogate)
+///    and must not be `0xFFFF` (the "shall not be a noncharacter"
+///    rule from the AGL Public Implementation Notes).
+///
+/// Returns `None` for any name that doesn't match either shape
+/// strictly — the caller falls back to its unknown-glyph branch.
+fn uni_prefix_decode(name: &str) -> Option<String> {
+    if let Some(rest) = name.strip_prefix("uni") {
+        // BMP-group form. The trailing characters must split cleanly
+        // into 4-digit groups.
+        if rest.is_empty() || rest.len() % 4 != 0 {
+            return None;
+        }
+        let mut out = String::with_capacity(rest.len() / 4);
+        for chunk in rest.as_bytes().chunks(4) {
+            // SAFETY: chunks of 4 ASCII bytes are always valid UTF-8.
+            let hex = std::str::from_utf8(chunk).ok()?;
+            // AGL PIN §3 mandates uppercase ASCII hex. Reject
+            // lowercase / mixed-case to keep the canonical form clean
+            // (some producers write lowercase; treat them as unknown).
+            if !is_uppercase_hex(hex) {
+                return None;
+            }
+            let cp = u32::from_str_radix(hex, 16).ok()?;
+            // Surrogate halves and noncharacter U+FFFF rejected.
+            if (0xD800..=0xDFFF).contains(&cp) || cp == 0xFFFF {
+                return None;
+            }
+            let c = char::from_u32(cp)?;
+            out.push(c);
+        }
+        Some(out)
+    } else if let Some(rest) = name.strip_prefix('u') {
+        // Single-codepoint form, 4..=6 hex digits, supplementary
+        // planes allowed.
+        if !(4..=6).contains(&rest.len()) {
+            return None;
+        }
+        if !is_uppercase_hex(rest) {
+            return None;
+        }
+        let cp = u32::from_str_radix(rest, 16).ok()?;
+        if (0xD800..=0xDFFF).contains(&cp) || cp == 0xFFFF {
+            return None;
+        }
+        let c = char::from_u32(cp)?;
+        Some(c.to_string())
+    } else {
+        None
     }
-    // No allocation-free general decoder yet. Keep the table tight.
-    None
+}
+
+/// Returns true iff every byte in `s` is `0..=9` / `A..=F`. AGL PIN
+/// §3 specifies uppercase; we treat lowercase as a non-match so a
+/// `/u00ff` doesn't collide with the canonical `/u00FF`.
+fn is_uppercase_hex(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
 }
 
 /// The shipping AGL subset. Held as an array literal so the binary
@@ -1146,31 +1210,141 @@ mod tests {
 
     #[test]
     fn agl_lookup_basic_latin() {
-        assert_eq!(glyph_name_to_unicode("A"), Some("A"));
-        assert_eq!(glyph_name_to_unicode("space"), Some(" "));
-        assert_eq!(glyph_name_to_unicode("zero"), Some("0"));
+        assert_eq!(glyph_name_to_unicode("A").as_deref(), Some("A"));
+        assert_eq!(glyph_name_to_unicode("space").as_deref(), Some(" "));
+        assert_eq!(glyph_name_to_unicode("zero").as_deref(), Some("0"));
     }
 
     #[test]
     fn agl_lookup_smart_quotes() {
-        assert_eq!(glyph_name_to_unicode("quoteright"), Some("\u{2019}"));
-        assert_eq!(glyph_name_to_unicode("quotedblleft"), Some("\u{201C}"));
+        assert_eq!(
+            glyph_name_to_unicode("quoteright").as_deref(),
+            Some("\u{2019}")
+        );
+        assert_eq!(
+            glyph_name_to_unicode("quotedblleft").as_deref(),
+            Some("\u{201C}")
+        );
     }
 
     #[test]
     fn agl_lookup_ligature() {
-        assert_eq!(glyph_name_to_unicode("fi"), Some("fi"));
-        assert_eq!(glyph_name_to_unicode("fl"), Some("fl"));
+        assert_eq!(glyph_name_to_unicode("fi").as_deref(), Some("fi"));
+        assert_eq!(glyph_name_to_unicode("fl").as_deref(), Some("fl"));
     }
 
     #[test]
     fn agl_lookup_notdef_is_empty() {
-        assert_eq!(glyph_name_to_unicode(".notdef"), Some(""));
+        assert_eq!(glyph_name_to_unicode(".notdef").as_deref(), Some(""));
     }
 
     #[test]
     fn agl_lookup_unknown() {
-        assert_eq!(glyph_name_to_unicode("notaglyphname"), None);
+        assert!(glyph_name_to_unicode("notaglyphname").is_none());
+    }
+
+    #[test]
+    fn agl_uni_bmp_single_group() {
+        // AGL PIN §3 — `uniXXXX` for one BMP codepoint.
+        assert_eq!(
+            glyph_name_to_unicode("uni201C").as_deref(),
+            Some("\u{201C}")
+        );
+        assert_eq!(
+            glyph_name_to_unicode("uni2019").as_deref(),
+            Some("\u{2019}")
+        );
+        // BMP edge — U+0041 ('A'). Static table preferred when `/A` is
+        // emitted, but the escape resolves through this path too.
+        assert_eq!(glyph_name_to_unicode("uni0041").as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn agl_uni_bmp_multi_group() {
+        // Multi-group concatenation per AGL PIN §3 — two codepoints
+        // glued into one glyph name.
+        assert_eq!(
+            glyph_name_to_unicode("uni20142019").as_deref(),
+            Some("\u{2014}\u{2019}")
+        );
+    }
+
+    #[test]
+    fn agl_uni_supplementary_plane() {
+        // `uXXXXXXXX` form for a supplementary-plane codepoint.
+        // U+1F600 GRINNING FACE — encoded as 5 hex chars.
+        assert_eq!(
+            glyph_name_to_unicode("u1F600").as_deref(),
+            Some("\u{1F600}")
+        );
+        // Full 6-char form for the highest valid Unicode (U+10FFFF).
+        assert_eq!(
+            glyph_name_to_unicode("u10FFFF").as_deref(),
+            Some("\u{10FFFF}")
+        );
+        // 4-digit `u` form is also valid per AGL PIN §3.
+        assert_eq!(glyph_name_to_unicode("u00A9").as_deref(), Some("\u{00A9}"));
+    }
+
+    #[test]
+    fn agl_uni_rejects_surrogate_halves() {
+        // U+D800 is the start of the surrogate range — must not decode.
+        assert!(glyph_name_to_unicode("uniD800").is_none());
+        assert!(glyph_name_to_unicode("uniDFFF").is_none());
+        assert!(glyph_name_to_unicode("uD800").is_none());
+    }
+
+    #[test]
+    fn agl_uni_rejects_ffff_noncharacter() {
+        // AGL PIN §3 carves out U+FFFF.
+        assert!(glyph_name_to_unicode("uniFFFF").is_none());
+        assert!(glyph_name_to_unicode("uFFFF").is_none());
+    }
+
+    #[test]
+    fn agl_uni_rejects_misshapen_input() {
+        // `uni` with a remainder not divisible by 4 — reject.
+        assert!(glyph_name_to_unicode("uni20").is_none());
+        assert!(glyph_name_to_unicode("uni20142").is_none());
+        // `uni` with no remainder — reject.
+        assert!(glyph_name_to_unicode("uni").is_none());
+        // `u` with too-few or too-many hex digits — reject.
+        assert!(glyph_name_to_unicode("u041").is_none());
+        assert!(glyph_name_to_unicode("u1234567").is_none());
+        // `u` over U+10FFFF — reject (char::from_u32 returns None).
+        assert!(glyph_name_to_unicode("u110000").is_none());
+        // Lowercase hex — AGL canon is uppercase, reject so the
+        // ambiguity doesn't propagate into the encoding table.
+        assert!(glyph_name_to_unicode("uni201c").is_none());
+        assert!(glyph_name_to_unicode("u1f600").is_none());
+        // Non-hex bytes in the suffix — reject.
+        assert!(glyph_name_to_unicode("uniZZZZ").is_none());
+        // The bare `u` / `uni` prefix on a real AGL name (e.g.
+        // `university` — not in the AGL subset) must not be mistaken
+        // for the escape form.
+        assert!(glyph_name_to_unicode("university").is_none());
+    }
+
+    #[test]
+    fn agl_uni_escape_in_differences() {
+        // End-to-end: a `/Differences` override that uses the
+        // `uniXXXX` escape decodes to the correct Unicode payload.
+        let base = EncodingMap::from_base(BaseEncoding::WinAnsi);
+        let diffs = EncodingDifferences {
+            overrides: vec![
+                EncodingOverride {
+                    code: 0x80,
+                    glyph_name: "uni201C".to_string(),
+                },
+                EncodingOverride {
+                    code: 0x81,
+                    glyph_name: "u1F600".to_string(),
+                },
+            ],
+        };
+        let out = apply_encoding_differences(&base, &diffs);
+        assert_eq!(out.decode(&[0x80]), "\u{201C}");
+        assert_eq!(out.decode(&[0x81]), "\u{1F600}");
     }
 
     #[test]
