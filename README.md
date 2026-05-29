@@ -495,6 +495,29 @@ to interpreting each 2-byte CID as a BMP code point. Simple fonts
 honour `/Encoding /WinAnsiEncoding` and `/Encoding /MacRomanEncoding`
 (Annex D.2), with a Latin-1 fallback for everything else.
 
+Round 182 closes the **mixed-width `/ToUnicode` codespace** gap.
+Before this round the CMap parser skipped every `codespacerange`
+block and the decoder assumed a single global byte-width inferred
+from the first `bfchar` / `bfrange` source operand — which silently
+mis-decoded any real-world CMap that mixes a 1-byte ASCII passthrough
+with a 2-byte CJK territory (the Adobe-Japan1 / Adobe-GB1 /
+Adobe-CNS1 / Adobe-Korea1 shape). The parser now captures every
+`begincodespacerange ... endcodespacerange` entry, and the
+`FontDecoder::ToUnicode` decode path walks bytes left-to-right
+selecting the first declared codespace whose byte-component bounds
+cover the candidate input prefix (per Adobe Tech Note #5411 §2 +
+Tech Note #5014 §3.1). Per §3.1 the match is **byte-component**, not
+a linear u32 interval: `<8140>..<FCFC>` accepts `81 75` (low byte
+0x75 in [0x40..=0xFC]) but rejects `81 39` (low byte 0x39 below
+0x40) — exactly the rule the naive interval comparison would get
+wrong. Unmatched input emits U+FFFD and the decoder advances one
+byte so subsequent in-codespace input still resolves. Adds three
+end-to-end integration tests (mixed-width decode, out-of-codespace
+replacement, inter-range byte rejection) plus eight CMap-parser
+unit tests. CMaps that omit the §9.10.3 mandatory header (rare,
+hand-crafted) continue to decode through the legacy single-width
+fallback path.
+
 ```rust,ignore
 use oxideav_pdf::reader::DocumentReader;
 

@@ -590,6 +590,44 @@ impl FontDecoder {
         match self {
             FontDecoder::ToUnicode { map, cid_width } => {
                 let mut out = String::new();
+                // When the CMap declared `codespacerange` entries, walk
+                // bytes left-to-right per Adobe Tech Note #5411 §2 +
+                // Tech Note #5014 §3.1: at each position, try each
+                // codespace in declaration order and pick the first
+                // whose `lo..=hi` byte-component bounds cover the
+                // candidate input prefix. Unmatched input advances by
+                // one byte and emits U+FFFD. This is what makes
+                // mixed-width CMaps (1-byte ASCII passthrough alongside
+                // a 2-byte CJK territory) decode correctly.
+                if !map.codespaces.is_empty() {
+                    let mut i = 0;
+                    while i < bytes.len() {
+                        if let Some(w) = map.match_codespace_width(&bytes[i..]) {
+                            let cid = bytes_to_u32(&bytes[i..i + w]);
+                            if let Some(s) = map.lookup(cid) {
+                                out.push_str(s);
+                            } else {
+                                out.push('\u{FFFD}');
+                            }
+                            i += w;
+                        } else {
+                            // No codespace covered this position. Adobe
+                            // Tech Note #5411 §2 says the decoder
+                            // should emit U+FFFD for the unmatched
+                            // prefix and resume scanning; we resume at
+                            // the next byte (the conservative choice
+                            // that doesn't drop subsequent in-codespace
+                            // input).
+                            out.push('\u{FFFD}');
+                            i += 1;
+                        }
+                    }
+                    return out;
+                }
+                // No codespacerange declared — fall back to the legacy
+                // single-width decode using the width inferred from the
+                // first bfchar / bfrange source operand. Handles hand-
+                // crafted CMaps that omit the §9.10.3 mandatory header.
                 let w = *cid_width as usize;
                 let mut i = 0;
                 while i + w <= bytes.len() {
@@ -634,11 +672,60 @@ impl FontDecoder {
 
 // ────────────────────────── CMap parser ──────────────────────────
 
-/// A parsed `/ToUnicode` CMap — the minimal slice ISO 32000-1 §9.10.3
-/// allows: `bfchar` and `bfrange` blocks. The CMap header may declare
-/// codespace ranges; we infer the byte width from the first observed
-/// `bfchar` / `bfrange` source key length (1 or 2 — the only widths the
-/// PDF spec allows for a CIDFont).
+/// One `<lo> <hi>` pair declared inside a `begincodespacerange` /
+/// `endcodespacerange` block. The codespace's byte width is the length
+/// of `lo` (and `hi`), and `lo` / `hi` carry the inclusive bounds of
+/// the in-codespace input byte sequences for that width.
+///
+/// Adobe Tech Note #5411 ("ToUnicode CMap File Tutorial") §2 + Adobe
+/// Tech Note #5014 §3.1 spell out the per-byte hierarchical match: a
+/// codespace `<8140>..<FCFC>` accepts the 2-byte input `8175` if and
+/// only if **each byte** falls inside the corresponding `lo[i]..hi[i]`
+/// slot — *not* the linear u32 interval `bytes_to_u32(lo)..bytes_to_u32(hi)`.
+/// (That hierarchical rule is what lets a CJK CMap declare
+/// `<00> <80>` for ASCII passthrough and `<8140> <FCFC>` for the
+/// Shift-JIS-shaped two-byte territory without the two-byte range
+/// implicitly covering `<8181>..<8189>` etc. that the linear u32
+/// interval would imply.)
+#[derive(Clone, Debug)]
+pub(crate) struct CodespaceRange {
+    pub lo: Vec<u8>,
+    pub hi: Vec<u8>,
+}
+
+impl CodespaceRange {
+    fn width(&self) -> usize {
+        self.lo.len()
+    }
+
+    /// True iff `bytes[..self.width()]` is component-wise inside
+    /// `lo..=hi` per Adobe Tech Note #5014 §3.1.
+    fn matches(&self, bytes: &[u8]) -> bool {
+        let w = self.width();
+        if bytes.len() < w {
+            return false;
+        }
+        bytes[..w]
+            .iter()
+            .zip(self.lo.iter().zip(self.hi.iter()))
+            .all(|(b, (lo, hi))| b >= lo && b <= hi)
+    }
+}
+
+/// A parsed `/ToUnicode` CMap (ISO 32000-1 §9.10.3 + Adobe Tech Note
+/// #5411 "ToUnicode CMap File Tutorial" + Adobe Tech Note #5014
+/// "CMap & CIDFont Files Specification"). The parser covers the slice
+/// the spec mandates for text-extraction CMaps:
+///
+/// * `begincodespacerange ... endcodespacerange` — the per-width input
+///   byte territory the CMap is defined over. Mixed widths (e.g. a
+///   1-byte ASCII passthrough alongside a 2-byte CJK territory) are
+///   captured per range, not collapsed to a single global width.
+/// * `beginbfchar ... endbfchar` — explicit `<src> -> <dst>` Unicode
+///   mappings.
+/// * `beginbfrange ... endbfrange` — `<lo> <hi> <dst>` (scalar) /
+///   `<lo> <hi> [<dst0> <dst1> …]` (per-source array) Unicode
+///   mappings.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CMap {
     /// CID (interpreted as u32) → UTF-8 string. Multi-character target
@@ -647,8 +734,20 @@ pub(crate) struct CMap {
     table: HashMap<u32, String>,
     /// Inferred from the first bfchar/bfrange source operand. 1 for
     /// simple fonts (rare — usually accompanied by a tiny WinAnsi-ish
-    /// table), 2 for the standard CIDFont case.
+    /// table), 2 for the standard CIDFont case. Used as the fallback
+    /// width when no `codespacerange` block was declared (legacy / hand-
+    /// crafted CMaps that omit the §9.10.3 mandatory header).
     pub(crate) byte_width: u8,
+    /// Declared `codespacerange` entries, in declaration order. When
+    /// non-empty, the decoder walks input bytes left-to-right, trying
+    /// each codespace's width in declaration order at every position
+    /// and selecting the first whose `lo..=hi` byte-component bounds
+    /// cover the candidate input prefix. This is what makes mixed-width
+    /// CMaps (the Adobe-Japan1 / Adobe-GB1 family) decode correctly —
+    /// a 1-byte ASCII range and a 2-byte CJK range coexist in the same
+    /// CMap and the per-codespace width selection picks the right one
+    /// per input byte position.
+    pub(crate) codespaces: Vec<CodespaceRange>,
 }
 
 impl CMap {
@@ -664,6 +763,11 @@ impl CMap {
             if i >= bytes.len() {
                 break;
             }
+            if let Some(rest) = peek_keyword(bytes, i, b"begincodespacerange") {
+                i = rest;
+                i = parse_codespacerange(bytes, i, &mut cm)?;
+                continue;
+            }
             // bfchar block: `N beginbfchar … endbfchar`.
             if let Some(rest) = peek_keyword(bytes, i, b"beginbfchar") {
                 i = rest;
@@ -676,8 +780,10 @@ impl CMap {
                 continue;
             }
             // Skip any other token — the CMap header (`CMapName`,
-            // `CIDSystemInfo`, `codespacerange`, etc.) is ignored;
-            // we only care about the bfchar/bfrange payload.
+            // `CIDSystemInfo`, etc.) and any non-bf / non-codespace
+            // blocks (`cidchar`, `cidrange`, `notdefchar`, `notdefrange`,
+            // …) are ignored: only the bf / codespace surface is
+            // load-bearing for Unicode extraction.
             i = skip_token(bytes, i);
         }
         Ok(cm)
@@ -685,6 +791,57 @@ impl CMap {
 
     fn lookup(&self, cid: u32) -> Option<&str> {
         self.table.get(&cid).map(|s| s.as_str())
+    }
+
+    /// Find the codespace whose width-prefix of `bytes` matches per the
+    /// Adobe Tech Note #5014 §3.1 byte-component rule, returning the
+    /// matched width (1..=4). `None` when no codespace matches at this
+    /// position. Codespaces are walked in declaration order so a CMap
+    /// that lists `<00><7F>` (1 byte) before `<8140><FCFC>` (2 bytes)
+    /// picks 1 byte for `0x41` and 2 bytes for `0x81 0x40`, matching
+    /// what the §9.10.3 decoder is required to do.
+    fn match_codespace_width(&self, bytes: &[u8]) -> Option<usize> {
+        for cs in &self.codespaces {
+            if cs.matches(bytes) {
+                return Some(cs.width());
+            }
+        }
+        None
+    }
+}
+
+fn parse_codespacerange(bytes: &[u8], mut i: usize, cm: &mut CMap) -> Result<usize, PdfError> {
+    loop {
+        i = skip_ws_and_comments(bytes, i);
+        if i >= bytes.len() {
+            return Err(PdfError::other(
+                "PDF CMap: unterminated begincodespacerange block",
+            ));
+        }
+        if let Some(rest) = peek_keyword(bytes, i, b"endcodespacerange") {
+            return Ok(rest);
+        }
+        // One codespace entry: `<lo> <hi>`. Both hex strings must share
+        // the same byte width (the codespace width) per Adobe Tech Note
+        // #5014 §3.1 / Tech Note #5411 §2. A `lo`/`hi` pair whose
+        // widths diverge is ill-formed; we skip it tolerantly so a
+        // malformed CMap doesn't deny the rest of the document.
+        let (lo, after_lo) = read_hex_string_payload(bytes, i)?;
+        i = after_lo;
+        i = skip_ws_and_comments(bytes, i);
+        let (hi, after_hi) = read_hex_string_payload(bytes, i)?;
+        i = after_hi;
+        if lo.is_empty() || hi.is_empty() || lo.len() != hi.len() {
+            continue;
+        }
+        // Cap width at 4 (the Adobe Tech Note #5014 §3.1 ceiling: PS
+        // CMaps allow 1..=4 byte codespaces). Anything wider is an
+        // out-of-spec CMap; ignore the entry rather than risk an
+        // unbounded width that the decoder can't handle anyway.
+        if lo.len() > 4 {
+            continue;
+        }
+        cm.codespaces.push(CodespaceRange { lo, hi });
     }
 }
 
@@ -703,7 +860,8 @@ fn parse_bfchar(bytes: &[u8], mut i: usize, cm: &mut CMap) -> Result<usize, PdfE
         i = skip_ws_and_comments(bytes, i);
         let (dst_bytes, after_dst) = read_hex_string_payload(bytes, i)?;
         i = after_dst;
-        // Capture byte_width from the first src.
+        // Capture byte_width from the first src — only used as a
+        // fallback when no codespacerange block was declared.
         if !src_bytes.is_empty() {
             cm.byte_width = src_bytes.len() as u8;
         }
@@ -1822,6 +1980,164 @@ mod tests {
         let cmap = b"beginbfchar <0001> <00660069> endbfchar";
         let parsed = CMap::parse(cmap).unwrap();
         assert_eq!(parsed.lookup(1), Some("fi"));
+    }
+
+    #[test]
+    fn cmap_codespacerange_single_width_parses() {
+        let cmap = b"\
+1 begincodespacerange
+<0000> <FFFF>
+endcodespacerange
+2 beginbfchar
+<0041> <0041>
+<0042> <0042>
+endbfchar
+";
+        let parsed = CMap::parse(cmap).unwrap();
+        assert_eq!(parsed.codespaces.len(), 1);
+        assert_eq!(parsed.codespaces[0].width(), 2);
+        assert_eq!(parsed.codespaces[0].lo, vec![0x00, 0x00]);
+        assert_eq!(parsed.codespaces[0].hi, vec![0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn cmap_codespacerange_mixed_width_parses_and_selects() {
+        // 1-byte territory <00>..<7F> (ASCII) plus a 2-byte territory
+        // <8140>..<FCFC> (Shift-JIS-shaped).
+        let cmap = b"\
+2 begincodespacerange
+<00> <7F>
+<8140> <FCFC>
+endcodespacerange
+";
+        let parsed = CMap::parse(cmap).unwrap();
+        assert_eq!(parsed.codespaces.len(), 2);
+        // 0x41 in the 1-byte range.
+        assert_eq!(parsed.match_codespace_width(&[0x41]), Some(1));
+        // 0x81 0x40 in the 2-byte range — first byte 0x81 is outside
+        // [0x00..=0x7F], so the 1-byte codespace doesn't match; the
+        // 2-byte one does.
+        assert_eq!(parsed.match_codespace_width(&[0x81, 0x40]), Some(2));
+        // 0x81 0x39: first byte in 2-byte's [0x81..=0xFC], second byte
+        // 0x39 BELOW 2-byte's [0x40..=0xFC] — Tech Note #5014 §3.1
+        // component-wise rule says NO MATCH. (The linear u32 interval
+        // 0x8140..=0xFCFC would match — exactly the bug we're closing.)
+        assert_eq!(parsed.match_codespace_width(&[0x81, 0x39]), None);
+        // 0xFD outside both ranges.
+        assert_eq!(parsed.match_codespace_width(&[0xFD]), None);
+    }
+
+    #[test]
+    fn cmap_codespacerange_component_wise_match() {
+        // The §3.1 rule: the canonical Shift-JIS-ish range
+        // <8140>..<FCFC> excludes <8130> (low byte below 0x40) and
+        // <FD00> (high byte above 0xFC). This is the test that nails
+        // the difference between byte-component bounds and a linear
+        // u32 interval.
+        let cmap = b"1 begincodespacerange <8140> <FCFC> endcodespacerange";
+        let parsed = CMap::parse(cmap).unwrap();
+        assert_eq!(parsed.match_codespace_width(&[0x81, 0x40]), Some(2));
+        assert_eq!(parsed.match_codespace_width(&[0xFC, 0xFC]), Some(2));
+        assert_eq!(parsed.match_codespace_width(&[0x81, 0x39]), None);
+        assert_eq!(parsed.match_codespace_width(&[0xFD, 0x00]), None);
+    }
+
+    #[test]
+    fn cmap_codespacerange_skips_mismatched_widths() {
+        // A malformed entry whose <lo> and <hi> widths diverge is
+        // dropped tolerantly; the well-formed entry that follows is
+        // still captured.
+        let cmap = b"\
+2 begincodespacerange
+<00> <FFFF>
+<0000> <FFFF>
+endcodespacerange
+";
+        let parsed = CMap::parse(cmap).unwrap();
+        assert_eq!(parsed.codespaces.len(), 1);
+        assert_eq!(parsed.codespaces[0].width(), 2);
+    }
+
+    #[test]
+    fn cmap_decode_mixed_width_picks_per_position() {
+        // 1-byte ASCII <00>..<7F> alongside 2-byte <8140>..<FCFC>.
+        // <00>..<7F> maps each byte to itself (handled by a bfchar
+        // entry for <41>); <8140> maps to U+4E00 (the canonical CJK
+        // "one"). Input bytes: 0x41 0x81 0x40 → "A" + U+4E00.
+        let cmap = b"\
+2 begincodespacerange
+<00> <7F>
+<8140> <FCFC>
+endcodespacerange
+1 beginbfchar
+<41> <0041>
+endbfchar
+1 beginbfchar
+<8140> <4E00>
+endbfchar
+";
+        let parsed = CMap::parse(cmap).unwrap();
+        let decoder = FontDecoder::ToUnicode {
+            map: parsed,
+            cid_width: 1, // ignored when codespaces are present
+        };
+        let s = decoder.decode(&[0x41, 0x81, 0x40]);
+        assert_eq!(s, "A\u{4E00}");
+    }
+
+    #[test]
+    fn cmap_decode_unmapped_in_codespace_emits_replacement() {
+        // <00>..<FF> 1-byte territory, no bfchar entries. Every input
+        // byte is in-codespace but unmapped — each must surface as
+        // U+FFFD per Adobe Tech Note #5411 §2.
+        let cmap = b"1 begincodespacerange <00> <FF> endcodespacerange";
+        let parsed = CMap::parse(cmap).unwrap();
+        let decoder = FontDecoder::ToUnicode {
+            map: parsed,
+            cid_width: 1,
+        };
+        let s = decoder.decode(&[0x41, 0x42]);
+        assert_eq!(s, "\u{FFFD}\u{FFFD}");
+    }
+
+    #[test]
+    fn cmap_decode_out_of_codespace_emits_replacement_and_advances() {
+        // <00>..<7F> 1-byte codespace only. Input 0xFF is OUT of every
+        // declared codespace; the decoder emits U+FFFD and advances
+        // one byte so a following in-codespace byte still resolves.
+        let cmap = b"\
+1 begincodespacerange
+<00> <7F>
+endcodespacerange
+1 beginbfchar
+<41> <0041>
+endbfchar
+";
+        let parsed = CMap::parse(cmap).unwrap();
+        let decoder = FontDecoder::ToUnicode {
+            map: parsed,
+            cid_width: 1,
+        };
+        let s = decoder.decode(&[0xFF, 0x41]);
+        assert_eq!(s, "\u{FFFD}A");
+    }
+
+    #[test]
+    fn cmap_decode_legacy_no_codespacerange_uses_byte_width_fallback() {
+        // No codespacerange — the decoder falls back to the legacy
+        // single-width path that uses `byte_width` inferred from the
+        // first bfchar source operand. Hand-crafted CMaps that omit
+        // the §9.10.3 mandatory header still decode.
+        let cmap = b"beginbfchar <0041> <0048> <0042> <0069> endbfchar";
+        let parsed = CMap::parse(cmap).unwrap();
+        assert!(parsed.codespaces.is_empty());
+        assert_eq!(parsed.byte_width, 2);
+        let decoder = FontDecoder::ToUnicode {
+            map: parsed,
+            cid_width: 2,
+        };
+        let s = decoder.decode(&[0x00, 0x41, 0x00, 0x42]);
+        assert_eq!(s, "Hi");
     }
 
     #[test]
