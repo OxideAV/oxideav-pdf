@@ -21,6 +21,12 @@
 //!    Latin-1 (the writer never emits this shape; included so the round
 //!    is robust against hand-laid PDFs from older tooling).
 //!
+//! `TJ` numeric position adjustments are read per ISO 32000-1 §9.4.3
+//! (Table 109 + Figure 46): a rightward gap wider than a quarter-em is
+//! recovered as an inter-word space, so words a producer separated with
+//! a bare displacement (no literal space glyph) extract correctly while
+//! tight intra-word kerning stays joined. See [`TextWalker::emit_show_tj`].
+//!
 //! Reading-order reconstruction (column / paragraph segmentation) is a
 //! future-round followup. The runs come out in stream order — exactly
 //! the way the page's painter would have laid them down.
@@ -1222,12 +1228,12 @@ enum TextOperand {
 #[derive(Clone, Debug)]
 enum TJItem {
     Str(Vec<u8>),
-    /// Kerning offset in *text-space units / 1000* (positive = move
-    /// glyph rightwards by `f / 1000 * font_size` in user space). The
-    /// field is preserved for round-23+ layout reconstruction; the
-    /// round-22 walker drops it because it doesn't change the textual
-    /// payload, only the typographic spacing.
-    #[allow(dead_code)]
+    /// Numeric `TJ` position adjustment, in thousandths of a text-space
+    /// unit (ISO 32000-1 §9.4.3, Table 109). The value is *subtracted*
+    /// from the horizontal coordinate: a negative number opens a
+    /// rightward gap before the next glyph (Figure 46), a positive one
+    /// pulls it leftward. `emit_show_tj` turns a gap wider than
+    /// [`TextWalker::WORD_BREAK_GAP`] into an inter-word space.
     Kern(f32),
 }
 
@@ -1469,17 +1475,7 @@ impl TextWalker {
             }
             b"TJ" => {
                 let arr = self.pop_array().unwrap_or_default();
-                let mut buf = Vec::new();
-                for item in arr {
-                    match item {
-                        TJItem::Str(b) => buf.extend_from_slice(&b),
-                        // Kerning offsets don't change the text content;
-                        // a future-round layout pass would translate
-                        // them into spaces or word breaks.
-                        TJItem::Kern(_) => {}
-                    }
-                }
-                self.emit_show(&buf);
+                self.emit_show_tj(&arr);
             }
             b"'" => {
                 // Move-and-show: T*, then Tj.
@@ -1615,6 +1611,17 @@ impl TextWalker {
         Some(nums)
     }
 
+    /// Decode a single show-operand byte string through the current
+    /// font's decoder (Latin-1 fallback when no font resolved).
+    fn decode_bytes(&self, bytes: &[u8]) -> String {
+        match self.fonts.get(&self.cur_font) {
+            Some(d) => d.decode(bytes),
+            // No font resolved — fall back to Latin-1 bytes so the run
+            // isn't dropped silently.
+            None => bytes.iter().map(|&b| b as char).collect(),
+        }
+    }
+
     fn emit_show(&mut self, bytes: &[u8]) {
         if !self.in_text {
             // Show outside BT/ET — malformed but tolerate; the writer
@@ -1622,15 +1629,65 @@ impl TextWalker {
             self.operands.clear();
             return;
         }
-        let decoder = self.fonts.get(&self.cur_font);
-        let text = match decoder {
-            Some(d) => d.decode(bytes),
-            None => {
-                // No font resolved — fall back to Latin-1 bytes so the
-                // run isn't dropped silently.
-                bytes.iter().map(|&b| b as char).collect()
+        let text = self.decode_bytes(bytes);
+        self.push_run(text);
+        self.operands.clear();
+    }
+
+    /// `TJ` show: decode each string element and translate the numeric
+    /// position adjustments between them into word breaks.
+    ///
+    /// ISO 32000-1 §9.4.3 (Table 109, `TJ`): a numeric array element is
+    /// expressed in thousandths of a text-space unit and is *subtracted*
+    /// from the current horizontal coordinate, so a **negative** number
+    /// opens a rightward gap before the next glyph (Figure 46). Small
+    /// negative kerns (the figure's −120 / −95 between letters of "AWAY")
+    /// are intra-word micro-spacing and must not split a word; a gap that
+    /// exceeds [`Self::WORD_BREAK_GAP`] of an em is the unglyphed
+    /// inter-word space many producers emit in place of a literal space
+    /// character. A single U+0020 is inserted there so text extracted
+    /// from such streams reads `hello world`, not `helloworld`.
+    ///
+    /// The threshold is an extraction-layer heuristic (the spec defines
+    /// the geometry, not a word-break rule). It is intentionally above
+    /// the figure's −120 kern so spec EXAMPLE-class kerning stays joined.
+    fn emit_show_tj(&mut self, arr: &[TJItem]) {
+        if !self.in_text {
+            self.operands.clear();
+            return;
+        }
+        let mut text = String::new();
+        // Pending rightward gap (in thousandths of an em) accumulated by
+        // numeric elements since the last string element. Applied as a
+        // word break only when the next string element arrives, so a
+        // trailing adjustment doesn't append a dangling space.
+        let mut pending_gap = 0.0f32;
+        for item in arr {
+            match item {
+                TJItem::Str(b) => {
+                    if pending_gap >= Self::WORD_BREAK_GAP
+                        && !text.is_empty()
+                        && !text.ends_with(' ')
+                    {
+                        text.push(' ');
+                    }
+                    pending_gap = 0.0;
+                    text.push_str(&self.decode_bytes(b));
+                }
+                // Numeric adjustment: subtracted from the horizontal
+                // coordinate, so negate to get the rightward gap. Positive
+                // numbers pull the next glyph leftward (overlap / negative
+                // kern) and never open a word break.
+                TJItem::Kern(adj) => pending_gap += -adj,
             }
-        };
+        }
+        self.push_run(text);
+        self.operands.clear();
+    }
+
+    /// Append a decoded run at the current text position + font, stamping
+    /// the in-scope MCID.
+    fn push_run(&mut self, text: String) {
         self.runs.push(TextRun {
             text,
             position: (self.tm[4], self.tm[5]),
@@ -1640,8 +1697,16 @@ impl TextWalker {
         // Stamp the current MCID (top of stack) onto the run.
         let cur_mcid = self.mcid_stack.last().copied().unwrap_or(None);
         self.run_mcids.push(cur_mcid);
-        self.operands.clear();
     }
+
+    /// Minimum rightward `TJ` gap, in thousandths of an em, that the
+    /// text extractor treats as an inter-word space rather than
+    /// intra-word kerning. 0.25 em (= 250) is comfortably above the
+    /// ISO 32000-1 Figure 46 kerns (−120 / −95) yet below a real space
+    /// advance (~0.25–0.35 em for most fonts), so word boundaries that a
+    /// producer encoded purely as a `TJ` displacement are recovered
+    /// without false-splitting tightly-kerned text.
+    const WORD_BREAK_GAP: f32 = 250.0;
 }
 
 // ────────────────────────── helpers ──────────────────────────

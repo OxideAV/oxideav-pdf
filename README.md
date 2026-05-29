@@ -518,6 +518,24 @@ unit tests. CMaps that omit the §9.10.3 mandatory header (rare,
 hand-crafted) continue to decode through the legacy single-width
 fallback path.
 
+Round 188 closes the **`TJ` word-break** gap. Per §9.4.3 (Table 109 +
+Figure 46) a numeric `TJ` array element is expressed in thousandths of
+a text-space unit and is *subtracted* from the horizontal coordinate,
+so a negative number opens a rightward gap before the next glyph. Many
+producers encode the space between two words purely as such a
+displacement, with no literal space glyph in the strings — before this
+round the walker concatenated every string fragment and dropped the
+numeric elements, extracting `helloworld` from text that reads `hello
+world`. The walker now sums the rightward gap between fragments and
+inserts a single U+0020 when it reaches a quarter-em (250 thousandths).
+The threshold sits above the Figure 46 intra-word kerns (−120 / −95
+inside "AWAY", which stay joined) and below a typical space advance,
+so genuine word boundaries are recovered without false-splitting
+tightly-kerned runs. Positive (leftward / overlap) adjustments never
+break, a leading adjustment emits no dangling space, and a fragment
+already ending in a space is not doubled. Adds six end-to-end tests in
+`tests/tj_word_break_round188.rs`.
+
 ```rust,ignore
 use oxideav_pdf::reader::DocumentReader;
 
