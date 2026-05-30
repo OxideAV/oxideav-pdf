@@ -44,3 +44,28 @@ fn parse_inline_image_string_escape_no_slice_panic() {
     let _ = read_pdf_to_scene(bytes);
     let _ = extract_inline_images_from_stream(bytes);
 }
+
+/// Round 191 fuzz: a crafted hybrid-reference PDF whose §7.5.8 XRef
+/// stream declared the catalog (object 1) as a §7.5.7 Type-2
+/// compressed entry whose containing ObjStm is object 1 itself.
+/// `resolve(1)` saw the compressed entry, called
+/// `decode_objstm_container(wanted=1, container=1)`, which called
+/// `self.resolve(1)` again — looping until the call stack overflowed
+/// under the AddressSanitizer-instrumented fuzz harness. The fix
+/// rejects any Type-2 entry whose container is itself a Type-2
+/// entry before re-entering `resolve` (§7.5.7 normatively forbids
+/// nested object streams, so the cycle is statically detectable
+/// from the xref table).
+///
+/// Crash discovered: scheduled Fuzz workflow run 26628044506 against
+/// pre-r188 master 98ff5a3, artifact
+/// `crash-b5c79fc051a5101edb905232369d071e99f29c4d`.
+#[test]
+fn parse_objstm_self_container_no_stack_overflow() {
+    let bytes = include_bytes!("fixtures/fuzz_objstm_self_container_cycle.bin");
+    // Pre-fix this aborts via stack overflow (libfuzzer reports
+    // `AddressSanitizer: stack-overflow`); post-fix it returns
+    // `Err(PdfError::Other(…))` citing the §7.5.7 rule.
+    let _ = read_pdf_to_scene(bytes);
+    let _ = extract_inline_images_from_stream(bytes);
+}

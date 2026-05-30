@@ -1242,9 +1242,18 @@ target locally and surfaced two reader-side panics (a §7.7.3.2
 /Pages-tree cycle that recursed forever, and a §7.3.4.2 literal
 string with a trailing `\` that overran the slice index), both
 fixed in this round with regression coverage under
-`tests/fuzz_regressions.rs`. CI runs the suite daily under
-`.github/workflows/fuzz.yml` with a 30-minute total budget split
-across the three targets.
+`tests/fuzz_regressions.rs`. Round 191 fixed a third — a §7.5.7
+Type-2 xref entry whose container number was itself a Type-2 entry
+(forbidden by spec — "object streams shall not contain object
+streams") looped `resolve` → `decode_objstm_container` → `resolve`
+forever before the cycle guard caught it, blowing the call stack
+under AddressSanitizer. The resolver now rejects such entries
+statically from the xref table, and `Parser::parse_array` /
+`parse_dict_or_stream` carry a hard `MAX_PARSE_DEPTH = 256`
+ceiling so a deeply-nested-composite-only sibling input surfaces
+a clean error instead of overflowing. CI runs the suite daily
+under `.github/workflows/fuzz.yml` with a 30-minute total budget
+split across the three targets.
 
 ## Criterion bench harness (round 148)
 

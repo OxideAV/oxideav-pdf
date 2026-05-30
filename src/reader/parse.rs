@@ -73,6 +73,19 @@ where
     }
 }
 
+/// Hard ceiling on nested array / dict recursion. ISO 32000-1 places
+/// no explicit cap on object nesting, but real-world PDFs rarely
+/// exceed a depth of ~30 (page-tree fragments, ColorSpace arrays,
+/// AcroForm field trees). A hostile crafted file containing
+/// `[[[[[[[...]]]]]]]` thousands deep would overflow the parser's
+/// thread stack before reaching this guard at ~100; the guard turns
+/// the abort into a recoverable [`PdfError`]. Picked to be well
+/// above any legitimate PDF while staying low enough that a typical
+/// 8 MB Rust thread stack survives the recursion (each
+/// `parse_array` / `parse_dict_or_stream` frame is small —
+/// `Vec<Object>` setup + a token lookahead).
+const MAX_PARSE_DEPTH: u32 = 256;
+
 /// Recursive-descent parser over a [`Lexer`].
 pub struct Parser<'a> {
     lex: Lexer<'a>,
@@ -81,6 +94,13 @@ pub struct Parser<'a> {
     /// pulling from the lexer. Matches the conventional 1-token
     /// lookahead recursive-descent shape.
     peeked: Option<Token<'a>>,
+    /// Current array / dict nesting depth — incremented on entry to
+    /// [`Self::parse_array`] / [`Self::parse_dict_or_stream`] and
+    /// checked against [`MAX_PARSE_DEPTH`] to bound the thread-stack
+    /// footprint of a crafted PDF whose body is deeply nested
+    /// composite objects. See the constant's doc-comment for the
+    /// rationale.
+    depth: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -88,13 +108,18 @@ impl<'a> Parser<'a> {
         Self {
             lex: Lexer::new(input),
             peeked: None,
+            depth: 0,
         }
     }
 
     /// Construct from an existing [`Lexer`] — used by the xref /
     /// trailer scanner so the same cursor state is shared.
     pub fn from_lexer(lex: Lexer<'a>) -> Self {
-        Self { lex, peeked: None }
+        Self {
+            lex,
+            peeked: None,
+            depth: 0,
+        }
     }
 
     /// Borrow the underlying lexer (for `seek` / `slice` / `position`).
@@ -242,19 +267,45 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_array(&mut self, resolver: &mut dyn LengthResolver) -> Result<Object, PdfError> {
-        let mut items = Vec::new();
-        loop {
-            let tok = self.next()?.ok_or_else(|| {
-                PdfError::other("PDF parser: unterminated array (EOF before `]`)")
-            })?;
-            if let TokenKind::ArrayEnd = tok.kind {
-                return Ok(Object::Array(items));
-            }
-            items.push(self.object_from_token(tok, resolver)?);
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(PdfError::other(format!(
+                "PDF parser: array nesting exceeds maximum depth ({MAX_PARSE_DEPTH})"
+            )));
         }
+        self.depth += 1;
+        let result = (|| -> Result<Object, PdfError> {
+            let mut items = Vec::new();
+            loop {
+                let tok = self.next()?.ok_or_else(|| {
+                    PdfError::other("PDF parser: unterminated array (EOF before `]`)")
+                })?;
+                if let TokenKind::ArrayEnd = tok.kind {
+                    return Ok(Object::Array(items));
+                }
+                items.push(self.object_from_token(tok, resolver)?);
+            }
+        })();
+        self.depth -= 1;
+        result
     }
 
     fn parse_dict_or_stream(
+        &mut self,
+        start: usize,
+        resolver: &mut dyn LengthResolver,
+    ) -> Result<Object, PdfError> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(PdfError::other(format!(
+                "PDF parser: dict nesting exceeds maximum depth ({MAX_PARSE_DEPTH})"
+            )));
+        }
+        self.depth += 1;
+        let result = self.parse_dict_or_stream_inner(start, resolver);
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_dict_or_stream_inner(
         &mut self,
         start: usize,
         resolver: &mut dyn LengthResolver,
@@ -668,5 +719,48 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "Pages");
         assert!(matches!(entries[0].1, Object::Reference(_)));
+    }
+
+    /// Deeply nested arrays must surface a clean `PdfError` from the
+    /// [`MAX_PARSE_DEPTH`] guard rather than blowing the thread stack
+    /// — round 191 hardening alongside the fuzz-discovered ObjStm
+    /// container-cycle fix in `document.rs`.
+    #[test]
+    fn deeply_nested_array_rejected_below_stack_overflow() {
+        let mut body = vec![b'['; MAX_PARSE_DEPTH as usize + 8];
+        body.extend(std::iter::repeat_n(b']', MAX_PARSE_DEPTH as usize + 8));
+        let err = Parser::new(&body)
+            .parse_object()
+            .expect_err("over-deep array must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("nesting") || msg.contains("depth"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    /// Same shape, but for dictionaries — deeply nested `<< /k <<
+    /// /k << ... >> >> >>` must surface a clean error instead of
+    /// recursing past the thread stack.
+    #[test]
+    fn deeply_nested_dict_rejected_below_stack_overflow() {
+        // Each level needs a `/k ` key + `<<` open + matching `>>`.
+        let levels = (MAX_PARSE_DEPTH as usize) + 8;
+        let mut body = Vec::new();
+        for _ in 0..levels {
+            body.extend_from_slice(b"<< /k ");
+        }
+        body.extend_from_slice(b"null");
+        for _ in 0..levels {
+            body.extend_from_slice(b" >>");
+        }
+        let err = Parser::new(&body)
+            .parse_object()
+            .expect_err("over-deep dict must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("nesting") || msg.contains("depth"),
+            "unexpected error message: {msg}"
+        );
     }
 }

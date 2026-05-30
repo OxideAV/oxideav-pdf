@@ -434,6 +434,25 @@ impl<'a> DocumentReader<'a> {
         obj_stream_num: u32,
     ) -> Result<ObjStmDecoded, PdfError> {
         let container_id = ObjectId::new(obj_stream_num);
+        // §7.5.7: "An object stream shall not contain other object
+        // streams. Furthermore, the cross-reference entries for
+        // compressed objects shall not themselves use type 2 to point
+        // back at the containing object stream." A hostile xref that
+        // marks the container as itself compressed (or as compressed
+        // inside another container that is in turn compressed inside
+        // it) would otherwise loop `resolve` → `decode_objstm_container`
+        // → `resolve` until the stack overflows. Reject any Type-2 entry
+        // for the container before re-entering `resolve`. Caught from
+        // a fuzz finding (parse target stack-overflow on a crafted
+        // hybrid-reference file whose XRefStm declared object 1 as
+        // compressed inside container 1).
+        if let Some(XrefEntry::Compressed { .. }) = self.xref.entries.get(&container_id.number) {
+            return Err(PdfError::other(format!(
+                "PDF reader: ObjStm container {container_id:?} (for compressed object \
+                 {wanted:?}) is itself declared as a Type-2 compressed entry in the xref \
+                 — forbidden by ISO 32000-1 §7.5.7"
+            )));
+        }
         let container = self.resolve(container_id)?;
         let Object::Stream(s) = container else {
             return Err(PdfError::other(format!(
