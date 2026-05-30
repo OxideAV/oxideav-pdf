@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- attachments (round 194): PDF 2.0 Associated Files — `/AFRelationship`
+  on filespec dicts + `/AF` arrays on the catalog and per page
+  (ISO 32000-2 §7.11.3 Table 44 + §14.13.3 + §14.13.4). New
+  `AfRelationship` enum covers the eight enumerated values
+  (`Source`, `Data`, `Alternative`, `Supplement`, `EncryptedPayload`,
+  `FormData`, `Schema`, `Unspecified`); builder
+  `Attachment::with_af_relationship(rel)` opts an attachment into the
+  associated-files semantics. Page-level `/AF` is populated only when
+  the attachment also carries a `FileAttachment` annotation on that
+  page. Attachments without an explicit relationship preserve the
+  round-33 byte shape exactly — no `/AFRelationship` Name, no `/AF`
+  arrays. Reader-side `PdfAttachment` gains a matching
+  `af_relationship: Option<AfRelationship>` field; vendor /
+  second-class Names (§Annex E) surface as `None` rather than being
+  coerced into one of the enumerated values. `qpdf --check` accepts
+  the writer output. Eight new tests in
+  `tests/af_relationship_round194.rs` cover the writer wire shape,
+  all eight reader round-trips, the explicit-`Unspecified` vs.
+  absence distinction, and qpdf validation.
+
 ## [0.1.3](https://github.com/OxideAV/oxideav-pdf/compare/v0.1.2...v0.1.3) - 2026-05-30
 
 ### Other

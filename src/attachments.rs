@@ -13,6 +13,27 @@
 //! displays a paperclip / pushpin marker the user can click to extract
 //! or open the attachment.
 //!
+//! # Round 194 — PDF 2.0 Associated Files (ISO 32000-2 §14.13)
+//!
+//! Each [`Attachment`] may also carry an [`AfRelationship`] value via
+//! [`Attachment::with_af_relationship`]. When set, the writer emits:
+//!
+//! * `/AFRelationship /<value>` on the filespec dict (§7.11.3 Table 44).
+//! * The filespec's object reference in the catalog `/AF` array
+//!   (§14.13.3 + §7.7.2 Table 29), so the attachment is recognised as
+//!   document-level associated content (the shape PDF/A-3 producers
+//!   use to identify embedded source data such as XML invoices).
+//! * The same reference in the **page** `/AF` array (§14.13.4 +
+//!   §7.7.3.3 page object) when the attachment additionally carries a
+//!   `FileAttachment` annotation — this places the associated-files
+//!   semantics on the page that surfaces the marker.
+//!
+//! Attachments without an explicit `AFRelationship` continue to behave
+//! exactly as before (no `/AF` entries written; round-33 byte shape
+//! preserved). The reader-side [`crate::read_pdf_attachments`] surfaces
+//! the parsed relationship on its [`crate::PdfAttachment::af_relationship`]
+//! field.
+//!
 //! Provenance: ISO 32000-1 §7.11 (file specifications), §3.10 (file
 //! specification dictionaries), §12.5.6.15 (FileAttachment
 //! annotations), §7.7.4 (catalog `/Names`), §7.9.6 (name tree
@@ -60,6 +81,84 @@ use crate::writer::render_frame_for_linearize as render_frame;
 // Public API.
 // ---------------------------------------------------------------------
 
+/// Relationship between an associated file and the PDF object that
+/// references it, per ISO 32000-2 §7.11.3 Table 44 (`/AFRelationship`)
+/// + §14.13 (Associated Files).
+///
+/// All eight values enumerated by the spec are listed below. The
+/// default (used when an [`Attachment`] does not call
+/// [`Attachment::with_af_relationship`]) is *no* `/AFRelationship`
+/// entry on the filespec and *no* `/AF` array on the catalog or page —
+/// matching the round-33 byte shape exactly. Callers that want the
+/// spec's defaulted `Unspecified` reading must set it explicitly via
+/// `with_af_relationship(AfRelationship::Unspecified)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AfRelationship {
+    /// `Source` — the file is the original source material for the
+    /// associated content (§7.11.3 Table 44 row "Source").
+    Source,
+    /// `Data` — information used to derive a visual presentation, e.g.
+    /// the CSV behind a chart (Table 44 row "Data").
+    Data,
+    /// `Alternative` — an alternative representation of content
+    /// (Table 44 row "Alternative").
+    Alternative,
+    /// `Supplement` — supplemental representation of the original
+    /// source, e.g. a MathML version of an equation
+    /// (Table 44 row "Supplement").
+    Supplement,
+    /// `EncryptedPayload` — encrypted payload document for the
+    /// unencrypted-wrapper pattern (§7.6.7 + Table 44).
+    EncryptedPayload,
+    /// `FormData` — data associated with the AcroForm of this PDF
+    /// (Table 44 row "FormData").
+    FormData,
+    /// `Schema` — schema definition for the associated object, e.g. an
+    /// XML schema for a metadata stream (Table 44 row "Schema").
+    Schema,
+    /// `Unspecified` — relationship is not known or not describable
+    /// using the other values (Table 44 row "Unspecified"). NOTE 2 in
+    /// the spec instructs producers to use this only when no other
+    /// value correctly reflects the relationship.
+    Unspecified,
+}
+
+impl AfRelationship {
+    /// Lower the enum to the exact PDF Name (§7.3.5) that appears on
+    /// the wire after `/AFRelationship`. Names are spelled exactly as
+    /// in ISO 32000-2 §7.11.3 Table 44 (CamelCase, no escaping needed
+    /// — all-ASCII identifier characters).
+    pub fn as_pdf_name(&self) -> &'static str {
+        match self {
+            Self::Source => "Source",
+            Self::Data => "Data",
+            Self::Alternative => "Alternative",
+            Self::Supplement => "Supplement",
+            Self::EncryptedPayload => "EncryptedPayload",
+            Self::FormData => "FormData",
+            Self::Schema => "Schema",
+            Self::Unspecified => "Unspecified",
+        }
+    }
+
+    /// Inverse of [`Self::as_pdf_name`]. Unknown / vendor-extension
+    /// (§Annex E "second-class names") values return `None` — the
+    /// reader surfaces these as `None` rather than fabricating a value.
+    pub fn from_pdf_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "Source" => Self::Source,
+            "Data" => Self::Data,
+            "Alternative" => Self::Alternative,
+            "Supplement" => Self::Supplement,
+            "EncryptedPayload" => Self::EncryptedPayload,
+            "FormData" => Self::FormData,
+            "Schema" => Self::Schema,
+            "Unspecified" => Self::Unspecified,
+            _ => return None,
+        })
+    }
+}
+
 /// One file to embed inside the PDF.
 ///
 /// `name` is the user-visible file name (used for both `/F` PDFDocEncoded
@@ -104,11 +203,21 @@ pub struct Attachment {
     /// Optional `/FileAttachment` icon name per §12.5.6.15 Table 187:
     /// `Graph`, `Paperclip`, `PushPin`, `Tag`. Defaults to `PushPin`.
     pub annotation_icon: Option<String>,
+    /// Optional `/AFRelationship` per ISO 32000-2 §7.11.3 Table 44.
+    /// When `Some`, the writer emits the matching `/AFRelationship`
+    /// Name on this attachment's filespec and includes the filespec
+    /// reference in the catalog `/AF` array (§14.13.3). When the
+    /// attachment also carries an annotation, the page-level `/AF`
+    /// array is populated too (§14.13.4). `None` ⇒ the filespec
+    /// carries no `/AFRelationship` and no `/AF` arrays are emitted —
+    /// preserving the round-33 byte shape exactly.
+    pub af_relationship: Option<AfRelationship>,
 }
 
 impl Attachment {
     /// Convenience constructor — only the required fields. `mime_type`
-    /// / `modified` / annotation pieces are all `None`.
+    /// / `modified` / annotation pieces / `af_relationship` are all
+    /// `None`.
     pub fn new(name: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Self {
         Self {
             name: name.into(),
@@ -118,6 +227,7 @@ impl Attachment {
             annotation_page: None,
             annotation_rect: None,
             annotation_icon: None,
+            af_relationship: None,
         }
     }
 
@@ -137,6 +247,18 @@ impl Attachment {
     pub fn with_annotation(mut self, page_index: usize, rect: [f32; 4]) -> Self {
         self.annotation_page = Some(page_index);
         self.annotation_rect = Some(rect);
+        self
+    }
+
+    /// Builder-style `/AFRelationship` setter (ISO 32000-2 §7.11.3
+    /// Table 44 + §14.13). Calling this both stamps `/AFRelationship`
+    /// on the filespec dict and opts the attachment into the catalog
+    /// (and, if `with_annotation` is also set, page) `/AF` arrays. PDF
+    /// 1.7 consumers ignore both entries, so the same writer call also
+    /// produces PDF/A-3-shaped output for downstream consumers that
+    /// understand it.
+    pub fn with_af_relationship(mut self, rel: AfRelationship) -> Self {
+        self.af_relationship = Some(rel);
         self
     }
 }
@@ -238,11 +360,24 @@ pub fn write_pdf_with_attachments(
     let mut filespec_entries: Vec<(String, ObjectId)> = Vec::with_capacity(attachments.len());
     // Track per-page annotation refs to patch into /Annots.
     let mut by_page: Vec<Vec<ObjectId>> = (0..n_pages).map(|_| Vec::new()).collect();
+    // ISO 32000-2 §14.13.3 — every attachment whose `/AFRelationship`
+    // is set contributes its filespec id to the catalog `/AF` array.
+    // Order in the array follows the order in `attachments` (§14.13
+    // is silent on ordering; we preserve caller order for stability).
+    let mut catalog_af_refs: Vec<ObjectId> = Vec::new();
+    // §14.13.4 — page-level `/AF` array. Only attachments whose
+    // annotation lands on a page AND that carry an `/AFRelationship`
+    // contribute here.
+    let mut page_af_refs: Vec<Vec<ObjectId>> = (0..n_pages).map(|_| Vec::new()).collect();
 
     for attachment in attachments {
         let stream_id = emit_embedded_file_stream(&mut doc, attachment);
         let filespec_id = emit_filespec_dict(&mut doc, attachment, stream_id);
         filespec_entries.push((attachment.name.clone(), filespec_id));
+
+        if attachment.af_relationship.is_some() {
+            catalog_af_refs.push(filespec_id);
+        }
 
         if let (Some(page_idx), Some(rect)) =
             (attachment.annotation_page, attachment.annotation_rect)
@@ -256,6 +391,10 @@ pub fn write_pdf_with_attachments(
             );
             let annot_id = doc.add(Object::Dict(annot_dict));
             by_page[page_idx].push(annot_id);
+
+            if attachment.af_relationship.is_some() {
+                page_af_refs[page_idx].push(filespec_id);
+            }
         }
     }
 
@@ -280,9 +419,30 @@ pub fn write_pdf_with_attachments(
         }
     }
 
+    // ---- ISO 32000-2 §14.13.3 — catalog /AF array ----------------
+    // Patch only when at least one attachment opted in by setting its
+    // `af_relationship`. Round-33 byte shape (no /AF emitted) is
+    // therefore preserved exactly for callers that don't set the
+    // relationship.
+    if !catalog_af_refs.is_empty() {
+        let catalog = doc.object_mut(pages_build.catalog_id).ok_or_else(|| {
+            PdfError::other("write_pdf_with_attachments: catalog id missing for /AF patch")
+        })?;
+        if let Object::Dict(d) = catalog {
+            let arr: Vec<Object> = catalog_af_refs
+                .iter()
+                .map(|id| Object::Reference(*id))
+                .collect();
+            d.set("AF", Object::Array(arr));
+        }
+    }
+
     // ---- Patch each page's /Annots array (FileAttachment side) ---
+    // and, when the attachment opted into associated-files semantics,
+    // its `/AF` array (ISO 32000-2 §14.13.4 + §7.7.3.3).
     for (page_idx, annot_ids) in by_page.iter().enumerate() {
-        if annot_ids.is_empty() {
+        let af_ids = &page_af_refs[page_idx];
+        if annot_ids.is_empty() && af_ids.is_empty() {
             continue;
         }
         let page_id = pages_build.page_ids[page_idx];
@@ -290,19 +450,25 @@ pub fn write_pdf_with_attachments(
             PdfError::other("write_pdf_with_attachments: page id missing after build_pages")
         })?;
         if let Object::Dict(d) = page_obj {
-            // Merge with any pre-existing /Annots array (none in
-            // this writer path, but defensive).
-            let mut existing: Vec<Object> = d
-                .entries()
-                .iter()
-                .find(|(k, _)| k == "Annots")
-                .and_then(|(_, v)| match v {
-                    Object::Array(a) => Some(a.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            existing.extend(annot_ids.iter().map(|i| Object::Reference(*i)));
-            d.set("Annots", Object::Array(existing));
+            if !annot_ids.is_empty() {
+                // Merge with any pre-existing /Annots array (none in
+                // this writer path, but defensive).
+                let mut existing: Vec<Object> = d
+                    .entries()
+                    .iter()
+                    .find(|(k, _)| k == "Annots")
+                    .and_then(|(_, v)| match v {
+                        Object::Array(a) => Some(a.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                existing.extend(annot_ids.iter().map(|i| Object::Reference(*i)));
+                d.set("Annots", Object::Array(existing));
+            }
+            if !af_ids.is_empty() {
+                let arr: Vec<Object> = af_ids.iter().map(|id| Object::Reference(*id)).collect();
+                d.set("AF", Object::Array(arr));
+            }
         } else {
             return Err(PdfError::other(
                 "write_pdf_with_attachments: page object is not a Dict",
@@ -402,6 +568,17 @@ fn emit_filespec_dict(
         // panes show something other than just the file name.
         let desc = format!("{} ({mime})", attachment.name);
         filespec.set("Desc", Object::LiteralString(desc.into_bytes()));
+    }
+
+    // ISO 32000-2 §7.11.3 Table 44 — /AFRelationship name when the
+    // caller has opted into PDF 2.0 associated-files semantics. The
+    // Name spellings come straight from the spec's enumeration; see
+    // `AfRelationship::as_pdf_name`.
+    if let Some(rel) = attachment.af_relationship {
+        filespec.set(
+            "AFRelationship",
+            Object::Name(rel.as_pdf_name().to_string()),
+        );
     }
 
     doc.add(Object::Dict(filespec))
@@ -542,6 +719,53 @@ mod tests {
         assert_eq!(a.modified.as_deref(), Some("D:20260515120000Z"));
         assert_eq!(a.annotation_page, Some(0));
         assert_eq!(a.annotation_rect, Some([10.0, 10.0, 30.0, 30.0]));
+    }
+
+    #[test]
+    fn af_relationship_round_trips_through_pdf_name() {
+        // All eight values must serialise to a non-empty CamelCase Name
+        // (no whitespace, no slash escaping needed) AND parse back via
+        // `from_pdf_name`.
+        for r in [
+            AfRelationship::Source,
+            AfRelationship::Data,
+            AfRelationship::Alternative,
+            AfRelationship::Supplement,
+            AfRelationship::EncryptedPayload,
+            AfRelationship::FormData,
+            AfRelationship::Schema,
+            AfRelationship::Unspecified,
+        ] {
+            let n = r.as_pdf_name();
+            assert!(!n.is_empty());
+            assert!(n.chars().all(|c| c.is_ascii_alphanumeric()));
+            assert_eq!(AfRelationship::from_pdf_name(n), Some(r));
+        }
+    }
+
+    #[test]
+    fn af_relationship_unknown_name_returns_none() {
+        // §Annex E second-class names ("MyVendor_FooBar") must NOT be
+        // silently coerced into one of the enumerated values.
+        assert_eq!(AfRelationship::from_pdf_name("MyVendor_FooBar"), None);
+        assert_eq!(AfRelationship::from_pdf_name(""), None);
+        // Case-sensitive per §7.3.5 (Names are case-sensitive).
+        assert_eq!(AfRelationship::from_pdf_name("source"), None);
+        assert_eq!(AfRelationship::from_pdf_name("DATA"), None);
+    }
+
+    #[test]
+    fn attachment_default_has_no_af_relationship() {
+        let a = Attachment::new("a.txt", b"x".to_vec());
+        assert_eq!(a.af_relationship, None);
+    }
+
+    #[test]
+    fn attachment_with_af_relationship_builder_carries_through() {
+        let a = Attachment::new("invoice.xml", b"<x/>".to_vec())
+            .with_mime_type("application/xml")
+            .with_af_relationship(AfRelationship::Source);
+        assert_eq!(a.af_relationship, Some(AfRelationship::Source));
     }
 
     #[test]

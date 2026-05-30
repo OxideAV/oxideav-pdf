@@ -21,6 +21,7 @@
 //! malformed entries are skipped silently rather than aborting the
 //! whole tree (matches the round-26 annotation reader's contract).
 
+use crate::attachments::AfRelationship;
 use crate::error::PdfError;
 use crate::objects::{Dict, Object};
 use crate::reader::document::{decode_stream, DocumentReader};
@@ -39,6 +40,15 @@ pub struct PdfAttachment {
     /// `/Params /ModDate` modification date (raw PDF date string,
     /// `D:YYYYMMDDHHmmSSOHH'mm'` per §7.9.4). `None` when absent.
     pub modified: Option<String>,
+    /// `/AFRelationship` Name from the filespec dict, parsed per
+    /// ISO 32000-2 §7.11.3 Table 44. `None` when the filespec omits
+    /// the entry (the spec defaults the *meaning* to `Unspecified`
+    /// but we surface absence as `None` so callers can distinguish a
+    /// PDF 1.x attachment from a PDF 2.0 producer that explicitly
+    /// wrote `/AFRelationship /Unspecified`). Vendor / second-class
+    /// names (§Annex E) outside the enumerated eight also surface as
+    /// `None` — the reader refuses to coerce unknown names.
+    pub af_relationship: Option<AfRelationship>,
 }
 
 /// Walk the catalog → `/Names → /EmbeddedFiles` name tree and surface
@@ -147,6 +157,8 @@ pub fn attachments(reader: &mut DocumentReader<'_>) -> Result<Vec<PdfAttachment>
 
         let modified = read_params_moddate(&stream_obj.dict);
 
+        let af_relationship = read_af_relationship(&filespec_dict);
+
         let bytes = decode_stream(&stream_obj)?;
 
         out.push(PdfAttachment {
@@ -154,6 +166,7 @@ pub fn attachments(reader: &mut DocumentReader<'_>) -> Result<Vec<PdfAttachment>
             mime_type,
             bytes,
             modified,
+            af_relationship,
         });
     }
 
@@ -226,6 +239,23 @@ fn decode_filespec_name(filespec: &Dict) -> Option<String> {
         .find(|(k, _)| k == "UF")
         .or_else(|| filespec.entries().iter().find(|(k, _)| k == "F"));
     pick.and_then(|(_, v)| decode_text_obj(v))
+}
+
+/// Decode the optional `/AFRelationship` Name from a filespec dict
+/// (ISO 32000-2 §7.11.3 Table 44). Returns `None` when the entry is
+/// absent, isn't a Name, or carries a vendor / second-class Name that
+/// isn't one of the eight enumerated relationships — the reader
+/// refuses to coerce unknown names.
+fn read_af_relationship(filespec: &Dict) -> Option<AfRelationship> {
+    let val = filespec
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "AFRelationship")
+        .map(|(_, v)| v)?;
+    match val {
+        Object::Name(s) => AfRelationship::from_pdf_name(s),
+        _ => None,
+    }
 }
 
 /// Decode a `/Params /ModDate` entry from the embedded-file stream

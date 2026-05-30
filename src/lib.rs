@@ -70,7 +70,8 @@ pub use annotations::{
     FreeTextQuadding,
 };
 pub use attachments::{
-    write_pdf_with_annotations_and_attachments, write_pdf_with_attachments, Attachment,
+    write_pdf_with_annotations_and_attachments, write_pdf_with_attachments, AfRelationship,
+    Attachment,
 };
 pub use error::PdfError;
 pub use outline::{LinkAnnotationSpec, LinkTarget, OutlineDestination, OutlineSpec};

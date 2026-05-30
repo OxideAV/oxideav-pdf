@@ -1078,8 +1078,50 @@ Name-tree keys are emitted in byte-wise lexicographic order per
 
 The reader-side counterpart [`read_pdf_attachments`] walks the same
 name tree back into `Vec<PdfAttachment { name, mime_type, bytes,
-modified }>`. `qpdf --check` and `qpdf --json` both accept the
-output; `qpdf --json` lists each embedded file by name.
+modified, af_relationship }>`. `qpdf --check` and `qpdf --json` both
+accept the output; `qpdf --json` lists each embedded file by name.
+
+## PDF 2.0 Associated Files (`/AFRelationship` + `/AF`, round 194)
+
+Round 194 surfaces ISO 32000-2 §14.13 **Associated Files**. Each
+[`Attachment`] now carries an optional [`AfRelationship`] enum (per
+§7.11.3 Table 44) whose eight values match the spec verbatim:
+`Source`, `Data`, `Alternative`, `Supplement`, `EncryptedPayload`,
+`FormData`, `Schema`, `Unspecified`. Setting it via
+`with_af_relationship(rel)` stamps three additions onto the wire:
+
+- `/AFRelationship /<Name>` on the filespec dict (§7.11.3 Table 44).
+- The filespec reference in the **catalog** `/AF` array
+  (§14.13.3 + §7.7.2 Table 29), so any PDF/A-3-aware consumer can
+  enumerate the associated source content document-wide.
+- The same reference in the per-**page** `/AF` array
+  (§14.13.4 + §7.7.3.3) when the attachment also carries a
+  `FileAttachment` annotation on that page.
+
+```rust,ignore
+use oxideav_pdf::{write_pdf_with_attachments, AfRelationship, Attachment};
+
+let pdf = write_pdf_with_attachments(&scene, &[
+    Attachment::new("invoice.xml", invoice_xml)
+        .with_mime_type("application/xml")
+        .with_af_relationship(AfRelationship::Source),  // PDF/A-3-shaped
+    Attachment::new("data.csv", csv_bytes)
+        .with_mime_type("text/csv")
+        .with_af_relationship(AfRelationship::Data)
+        .with_annotation(0, [10.0, 10.0, 30.0, 30.0]),  // also in page /AF
+])?;
+# Ok::<(), oxideav_pdf::PdfError>(())
+```
+
+The reader-side [`read_pdf_attachments`] now surfaces
+`af_relationship: Option<AfRelationship>` on each `PdfAttachment`:
+`None` when the producer omitted the entry (PDF 1.x behaviour), or a
+vendor / second-class Name (§Annex E) sat in the slot — the reader
+refuses to coerce unknown Names; the eight enumerated values
+round-trip exactly. An attachment that does not call
+`with_af_relationship` preserves the round-33 byte shape exactly: no
+`/AFRelationship` Name, no `/AF` arrays on the catalog or page.
+`qpdf --check` accepts the round-194 output.
 
 ## Document time-stamp signatures (round 34)
 
