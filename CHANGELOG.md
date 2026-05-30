@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/OxideAV/oxideav-pdf/compare/v0.1.2...v0.1.3) - 2026-05-30
+
+### Other
+
+- §7.5.7 reject Type-2 entry whose container is itself Type-2 (fuzz fix)
+- §9.4.3 TJ position-adjustment word-break recovery
+- §9.10.3 ToUnicode CMap codespacerange (mixed-width decode)
+- AGL Public Implementation Notes §3 uniXXXX/uXXXXXXXX escapes
+- round 151: §7.5.7 compressed-object resolver cache (17.6× ObjStm open)
+- round 148: Criterion bench harness for reader hot paths
+- round 145: cargo-fuzz harness + two reader hardenings
+- §7.5.8.3 XRef-stream forward-compat for unknown entry types
+- resolve Tj/TJ text-show against /Resources /Font (Table 105+108+109)
+- pin tests/fixtures/* to binary in .gitattributes
+- resolve gs operator against /Resources /ExtGState (Table 58)
+- §7.5.8.4 hybrid-reference /XRefStm merge in parse_xref
+- honour cs/CS colour-space selection for sc/scn operators
+
 ### Other
 
 - reader: §7.5.7 compressed-object resolver now rejects a Type-2 xref entry whose container is itself declared as a Type-2 entry, before re-entering the resolver (round 191). The spec normatively forbids nested object streams, so this configuration is statically detectable from the xref table — and pre-fix `resolve(N)` would call `decode_objstm_container(wanted=N, container=N)` which called `self.resolve(N)` again, looping until the call stack overflowed. Caught by the scheduled Fuzz workflow (run 26628044506) against pre-r188 master 98ff5a3 — a crafted hybrid-reference file (`tests/fixtures/fuzz_objstm_self_container_cycle.bin`) whose §7.5.8 XRef stream declared the catalog (object 1) as compressed inside container 1 triggered an `AddressSanitizer: stack-overflow` abort. The reader now surfaces a clean `PdfError::Other` citing the §7.5.7 rule. Also adds a hard `MAX_PARSE_DEPTH = 256` ceiling to `Parser::parse_array` / `parse_dict_or_stream` so a sibling crafted input of `[[[[...]]]]` thousands deep produces a recoverable error instead of overflowing the thread stack. Three new tests pin the fix (one fuzz regression, two parser depth-guard unit tests)
