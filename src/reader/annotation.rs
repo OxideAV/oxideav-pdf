@@ -20,11 +20,34 @@
 //!   target decoder so callers get the same go-to / URI dispatch.
 //! * **`/Widget`** (§12.5.6.19 Table 188) — form-field hosting; field
 //!   metadata (FT, T, V) is surfaced when present.
+//! * **`/Line`** (§12.5.6.7 Table 175, round 197) — straight-line
+//!   markup: `/L` two-endpoint coordinates, `/LE` line-ending
+//!   styles, `/IC` interior colour, `/LL` / `/LLE` / `/LLO` leader
+//!   geometry, `/Cap` caption flag, `/IT` intent.
+//! * **`/Polygon`** / **`/PolyLine`** (§12.5.6.9 Table 178, round 197)
+//!   — `/Vertices` 2N reals, `/LE` line endings (PolyLine only per
+//!   spec but surfaced uniformly), `/IC`, `/IT` intent
+//!   (`PolygonCloud` / `PolyLineDimension` / `PolygonDimension`).
+//! * **`/Ink`** (§12.5.6.13 Table 182, round 197) — `/InkList` of
+//!   strokes, each one a flat `[x0 y0 x1 y1 …]` array (round-trips
+//!   the round-32 `write_pdf_with_annotations` Ink writer).
+//! * **`/Caret`** (§12.5.6.11 Table 180, round 197) — `/RD`
+//!   rectangle differences, `/Sy` paragraph-symbol (`P` / `None`).
+//! * **`/Popup`** (§12.5.6.14 Table 183, round 197) — `/Open` flag
+//!   plus the parent annotation reference (`/Parent`) preserved as
+//!   an [`ObjectId`] so callers can correlate a pop-up with its
+//!   markup parent.
+//! * **`/FileAttachment`** (§12.5.6.15 Table 184, round 197) —
+//!   `/Name` icon (`GraphPushPin` / `PaperclipTag` / `PushPin`
+//!   default) and the referenced `/FS` filespec's user-visible name
+//!   resolved through the same `/UF`-preferred / `/F` fallback path
+//!   the round-33 attachment reader uses. Round-trips the round-33
+//!   `write_pdf_with_attachments` annotation marker.
 //!
 //! Unknown subtypes still come back as [`AnnotationKind::Other`] with
 //! the raw `/Subtype` name — callers walking forensic / archival PDFs
-//! get a complete enumeration even for the long tail (Movie, Sound,
-//! 3D, RichMedia, …).
+//! get a complete enumeration even for the long tail (Sound, Movie,
+//! Screen, Redact, 3D, RichMedia, …).
 //!
 //! Pages without `/Annots` contribute zero entries; a malformed annot
 //! dict is skipped (best-effort enumeration matches the round-21
@@ -148,6 +171,113 @@ pub enum AnnotationKind {
         /// `/V` — current value text (Names + strings collapse to a
         /// String form; `null` ⇒ `None`).
         value: Option<String>,
+    },
+    /// `/Subtype /Line` — straight-line markup (§12.5.6.7 Table 175,
+    /// round 197). Two-endpoint line on the page; the `Rect` field
+    /// is the bounding box, the `L` endpoints carry the line itself.
+    Line {
+        /// `/L` — `[x1 y1 x2 y2]` endpoints in default user space.
+        /// Required per Table 175.
+        l: [f32; 4],
+        /// `/LE` — two-element line-ending styles. Per Table 175 the
+        /// default is `[/None /None]`; the spec values are listed in
+        /// Table 176 (`Square`, `Circle`, `Diamond`, `OpenArrow`,
+        /// `ClosedArrow`, `None`, `Butt`, `ROpenArrow`,
+        /// `RClosedArrow`, `Slash`). Round-197 surfaces them raw —
+        /// callers that care about rendering compare strings.
+        line_endings: Option<[String; 2]>,
+        /// `/IC` interior colour for filled line-ending shapes (same
+        /// 0/1/3/4-component layout as the outer `/C`).
+        interior_colour: Option<Vec<f32>>,
+        /// `/LL` — leader-line length, in default user-space units.
+        /// Positive values lead clockwise from start→end (per spec
+        /// Figure 60). `None` when omitted (default 0 per Table 175).
+        leader_line: Option<f32>,
+        /// `/LLE` — leader-line extension length (≥ 0). `None` when
+        /// omitted (default 0 per Table 175).
+        leader_line_extension: Option<f32>,
+        /// `/LLO` — leader-line offset (PDF 1.7, ≥ 0). `None` when
+        /// omitted.
+        leader_line_offset: Option<f32>,
+        /// `/Cap` — true iff the Contents / RC text should be drawn
+        /// as a caption on the line (Figure 61 / 62). Defaults to
+        /// false per Table 175.
+        cap: bool,
+        /// `/IT` intent (`LineArrow` / `LineDimension`); raw name
+        /// preserved.
+        intent: Option<String>,
+    },
+    /// `/Subtype /Polygon` or `/Subtype /PolyLine` — closed-polygon
+    /// or open-polyline markup (§12.5.6.9 Table 178, round 197).
+    PolygonOrPolyLine {
+        /// `true` for `Polygon`, `false` for `PolyLine`.
+        is_polygon: bool,
+        /// `/Vertices` — alternating `[x1 y1 x2 y2 …]` in default
+        /// user space.
+        vertices: Vec<f32>,
+        /// `/LE` line endings (PolyLine only per spec). Same two-name
+        /// shape as `Line::line_endings`.
+        line_endings: Option<[String; 2]>,
+        /// `/IC` interior colour (same layout as Line).
+        interior_colour: Option<Vec<f32>>,
+        /// `/IT` intent — `PolygonCloud`, `PolyLineDimension`,
+        /// `PolygonDimension`.
+        intent: Option<String>,
+    },
+    /// `/Subtype /Ink` — freehand scribble (§12.5.6.13 Table 182,
+    /// round 197). Round-trip target for the round-32
+    /// `write_pdf_with_annotations` Ink writer.
+    Ink {
+        /// `/InkList` — one `Vec<f32>` per stroked path, each a flat
+        /// `[x0 y0 x1 y1 …]` series in default user space.
+        ink_list: Vec<Vec<f32>>,
+    },
+    /// `/Subtype /Caret` — text-edit caret (§12.5.6.11 Table 180,
+    /// round 197).
+    Caret {
+        /// `/RD` rectangle differences inside `/Rect`, optional.
+        rect_diffs: Option<[f32; 4]>,
+        /// `/Sy` — paragraph symbol. `P` ⇒ paragraph mark, `None`
+        /// ⇒ no symbol. Defaults to `None` per Table 180.
+        symbol: String,
+    },
+    /// `/Subtype /Popup` — text editor for a markup parent
+    /// (§12.5.6.14 Table 183, round 197). Per Table 169 Popup is not
+    /// itself a markup type — it hangs off a parent markup annot via
+    /// `/Parent` (an indirect reference per Table 183).
+    Popup {
+        /// `/Parent` — indirect reference to the parent markup
+        /// annotation, preserved as an [`ObjectId`] so callers can
+        /// re-resolve. `None` when omitted (the spec considers this
+        /// malformed — Popup with no parent has no editing target —
+        /// but tolerant readers still surface the dict).
+        parent: Option<ObjectId>,
+        /// `/Open` — initial visibility (defaults to false per
+        /// Table 183).
+        open: bool,
+    },
+    /// `/Subtype /FileAttachment` — embedded-file marker
+    /// (§12.5.6.15 Table 184, round 197). Round-trip target for the
+    /// round-33 `write_pdf_with_attachments` annotation marker.
+    FileAttachment {
+        /// `/Name` icon — defaults to `PushPin` per Table 184. The
+        /// spec also names `GraphPushPin` and `PaperclipTag`;
+        /// additional names may be supported.
+        icon: String,
+        /// User-visible file name resolved from the `/FS` filespec.
+        /// Prefers `/UF` (UTF-16BE-with-BOM) over `/F`
+        /// (PDFDocEncoded) per §7.11.2 Table 43, matching the
+        /// round-33 attachment reader's behaviour. `None` when the
+        /// filespec is missing, unresolvable, or carries neither
+        /// name field.
+        file_name: Option<String>,
+        /// `/FS` filespec indirect-reference target, preserved so
+        /// callers can correlate the annotation with an entry from
+        /// `read_pdf_attachments` (same `ObjectId`). `None` when the
+        /// `/FS` entry is a direct dictionary rather than a
+        /// reference (rare but legal — the spec only requires the
+        /// entry to be a "file specification").
+        filespec: Option<ObjectId>,
     },
     /// Subtype this round doesn't decode — name surfaced verbatim.
     Other { subtype: String },
@@ -304,6 +434,88 @@ fn decode_annotation(
             field_name: decode_text_string(find_entry(annot, "T")),
             value: decode_field_value(find_entry(annot, "V")),
         },
+        // Round 197 — §12.5.6.7 Line annotation (Table 175).
+        "Line" => {
+            // `/L` is required per Table 175 — without it we still
+            // surface the dict but supply a zero-length placeholder
+            // so callers don't have to special-case Option. This
+            // matches the tolerant-reader contract every other
+            // subtype follows.
+            let l = decode_rect_diffs(find_entry(annot, "L")).unwrap_or([0.0; 4]);
+            AnnotationKind::Line {
+                l,
+                line_endings: decode_two_name_array(find_entry(annot, "LE")),
+                interior_colour: decode_real_array(find_entry(annot, "IC")),
+                leader_line: decode_real(find_entry(annot, "LL")),
+                leader_line_extension: decode_real(find_entry(annot, "LLE")),
+                leader_line_offset: decode_real(find_entry(annot, "LLO")),
+                cap: matches!(find_entry(annot, "Cap"), Some(Object::Bool(true))),
+                intent: match find_entry(annot, "IT") {
+                    Some(Object::Name(s)) => Some(s.clone()),
+                    _ => None,
+                },
+            }
+        }
+        // Round 197 — §12.5.6.9 Polygon / PolyLine (Table 178).
+        "Polygon" | "PolyLine" => AnnotationKind::PolygonOrPolyLine {
+            is_polygon: subtype == "Polygon",
+            vertices: decode_real_array(find_entry(annot, "Vertices")).unwrap_or_default(),
+            line_endings: decode_two_name_array(find_entry(annot, "LE")),
+            interior_colour: decode_real_array(find_entry(annot, "IC")),
+            intent: match find_entry(annot, "IT") {
+                Some(Object::Name(s)) => Some(s.clone()),
+                _ => None,
+            },
+        },
+        // Round 197 — §12.5.6.13 Ink (Table 182).
+        "Ink" => AnnotationKind::Ink {
+            ink_list: decode_ink_list(find_entry(annot, "InkList")),
+        },
+        // Round 197 — §12.5.6.11 Caret (Table 180).
+        "Caret" => AnnotationKind::Caret {
+            rect_diffs: decode_rect_diffs(find_entry(annot, "RD")),
+            symbol: match find_entry(annot, "Sy") {
+                Some(Object::Name(s)) => s.clone(),
+                _ => "None".to_string(),
+            },
+        },
+        // Round 197 — §12.5.6.14 Popup (Table 183). The Parent
+        // entry is normatively an indirect reference per Table 183;
+        // we surface the target id when present.
+        "Popup" => AnnotationKind::Popup {
+            parent: match find_entry(annot, "Parent") {
+                Some(Object::Reference(id)) => Some(*id),
+                _ => None,
+            },
+            open: matches!(find_entry(annot, "Open"), Some(Object::Bool(true))),
+        },
+        // Round 197 — §12.5.6.15 FileAttachment (Table 184).
+        // Resolves the user-visible filename through the same
+        // /UF-preferred / /F-fallback path the round-33 attachment
+        // reader uses (§7.11.2 Table 43).
+        "FileAttachment" => {
+            let (filespec_id, filespec_dict) = match find_entry(annot, "FS") {
+                Some(Object::Reference(id)) => {
+                    let resolved = reader.resolve(*id)?;
+                    let dict = match resolved {
+                        Object::Dict(d) => Some(d),
+                        _ => None,
+                    };
+                    (Some(*id), dict)
+                }
+                Some(Object::Dict(d)) => (None, Some(d.clone())),
+                _ => (None, None),
+            };
+            let file_name = filespec_dict.as_ref().and_then(decode_filespec_name);
+            AnnotationKind::FileAttachment {
+                icon: match find_entry(annot, "Name") {
+                    Some(Object::Name(s)) => s.clone(),
+                    _ => "PushPin".to_string(),
+                },
+                file_name,
+                filespec: filespec_id,
+            }
+        }
         other => AnnotationKind::Other {
             subtype: other.to_string(),
         },
@@ -469,6 +681,86 @@ fn decode_rect_diffs(o: Option<&Object>) -> Option<[f32; 4]> {
     } else {
         None
     }
+}
+
+/// Decode a single Real / Integer numeric Object as `f32`. Used for
+/// Table 175's leader-line scalars (`/LL`, `/LLE`, `/LLO`).
+fn decode_real(o: Option<&Object>) -> Option<f32> {
+    match o? {
+        Object::Real(f) => Some(*f as f32),
+        Object::Integer(n) => Some(*n as f32),
+        _ => None,
+    }
+}
+
+/// Decode a two-element Name array — `/LE` line endings per
+/// Table 176, e.g. `[/OpenArrow /ClosedArrow]`. Returns `None` when
+/// the array is missing, the wrong length, or contains non-Name
+/// elements. The spec defaults to `[/None /None]` when absent (round
+/// 197 surfaces the absence as `None` so callers can distinguish a
+/// producer that explicitly wrote the default).
+fn decode_two_name_array(o: Option<&Object>) -> Option<[String; 2]> {
+    let arr = match o? {
+        Object::Array(items) => items,
+        _ => return None,
+    };
+    if arr.len() != 2 {
+        return None;
+    }
+    let a = match &arr[0] {
+        Object::Name(s) => s.clone(),
+        _ => return None,
+    };
+    let b = match &arr[1] {
+        Object::Name(s) => s.clone(),
+        _ => return None,
+    };
+    Some([a, b])
+}
+
+/// Decode an `/InkList` — an array of arrays, each inner array a flat
+/// `[x0 y0 x1 y1 …]` series in default user space (Table 182).
+/// Malformed inner elements (non-array entries, non-numeric coords)
+/// are skipped silently — best-effort enumeration matches the rest of
+/// the annotation reader.
+fn decode_ink_list(o: Option<&Object>) -> Vec<Vec<f32>> {
+    let Some(Object::Array(strokes)) = o else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(strokes.len());
+    for s in strokes {
+        let Object::Array(coords) = s else { continue };
+        let mut flat = Vec::with_capacity(coords.len());
+        let mut ok = true;
+        for c in coords {
+            match c {
+                Object::Real(f) => flat.push(*f as f32),
+                Object::Integer(n) => flat.push(*n as f32),
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            out.push(flat);
+        }
+    }
+    out
+}
+
+/// Decode the user-visible name from a `/Filespec` dict, preferring
+/// `/UF` (UTF-16BE-with-BOM, PDF 1.7+) over `/F` (PDFDocEncoded) per
+/// §7.11.2 Table 43. Mirrors the round-33 attachment reader's
+/// `decode_filespec_name` so FileAttachment annotations and embedded
+/// files report identical names.
+fn decode_filespec_name(filespec: &Dict) -> Option<String> {
+    let pick = filespec
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "UF")
+        .or_else(|| filespec.entries().iter().find(|(k, _)| k == "F"));
+    decode_text_string(pick.map(|(_, v)| v))
 }
 
 /// PDF "text string" decode — handles literal-PDFDocEncoding and

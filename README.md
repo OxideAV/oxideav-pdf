@@ -770,10 +770,29 @@ Tables 169..209). Per-subtype payload covers `/Text` (sticky notes —
 text-markup variants `/Highlight` / `/Underline` / `/Squiggly` /
 `/StrikeOut` (`/QuadPoints`), `/Square` + `/Circle` (`/IC`, `/RD`),
 `/Link` (re-uses the round-25 go-to / URI decoder), and `/Widget`
-(`/FT`, `/T`, `/V`). Unknown subtypes (Movie, Sound, 3D, RichMedia,
-…) surface as `AnnotationKind::Other { subtype }`. Common Table 164
-fields (`/Rect`, `/Contents`, `/NM`, `/M`, `/F`, `/C`, `/Border`) are
-decoded for every subtype.
+(`/FT`, `/T`, `/V`). Round 197 closes six more subtypes — `/Line`
+(§12.5.6.7 Table 175 — `/L` endpoints, `/LE` line-ending styles,
+`/IC` interior colour, `/LL` / `/LLE` / `/LLO` leader geometry,
+`/Cap` caption flag, `/IT` intent), `/Polygon` + `/PolyLine`
+(§12.5.6.9 Table 178 — `/Vertices`, `/LE`, `/IC`, `/IT` for the
+`PolygonCloud` / `PolyLineDimension` / `PolygonDimension`
+intents), `/Ink` (§12.5.6.13 Table 182 — `/InkList` of strokes,
+closing the round-trip with the round-32 `write_pdf_with_annotations`
+Ink writer), `/Caret` (§12.5.6.11 Table 180 — `/RD`, `/Sy`
+paragraph symbol), `/Popup` (§12.5.6.14 Table 183 — `/Parent`
+indirect ref preserved as an `ObjectId`, `/Open` flag), and
+`/FileAttachment` (§12.5.6.15 Table 184 — `/Name` icon,
+filespec-resolved user-visible name via the same `/UF`-preferred
+/ `/F` fallback path the round-33 attachment reader uses,
+closing the round-trip with the round-33
+`write_pdf_with_attachments` annotation marker). The remaining
+long-tail subtypes (Movie, Sound, Screen, Redact, 3D, RichMedia,
+…) still surface as `AnnotationKind::Other { subtype }` — they
+need cross-crate plumbing (audio/video streams, rendition
+actions, structure-tree integration) the round-26 reader
+doesn't reach. Common Table 164 fields (`/Rect`, `/Contents`,
+`/NM`, `/M`, `/F`, `/C`, `/Border`) are decoded for every
+subtype.
 
 ```rust,ignore
 use oxideav_pdf::{reader::DocumentReader, AnnotationKind};

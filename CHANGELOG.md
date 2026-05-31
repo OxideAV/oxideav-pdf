@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- annotations (round 197): six new `/Subtype` decoders in the
+  round-26 generic annotation reader — **Line** (§12.5.6.7
+  Table 175 — `/L`, `/LE`, `/IC`, `/LL`, `/LLE`, `/LLO`, `/Cap`,
+  `/IT`), **Polygon** + **PolyLine** (§12.5.6.9 Table 178 —
+  `/Vertices`, `/LE`, `/IC`, `/IT`), **Ink** (§12.5.6.13 Table 182
+  — `/InkList`, closes the round-trip with the round-32
+  `write_pdf_with_annotations` Ink writer), **Caret** (§12.5.6.11
+  Table 180 — `/RD`, `/Sy`), **Popup** (§12.5.6.14 Table 183 —
+  `/Parent` indirect ref preserved as `ObjectId`, `/Open`), and
+  **FileAttachment** (§12.5.6.15 Table 184 — `/Name` icon,
+  filespec-resolved user-visible name via the same
+  `/UF`-preferred / `/F` fallback path the round-33 attachment
+  reader uses; closes the round-trip with the round-33
+  `write_pdf_with_attachments` annotation marker). Before this
+  round all six subtypes fell through to `AnnotationKind::Other
+  { subtype }` — they round-tripped structurally (the writer's
+  output decoded back as Other) but callers couldn't see the
+  structured payload. The reader is tolerant of malformed dicts
+  (a Line without `/L` surfaces `[0; 4]`; an Ink with an empty
+  `/InkList` surfaces an empty Vec; a FileAttachment without
+  `/FS` surfaces `file_name: None`). Movie / Sound / Screen /
+  Redact / 3D / RichMedia still fall through to
+  `AnnotationKind::Other` since they need cross-crate plumbing
+  (audio/video streams + rendition actions + structure-tree
+  integration). Adds 16 new tests in
+  `tests/annotations_round197.rs`; the round-32 writer test
+  `ink_annotation_emits_inklist` was updated to assert the new
+  structured shape (was previously asserting `Other("Ink")`).
 - attachments (round 194): PDF 2.0 Associated Files — `/AFRelationship`
   on filespec dicts + `/AF` arrays on the catalog and per page
   (ISO 32000-2 §7.11.3 Table 44 + §14.13.3 + §14.13.4). New

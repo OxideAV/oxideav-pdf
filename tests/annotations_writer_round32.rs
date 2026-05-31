@@ -365,9 +365,8 @@ fn ink_annotation_emits_inklist() {
         },
     );
     let pdf = write_pdf_with_annotations(&scene, &[annot]).expect("write");
-    // The reader's round-26 enumeration doesn't decode /Ink (it falls
-    // through to Other), so we just confirm the dict survives
-    // round-trip and the subtype + InkList tokens are present.
+    // Round-197 closed the reader's Ink decode (`AnnotationKind::Ink`).
+    // We confirm both the wire shape and the structured round-trip.
     let contains = |needle: &[u8]| pdf.windows(needle.len()).any(|w| w == needle);
     assert!(
         contains(b"/Ink"),
@@ -378,15 +377,22 @@ fn ink_annotation_emits_inklist() {
         "missing /InkList entry in serialised PDF"
     );
 
-    // Also confirm the round-26 reader surfaces it with the right
-    // raw subtype name via AnnotationKind::Other (or — depending on
-    // reader extensions — surfaces it at all).
     let mut r = DocumentReader::open(&pdf).expect("reader open");
     let anns = read_pdf_annotations(&mut r).expect("read");
     assert_eq!(anns.len(), 1);
     match &anns[0].kind {
-        AnnotationKind::Other { subtype } => assert_eq!(subtype, "Ink"),
-        other => panic!("expected Other('Ink'), got {other:?}"),
+        AnnotationKind::Ink { ink_list } => {
+            assert_eq!(ink_list.len(), 2);
+            assert_eq!(
+                ink_list[0],
+                vec![30.0_f32, 210.0, 80.0, 250.0, 130.0, 230.0]
+            );
+            assert_eq!(
+                ink_list[1],
+                vec![150.0_f32, 220.0, 200.0, 270.0, 260.0, 240.0]
+            );
+        }
+        other => panic!("expected Ink, got {other:?}"),
     }
 }
 
