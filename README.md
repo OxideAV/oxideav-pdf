@@ -785,8 +785,21 @@ indirect ref preserved as an `ObjectId`, `/Open` flag), and
 filespec-resolved user-visible name via the same `/UF`-preferred
 / `/F` fallback path the round-33 attachment reader uses,
 closing the round-trip with the round-33
-`write_pdf_with_attachments` annotation marker). The remaining
-long-tail subtypes (Movie, Sound, Screen, Redact, 3D, RichMedia,
+`write_pdf_with_attachments` annotation marker). **Round 204**
+closes two more — `/Watermark` (§12.5.6.22 Table 190 — optional
+`/FixedPrint` Table 191 sub-dict surfaced through a new
+[`FixedPrint`] struct carrying `/Matrix` six-number affine + `/H`
++ `/V` media-relative percentages, each reverting to its Table
+191 default when the entry is absent) and `/Redact` (§12.5.6.23
+Table 192 — `/QuadPoints` content region, three-component
+DeviceRGB `/IC` interior fill, `/RO` overlay-appearance Form
+XObject preserved as an `ObjectId`, `/OverlayText` + `/Repeat`
++ `/DA` + `/Q` overlay text). The redact reader is
+non-destructive — it surfaces the metadata so a privacy-audit
+consumer can enumerate what *would* be removed by a PDF
+1.7-compliant redactor without performing the destructive
+content-removal step described by §12.5.6.23 NOTE. The remaining
+long-tail subtypes (Movie, Sound, Screen, 3D, RichMedia,
 …) still surface as `AnnotationKind::Other { subtype }` — they
 need cross-crate plumbing (audio/video streams, rendition
 actions, structure-tree integration) the round-26 reader

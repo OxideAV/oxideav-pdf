@@ -93,11 +93,11 @@ pub use reader::{
     read_pdf_to_scene_with_certificate, read_pdf_to_scene_with_certificate_and_trust_store,
     read_pdf_to_scene_with_password, signatures as read_pdf_signatures,
     signed_bytes as pdf_signed_bytes, verify_hierarchy as verify_pdf_hierarchy, ActionKind,
-    ActionTrigger, AnnotationKind, ColorSpace, HierarchyIssue, HierarchyReport, InlineImageFilter,
-    IssueSeverity, LayoutMode, LinearizationParams, MarkedTextRun, OutlineNode, PdfACatalogSignals,
-    PdfAConformance, PdfAction, PdfAnnotation, PdfAttachment, PdfDocTimestamp, PdfImageXObject,
-    PdfInlineImage, PdfLink, PdfLinkTarget, PdfMarkedTextExtraction, PdfOutline, PdfSignature,
-    PdfTextExtraction, ReadingOrderText, TextMarkupVariant, TextRun, XmpPacket,
+    ActionTrigger, AnnotationKind, ColorSpace, FixedPrint, HierarchyIssue, HierarchyReport,
+    InlineImageFilter, IssueSeverity, LayoutMode, LinearizationParams, MarkedTextRun, OutlineNode,
+    PdfACatalogSignals, PdfAConformance, PdfAction, PdfAnnotation, PdfAttachment, PdfDocTimestamp,
+    PdfImageXObject, PdfInlineImage, PdfLink, PdfLinkTarget, PdfMarkedTextExtraction, PdfOutline,
+    PdfSignature, PdfTextExtraction, ReadingOrderText, TextMarkupVariant, TextRun, XmpPacket,
 };
 pub use sig::{
     add_document_timestamp, build_tst_info, pkcs7_wrap_signed_data, sign_pdf_from_scene,

@@ -43,11 +43,23 @@
 //!   resolved through the same `/UF`-preferred / `/F` fallback path
 //!   the round-33 attachment reader uses. Round-trips the round-33
 //!   `write_pdf_with_attachments` annotation marker.
+//! * **`/Watermark`** (§12.5.6.22 Table 190, round 204) — fixed-print
+//!   positioning surfaced through [`FixedPrint`] (Table 191): the
+//!   `/Matrix` affine + `/H` / `/V` media-relative percentages that
+//!   make a watermark render at the same absolute position on every
+//!   printed sheet regardless of the destination media size.
+//! * **`/Redact`** (§12.5.6.23 Table 192, round 204) — non-destructive
+//!   redaction marker: `/QuadPoints` content region, `/IC` interior
+//!   fill, `/RO` overlay-appearance Form XObject (preserved as an
+//!   `ObjectId`), `/OverlayText` + `/Repeat` + `/DA` + `/Q` overlay
+//!   text. Round-204 enumerates these for privacy-audit consumers; the
+//!   destructive content-removal step described by §12.5.6.23 NOTE is
+//!   a separate higher-level pass and is *not* applied by the reader.
 //!
 //! Unknown subtypes still come back as [`AnnotationKind::Other`] with
 //! the raw `/Subtype` name — callers walking forensic / archival PDFs
 //! get a complete enumeration even for the long tail (Sound, Movie,
-//! Screen, Redact, 3D, RichMedia, …).
+//! Screen, 3D, RichMedia, …).
 //!
 //! Pages without `/Annots` contribute zero entries; a malformed annot
 //! dict is skipped (best-effort enumeration matches the round-21
@@ -256,6 +268,64 @@ pub enum AnnotationKind {
         /// Table 183).
         open: bool,
     },
+    /// `/Subtype /Watermark` — fixed-position printed graphics
+    /// (§12.5.6.22 Table 190, round 204). Round-204 surfaces the
+    /// optional `/FixedPrint` dict (§12.5.6.22 Table 191): printing
+    /// applications use the `/Matrix` + `/H` / `/V` percentages to
+    /// position the watermark relative to the *printed* media (not
+    /// the PDF page), so a screen viewer and a print path render
+    /// the same dict differently.
+    Watermark {
+        /// Decoded `/FixedPrint` dictionary, when present. `None`
+        /// means the watermark has no media-relative positioning —
+        /// per Table 190 it is then drawn without any special
+        /// consideration for the dimensions of the target media.
+        fixed_print: Option<FixedPrint>,
+    },
+    /// `/Subtype /Redact` — redaction marker (§12.5.6.23 Table 192,
+    /// round 204). The round-26 reader is *non-destructive*: it
+    /// surfaces every redact dict it can decode, but applying the
+    /// redaction (actually destroying the underlying content) is a
+    /// separate higher-level pass. This variant carries the spec's
+    /// content-region + overlay-appearance fields verbatim so a
+    /// privacy-audit tool can enumerate what *would* be removed by a
+    /// PDF 1.7-compliant redactor without invoking that destructive
+    /// path.
+    Redact {
+        /// `/QuadPoints` — 8N reals giving the quads of the content
+        /// region intended for removal. When omitted the spec falls
+        /// back to the outer `/Rect`; round-204 surfaces `None` so
+        /// callers can distinguish "explicit empty" vs "use Rect".
+        quad_points: Option<Vec<f32>>,
+        /// `/IC` — DeviceRGB fill applied after content removal
+        /// (three components in 0..=1). Ignored by the spec when
+        /// `/RO` is present.
+        interior_colour: Option<[f32; 3]>,
+        /// `/RO` indirect reference — Form XObject overlay
+        /// appearance (§8.10). Round-204 surfaces the `ObjectId`
+        /// so callers can re-resolve; payload decoding is left to
+        /// the consumer because the overlay stream is a generic
+        /// Form XObject (`/Subtype /Form`), not a redact-specific
+        /// shape.
+        overlay_form: Option<ObjectId>,
+        /// `/OverlayText` — text-string drawn over the redacted
+        /// region after removal. Ignored per spec when `/RO` is
+        /// present.
+        overlay_text: Option<String>,
+        /// `/Repeat` — `true` ⇒ the overlay text tiles to fill the
+        /// region. Defaults to `false` per Table 192. Ignored when
+        /// `/RO` is present.
+        repeat: bool,
+        /// `/DA` — appearance string for the overlay text (the
+        /// `/Helv 12 Tf 0 g`-style content snippet from §12.7.3.3).
+        /// "Required if OverlayText is present, ignored otherwise"
+        /// per Table 192; surfaced as raw bytes so callers can
+        /// re-feed the snippet through the content-stream parser.
+        default_appearance: Option<String>,
+        /// `/Q` — overlay-text justification: 0 left (default), 1
+        /// centre, 2 right. Ignored when `/RO` is present.
+        quadding: u8,
+    },
     /// `/Subtype /FileAttachment` — embedded-file marker
     /// (§12.5.6.15 Table 184, round 197). Round-trip target for the
     /// round-33 `write_pdf_with_attachments` annotation marker.
@@ -290,6 +360,38 @@ pub enum TextMarkupVariant {
     Underline,
     Squiggly,
     StrikeOut,
+}
+
+/// Decoded `/FixedPrint` dictionary for [`AnnotationKind::Watermark`]
+/// (ISO 32000-1 §12.5.6.22 Table 191, round 204). All entries are
+/// optional except `/Type`; the round-204 reader carries `/Matrix`
+/// (defaulting to identity per spec), `/H`, and `/V` (each defaulting
+/// to `0.0` per spec).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FixedPrint {
+    /// `/Matrix` — six-number affine transform applied to the
+    /// annotation rectangle before rendering. Defaults to the
+    /// identity matrix `[1 0 0 1 0 0]` when omitted.
+    pub matrix: [f32; 6],
+    /// `/H` — horizontal translation as a fraction of the printed
+    /// media width (`1.0` ≡ 100%). Defaults to `0.0` when omitted.
+    /// Per Table 191 negative values are not recommended (content
+    /// may render off-page).
+    pub h: f32,
+    /// `/V` — vertical translation as a fraction of the printed
+    /// media height. Defaults to `0.0` when omitted.
+    pub v: f32,
+}
+
+impl Default for FixedPrint {
+    fn default() -> Self {
+        Self {
+            // PDF identity transform (§8.3.4) — `a=1 b=0 c=0 d=1 e=0 f=0`.
+            matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            h: 0.0,
+            v: 0.0,
+        }
+    }
 }
 
 /// Walk every page in DFS order, collecting every annotation.
@@ -489,6 +591,60 @@ fn decode_annotation(
             },
             open: matches!(find_entry(annot, "Open"), Some(Object::Bool(true))),
         },
+        // Round 204 — §12.5.6.22 Watermark (Table 190).
+        // The required keys are just `/Subtype /Watermark`; the
+        // structural payload is the optional `/FixedPrint` sub-dict
+        // (Table 191) that carries media-relative positioning.
+        "Watermark" => {
+            let fixed_print = match find_entry(annot, "FixedPrint").cloned() {
+                Some(o) => {
+                    let resolved = reader.deref(o)?;
+                    decode_fixed_print(&resolved)
+                }
+                None => None,
+            };
+            AnnotationKind::Watermark { fixed_print }
+        }
+        // Round 204 — §12.5.6.23 Redact (Table 192).
+        // Non-destructive enumeration only — the redact-application
+        // step (actually removing content) is a separate higher-level
+        // pass per spec NOTE in §12.5.6.23.
+        "Redact" => {
+            let quad_points = decode_real_array(find_entry(annot, "QuadPoints"));
+            // Table 192 constrains /IC to three DeviceRGB components.
+            // Anything else (a stray 4-CMYK or 1-Gray) gets dropped:
+            // the spec is explicit ("three numbers in the range 0.0 to
+            // 1.0").
+            let interior_colour = decode_real_array(find_entry(annot, "IC")).and_then(|v| {
+                if v.len() == 3 {
+                    Some([v[0], v[1], v[2]])
+                } else {
+                    None
+                }
+            });
+            // /RO is an indirect ref to a Form XObject (§8.10);
+            // preserve as ObjectId so callers can re-resolve.
+            let overlay_form = match find_entry(annot, "RO") {
+                Some(Object::Reference(id)) => Some(*id),
+                _ => None,
+            };
+            let overlay_text = decode_text_string(find_entry(annot, "OverlayText"));
+            let repeat = matches!(find_entry(annot, "Repeat"), Some(Object::Bool(true)));
+            let default_appearance = decode_text_string(find_entry(annot, "DA"));
+            let quadding = match find_entry(annot, "Q") {
+                Some(Object::Integer(n)) => (*n).clamp(0, 2) as u8,
+                _ => 0,
+            };
+            AnnotationKind::Redact {
+                quad_points,
+                interior_colour,
+                overlay_form,
+                overlay_text,
+                repeat,
+                default_appearance,
+                quadding,
+            }
+        }
         // Round 197 — §12.5.6.15 FileAttachment (Table 184).
         // Resolves the user-visible filename through the same
         // /UF-preferred / /F-fallback path the round-33 attachment
@@ -747,6 +903,51 @@ fn decode_ink_list(o: Option<&Object>) -> Vec<Vec<f32>> {
         }
     }
     out
+}
+
+/// Decode a `/FixedPrint` sub-dict (§12.5.6.22 Table 191) into the
+/// round-204 [`FixedPrint`] struct. Returns `None` only when the
+/// resolved object is not a dictionary at all — a dict whose entries
+/// are all absent yields the all-default value (identity matrix,
+/// H=V=0.0) so the presence-vs-absence signal at the outer
+/// `AnnotationKind::Watermark { fixed_print }` slot stays meaningful.
+///
+/// Per Table 191 the `/Type /FixedPrint` marker is required; we don't
+/// re-validate it here because a malformed type marker shouldn't strip
+/// the structural payload from a forensic enumeration. A `/Matrix`
+/// whose array isn't exactly six numbers reverts to the identity
+/// default rather than failing the whole decode.
+fn decode_fixed_print(o: &Object) -> Option<FixedPrint> {
+    let Object::Dict(d) = o else {
+        return None;
+    };
+    let mut out = FixedPrint::default();
+    if let Some(Object::Array(items)) = find_entry(d, "Matrix") {
+        if items.len() == 6 {
+            let mut tmp = [0f32; 6];
+            let mut ok = true;
+            for (i, it) in items.iter().enumerate() {
+                match it {
+                    Object::Real(f) => tmp[i] = *f as f32,
+                    Object::Integer(n) => tmp[i] = *n as f32,
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                out.matrix = tmp;
+            }
+        }
+    }
+    if let Some(v) = decode_real(find_entry(d, "H")) {
+        out.h = v;
+    }
+    if let Some(v) = decode_real(find_entry(d, "V")) {
+        out.v = v;
+    }
+    Some(out)
 }
 
 /// Decode the user-visible name from a `/Filespec` dict, preferring

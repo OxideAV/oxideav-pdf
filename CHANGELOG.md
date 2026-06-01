@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- annotations (round 204): two new `/Subtype` decoders in the
+  round-26 generic annotation reader — **Watermark** (§12.5.6.22
+  Table 190 — optional `/FixedPrint` indirect ref surfaced through
+  a new [`FixedPrint`] struct carrying Table 191's `/Matrix` six-
+  number affine plus `/H` / `/V` media-relative percentages, each
+  reverting to its Table 191 default when the entry is absent so
+  partial dicts decode cleanly) and **Redact** (§12.5.6.23
+  Table 192 — `/QuadPoints` content region, three-component
+  DeviceRGB `/IC` interior fill, `/RO` overlay-appearance Form
+  XObject preserved as an `ObjectId` for callers to re-resolve,
+  `/OverlayText` + `/Repeat` + `/DA` + `/Q` overlay text). Before
+  this round both subtypes fell through to
+  `AnnotationKind::Other { subtype }`. The redact reader is
+  non-destructive: it surfaces the metadata so a privacy-audit
+  consumer can enumerate what *would* be removed by a PDF
+  1.7-compliant redactor without performing the destructive
+  content-removal step described by §12.5.6.23 NOTE. `/IC` that
+  isn't exactly three DeviceRGB components is rejected to `None`
+  rather than silently mis-typed (Table 192 explicitly constrains
+  it to three numbers); a malformed six-number `/Matrix` reverts
+  to the identity default rather than refusing the whole
+  watermark. Movie / Sound / Screen / 3D / RichMedia still fall
+  through to `AnnotationKind::Other` since they need cross-crate
+  plumbing (audio/video streams + rendition actions +
+  structure-tree integration). Adds 15 new tests in
+  `tests/annotations_round204.rs` covering absent vs. inline vs.
+  indirect `/FixedPrint`, Table 191 default propagation, the
+  `/RO`-vs-`/IC`-vs-`/OverlayText` precedence shape from Table
+  192, UTF-16BE-with-BOM `/OverlayText` decode, multi-quad
+  `/QuadPoints` preservation, and cross-subtype enumeration
+  alongside the round-197 long-tail.
 - annotations (round 197): six new `/Subtype` decoders in the
   round-26 generic annotation reader — **Line** (§12.5.6.7
   Table 175 — `/L`, `/LE`, `/IC`, `/LL`, `/LLE`, `/LLO`, `/Cap`,
@@ -30,10 +61,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (a Line without `/L` surfaces `[0; 4]`; an Ink with an empty
   `/InkList` surfaces an empty Vec; a FileAttachment without
   `/FS` surfaces `file_name: None`). Movie / Sound / Screen /
-  Redact / 3D / RichMedia still fall through to
+  Redact / Watermark / 3D / RichMedia still fall through to
   `AnnotationKind::Other` since they need cross-crate plumbing
   (audio/video streams + rendition actions + structure-tree
-  integration). Adds 16 new tests in
+  integration). Round 204 lifts /Redact and /Watermark out of
+  this fallback set. Adds 16 new tests in
   `tests/annotations_round197.rs`; the round-32 writer test
   `ink_annotation_emits_inklist` was updated to assert the new
   structured shape (was previously asserting `Other("Ink")`).

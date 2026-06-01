@@ -469,10 +469,14 @@ fn file_attachment_annotation_missing_fs_still_surfaces() {
 #[test]
 fn unknown_subtype_still_falls_through_to_other() {
     // Confirm round-197's new variants don't shadow the existing
-    // Other fallback for subtypes this round still doesn't decode.
+    // Other fallback for subtypes that still aren't structurally
+    // decoded. Round-204 lifted /Redact + /Watermark into their own
+    // variants, so this test now exercises two of the remaining
+    // long-tail subtypes that need cross-crate plumbing
+    // (/Movie + /Sound = audio/video stream payloads).
     let pdf = synth_pdf_with_annotations(&[
         "<< /Type /Annot /Subtype /Movie /Rect [0 0 30 30] >>",
-        "<< /Type /Annot /Subtype /Redact /Rect [0 0 30 30] >>",
+        "<< /Type /Annot /Subtype /Sound /Rect [0 0 30 30] >>",
     ]);
     let mut r = DocumentReader::open(&pdf).unwrap();
     let anns = read_pdf_annotations(&mut r).unwrap();
@@ -482,7 +486,7 @@ fn unknown_subtype_still_falls_through_to_other() {
         other => panic!("expected Other(Movie), got {other:?}"),
     }
     match &anns[1].kind {
-        AnnotationKind::Other { subtype } => assert_eq!(subtype, "Redact"),
-        other => panic!("expected Other(Redact), got {other:?}"),
+        AnnotationKind::Other { subtype } => assert_eq!(subtype, "Sound"),
+        other => panic!("expected Other(Sound), got {other:?}"),
     }
 }

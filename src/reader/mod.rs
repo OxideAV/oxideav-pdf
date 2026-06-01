@@ -43,7 +43,7 @@ pub mod xmp;
 pub mod xref;
 
 pub use actions::{actions, ActionKind, ActionTrigger, PdfAction};
-pub use annotation::{annotations, AnnotationKind, PdfAnnotation, TextMarkupVariant};
+pub use annotation::{annotations, AnnotationKind, FixedPrint, PdfAnnotation, TextMarkupVariant};
 pub use attachments::{attachments, PdfAttachment};
 pub use content::{
     parse_content_stream, parse_content_stream_full, parse_content_stream_with_resources,
