@@ -798,14 +798,28 @@ XObject preserved as an `ObjectId`, `/OverlayText` + `/Repeat`
 non-destructive — it surfaces the metadata so a privacy-audit
 consumer can enumerate what *would* be removed by a PDF
 1.7-compliant redactor without performing the destructive
-content-removal step described by §12.5.6.23 NOTE. The remaining
-long-tail subtypes (Movie, Sound, Screen, 3D, RichMedia,
-…) still surface as `AnnotationKind::Other { subtype }` — they
-need cross-crate plumbing (audio/video streams, rendition
-actions, structure-tree integration) the round-26 reader
-doesn't reach. Common Table 164 fields (`/Rect`, `/Contents`,
-`/NM`, `/M`, `/F`, `/C`, `/Border`) are decoded for every
-subtype.
+content-removal step described by §12.5.6.23 NOTE. **Round 209**
+closes three more — `/Sound` (§12.5.6.16 Table 185 — the
+required §13.3 sound stream surfaced as an `ObjectId` so callers
+re-resolve through their own audio plumbing, plus the `/Name`
+icon defaulting to `Speaker` per Table 185), `/Movie`
+(§12.5.6.17 Table 186 — `/T` title used by §12.6.4.9 movie
+actions, the required §13.4 `/Movie` dict preserved as an
+`ObjectId`, and `/A` collapsed to a new `MovieActivation`
+tri-state — `Play` for `true` or absent per Table 186 default,
+`Dont` for `false`, `Custom(id)` for an indirect reference to a
+§13.4 movie-activation dict), and `/Screen` (§12.5.6.18
+Table 187 — `/T` title plus appearance-characteristics `/MK`,
+action `/A`, and additional-actions `/AA` indirect refs
+preserved as `ObjectId`s so callers re-resolve through the
+round-36 `actions` reader and the §12.6.4.13 rendition-action
+target). The remaining long-tail subtypes (3D, RichMedia,
+TrapNet, PrinterMark, Projection) still surface as
+`AnnotationKind::Other { subtype }` — they need cross-crate
+plumbing (§13.6 3D graphics, ISO 32000-2 §13.7 rich-media,
+structure-tree integration) the round-26 reader doesn't reach.
+Common Table 164 fields (`/Rect`, `/Contents`, `/NM`, `/M`,
+`/F`, `/C`, `/Border`) are decoded for every subtype.
 
 ```rust,ignore
 use oxideav_pdf::{reader::DocumentReader, AnnotationKind};

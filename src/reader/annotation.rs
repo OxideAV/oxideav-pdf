@@ -55,11 +55,32 @@
 //!   text. Round-204 enumerates these for privacy-audit consumers; the
 //!   destructive content-removal step described by §12.5.6.23 NOTE is
 //!   a separate higher-level pass and is *not* applied by the reader.
+//! * **`/Sound`** (§12.5.6.16 Table 185, round 209) — sound annotation:
+//!   the required `/Sound` stream object preserved as an [`ObjectId`]
+//!   (so callers can re-resolve the §13.3 sound object themselves —
+//!   playback is out of scope for this crate, which doesn't bundle an
+//!   audio decoder), plus the `/Name` icon (`Speaker` default per
+//!   Table 185, or `Mic`, or an authoring-tool extension).
+//! * **`/Movie`** (§12.5.6.17 Table 186, round 209) — movie annotation:
+//!   `/T` title (used by §12.6.4.9 movie actions to look up the
+//!   annotation), the required `/Movie` dictionary preserved as an
+//!   [`ObjectId`] when it's an indirect reference (the §13.4 movie
+//!   metadata itself is out of scope — this crate doesn't decode video),
+//!   and `/A` collapsed to a [`MovieActivation`] tri-state that captures
+//!   the boolean shorthand and the optional movie-activation dict.
+//! * **`/Screen`** (§12.5.6.18 Table 187, round 209) — screen
+//!   annotation: `/T` title, plus the appearance-characteristics
+//!   `/MK` dictionary, `/A` action, and `/AA` additional-actions
+//!   indirect references preserved as [`ObjectId`]s so callers can
+//!   re-resolve them through the reader. Screen annotations exist to
+//!   anchor §12.6.4.13 rendition actions to a region of the page;
+//!   round-209 surfaces enough metadata to enumerate them without
+//!   pulling rendition-action plumbing into this crate.
 //!
 //! Unknown subtypes still come back as [`AnnotationKind::Other`] with
 //! the raw `/Subtype` name — callers walking forensic / archival PDFs
-//! get a complete enumeration even for the long tail (Sound, Movie,
-//! Screen, 3D, RichMedia, …).
+//! get a complete enumeration even for the long tail (3D, RichMedia,
+//! TrapNet, PrinterMark, …).
 //!
 //! Pages without `/Annots` contribute zero entries; a malformed annot
 //! dict is skipped (best-effort enumeration matches the round-21
@@ -349,8 +370,107 @@ pub enum AnnotationKind {
         /// entry to be a "file specification").
         filespec: Option<ObjectId>,
     },
+    /// `/Subtype /Sound` — sound annotation (§12.5.6.16 Table 185,
+    /// round 209). The §13.3 sound stream itself is preserved as an
+    /// `ObjectId` rather than decoded — this crate doesn't bundle an
+    /// audio decoder, and consumers that care about playback already
+    /// route raw streams through one of the workspace's audio codec
+    /// crates. The sound stream is required per Table 185; a Sound
+    /// annotation that lacks `/Sound` (malformed) surfaces `None` and
+    /// is still enumerated rather than dropped, matching the round-197
+    /// tolerant-reader contract every other subtype follows.
+    Sound {
+        /// `/Sound` indirect reference — §13.3 sound stream object.
+        /// Preserved verbatim so callers can re-resolve the stream
+        /// dictionary (sample rate, channels, encoding, bytes) on
+        /// demand. `None` when the entry is absent or a direct
+        /// stream (no indirect target to surface).
+        sound: Option<ObjectId>,
+        /// `/Name` icon identifier — `Speaker` (default per Table 185),
+        /// `Mic`, or an authoring-tool extension name.
+        icon: String,
+    },
+    /// `/Subtype /Movie` — movie annotation (§12.5.6.17 Table 186,
+    /// round 209). The §13.4 movie metadata is preserved as an
+    /// `ObjectId` when it's an indirect reference rather than decoded
+    /// — this crate doesn't decode video; consumers route the resolved
+    /// movie dict through the appropriate video codec crate themselves.
+    Movie {
+        /// `/T` title — text string §12.6.4.9 movie actions use to
+        /// look up this annotation by name. Optional per Table 186.
+        title: Option<String>,
+        /// `/Movie` — §13.4 movie dictionary. Preserved as `ObjectId`
+        /// when the entry is an indirect reference (the common shape
+        /// because the movie dict carries large indirect data blocks);
+        /// surfaced as `None` when the dict is inline (rare — the
+        /// outer Movie annotation dict and inline movie dict would
+        /// share the same key namespace, which the spec example in
+        /// §13.4 does not do). Required per Table 186; malformed
+        /// dicts still enumerate to keep audit-walks complete.
+        movie: Option<ObjectId>,
+        /// `/A` activation — tri-state collapse of the spec's
+        /// "boolean or dictionary" shape. `MovieActivation::Play` for
+        /// `true` (the Table 186 default), `MovieActivation::Dont` for
+        /// `false`, `MovieActivation::Custom(id)` for an indirect
+        /// reference to a movie-activation dict (preserved verbatim
+        /// so callers can re-resolve the §13.4 activation parameters).
+        activation: MovieActivation,
+    },
+    /// `/Subtype /Screen` — screen annotation (§12.5.6.18 Table 187,
+    /// round 209). Screen annotations exist to anchor §12.6.4.13
+    /// rendition actions to a region of a page; round-209 surfaces the
+    /// title, the appearance-characteristics `/MK` dict reference, and
+    /// the `/A` / `/AA` action references. Rendition-action decoding
+    /// itself is downstream of round-26 actions and remains out of
+    /// scope for the annotation reader.
+    Screen {
+        /// `/T` — title of the screen annotation. Optional per
+        /// Table 187.
+        title: Option<String>,
+        /// `/MK` — appearance characteristics dictionary (Table 189)
+        /// preserved as `ObjectId` when the entry is an indirect
+        /// reference. The `/I` sub-entry of this dict provides the
+        /// icon used by `/AP`; round-209 doesn't traverse `/MK` itself
+        /// because the same dict shape is used by Widget annotations
+        /// (and is therefore better surfaced through a shared decoder
+        /// in a follow-up round).
+        appearance_chars: Option<ObjectId>,
+        /// `/A` — action triggered when the annotation is activated.
+        /// Preserved as `ObjectId` so callers can re-resolve through
+        /// the round-36 `actions` reader. Inline action dicts are not
+        /// surfaced here because the round-36 reader walks indirect
+        /// actions anyway and a screen annotation's `/A` is, in
+        /// practice, always an indirect reference to a rendition
+        /// action dict (§12.6.4.13).
+        action: Option<ObjectId>,
+        /// `/AA` — additional-actions dictionary (§12.6.3 Trigger
+        /// Events) for event-driven behaviour (page-open, mouse-down,
+        /// focus-gain, …). Preserved as `ObjectId`; the round-36
+        /// `actions` reader handles the per-trigger walk.
+        additional_actions: Option<ObjectId>,
+    },
     /// Subtype this round doesn't decode — name surfaced verbatim.
     Other { subtype: String },
+}
+
+/// `/A` activation tri-state for [`AnnotationKind::Movie`] (Table 186,
+/// round 209). The spec types `/A` as "boolean or dictionary":
+/// `true` ⇒ play with defaults, `false` ⇒ don't play, dict ⇒ a
+/// movie-activation dictionary with custom parameters (volume, rate,
+/// `/Start`, `/Duration`, …). The default when `/A` is absent is
+/// `true` per Table 186 — so a malformed annotation that omits `/A`
+/// entirely surfaces `MovieActivation::Play`, matching what a
+/// conforming reader would do when rendering it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MovieActivation {
+    /// `/A true` (or `/A` absent — Table 186 default).
+    Play,
+    /// `/A false` — explicit suppression.
+    Dont,
+    /// `/A << … >>` as an indirect reference — custom movie-activation
+    /// dict (§13.4 movie activation parameters). Preserved as
+    /// `ObjectId` so callers can re-resolve.
+    Custom(ObjectId),
 }
 
 /// Text-markup variant tag for [`AnnotationKind::TextMarkup`].
@@ -672,6 +792,63 @@ fn decode_annotation(
                 filespec: filespec_id,
             }
         }
+        // Round 209 — §12.5.6.16 Sound (Table 185). The §13.3 sound
+        // stream is preserved as ObjectId rather than decoded; this
+        // crate doesn't carry an audio decoder.
+        "Sound" => AnnotationKind::Sound {
+            sound: match find_entry(annot, "Sound") {
+                Some(Object::Reference(id)) => Some(*id),
+                _ => None,
+            },
+            icon: match find_entry(annot, "Name") {
+                Some(Object::Name(s)) => s.clone(),
+                _ => "Speaker".to_string(),
+            },
+        },
+        // Round 209 — §12.5.6.17 Movie (Table 186). The §13.4 movie
+        // dict is preserved as ObjectId. The `/A` entry is normatively
+        // typed "boolean or dictionary"; round-209 collapses that to
+        // MovieActivation::{Play, Dont, Custom(id)}.
+        "Movie" => {
+            let activation = match find_entry(annot, "A") {
+                Some(Object::Bool(true)) => MovieActivation::Play,
+                Some(Object::Bool(false)) => MovieActivation::Dont,
+                Some(Object::Reference(id)) => MovieActivation::Custom(*id),
+                // Table 186 default when /A is absent is true.
+                None => MovieActivation::Play,
+                // Inline dict, integer, or other shape — neither
+                // boolean nor a resolvable indirect ref. Default to
+                // Play per Table 186 rather than dropping the annot.
+                _ => MovieActivation::Play,
+            };
+            AnnotationKind::Movie {
+                title: decode_text_string(find_entry(annot, "T")),
+                movie: match find_entry(annot, "Movie") {
+                    Some(Object::Reference(id)) => Some(*id),
+                    _ => None,
+                },
+                activation,
+            }
+        }
+        // Round 209 — §12.5.6.18 Screen (Table 187). Anchor for
+        // §12.6.4.13 rendition actions; round-209 surfaces title +
+        // MK/A/AA refs so callers can enumerate without pulling
+        // rendition-action plumbing into the annotation reader.
+        "Screen" => AnnotationKind::Screen {
+            title: decode_text_string(find_entry(annot, "T")),
+            appearance_chars: match find_entry(annot, "MK") {
+                Some(Object::Reference(id)) => Some(*id),
+                _ => None,
+            },
+            action: match find_entry(annot, "A") {
+                Some(Object::Reference(id)) => Some(*id),
+                _ => None,
+            },
+            additional_actions: match find_entry(annot, "AA") {
+                Some(Object::Reference(id)) => Some(*id),
+                _ => None,
+            },
+        },
         other => AnnotationKind::Other {
             subtype: other.to_string(),
         },

@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- annotations (round 209): three new `/Subtype` decoders in the
+  round-26 generic annotation reader — **Sound** (§12.5.6.16
+  Table 185 — required `/Sound` indirect stream surfaced as an
+  `ObjectId` so callers re-resolve the §13.3 sound object through
+  their own audio codec plumbing — this crate doesn't bundle an
+  audio decoder — plus the `/Name` icon defaulting to `Speaker`
+  per Table 185), **Movie** (§12.5.6.17 Table 186 — optional `/T`
+  title used by §12.6.4.9 movie actions, the required `/Movie`
+  dict preserved as an `ObjectId` so callers route the §13.4
+  metadata through their own video plumbing, and `/A` collapsed
+  to a new [`MovieActivation`] tri-state — `Play` for `true` or
+  absent per Table 186 default, `Dont` for `false`, `Custom(id)`
+  for an indirect reference to a §13.4 movie-activation dict),
+  and **Screen** (§12.5.6.18 Table 187 — `/T` title, plus
+  appearance-characteristics `/MK` + action `/A` +
+  additional-actions `/AA` indirect refs preserved as
+  `ObjectId`s so callers re-resolve through the round-36
+  `actions` reader and the §12.6.4.13 rendition-action target).
+  Before this round all three subtypes fell through to
+  `AnnotationKind::Other { subtype }`; the long tail of audio /
+  video annotation metadata was therefore invisible to PDF
+  forensic / archival walks even though the underlying objects
+  carry rich structural information. The reader is tolerant of
+  malformed dicts (a Sound annotation that lacks the required
+  `/Sound` stream surfaces `sound: None` with the default icon;
+  a Movie annotation without `/Movie` enumerates with
+  `movie: None` rather than being dropped). `/A` on a Screen
+  annotation is *only* surfaced when it's an indirect reference;
+  inline action dicts surface `action: None` and let callers
+  walk the raw annotation dict themselves through
+  [`reader::DocumentReader`] — the round-36 `actions` reader
+  already handles indirect actions, so this keeps the surface
+  small without losing recoverability. 3D / RichMedia / TrapNet
+  / PrinterMark / Projection still fall through to
+  `AnnotationKind::Other` since they need cross-crate plumbing
+  (§13.6 3D graphics + ISO 32000-2 §13.7 rich-media). Adds 13
+  new tests in `tests/annotations_round209.rs` covering absent
+  vs. inline vs. indirect `/Sound`, the Table 186 `/A` tri-state
+  (default-Play / explicit-true / explicit-false / indirect dict
+  → Custom), UTF-16BE-with-BOM `/T` decode, the bare
+  `/Subtype /Screen` zero-metadata case, the inline `/A`
+  short-circuit, and cross-subtype enumeration alongside the
+  round-197 / round-204 long tail. The round-26
+  `unknown_subtype_falls_through_to_other` test and the round-197
+  long-tail enumeration test were both updated to use `/3D` +
+  `/RichMedia` as their unknown-subtype placeholders now that
+  `/Sound` / `/Movie` / `/Screen` are structurally decoded.
 - annotations (round 204): two new `/Subtype` decoders in the
   round-26 generic annotation reader — **Watermark** (§12.5.6.22
   Table 190 — optional `/FixedPrint` indirect ref surfaced through
