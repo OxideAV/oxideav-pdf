@@ -352,13 +352,14 @@ fn round209_subtypes_enumerate_alongside_long_tail() {
                  /T (m) /Movie 10 0 R >>";
     let screen = "<< /Type /Annot /Subtype /Screen /Rect [0 0 10 10] \
                   /T (s) >>";
-    // Anything still in the long tail (3D, RichMedia) keeps falling
+    // Anything still in the long tail (RichMedia after round 220
+    // lifted /3D out into its own structured variant) keeps falling
     // through to AnnotationKind::Other.
-    let three_d = "<< /Type /Annot /Subtype /3D /Rect [0 0 10 10] >>";
+    let rich_media = "<< /Type /Annot /Subtype /RichMedia /Rect [0 0 10 10] >>";
     let sound_stream = "<< /Length 0 >>\nstream\n\nendstream";
     let movie_dict = "<< /F (x.mov) >>";
     let pdf = synth_pdf_with_objects(
-        &[sound, movie, screen, three_d, sound_stream, movie_dict],
+        &[sound, movie, screen, rich_media, sound_stream, movie_dict],
         &[5, 6, 7, 8],
     );
     let annots = read_annots(&pdf);
@@ -367,7 +368,7 @@ fn round209_subtypes_enumerate_alongside_long_tail() {
     assert!(matches!(annots[1].kind, AnnotationKind::Movie { .. }));
     assert!(matches!(annots[2].kind, AnnotationKind::Screen { .. }));
     match &annots[3].kind {
-        AnnotationKind::Other { subtype } => assert_eq!(subtype, "3D"),
-        other => panic!("expected Other(\"3D\"), got {:?}", other),
+        AnnotationKind::Other { subtype } => assert_eq!(subtype, "RichMedia"),
+        other => panic!("expected Other(\"RichMedia\"), got {:?}", other),
     }
 }

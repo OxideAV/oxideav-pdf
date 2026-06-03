@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- annotations (round 220): `/Subtype /3D` decoder in the round-26
+  generic annotation reader — **3D** (§13.6.2 Table 298, PDF 1.6 —
+  3D artwork annotation, the means by which U3D / PRC artwork is
+  embedded in a PDF). Before this round 3D annotations fell through
+  to `AnnotationKind::Other { subtype: "3D" }`, so callers walking
+  forensic / archival PDFs had to special-case the stringly-typed
+  name. The new `AnnotationKind::ThreeD` variant surfaces the `/3DD`
+  artwork reference (the §13.6.3 stream or §13.6.3.3 reference
+  dictionary, preserved as `ObjectId` — this crate does not decode
+  the 3D payload), the `/3DV` initial-view selector collapsed into
+  a `ThreeDViewSelector` four-shape union (view-dict ref / `/VA`
+  index / `/IN`-matching string / `F`/`L`/`D` symbolic, matching
+  the four spec alternatives), the `/3DA` activation dictionary
+  surfaced through a new `ThreeDActivation` struct that carries
+  every Table 299 field (`/A`, `/AIS`, `/D`, `/DIS`, plus the
+  PDF 1.7 `/TB` and `/NP` toolbar/navigation-panel flags), the
+  `/3DI` interactive-use flag (default `true` per Table 298 when
+  absent), and the `/3DB` 3D view box rectangle. The activation
+  dict is resolved through `DocumentReader::deref` so both inline
+  and indirect-ref forms decode uniformly. Unknown Name values for
+  `/A` / `/AIS` / `/D` / `/DIS` are preserved verbatim so a
+  forensic walk still sees what the producer wrote (the spec
+  enumerations are open-ended in practice). The only annotation
+  subtypes still falling through to `AnnotationKind::Other` are now
+  the PDF 1.7 Adobe-extension `/RichMedia` (Annex H multimedia,
+  needs Flash / video plumbing this crate does not carry) and the
+  occasional `/Projection` extension — well into the long-tail
+  forensic-only territory.
 - annotations (round 215): two more `/Subtype` decoders in the
   round-26 generic annotation reader — **PrinterMark** (§12.5.6.20
   Table 362, PDF 1.4 — production printer's mark, e.g. registration

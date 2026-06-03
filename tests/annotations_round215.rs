@@ -327,13 +327,13 @@ fn round215_subtypes_enumerate_alongside_long_tail() {
                         /MN /CutMark >>";
     let trap_net = "<< /Type /Annot /Subtype /TrapNet /Rect [0 0 200 200] \
                     /LastModified (D:20260101000000Z) >>";
-    // 3D and RichMedia still need cross-crate plumbing (or a PDF 2.0
-    // pass for Projection) — round-215 keeps them on the long-tail
-    // Other side.
-    let three_d = "<< /Type /Annot /Subtype /3D /Rect [0 0 10 10] >>";
+    // RichMedia and Projection still need cross-crate plumbing —
+    // round-215 (and round-220, which lifted /3D out into its own
+    // structured variant) keeps them on the long-tail Other side.
     let rich_media = "<< /Type /Annot /Subtype /RichMedia /Rect [0 0 10 10] >>";
+    let projection = "<< /Type /Annot /Subtype /Projection /Rect [0 0 10 10] >>";
     let pdf = synth_pdf_with_objects(
-        &[printer_mark, trap_net, three_d, rich_media],
+        &[printer_mark, trap_net, rich_media, projection],
         &[5, 6, 7, 8],
     );
     let annots = read_annots(&pdf);
@@ -341,11 +341,11 @@ fn round215_subtypes_enumerate_alongside_long_tail() {
     assert!(matches!(annots[0].kind, AnnotationKind::PrinterMark { .. }));
     assert!(matches!(annots[1].kind, AnnotationKind::TrapNet { .. }));
     match &annots[2].kind {
-        AnnotationKind::Other { subtype } => assert_eq!(subtype, "3D"),
-        other => panic!("expected Other(\"3D\"), got {:?}", other),
-    }
-    match &annots[3].kind {
         AnnotationKind::Other { subtype } => assert_eq!(subtype, "RichMedia"),
         other => panic!("expected Other(\"RichMedia\"), got {:?}", other),
+    }
+    match &annots[3].kind {
+        AnnotationKind::Other { subtype } => assert_eq!(subtype, "Projection"),
+        other => panic!("expected Other(\"Projection\"), got {:?}", other),
     }
 }

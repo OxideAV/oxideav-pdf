@@ -828,13 +828,37 @@ enough for a regenerator to decide whether the cached traps are
 still valid). Neither carries any cross-crate plumbing
 dependency: the rendering itself lives in the Form-XObject
 appearance stream referenced from `/AP /N` (§8.10) and stays
-routed through the existing Form-XObject walker. The remaining
-long-tail subtypes (3D, RichMedia, Projection) still surface as
+routed through the existing Form-XObject walker. **Round 220**
+closes one more — `/3D` (§13.6.2 Table 298 — PDF 1.6 3D
+artwork annotation, the means by which U3D / PRC artwork is
+embedded in a PDF document). The new `AnnotationKind::ThreeD`
+variant surfaces the `/3DD` artwork reference (§13.6.3 stream
+or §13.6.3.3 reference dictionary, preserved as `ObjectId` since
+this crate doesn't decode 3D artwork), the `/3DV` initial-view
+selector collapsed into a new `ThreeDViewSelector` four-shape
+union (`View(ObjectId)` for a 3D view-dict reference,
+`Index(i64)` for a `/VA`-array index, `Name(String)` for a
+text-string match against a view's `/IN`, and `Symbolic(String)`
+for the `F` / `L` / `D` first/last/default selector — matching
+Table 298's four spec alternatives), the `/3DA` activation
+dictionary decoded into a new `ThreeDActivation` struct
+carrying every Table 299 field (`/A`, `/AIS`, `/D`, `/DIS`,
+plus the PDF 1.7 `/TB` and `/NP` toolbar / navigation-panel
+flags), the `/3DI` interactive-use flag (Table 298 default
+`true` when absent), and the `/3DB` 3D view box rectangle. The
+activation dict resolves through `DocumentReader::deref` so
+inline and indirect-ref forms decode uniformly; unknown Name
+values in `/A` / `/AIS` / `/D` / `/DIS` pass through verbatim so
+a forensic walk sees what the producer wrote (the spec
+enumerations are open-ended in practice). The actual 3D
+artwork payload stays out of scope — this crate does not bundle
+a 3D-graphics decoder. The remaining long-tail subtypes
+(RichMedia, Projection) still surface as
 `AnnotationKind::Other { subtype }` — they need cross-crate
-plumbing (§13.6 3D graphics, ISO 32000-2 §13.7 rich-media) the
-round-26 reader doesn't reach. Common Table 164 fields
-(`/Rect`, `/Contents`, `/NM`, `/M`, `/F`, `/C`, `/Border`) are
-decoded for every subtype.
+plumbing (ISO 32000-2 §13.7 rich-media) the round-26 reader
+doesn't reach. Common Table 164 fields (`/Rect`, `/Contents`,
+`/NM`, `/M`, `/F`, `/C`, `/Border`) are decoded for every
+subtype.
 
 ```rust,ignore
 use oxideav_pdf::{reader::DocumentReader, AnnotationKind};

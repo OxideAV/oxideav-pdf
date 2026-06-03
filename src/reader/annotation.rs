@@ -90,10 +90,25 @@
 //!   object-tracking form), plus the optional `/FontFauxing` array of
 //!   substituted-font references — enough for a trap-network
 //!   regenerator to decide whether the cached traps are still valid.
+//! * **`/3D`** (§13.6.2 Table 298, round 220) — 3D artwork annotation
+//!   (PDF 1.6). Surfaces the `/3DD` artwork reference (the §13.6.3 U3D
+//!   / PRC stream or §13.6.3.3 reference dictionary, preserved as
+//!   [`ObjectId`] — this crate does not decode 3D artwork), the `/3DV`
+//!   initial-view selector collapsed into a [`ThreeDViewSelector`]
+//!   four-shape union (view-dict ref / `/VA` index / `/IN`-matching
+//!   string / `F` / `L` / `D` symbolic), the `/3DA` activation
+//!   dictionary surfaced through [`ThreeDActivation`] (Table 299:
+//!   `/A`, `/AIS`, `/D`, `/DIS`, plus the PDF 1.7 `/TB` and `/NP`
+//!   toolbar/navigation-panel flags), the `/3DI` interactive-use flag
+//!   (default `true` per Table 298), and the `/3DB` 3D view box
+//!   rectangle (default per spec is `/Rect` re-expressed in the
+//!   annotation's target coordinate system — the caller computes that
+//!   from the outer `PdfAnnotation::rect` field when the entry is
+//!   absent).
 //!
 //! Unknown subtypes still come back as [`AnnotationKind::Other`] with
 //! the raw `/Subtype` name — callers walking forensic / archival PDFs
-//! get a complete enumeration even for the long tail (3D, RichMedia,
+//! get a complete enumeration even for the long tail (RichMedia,
 //! Projection, …).
 //!
 //! Pages without `/Annots` contribute zero entries; a malformed annot
@@ -514,8 +529,123 @@ pub enum AnnotationKind {
         /// trap-network generation. `None` when the entry is absent.
         font_fauxing: Option<Vec<ObjectId>>,
     },
+    /// `/Subtype /3D` — 3D artwork annotation (§13.6.2 Table 298,
+    /// round 220). PDF 1.6. Surfaces the artwork reference, the
+    /// initial view selector, the activation behaviour, the
+    /// interactive-use flag, and the 3D view box. The actual 3D
+    /// stream (§13.6.3 U3D / PRC payload) is preserved as
+    /// [`ObjectId`] — this crate does not decode 3D artwork.
+    ThreeD {
+        /// `/3DD` — the 3D stream (§13.6.3) or 3D reference dict
+        /// (§13.6.3.3) that carries the artwork. Required per
+        /// Table 298. Surfaced as `ObjectId` when an indirect
+        /// reference (the common shape — both streams and reference
+        /// dicts are always indirect); `None` if the producer
+        /// inlined a dict directly or omitted the key entirely
+        /// (the reader is tolerant of the latter so a forensic
+        /// walk still surfaces the annotation skeleton).
+        artwork: Option<ObjectId>,
+        /// `/3DV` — the initial view to use when the annotation
+        /// is activated. Spec types this as one of: a 3D view
+        /// dictionary (indirect ref), an integer index into the
+        /// stream's `/VA` array, a text string matching a view's
+        /// `/IN` entry, or a Name `F` / `L` / `D` selecting the
+        /// first / last / default `/VA` entry. `None` when absent
+        /// (Table 298 default: "the default view in the 3D stream
+        /// object specified by 3DD").
+        view: Option<ThreeDViewSelector>,
+        /// `/3DA` — activation dictionary (Table 299) that governs
+        /// when the annotation activates / deactivates and what
+        /// state the artwork instance shall be in. Defaults are
+        /// applied per Table 299 when the entry is absent (the
+        /// reader returns `Some(ThreeDActivation::default())`) so
+        /// the spec's "Default value: an activation dictionary
+        /// containing default values for all its entries" is
+        /// honoured at the API level.
+        activation: ThreeDActivation,
+        /// `/3DI` — interactive-use flag. `true` ⇒ a conforming
+        /// reader should expose interactive rotate/pan/zoom
+        /// controls; `false` ⇒ the artwork is driven entirely by
+        /// scripts/animations. Defaults to `true` per Table 298
+        /// when absent.
+        interactive: bool,
+        /// `/3DB` — the 3D view box (rectangle in the annotation's
+        /// target coordinate system; the origin is the centre of
+        /// the annotation rectangle). `None` when absent; the
+        /// spec default is the annotation's `/Rect` expressed in
+        /// the target coordinate system, i.e. `[-w/2 -h/2 w/2 h/2]`,
+        /// which the caller can compute from the outer
+        /// `PdfAnnotation::rect` field if needed.
+        view_box: Option<[f32; 4]>,
+    },
     /// Subtype this round doesn't decode — name surfaced verbatim.
     Other { subtype: String },
+}
+
+/// `/3DV` initial-view selector for [`AnnotationKind::ThreeD`] (Table
+/// 298, round 220). Per spec the `/3DV` slot may carry any of four
+/// shapes; this enum is the lossless union of those.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ThreeDViewSelector {
+    /// Indirect reference to a 3D view dictionary (§13.6.4).
+    View(ObjectId),
+    /// Integer index into the 3D stream's `/VA` view array.
+    Index(i64),
+    /// Text-string match against a view's `/IN` (internal name).
+    Name(String),
+    /// Symbolic selector — `F` / `L` / `D` for first / last / default
+    /// `/VA` entry per Table 298. Anything else is preserved
+    /// verbatim so a forensic walk doesn't lose the producer's
+    /// extension.
+    Symbolic(String),
+}
+
+/// Decoded `/3DA` activation dictionary (Table 299) for
+/// [`AnnotationKind::ThreeD`] (round 220). All fields are optional
+/// and each one's `None` shape means "absent" (the per-field defaults
+/// described in the variant docstrings are applied at the time the
+/// caller decides to *render* the annotation; the reader stays
+/// lossless about presence-vs-default to keep round-trip diagnostics
+/// possible).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreeDActivation {
+    /// `/A` — activation circumstance: `PO` / `PV` / `XA`. Default
+    /// `XA` (the annotation stays inactive until explicit user
+    /// action). Preserved verbatim so unknown extension Names
+    /// pass through.
+    pub activation_when: Option<String>,
+    /// `/AIS` — artwork state on activation: `I` (instantiated,
+    /// scripts off) or `L` (live, scripts on). Default `L`.
+    pub artwork_state_on_activation: Option<String>,
+    /// `/D` — deactivation circumstance: `PC` / `PI` / `XD`.
+    /// Default `PI` (deactivate when the page becomes invisible).
+    pub deactivation_when: Option<String>,
+    /// `/DIS` — artwork state on deactivation: `U` (uninstantiated),
+    /// `I` (instantiated), or `L` (live). Default `U`.
+    pub artwork_state_on_deactivation: Option<String>,
+    /// `/TB` (PDF 1.7) — show interactive toolbar by default.
+    /// Spec default `true`.
+    pub toolbar: Option<bool>,
+    /// `/NP` (PDF 1.7) — show navigation panel (model tree / view
+    /// switcher) by default. Spec default `false`.
+    pub navigation_panel: Option<bool>,
+}
+
+impl Default for ThreeDActivation {
+    /// All-`None` value — semantically equivalent to "no `/3DA` entry
+    /// at all", per Table 298's "Default value: an activation
+    /// dictionary containing default values for all its entries"
+    /// language. Each field's documented spec default applies.
+    fn default() -> Self {
+        Self {
+            activation_when: None,
+            artwork_state_on_activation: None,
+            deactivation_when: None,
+            artwork_state_on_deactivation: None,
+            toolbar: None,
+            navigation_panel: None,
+        }
+    }
 }
 
 /// `/A` activation tri-state for [`AnnotationKind::Movie`] (Table 186,
@@ -914,6 +1044,60 @@ fn decode_annotation(
                 _ => None,
             },
         },
+        // Round 220 — §13.6.2 3D annotation (Table 298). The §13.6.3
+        // U3D / PRC stream is preserved as ObjectId rather than
+        // decoded; this crate does not carry a 3D-artwork decoder.
+        // The `/3DA` activation dict (Table 299) is decoded into a
+        // ThreeDActivation; an absent /3DA surfaces as the default
+        // value per Table 298.
+        "3D" => {
+            let artwork = match find_entry(annot, "3DD") {
+                Some(Object::Reference(id)) => Some(*id),
+                _ => None,
+            };
+            let view = decode_three_d_view_selector(find_entry(annot, "3DV"));
+            let activation = match find_entry(annot, "3DA").cloned() {
+                Some(o) => {
+                    let resolved = reader.deref(o)?;
+                    decode_three_d_activation(&resolved).unwrap_or_default()
+                }
+                None => ThreeDActivation::default(),
+            };
+            // Table 298 default for /3DI is `true`.
+            let interactive = match find_entry(annot, "3DI") {
+                Some(Object::Bool(b)) => *b,
+                _ => true,
+            };
+            let view_box = match find_entry(annot, "3DB") {
+                Some(Object::Array(items)) if items.len() == 4 => {
+                    let mut out = [0f32; 4];
+                    let mut ok = true;
+                    for (i, it) in items.iter().enumerate() {
+                        match it {
+                            Object::Real(f) => out[i] = *f as f32,
+                            Object::Integer(n) => out[i] = *n as f32,
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        Some(out)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            AnnotationKind::ThreeD {
+                artwork,
+                view,
+                activation,
+                interactive,
+                view_box,
+            }
+        }
         // Round 215 — §12.5.6.20 PrinterMark (Table 362). Only `/MN`
         // is annotation-dict-local; the rest of Table 362's optional
         // appearance fields (`/MarkStyle`, `/Colorants` in Table 363)
@@ -1329,6 +1513,71 @@ fn decode_pdf_string_bytes(b: &[u8]) -> String {
     } else {
         String::from_utf8_lossy(b).into_owned()
     }
+}
+
+/// Decode the `/3DV` initial-view selector for a `/3D` annotation
+/// (Table 298, round 220). Returns `None` only when the entry is
+/// absent or has a shape that doesn't fit any of the four spec
+/// alternatives (indirect ref, integer, text string, Name). The four
+/// spec alternatives become the four [`ThreeDViewSelector`] variants.
+fn decode_three_d_view_selector(o: Option<&Object>) -> Option<ThreeDViewSelector> {
+    match o? {
+        Object::Reference(id) => Some(ThreeDViewSelector::View(*id)),
+        Object::Integer(n) => Some(ThreeDViewSelector::Index(*n)),
+        Object::LiteralString(b) | Object::HexString(b) => {
+            Some(ThreeDViewSelector::Name(decode_pdf_string_bytes(b)))
+        }
+        Object::Name(s) => Some(ThreeDViewSelector::Symbolic(s.clone())),
+        _ => None,
+    }
+}
+
+/// Decode the `/3DA` activation dictionary (Table 299, round 220).
+/// Returns `None` only when the resolved object is not a dictionary —
+/// a dict whose entries are all absent yields `ThreeDActivation`
+/// with every field `None` (semantically equivalent to "no /3DA at
+/// all", in which case Table 298 says the per-field spec defaults
+/// apply). Unknown Name values for `/A` / `/AIS` / `/D` / `/DIS` are
+/// preserved verbatim so the caller still sees what the producer
+/// wrote — the spec enumerations are open-ended in practice (some
+/// producers emit `PV` variants that newer revisions never added to
+/// the formal list).
+fn decode_three_d_activation(o: &Object) -> Option<ThreeDActivation> {
+    let Object::Dict(d) = o else {
+        return None;
+    };
+    let activation_when = match find_entry(d, "A") {
+        Some(Object::Name(s)) => Some(s.clone()),
+        _ => None,
+    };
+    let artwork_state_on_activation = match find_entry(d, "AIS") {
+        Some(Object::Name(s)) => Some(s.clone()),
+        _ => None,
+    };
+    let deactivation_when = match find_entry(d, "D") {
+        Some(Object::Name(s)) => Some(s.clone()),
+        _ => None,
+    };
+    let artwork_state_on_deactivation = match find_entry(d, "DIS") {
+        Some(Object::Name(s)) => Some(s.clone()),
+        _ => None,
+    };
+    let toolbar = match find_entry(d, "TB") {
+        Some(Object::Bool(b)) => Some(*b),
+        _ => None,
+    };
+    let navigation_panel = match find_entry(d, "NP") {
+        Some(Object::Bool(b)) => Some(*b),
+        _ => None,
+    };
+    Some(ThreeDActivation {
+        activation_when,
+        artwork_state_on_activation,
+        deactivation_when,
+        artwork_state_on_deactivation,
+        toolbar,
+        navigation_panel,
+    })
 }
 
 #[cfg(test)]
