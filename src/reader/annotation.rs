@@ -76,11 +76,25 @@
 //!   anchor §12.6.4.13 rendition actions to a region of the page;
 //!   round-209 surfaces enough metadata to enumerate them without
 //!   pulling rendition-action plumbing into this crate.
+//! * **`/PrinterMark`** (§12.5.6.20 Table 362, round 215) — production
+//!   printer's mark (PDF 1.4 — registration target, colour bar, cut
+//!   mark, page-information bar). The `/MN` mark-name Name is
+//!   surfaced verbatim; the actual graphics live in the form-XObject
+//!   appearance stream referenced from `/AP /N` and stay routed
+//!   through the §8.10 Form XObject walker.
+//! * **`/TrapNet`** (§12.5.6.21 Table 366, round 215) — page-level
+//!   trap-network annotation (PDF 1.3). Per spec there is at most one
+//!   per page and it must be the last `/Annots` entry. Surfaces
+//!   `/LastModified` (when the producer used the date-watermark form)
+//!   *or* the `/Version` + `/AnnotStates` pair (when it used the
+//!   object-tracking form), plus the optional `/FontFauxing` array of
+//!   substituted-font references — enough for a trap-network
+//!   regenerator to decide whether the cached traps are still valid.
 //!
 //! Unknown subtypes still come back as [`AnnotationKind::Other`] with
 //! the raw `/Subtype` name — callers walking forensic / archival PDFs
 //! get a complete enumeration even for the long tail (3D, RichMedia,
-//! TrapNet, PrinterMark, …).
+//! Projection, …).
 //!
 //! Pages without `/Annots` contribute zero entries; a malformed annot
 //! dict is skipped (best-effort enumeration matches the round-21
@@ -448,6 +462,57 @@ pub enum AnnotationKind {
         /// focus-gain, …). Preserved as `ObjectId`; the round-36
         /// `actions` reader handles the per-trigger walk.
         additional_actions: Option<ObjectId>,
+    },
+    /// `/Subtype /PrinterMark` — production printer's mark
+    /// (§12.5.6.20 + Table 362, round 215). PDF 1.4. Carries the
+    /// optional `/MN` mark-name identifier (e.g. `ColorBar`,
+    /// `RegistrationTarget`, `CutMark`). The actual mark glyphs live
+    /// in the form-XObject appearance stream referenced from `/AP /N`;
+    /// the round-26 reader doesn't surface appearance streams (those
+    /// stay routed through the §8.10 Form XObject walker), so the
+    /// round-215 enumeration is the mark-type metadata only.
+    PrinterMark {
+        /// `/MN` — arbitrary mark-name Name identifying the type of
+        /// printer's mark (Table 362). `None` when the producer
+        /// omitted the entry (the spec makes it optional). Common
+        /// values seen in the wild include `ColorBar`,
+        /// `RegistrationTarget`, `CutMark`, `PageInformation`, but
+        /// the spec does not enumerate a closed set — the raw Name is
+        /// preserved verbatim so a colour-management tool can match
+        /// its own taxonomy.
+        mark_name: Option<String>,
+    },
+    /// `/Subtype /TrapNet` — page-level trap network
+    /// (§12.5.6.21 + Table 366, round 215). PDF 1.3. Carries either
+    /// the `/LastModified` date *or* the `/Version` + `/AnnotStates`
+    /// pair (the spec rules these out as mutually exclusive); the
+    /// optional `/FontFauxing` array of font references is also
+    /// surfaced so a trap-network validator can detect substitutions.
+    /// Per §12.5.6.21 a page has at most one TrapNet annotation, and
+    /// it must be the last element of the page's `/Annots` array —
+    /// the round-26 walker enumerates whatever the producer wrote.
+    TrapNet {
+        /// `/LastModified` — date string per §7.9.4 (PDF `D:` form),
+        /// when present. The spec marks this "Required if Version
+        /// and AnnotStates are absent" so a well-formed TrapNet
+        /// annotation has either this or the version-array pair.
+        last_modified: Option<String>,
+        /// `/Version` — unordered array of indirect references to
+        /// every object whose change would invalidate the trap
+        /// network. Surfaced as a `Vec<ObjectId>` so a regenerator
+        /// can enumerate the candidates. `None` when the entry is
+        /// absent (in which case `/LastModified` carries the
+        /// invalidation watermark).
+        version: Option<Vec<ObjectId>>,
+        /// `/AnnotStates` — appearance-state Names (one per
+        /// per-page annotation, in the page's `/Annots` order). The
+        /// spec allows a `null` element for annotations with no
+        /// `/AS` entry; the reader surfaces `None` for those slots.
+        /// `None` at the outer level when the entry is absent.
+        annot_states: Option<Vec<Option<String>>>,
+        /// `/FontFauxing` — references to fonts substituted during
+        /// trap-network generation. `None` when the entry is absent.
+        font_fauxing: Option<Vec<ObjectId>>,
     },
     /// Subtype this round doesn't decode — name surfaced verbatim.
     Other { subtype: String },
@@ -849,6 +914,40 @@ fn decode_annotation(
                 _ => None,
             },
         },
+        // Round 215 — §12.5.6.20 PrinterMark (Table 362). Only `/MN`
+        // is annotation-dict-local; the rest of Table 362's optional
+        // appearance fields (`/MarkStyle`, `/Colorants` in Table 363)
+        // live on the *form-XObject* referenced from `/AP /N`, not on
+        // the annot dict itself. The Form XObject walker is the right
+        // home for those — round-215 only surfaces the §12.5.6.20
+        // payload that distinguishes a PrinterMark from a generic
+        // appearance-only annot.
+        "PrinterMark" => AnnotationKind::PrinterMark {
+            mark_name: match find_entry(annot, "MN") {
+                Some(Object::Name(s)) => Some(s.clone()),
+                _ => None,
+            },
+        },
+        // Round 215 — §12.5.6.21 TrapNet (Table 366). All three of
+        // /LastModified, /Version, /AnnotStates, and /FontFauxing are
+        // surfaced; the spec's "either LastModified or
+        // (Version + AnnotStates)" mutual-exclusion is encoded as the
+        // outer Option pair — a tolerant reader does not reject an
+        // annot that violates it (no real producer mixes them, but a
+        // forensic walk should still enumerate what the producer
+        // actually wrote).
+        "TrapNet" => {
+            let last_modified = decode_text_string(find_entry(annot, "LastModified"));
+            let version = decode_indirect_ref_array(find_entry(annot, "Version"));
+            let annot_states = decode_optional_name_array(find_entry(annot, "AnnotStates"));
+            let font_fauxing = decode_indirect_ref_array(find_entry(annot, "FontFauxing"));
+            AnnotationKind::TrapNet {
+                last_modified,
+                version,
+                annot_states,
+                font_fauxing,
+            }
+        }
         other => AnnotationKind::Other {
             subtype: other.to_string(),
         },
@@ -1123,6 +1222,50 @@ fn decode_fixed_print(o: &Object) -> Option<FixedPrint> {
     }
     if let Some(v) = decode_real(find_entry(d, "V")) {
         out.v = v;
+    }
+    Some(out)
+}
+
+/// Decode an array of indirect references — `/Version` and
+/// `/FontFauxing` per Table 366. Non-reference elements (a direct dict
+/// snuck into a `/Version` slot, a null, …) are dropped silently so a
+/// best-effort enumeration still surfaces the references the producer
+/// did emit. Returns `None` when the entry is absent or not an array
+/// at all; an empty array surfaces as `Some(vec![])` so callers can
+/// distinguish "absent" from "explicitly empty".
+fn decode_indirect_ref_array(o: Option<&Object>) -> Option<Vec<ObjectId>> {
+    let Object::Array(items) = o? else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        if let Object::Reference(id) = it {
+            out.push(*id);
+        }
+    }
+    Some(out)
+}
+
+/// Decode `/AnnotStates` per Table 366 — an array of `Name` or `null`
+/// (one slot per per-page annotation, in `/Annots` order). The spec
+/// allows the null shape for annotations with no `/AS` entry; the
+/// reader surfaces `None` for those slots and `Some(name)` for the
+/// rest. Returns `None` at the outer level when the entry is absent or
+/// not an array; an empty array round-trips as `Some(vec![])`.
+fn decode_optional_name_array(o: Option<&Object>) -> Option<Vec<Option<String>>> {
+    let Object::Array(items) = o? else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        match it {
+            Object::Name(s) => out.push(Some(s.clone())),
+            Object::Null => out.push(None),
+            // Per spec the entries are Name-or-null; any other shape is
+            // malformed. Drop the slot rather than the whole array so
+            // enumeration still surfaces the well-formed neighbours.
+            _ => out.push(None),
+        }
     }
     Some(out)
 }

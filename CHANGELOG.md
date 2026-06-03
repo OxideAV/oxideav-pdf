@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- annotations (round 215): two more `/Subtype` decoders in the
+  round-26 generic annotation reader — **PrinterMark** (§12.5.6.20
+  Table 362, PDF 1.4 — production printer's mark, e.g. registration
+  target / colour bar / cut mark / page-information bar; the `/MN`
+  mark-name Name is surfaced verbatim through a new
+  `AnnotationKind::PrinterMark { mark_name }` variant so a
+  colour-management tool can match its own taxonomy without
+  pattern-matching on Table 362's open-ended set), and **TrapNet**
+  (§12.5.6.21 Table 366, PDF 1.3 — page-level trap network; the
+  reader surfaces `/LastModified` *or* the `/Version` +
+  `/AnnotStates` pair — Table 366 makes them mutually exclusive
+  but the reader stays tolerant of malformed annots — plus the
+  optional `/FontFauxing` array of substituted-font references,
+  enough for a trap-network regenerator to decide whether the
+  cached traps are still valid). Before this round both subtypes
+  fell through to `AnnotationKind::Other { subtype }`; pre-press /
+  print-production audit walks were therefore invisible to the
+  reader. The actual mark glyphs / trap geometry still live in the
+  Form-XObject appearance streams referenced from `/AP /N`
+  (§8.10) — round-215 is the annotation-dict-local metadata only.
+  3D / RichMedia / Projection remain on the long-tail `Other` side
+  since they need cross-crate plumbing (§13.6 3D graphics +
+  ISO 32000-2 §13.7 rich-media). Adds two helper functions
+  (`decode_indirect_ref_array` for `/Version` + `/FontFauxing` and
+  `decode_optional_name_array` for `/AnnotStates`' Name-or-null
+  shape per Table 366) and 10 new tests in
+  `tests/annotations_round215.rs` covering both subtypes (explicit
+  `/MN`, missing `/MN` falling back to `None`, the two TrapNet
+  forms, malformed-element tolerance, empty-array vs absent-array
+  distinction, and long-tail coexistence with 3D / RichMedia).
 - annotations (round 209): three new `/Subtype` decoders in the
   round-26 generic annotation reader — **Sound** (§12.5.6.16
   Table 185 — required `/Sound` indirect stream surfaced as an

@@ -813,13 +813,28 @@ Table 187 — `/T` title plus appearance-characteristics `/MK`,
 action `/A`, and additional-actions `/AA` indirect refs
 preserved as `ObjectId`s so callers re-resolve through the
 round-36 `actions` reader and the §12.6.4.13 rendition-action
-target). The remaining long-tail subtypes (3D, RichMedia,
-TrapNet, PrinterMark, Projection) still surface as
+target). **Round 215** closes two more —
+`/PrinterMark` (§12.5.6.20 Table 362 — PDF 1.4 production mark
+such as a registration target, colour bar, cut mark, or
+page-information bar; surfaces the `/MN` mark-name Name verbatim
+so a colour-management tool can match its own taxonomy without
+pattern-matching on Table 362's open-ended set) and `/TrapNet`
+(§12.5.6.21 Table 366 — PDF 1.3 page-level trap network;
+surfaces either `/LastModified` or the `/Version` +
+`/AnnotStates` pair — Table 366 makes them mutually exclusive
+but the reader stays tolerant of malformed annots — plus the
+optional `/FontFauxing` array of substituted-font references,
+enough for a regenerator to decide whether the cached traps are
+still valid). Neither carries any cross-crate plumbing
+dependency: the rendering itself lives in the Form-XObject
+appearance stream referenced from `/AP /N` (§8.10) and stays
+routed through the existing Form-XObject walker. The remaining
+long-tail subtypes (3D, RichMedia, Projection) still surface as
 `AnnotationKind::Other { subtype }` — they need cross-crate
-plumbing (§13.6 3D graphics, ISO 32000-2 §13.7 rich-media,
-structure-tree integration) the round-26 reader doesn't reach.
-Common Table 164 fields (`/Rect`, `/Contents`, `/NM`, `/M`,
-`/F`, `/C`, `/Border`) are decoded for every subtype.
+plumbing (§13.6 3D graphics, ISO 32000-2 §13.7 rich-media) the
+round-26 reader doesn't reach. Common Table 164 fields
+(`/Rect`, `/Contents`, `/NM`, `/M`, `/F`, `/C`, `/Border`) are
+decoded for every subtype.
 
 ```rust,ignore
 use oxideav_pdf::{reader::DocumentReader, AnnotationKind};
