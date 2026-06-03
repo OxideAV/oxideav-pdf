@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- annotations (round 227): three new `/Subtype` encoders in the
+  round-32 writer (`write_pdf_with_annotations`) — **Line**
+  (§12.5.6.7 Table 175), **Polygon** (§12.5.6.9 Table 178), and
+  **PolyLine** (§12.5.6.9 Table 178), closing the writer-side
+  symmetry for the round-197 reader's line-family decode. The new
+  `WriterAnnotationKind::Line` carries the required `/L`
+  four-real endpoints array plus every Table 175 optional field
+  (`/LE` two-name array per Table 176, `/IC` interior colour,
+  `/LL` / `/LLE` / `/LLO` leader-line geometry, `/Cap` caption
+  flag, `/IT` intent name); `WriterAnnotationKind::Polygon` and
+  `WriterAnnotationKind::PolyLine` carry the required `/Vertices`
+  flat coordinate list (validated to be even-length ≥ 4) plus
+  the Table 178 optional fields (`/LE` for PolyLine — Polygon
+  closes back to its start so the spec entry is omitted — `/IC`
+  interior colour, `/IT` intent). The writer is round-trip-tight:
+  every default-value field omits its entry on the wire so a
+  write-then-read cycle through `read_pdf_annotations` yields the
+  same `AnnotationKind::Line` / `AnnotationKind::PolygonOrPolyLine`
+  shape the round-197 reader test expects (e.g. `/Cap false` is
+  emitted as an absent key, matching the reader's
+  `matches!(find_entry(annot, "Cap"), Some(Object::Bool(true)))`
+  branch). Adds 10 new tests in `tests/annotations_writer_round227.rs`
+  covering minimal-required-fields round-trip on all three
+  subtypes, a fully-populated Line, a fully-populated PolyLine, an
+  Polygon-with-IC + intent, validation rejects (odd `/Vertices`
+  count, single-vertex polyline), a byte-level check that the
+  writer omits `/Cap` when the caller passes `cap: false`, and a
+  cross-subtype enumeration on a single page; +4 unit tests in
+  `src/annotations.rs` (the new `line_ending_pair` helper, two
+  `validate_annotations` shapes, and a build-dict shape check).
+  The reader is unchanged — round 197 already decodes these
+  subtypes; round 227 closes the symmetric writer.
 - annotations (round 220): `/Subtype /3D` decoder in the round-26
   generic annotation reader — **3D** (§13.6.2 Table 298, PDF 1.6 —
   3D artwork annotation, the means by which U3D / PRC artwork is

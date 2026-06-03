@@ -28,6 +28,21 @@
 //!   [`AnnotationKind::Ink`]: `/InkList` an array of stroke
 //!   point-sequences.
 //!
+//! Round 227 extends the writer with three more §12.5.6 subtypes that
+//! the round-197 reader already decodes, closing the symmetry for the
+//! markup-line family:
+//!
+//! * **`/Line`** straight-line markup (§12.5.6.7, Table 175) —
+//!   [`AnnotationKind::Line`]: required `/L` two-endpoint array, plus
+//!   the Table 175 optional fields (`/LE` line-ending pair, `/IC`
+//!   interior colour, `/LL` / `/LLE` / `/LLO` leader-line geometry,
+//!   `/Cap` caption flag, `/IT` intent name).
+//! * **`/Polygon`** and **`/PolyLine`** polygon / polyline markup
+//!   (§12.5.6.9, Table 178) — [`AnnotationKind::Polygon`] /
+//!   [`AnnotationKind::PolyLine`]: `/Vertices` flat vertex array plus
+//!   the Table 178 optional fields (`/LE` line-ending pair — PolyLine
+//!   only per spec, `/IC` interior colour, `/IT` intent name).
+//!
 //! The writer also carries every cross-subtype Table 164 field
 //! ([`Annotation::author`], `/M` modified-date, `/F` flags, `/C`
 //! colour, `/Border`).
@@ -165,6 +180,80 @@ pub enum AnnotationKind {
         /// `/InkList` — each inner vec is a single stroke as a flat
         /// list of `[x0, y0, x1, y1, …]` reals.
         strokes: Vec<Vec<f32>>,
+    },
+    /// `/Subtype /Line` — straight-line markup (§12.5.6.7, Table 175,
+    /// round 227). Two-endpoint line on the page; the outer
+    /// [`Annotation::rect`] is the bounding box, the `/L` four-real
+    /// array carries the line itself.
+    Line {
+        /// `/L [x1 y1 x2 y2]` — line endpoints in default user space.
+        /// Required per Table 175.
+        endpoints: [f32; 4],
+        /// `/LE [name1 name2]` — two-element line-ending styles
+        /// (Table 176 enumerates `None`, `Square`, `Circle`, `Diamond`,
+        /// `OpenArrow`, `ClosedArrow`, `Butt`, `ROpenArrow`,
+        /// `RClosedArrow`, `Slash`). Defaults to `[/None /None]` per
+        /// Table 175 when `None` (the writer omits the entry, matching
+        /// the round-197 reader's "absent → default" contract).
+        line_endings: Option<[String; 2]>,
+        /// `/IC` interior colour for filled line-ending shapes. Same
+        /// 0/1/3/4-component layout as outer `/C`. `None` ⇒ entry
+        /// omitted.
+        interior_colour: Option<Vec<f32>>,
+        /// `/LL` leader-line length, in default user-space units.
+        /// `None` ⇒ entry omitted (Table 175 default 0).
+        leader_line: Option<f32>,
+        /// `/LLE` leader-line extension length (≥ 0). `None` ⇒ entry
+        /// omitted (Table 175 default 0).
+        leader_line_extension: Option<f32>,
+        /// `/LLO` leader-line offset (PDF 1.7, ≥ 0). `None` ⇒ entry
+        /// omitted.
+        leader_line_offset: Option<f32>,
+        /// `/Cap` — emits `/Cap true` when set. Table 175 default
+        /// `false` ⇒ writer omits the entry on `false` so a
+        /// round-trip through the round-197 reader yields the same
+        /// "absent → false" shape.
+        cap: bool,
+        /// `/IT` intent (`LineArrow` / `LineDimension`). `None` ⇒
+        /// entry omitted.
+        intent: Option<String>,
+    },
+    /// `/Subtype /Polygon` — closed polygon markup (§12.5.6.9,
+    /// Table 178, round 227). Carries the `/Vertices` flat vertex
+    /// array plus the Table 178 optional fields.
+    Polygon {
+        /// `/Vertices [x1 y1 x2 y2 …]` — alternating coordinates in
+        /// default user space. Required per Table 178.
+        vertices: Vec<f32>,
+        /// `/IC` interior colour. Same layout as the outer `/C`. The
+        /// spec lists `/LE` for both Polygon and PolyLine but Table 178
+        /// notes it "Default value: [/None /None]"; the writer omits
+        /// it on Polygon to match the more-conformant
+        /// `/PolyLine`-only practice — callers that need a Polygon
+        /// with explicit line endings should use [`Self::PolyLine`]
+        /// instead.
+        interior_colour: Option<Vec<f32>>,
+        /// `/IT` intent (`PolygonCloud`, `PolygonDimension`). `None`
+        /// ⇒ entry omitted.
+        intent: Option<String>,
+    },
+    /// `/Subtype /PolyLine` — open polyline markup (§12.5.6.9,
+    /// Table 178, round 227). Carries the `/Vertices` flat vertex
+    /// array plus the Table 178 optional fields (`/LE`, `/IC`, `/IT`).
+    PolyLine {
+        /// `/Vertices [x1 y1 x2 y2 …]` — alternating coordinates in
+        /// default user space. Required per Table 178.
+        vertices: Vec<f32>,
+        /// `/LE [name1 name2]` — start/end line endings. Same name
+        /// taxonomy as [`Self::Line`]. `None` ⇒ entry omitted (spec
+        /// default `[/None /None]`).
+        line_endings: Option<[String; 2]>,
+        /// `/IC` interior colour. Same layout as the outer `/C`.
+        /// `None` ⇒ entry omitted.
+        interior_colour: Option<Vec<f32>>,
+        /// `/IT` intent (`PolyLineDimension`). `None` ⇒ entry
+        /// omitted.
+        intent: Option<String>,
     },
 }
 
@@ -341,6 +430,23 @@ fn validate_annotations(annotations: &[Annotation], n_pages: usize) -> Result<()
                      /QuadPoints array is empty",
                 )));
             }
+            // §12.5.6.9 Table 178: /Vertices is a flat (x, y) list,
+            // so length must be even and ≥ 4 (two vertices for a
+            // degenerate single-edge polyline; closed polygons need
+            // at least three vertices ≥ 6 coords but that's a
+            // higher-level check — Adobe's own polygon flattener
+            // emits two-vertex degenerate cases for collapsed
+            // markup edits).
+            AnnotationKind::Polygon { vertices, .. }
+            | AnnotationKind::PolyLine { vertices, .. }
+                if vertices.len() < 4 || vertices.len() % 2 != 0 =>
+            {
+                return Err(PdfError::other(format!(
+                    "write_pdf_with_annotations: annotation #{i} polygon/polyline \
+                     /Vertices needs an even number of coords ≥ 4 (got {})",
+                    vertices.len()
+                )));
+            }
             _ => {}
         }
     }
@@ -512,9 +618,97 @@ fn build_annotation_dict(annot: &Annotation, page_id: ObjectId) -> Result<Dict, 
             }
             d.set("InkList", Object::Array(inklist));
         }
+        AnnotationKind::Line {
+            endpoints,
+            line_endings,
+            interior_colour,
+            leader_line,
+            leader_line_extension,
+            leader_line_offset,
+            cap,
+            intent,
+        } => {
+            d.set("Subtype", Object::Name("Line".into()));
+            // /L — required four-real array per Table 175.
+            d.set(
+                "L",
+                Object::Array(endpoints.iter().map(|v| Object::Real(*v as f64)).collect()),
+            );
+            if let Some(le) = line_endings {
+                d.set("LE", line_ending_pair(le));
+            }
+            if let Some(ic) = interior_colour {
+                d.set("IC", colour_array(ic));
+            }
+            if let Some(ll) = leader_line {
+                d.set("LL", Object::Real(*ll as f64));
+            }
+            if let Some(lle) = leader_line_extension {
+                d.set("LLE", Object::Real(*lle as f64));
+            }
+            if let Some(llo) = leader_line_offset {
+                d.set("LLO", Object::Real(*llo as f64));
+            }
+            // /Cap defaults to false per Table 175 — only emit when
+            // true so a round-trip through the round-197 reader yields
+            // an absence-equals-default shape on the inverse direction.
+            if *cap {
+                d.set("Cap", Object::Bool(true));
+            }
+            if let Some(it) = intent {
+                d.set("IT", Object::Name(it.clone()));
+            }
+        }
+        AnnotationKind::Polygon {
+            vertices,
+            interior_colour,
+            intent,
+        } => {
+            d.set("Subtype", Object::Name("Polygon".into()));
+            d.set(
+                "Vertices",
+                Object::Array(vertices.iter().map(|v| Object::Real(*v as f64)).collect()),
+            );
+            if let Some(ic) = interior_colour {
+                d.set("IC", colour_array(ic));
+            }
+            if let Some(it) = intent {
+                d.set("IT", Object::Name(it.clone()));
+            }
+        }
+        AnnotationKind::PolyLine {
+            vertices,
+            line_endings,
+            interior_colour,
+            intent,
+        } => {
+            d.set("Subtype", Object::Name("PolyLine".into()));
+            d.set(
+                "Vertices",
+                Object::Array(vertices.iter().map(|v| Object::Real(*v as f64)).collect()),
+            );
+            if let Some(le) = line_endings {
+                d.set("LE", line_ending_pair(le));
+            }
+            if let Some(ic) = interior_colour {
+                d.set("IC", colour_array(ic));
+            }
+            if let Some(it) = intent {
+                d.set("IT", Object::Name(it.clone()));
+            }
+        }
     }
 
     Ok(d)
+}
+
+/// Encode a two-element line-ending name pair (§12.5.6.7 Table 176)
+/// as a `[name1 name2]` PDF array. Used by `/Line` and `/PolyLine`.
+fn line_ending_pair(pair: &[String; 2]) -> Object {
+    Object::Array(vec![
+        Object::Name(pair[0].clone()),
+        Object::Name(pair[1].clone()),
+    ])
 }
 
 #[cfg(test)]
@@ -569,5 +763,119 @@ mod tests {
             }
             _ => panic!("expected hex string"),
         }
+    }
+
+    #[test]
+    fn line_ending_pair_emits_two_name_objects() {
+        // §12.5.6.7 Table 176.
+        match line_ending_pair(&["OpenArrow".to_string(), "ClosedArrow".to_string()]) {
+            Object::Array(items) => {
+                assert_eq!(items.len(), 2);
+                assert!(matches!(items[0], Object::Name(ref n) if n == "OpenArrow"));
+                assert!(matches!(items[1], Object::Name(ref n) if n == "ClosedArrow"));
+            }
+            _ => panic!("expected array"),
+        }
+    }
+
+    #[test]
+    fn polygon_polyline_validation_rejects_odd_vertex_count() {
+        // §12.5.6.9 Table 178 — /Vertices is a flat (x, y) list.
+        let annots = vec![Annotation {
+            source_page_index: 0,
+            rect: [0.0, 0.0, 100.0, 100.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Polygon {
+                vertices: vec![10.0, 10.0, 20.0],
+                interior_colour: None,
+                intent: None,
+            },
+        }];
+        assert!(validate_annotations(&annots, 1).is_err());
+    }
+
+    #[test]
+    fn polygon_polyline_validation_rejects_under_two_vertices() {
+        let annots = vec![Annotation {
+            source_page_index: 0,
+            rect: [0.0, 0.0, 100.0, 100.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::PolyLine {
+                vertices: vec![10.0, 10.0],
+                line_endings: None,
+                interior_colour: None,
+                intent: None,
+            },
+        }];
+        assert!(validate_annotations(&annots, 1).is_err());
+    }
+
+    #[test]
+    fn polygon_polyline_validation_accepts_two_vertex_degenerate_case() {
+        // Two vertices = single edge — Adobe collapsed-markup edits
+        // routinely emit this shape, so the writer accepts it.
+        let annots = vec![Annotation {
+            source_page_index: 0,
+            rect: [0.0, 0.0, 100.0, 100.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::PolyLine {
+                vertices: vec![10.0, 10.0, 90.0, 90.0],
+                line_endings: None,
+                interior_colour: None,
+                intent: None,
+            },
+        }];
+        assert!(validate_annotations(&annots, 1).is_ok());
+    }
+
+    #[test]
+    fn line_writer_emits_l_endpoints_and_omits_cap_when_false() {
+        // §12.5.6.7 Table 175 — /Cap default is false; the writer
+        // omits the entry to keep the round-trip through the
+        // round-197 reader's "absent → false" branch tight.
+        let annot = Annotation {
+            source_page_index: 0,
+            rect: [0.0, 0.0, 100.0, 100.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Line {
+                endpoints: [10.0, 20.0, 110.0, 60.0],
+                line_endings: None,
+                interior_colour: None,
+                leader_line: None,
+                leader_line_extension: None,
+                leader_line_offset: None,
+                cap: false,
+                intent: None,
+            },
+        };
+        let d = build_annotation_dict(&annot, ObjectId::new(3)).unwrap();
+        // /L present with four reals.
+        let l = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "L")
+            .expect("/L emitted");
+        match &l.1 {
+            Object::Array(items) => assert_eq!(items.len(), 4),
+            _ => panic!("/L should be a four-real array"),
+        }
+        // /Cap absent (default false per Table 175).
+        assert!(!d.entries().iter().any(|(k, _)| k == "Cap"));
     }
 }

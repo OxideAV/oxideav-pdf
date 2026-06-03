@@ -1128,6 +1128,64 @@ Highlight/Underline/Squiggly/StrikeOut take a
 (each `[x0, y0, x1, y1, …]`). `qpdf --check` accepts the output;
 the round-26 reader round-trips every subtype.
 
+**Round 227** extends the writer with the line-family that the
+round-197 reader already decodes — `WriterAnnotationKind::Line`
+(§12.5.6.7 Table 175), `WriterAnnotationKind::Polygon`, and
+`WriterAnnotationKind::PolyLine` (§12.5.6.9 Table 178). `Line`
+carries the required `/L` four-real endpoint array plus every
+Table 175 optional (`/LE` two-name line-ending pair per
+Table 176, `/IC` interior colour, `/LL` / `/LLE` / `/LLO`
+leader-line geometry, `/Cap` caption flag, `/IT` intent name).
+Polygon / PolyLine carry the required `/Vertices` flat coordinate
+list (validated even-length ≥ 4) plus the Table 178 optionals
+(PolyLine adds `/LE`; Polygon closes back to its start so it has
+no line endings). The writer omits each default-value field (so a
+write-then-read cycle through `read_pdf_annotations` yields the
+same `AnnotationKind` shape the reader test expects — `/Cap false`
+is an absent key, not an explicit `/Cap false` token).
+
+```rust,ignore
+use oxideav_pdf::{write_pdf_with_annotations, Annotation, WriterAnnotationKind};
+
+let annots = vec![
+    Annotation {
+        source_page_index: 0,
+        rect: [10.0, 20.0, 110.0, 60.0],
+        author: None,
+        modified: None,
+        flags: None,
+        colour: None,
+        border: None,
+        kind: WriterAnnotationKind::Line {
+            endpoints: [10.0, 20.0, 110.0, 60.0],
+            line_endings: Some(["OpenArrow".into(), "ClosedArrow".into()]),
+            interior_colour: Some(vec![1.0, 0.0, 0.0]),
+            leader_line: Some(8.0),
+            leader_line_extension: Some(3.5),
+            leader_line_offset: None,
+            cap: true,
+            intent: Some("LineArrow".into()),
+        },
+    },
+    Annotation {
+        source_page_index: 0,
+        rect: [20.0, 20.0, 80.0, 80.0],
+        author: None,
+        modified: None,
+        flags: None,
+        colour: None,
+        border: None,
+        kind: WriterAnnotationKind::Polygon {
+            vertices: vec![20.0, 20.0, 80.0, 20.0, 80.0, 80.0],
+            interior_colour: Some(vec![0.7, 0.7, 0.95]),
+            intent: Some("PolygonCloud".into()),
+        },
+    },
+];
+let pdf = write_pdf_with_annotations(&scene, &annots)?;
+# Ok::<(), oxideav_pdf::PdfError>(())
+```
+
 ## Embedded file attachments (round 33)
 
 `write_pdf_with_attachments(scene, &[Attachment])` embeds arbitrary
