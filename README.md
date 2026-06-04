@@ -1186,6 +1186,81 @@ let pdf = write_pdf_with_annotations(&scene, &annots)?;
 # Ok::<(), oxideav_pdf::PdfError>(())
 ```
 
+**Round 232** extends the writer with the markup-editing pair the
+round-197 reader already decodes: `WriterAnnotationKind::Caret`
+(§12.5.6.11 Table 180) and `WriterAnnotationKind::Popup`
+(§12.5.6.14 Table 183). Caret carries the optional `/RD` rectangle
+differences (each component validated ≥ 0; the left+right and
+top+bottom insets must fit inside the outer `/Rect` per Table 180)
+plus a `CaretSymbol` enum modelling the two Table 180 values
+(`None` default ⇒ `/Sy` entry omitted, `Paragraph` ⇒ `/Sy /P`).
+Popup carries an optional `parent_index: Option<usize>` that the
+writer resolves to the actual on-wire object id of the parent
+markup annotation (a two-pass id allocation makes earlier-in-the
+-slice Popups able to reference later-in-the-slice parents); the
+writer rejects out-of-range, self-cycle, and Popup-pointing-at
+-Popup configurations (a Popup's parent must be a markup
+annotation per §12.5.6.14). `/Open` defaults to `false` and the
+writer omits the entry on `false`, so a write-then-read cycle
+through `read_pdf_annotations` yields the same
+`AnnotationKind::Caret { symbol: "None", .. }` /
+`AnnotationKind::Popup { parent: Some(_), open: false }` shape
+the round-197 reader test expects.
+
+```rust,ignore
+use oxideav_pdf::{
+    write_pdf_with_annotations, Annotation, CaretSymbol, WriterAnnotationKind,
+};
+
+let annots = vec![
+    // The edit position the reviewer is pointing at.
+    Annotation {
+        source_page_index: 0,
+        rect: [10.0, 20.0, 18.0, 60.0],
+        author: None,
+        modified: None,
+        flags: None,
+        colour: None,
+        border: None,
+        kind: WriterAnnotationKind::Caret {
+            rect_diffs: Some([2.0, 3.0, 4.0, 5.0]),
+            symbol: CaretSymbol::Paragraph,
+        },
+    },
+    // The note text the Popup will display for editing.
+    Annotation {
+        source_page_index: 0,
+        rect: [40.0, 100.0, 200.0, 130.0],
+        author: None,
+        modified: None,
+        flags: None,
+        colour: None,
+        border: None,
+        kind: WriterAnnotationKind::FreeText {
+            contents: "rewrite this paragraph".into(),
+            default_appearance: None,
+            quadding: oxideav_pdf::FreeTextQuadding::Left,
+        },
+    },
+    // Hangs off the FreeText (index 1 in this slice).
+    Annotation {
+        source_page_index: 0,
+        rect: [50.0, 50.0, 200.0, 150.0],
+        author: None,
+        modified: None,
+        flags: None,
+        colour: None,
+        border: None,
+        kind: WriterAnnotationKind::Popup {
+            parent_index: Some(1),
+            open: true,
+        },
+    },
+];
+let pdf = write_pdf_with_annotations(&scene, &annots)?;
+# Ok::<(), oxideav_pdf::PdfError>(())
+```
+
 ## Embedded file attachments (round 33)
 
 `write_pdf_with_attachments(scene, &[Attachment])` embeds arbitrary

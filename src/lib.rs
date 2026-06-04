@@ -66,7 +66,7 @@ pub use acroform::{
     FormFieldRadioGroup, FormFieldSignature, FormFieldText, RadioOption,
 };
 pub use annotations::{
-    write_pdf_with_annotations, Annotation, AnnotationKind as WriterAnnotationKind,
+    write_pdf_with_annotations, Annotation, AnnotationKind as WriterAnnotationKind, CaretSymbol,
     FreeTextQuadding,
 };
 pub use attachments::{

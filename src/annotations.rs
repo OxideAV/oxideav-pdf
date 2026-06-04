@@ -43,6 +43,20 @@
 //!   the Table 178 optional fields (`/LE` line-ending pair — PolyLine
 //!   only per spec, `/IC` interior colour, `/IT` intent name).
 //!
+//! Round 232 closes the **markup-editing pair** the round-197 reader
+//! already decodes:
+//!
+//! * **`/Caret`** text-edit caret (§12.5.6.11, Table 180) —
+//!   [`AnnotationKind::Caret`]: `/RD` rectangle differences (the
+//!   caret figure inset inside the outer `/Rect`), `/Sy` symbol name
+//!   (`P` for the paragraph-mark glyph, `None` for the bare caret).
+//! * **`/Popup`** text-editing window (§12.5.6.14, Table 183) —
+//!   [`AnnotationKind::Popup`]: `/Parent` indirect reference to the
+//!   parent markup annotation (encoded by index into the same
+//!   `annotations` slice so the writer can resolve it to the actual
+//!   on-wire object id after every annotation has been allocated),
+//!   plus the `/Open` initial-visibility flag.
+//!
 //! The writer also carries every cross-subtype Table 164 field
 //! ([`Annotation::author`], `/M` modified-date, `/F` flags, `/C`
 //! colour, `/Border`).
@@ -255,6 +269,75 @@ pub enum AnnotationKind {
         /// omitted.
         intent: Option<String>,
     },
+    /// `/Subtype /Caret` — text-edit caret marker (§12.5.6.11,
+    /// Table 180, round 232). Indicates the presence of text edits at
+    /// the position of the outer [`Annotation::rect`]. Optional
+    /// `/RD` shrinks the caret figure inside the rectangle (e.g. when
+    /// `/Sy /P` displays a paragraph mark whose bounds exceed the bare
+    /// caret); `/Sy` selects the rendered symbol.
+    Caret {
+        /// `/RD` rectangle differences `[left top right bottom]`,
+        /// each ≥ 0. The four values are the inset of the caret
+        /// figure inside the outer `/Rect`. `None` ⇒ entry omitted
+        /// (the caret fills the rectangle).
+        rect_diffs: Option<[f32; 4]>,
+        /// `/Sy` — caret symbol selector per Table 180.
+        symbol: CaretSymbol,
+    },
+    /// `/Subtype /Popup` — text-entry pop-up window (§12.5.6.14,
+    /// Table 183, round 232). A Popup is the editing surface for a
+    /// markup parent (Text, FreeText, Highlight, Caret, …); it carries
+    /// no appearance of its own and exists only to display the
+    /// parent's `/Contents` for editing.
+    ///
+    /// The `/Parent` field is normatively an indirect reference per
+    /// Table 183; the writer takes a 0-based index into the same
+    /// `annotations` slice as [`Self::parent_index`] and resolves it
+    /// to the actual on-wire object id after every annotation has
+    /// been allocated.
+    Popup {
+        /// 0-based index into the `annotations` slice passed to
+        /// [`write_pdf_with_annotations`] identifying the parent
+        /// markup annotation whose `/Contents` / `/M` / `/C` / `/T`
+        /// fields override this Popup's per Table 183. `None` ⇒
+        /// `/Parent` entry omitted (the spec example in §12.5.6.14
+        /// treats this as malformed — a Popup with no parent has no
+        /// editing target — but tolerant readers still surface the
+        /// dict, so the writer permits it).
+        parent_index: Option<usize>,
+        /// `/Open` — `true` ⇒ pop-up displayed at document open. Per
+        /// Table 183 the default is `false`; the writer omits the
+        /// entry on `false` so a round-trip through the round-197
+        /// reader yields the same "absent → false" shape.
+        open: bool,
+    },
+}
+
+/// `/Sy` symbol selector for [`AnnotationKind::Caret`] (ISO 32000-1
+/// §12.5.6.11 Table 180). Table 180 lists two values: `P` (a new
+/// paragraph mark should be associated with the caret) and `None`
+/// (no symbol). The default is `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaretSymbol {
+    /// `/Sy /None` — no symbol displayed (default per Table 180).
+    /// The writer omits the entry when this variant is set so a
+    /// round-trip through the round-197 reader yields the same
+    /// "absent → None" shape.
+    #[default]
+    None,
+    /// `/Sy /P` — the paragraph symbol (¶) is associated with the
+    /// caret. Spec-defined Table 180 value.
+    Paragraph,
+}
+
+impl CaretSymbol {
+    fn as_name(self) -> Option<&'static str> {
+        match self {
+            // Default per Table 180 — omit the /Sy entry.
+            Self::None => None,
+            Self::Paragraph => Some("P"),
+        }
+    }
 }
 
 /// `/Q` quadding (justification) for [`AnnotationKind::FreeText`].
@@ -354,13 +437,24 @@ pub fn write_pdf_with_annotations(
         doc.info = Some(info_id);
     }
 
-    // ---- Emit each annotation as an indirect object, bucketed by
-    // ---- source page.
+    // ---- Pass 1: allocate one id per annotation up front, so the
+    //              Popup subtype's `/Parent` indirect reference
+    //              (§12.5.6.14 Table 183) can resolve to the actual
+    //              on-wire id of its parent markup annotation.
+    let annotation_ids: Vec<ObjectId> = (0..annotations.len()).map(|_| doc.allocate_id()).collect();
+
+    // ---- Pass 2: build each annotation dict + commit it under its
+    //              pre-allocated id, bucketing by source page so the
+    //              `/Annots` array can be patched onto each page after.
     let mut by_page: Vec<Vec<ObjectId>> = (0..n_pages).map(|_| Vec::new()).collect();
-    for annot in annotations {
-        let dict = build_annotation_dict(annot, pages_build.page_ids[annot.source_page_index])?;
-        let id = doc.add(Object::Dict(dict));
-        by_page[annot.source_page_index].push(id);
+    for (i, annot) in annotations.iter().enumerate() {
+        let dict = build_annotation_dict(
+            annot,
+            pages_build.page_ids[annot.source_page_index],
+            &annotation_ids,
+        )?;
+        doc.add_object(annotation_ids[i], Object::Dict(dict));
+        by_page[annot.source_page_index].push(annotation_ids[i]);
     }
 
     // ---- Patch each page's /Annots array.
@@ -394,6 +488,7 @@ pub fn write_pdf_with_annotations(
 // ---------------------------------------------------------------------
 
 fn validate_annotations(annotations: &[Annotation], n_pages: usize) -> Result<(), PdfError> {
+    let n_annots = annotations.len();
     for (i, a) in annotations.iter().enumerate() {
         if a.source_page_index >= n_pages {
             return Err(PdfError::other(format!(
@@ -447,6 +542,64 @@ fn validate_annotations(annotations: &[Annotation], n_pages: usize) -> Result<()
                     vertices.len()
                 )));
             }
+            // §12.5.6.11 Table 180 — every /RD component must be ≥ 0
+            // and the inset must fit inside the outer /Rect (the
+            // top+bottom inset shall be < /Rect height, the
+            // left+right inset shall be < /Rect width).
+            AnnotationKind::Caret {
+                rect_diffs: Some(rd),
+                ..
+            } => {
+                if rd.iter().any(|v| *v < 0.0) {
+                    return Err(PdfError::other(format!(
+                        "write_pdf_with_annotations: annotation #{i} /Caret /RD \
+                         components must all be ≥ 0 (got {rd:?})",
+                    )));
+                }
+                let width = a.rect[2] - a.rect[0];
+                let height = a.rect[3] - a.rect[1];
+                if rd[0] + rd[2] >= width || rd[1] + rd[3] >= height {
+                    return Err(PdfError::other(format!(
+                        "write_pdf_with_annotations: annotation #{i} /Caret /RD \
+                         inset must fit inside /Rect (rd={rd:?}, rect={:?})",
+                        a.rect,
+                    )));
+                }
+            }
+            // §12.5.6.14 Table 183 — /Parent is normatively an
+            // indirect reference; the writer takes a 0-based index
+            // into the same annotations slice. The index must be in
+            // range and may not point at the Popup itself (a Popup
+            // can't be its own parent — that would be a self-cycle
+            // on dereference).
+            AnnotationKind::Popup {
+                parent_index: Some(idx),
+                ..
+            } => {
+                if *idx >= n_annots {
+                    return Err(PdfError::other(format!(
+                        "write_pdf_with_annotations: annotation #{i} /Popup parent_index {idx} \
+                         out of range (only {n_annots} annotation(s) supplied)",
+                    )));
+                }
+                if *idx == i {
+                    return Err(PdfError::other(format!(
+                        "write_pdf_with_annotations: annotation #{i} /Popup parent_index points \
+                         at itself; a Popup cannot be its own /Parent (§12.5.6.14)",
+                    )));
+                }
+                // The §12.5.6.14 text describes a Popup as the
+                // editing surface for a *markup* parent — Popup
+                // pointing at another Popup makes no semantic sense
+                // (no parent contents to display).
+                if matches!(annotations[*idx].kind, AnnotationKind::Popup { .. }) {
+                    return Err(PdfError::other(format!(
+                        "write_pdf_with_annotations: annotation #{i} /Popup parent_index {idx} \
+                         points at another /Popup; the parent must be a markup annotation \
+                         per §12.5.6.14",
+                    )));
+                }
+            }
             _ => {}
         }
     }
@@ -491,7 +644,11 @@ fn flatten_quad_points(qp: &[[f32; 8]]) -> Object {
     Object::Array(out)
 }
 
-fn build_annotation_dict(annot: &Annotation, page_id: ObjectId) -> Result<Dict, PdfError> {
+fn build_annotation_dict(
+    annot: &Annotation,
+    page_id: ObjectId,
+    annotation_ids: &[ObjectId],
+) -> Result<Dict, PdfError> {
     let mut d = Dict::new()
         .with("Type", Object::Name("Annot".into()))
         .with("Rect", rect_array(annot.rect))
@@ -697,6 +854,39 @@ fn build_annotation_dict(annot: &Annotation, page_id: ObjectId) -> Result<Dict, 
                 d.set("IT", Object::Name(it.clone()));
             }
         }
+        AnnotationKind::Caret { rect_diffs, symbol } => {
+            // §12.5.6.11 Table 180.
+            d.set("Subtype", Object::Name("Caret".into()));
+            if let Some(rd) = rect_diffs {
+                d.set(
+                    "RD",
+                    Object::Array(rd.iter().map(|v| Object::Real(*v as f64)).collect()),
+                );
+            }
+            // /Sy default is /None per Table 180 ⇒ writer omits the
+            // entry on `CaretSymbol::None` so a write-then-read cycle
+            // through the round-197 reader yields the same
+            // "absent → None symbol" branch.
+            if let Some(name) = symbol.as_name() {
+                d.set("Sy", Object::Name(name.into()));
+            }
+        }
+        AnnotationKind::Popup { parent_index, open } => {
+            // §12.5.6.14 Table 183.
+            d.set("Subtype", Object::Name("Popup".into()));
+            if let Some(idx) = parent_index {
+                // Validation (see validate_annotations) guarantees idx
+                // is in range — defensive indexing here would only
+                // mask a future skipped-validation regression.
+                d.set("Parent", Object::Reference(annotation_ids[*idx]));
+            }
+            // /Open default is false per Table 183 ⇒ writer omits the
+            // entry on `false` so a round-trip through the round-197
+            // reader yields the same "absent → false" branch.
+            if *open {
+                d.set("Open", Object::Bool(true));
+            }
+        }
     }
 
     Ok(d)
@@ -841,6 +1031,257 @@ mod tests {
     }
 
     #[test]
+    fn caret_symbol_default_is_none_and_omits_sy_entry() {
+        // §12.5.6.11 Table 180.
+        assert_eq!(CaretSymbol::default(), CaretSymbol::None);
+        assert!(CaretSymbol::None.as_name().is_none());
+        assert_eq!(CaretSymbol::Paragraph.as_name(), Some("P"));
+    }
+
+    #[test]
+    fn caret_writer_emits_subtype_and_omits_default_fields() {
+        // §12.5.6.11 Table 180 — bare-caret form: no /RD, no /Sy.
+        let annot = Annotation {
+            source_page_index: 0,
+            rect: [10.0, 20.0, 50.0, 60.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Caret {
+                rect_diffs: None,
+                symbol: CaretSymbol::None,
+            },
+        };
+        let d = build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)]).unwrap();
+        let subtype = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Subtype")
+            .expect("/Subtype emitted");
+        assert!(matches!(&subtype.1, Object::Name(n) if n == "Caret"));
+        // Default per Table 180 — /Sy absent.
+        assert!(!d.entries().iter().any(|(k, _)| k == "Sy"));
+        // No inset supplied — /RD absent.
+        assert!(!d.entries().iter().any(|(k, _)| k == "RD"));
+    }
+
+    #[test]
+    fn caret_writer_emits_sy_p_when_paragraph_set() {
+        let annot = Annotation {
+            source_page_index: 0,
+            rect: [10.0, 20.0, 50.0, 60.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Caret {
+                rect_diffs: Some([1.0, 2.0, 3.0, 4.0]),
+                symbol: CaretSymbol::Paragraph,
+            },
+        };
+        let d = build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)]).unwrap();
+        let sy = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Sy")
+            .expect("/Sy emitted");
+        assert!(matches!(&sy.1, Object::Name(n) if n == "P"));
+        let rd = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "RD")
+            .expect("/RD emitted");
+        match &rd.1 {
+            Object::Array(items) => assert_eq!(items.len(), 4),
+            _ => panic!("/RD should be a four-real array"),
+        }
+    }
+
+    #[test]
+    fn caret_validation_rejects_negative_rd() {
+        // §12.5.6.11 Table 180 — each component shall be ≥ 0.
+        let annots = vec![Annotation {
+            source_page_index: 0,
+            rect: [0.0, 0.0, 100.0, 100.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Caret {
+                rect_diffs: Some([-1.0, 0.0, 0.0, 0.0]),
+                symbol: CaretSymbol::None,
+            },
+        }];
+        let err = validate_annotations(&annots, 1).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("/RD"), "error mentions /RD: {msg}");
+    }
+
+    #[test]
+    fn caret_validation_rejects_inset_exceeding_rect() {
+        // §12.5.6.11 Table 180 — left+right and top+bottom insets
+        // must each fit inside the outer /Rect.
+        let annots = vec![Annotation {
+            source_page_index: 0,
+            rect: [0.0, 0.0, 10.0, 10.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Caret {
+                rect_diffs: Some([6.0, 6.0, 6.0, 6.0]),
+                symbol: CaretSymbol::None,
+            },
+        }];
+        assert!(validate_annotations(&annots, 1).is_err());
+    }
+
+    #[test]
+    fn popup_writer_resolves_parent_index_to_pre_allocated_id() {
+        // §12.5.6.14 Table 183 — the writer wires /Parent to the
+        // indirect reference of the annotation at index `parent_index`
+        // in the same slice.
+        let annot = Annotation {
+            source_page_index: 0,
+            rect: [10.0, 20.0, 110.0, 60.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Popup {
+                parent_index: Some(0),
+                open: true,
+            },
+        };
+        // Simulate the pass-1 allocations: ids 41 + 42 reserved for
+        // a two-annotation batch where this Popup is the second
+        // (index 1) and the parent markup is at index 0 ⇒ /Parent
+        // should resolve to id 41.
+        let pre_allocated = vec![ObjectId::new(41), ObjectId::new(42)];
+        let d = build_annotation_dict(&annot, ObjectId::new(3), &pre_allocated).unwrap();
+        let parent = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Parent")
+            .expect("/Parent emitted");
+        match &parent.1 {
+            Object::Reference(id) => assert_eq!(id.number, 41),
+            _ => panic!("/Parent should be an indirect reference"),
+        }
+        // /Open true ⇒ entry emitted.
+        let open = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Open")
+            .expect("/Open emitted");
+        assert!(matches!(&open.1, Object::Bool(true)));
+    }
+
+    #[test]
+    fn popup_writer_omits_open_when_default_false() {
+        // §12.5.6.14 Table 183 — /Open default is false ⇒ writer
+        // omits the entry on `false`.
+        let annot = Annotation {
+            source_page_index: 0,
+            rect: [10.0, 20.0, 110.0, 60.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Popup {
+                parent_index: None,
+                open: false,
+            },
+        };
+        let d = build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)]).unwrap();
+        assert!(!d.entries().iter().any(|(k, _)| k == "Open"));
+        // No parent supplied ⇒ /Parent absent (the tolerant-reader
+        // contract surfaces the dict; the spec considers this
+        // malformed but permitted on the read side).
+        assert!(!d.entries().iter().any(|(k, _)| k == "Parent"));
+    }
+
+    #[test]
+    fn popup_validation_rejects_out_of_range_parent_index() {
+        let annots = vec![Annotation {
+            source_page_index: 0,
+            rect: [0.0, 0.0, 100.0, 100.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Popup {
+                parent_index: Some(42),
+                open: false,
+            },
+        }];
+        let err = validate_annotations(&annots, 1).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("parent_index"), "error mentions index: {msg}");
+    }
+
+    #[test]
+    fn popup_validation_rejects_self_parent() {
+        let annots = vec![Annotation {
+            source_page_index: 0,
+            rect: [0.0, 0.0, 100.0, 100.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Popup {
+                parent_index: Some(0),
+                open: false,
+            },
+        }];
+        assert!(validate_annotations(&annots, 1).is_err());
+    }
+
+    #[test]
+    fn popup_validation_rejects_popup_parent_pointing_at_popup() {
+        // §12.5.6.14 — parent must be a markup annotation, not
+        // another Popup.
+        let annots = vec![
+            Annotation {
+                source_page_index: 0,
+                rect: [0.0, 0.0, 100.0, 100.0],
+                author: None,
+                modified: None,
+                flags: None,
+                colour: None,
+                border: None,
+                kind: AnnotationKind::Popup {
+                    parent_index: None,
+                    open: false,
+                },
+            },
+            Annotation {
+                source_page_index: 0,
+                rect: [0.0, 0.0, 100.0, 100.0],
+                author: None,
+                modified: None,
+                flags: None,
+                colour: None,
+                border: None,
+                kind: AnnotationKind::Popup {
+                    parent_index: Some(0),
+                    open: false,
+                },
+            },
+        ];
+        assert!(validate_annotations(&annots, 1).is_err());
+    }
+
+    #[test]
     fn line_writer_emits_l_endpoints_and_omits_cap_when_false() {
         // §12.5.6.7 Table 175 — /Cap default is false; the writer
         // omits the entry to keep the round-trip through the
@@ -864,7 +1305,7 @@ mod tests {
                 intent: None,
             },
         };
-        let d = build_annotation_dict(&annot, ObjectId::new(3)).unwrap();
+        let d = build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)]).unwrap();
         // /L present with four reals.
         let l = d
             .entries()

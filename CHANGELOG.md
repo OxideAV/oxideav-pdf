@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- annotations (round 232): two new `/Subtype` encoders in the
+  round-32 writer (`write_pdf_with_annotations`) — **Caret**
+  (§12.5.6.11 Table 180) and **Popup** (§12.5.6.14 Table 183),
+  closing the writer-side symmetry for the markup-editing pair the
+  round-197 reader already decodes. `WriterAnnotationKind::Caret`
+  carries the optional `/RD` rectangle differences (validated
+  non-negative + inset must fit inside the outer `/Rect` per
+  Table 180) and a new `CaretSymbol` enum modelling the Table 180
+  `/Sy` choice (`None` default, `Paragraph` for `/Sy /P`); the
+  writer omits `/Sy` on the default `None` variant so a write-then
+  -read cycle through `read_pdf_annotations` yields the same
+  "absent → \"None\"" reader branch. `WriterAnnotationKind::Popup`
+  carries an optional `parent_index: Option<usize>` that the writer
+  resolves to the actual on-wire object id of the parent markup
+  annotation (the dispatch loop now allocates ids up front, then
+  builds the annotation dicts under the pre-allocated ids so an
+  earlier-in-the-slice Popup can reference a later-in-the-slice
+  parent); validation rejects out-of-range, self-cycle, and
+  Popup-pointing-at-Popup configurations. The Popup writer also
+  omits `/Open` when the caller passes `false`, matching the
+  Table 183 default. Adds 12 new tests in
+  `tests/annotations_writer_round232.rs` covering bare-Caret /
+  Caret-with-paragraph-symbol round-trip, a byte-level check that
+  `/Sy` is absent on `CaretSymbol::None`, four Caret validation
+  rejects, bare-Popup / Popup-with-Text-parent round-trip
+  (asserting the reader-side `/Parent` indirect reference resolves
+  back to the Text annotation's dict), a byte-level check that
+  `/Open` is absent on `open: false`, three Popup validation
+  rejects, and a cross-subtype composite (Caret + FreeText +
+  open-Popup-on-FreeText on one page); +9 unit tests in
+  `src/annotations.rs` covering the new `CaretSymbol::as_name`
+  helper, the per-annotation pre-allocated-id resolution in the
+  Popup arm, default-field-omission for Caret + Popup, and every
+  new validation branch.
 - annotations (round 227): three new `/Subtype` encoders in the
   round-32 writer (`write_pdf_with_annotations`) — **Line**
   (§12.5.6.7 Table 175), **Polygon** (§12.5.6.9 Table 178), and
