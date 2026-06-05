@@ -1261,6 +1261,52 @@ let pdf = write_pdf_with_annotations(&scene, &annots)?;
 # Ok::<(), oxideav_pdf::PdfError>(())
 ```
 
+**Round 238** folds `/Subtype /FileAttachment` (§12.5.6.15 Table 184)
+into the generic annotation surface so callers no longer have to drop
+down to the dedicated `write_pdf_with_attachments` writer just to pin
+one file to a page. The new `WriterAnnotationKind::FileAttachment`
+variant takes a `file_name`, the raw `file_bytes`, an optional
+`mime_type`, and an optional `/Name` icon (defaulting to `/PushPin`
+per Table 184). The writer additionally materialises (a) a
+`/Type /EmbeddedFile` stream (§7.11.4 Table 45 — FlateDecode-compressed
+when smaller), (b) a `/Type /Filespec` dictionary (§7.11.3 Table 44 —
+`/F` PDFDocEncoded, `/UF` UTF-16BE-with-BOM, and `/EF` pointing at the
+stream), and (c) a catalog `/Names → /EmbeddedFiles` name-tree leaf
+keyed on `file_name` (§7.7.4 + §7.9.6.2 — keys sorted byte-wise) per
+FileAttachment annotation. The annotation's `/FS` entry then resolves
+to the filespec, so `read_pdf_attachments` enumerates the same files
+the FileAttachment markers point at.
+
+```rust,ignore
+use oxideav_pdf::{write_pdf_with_annotations, Annotation, WriterAnnotationKind};
+
+let annots = vec![
+    Annotation {
+        source_page_index: 0,
+        rect: [10.0, 20.0, 30.0, 40.0],
+        author: None,
+        modified: None,
+        flags: None,
+        colour: None,
+        border: None,
+        kind: WriterAnnotationKind::FileAttachment {
+            icon: None,
+            file_name: "notes.txt".into(),
+            file_bytes: b"hello, pdf attachment\n".to_vec(),
+            mime_type: Some("text/plain".into()),
+        },
+    },
+];
+let pdf = write_pdf_with_annotations(&scene, &annots)?;
+# Ok::<(), oxideav_pdf::PdfError>(())
+```
+
+Empty `file_name` is rejected at validation (§7.11.2 requires a
+non-empty file name). Two FileAttachment annotations on the same
+document each contribute one filespec to the shared name tree, which
+the round-33 `read_pdf_attachments` enumerator surfaces in byte-wise
+lexicographic order.
+
 ## Embedded file attachments (round 33)
 
 `write_pdf_with_attachments(scene, &[Attachment])` embeds arbitrary

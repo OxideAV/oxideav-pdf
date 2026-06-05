@@ -57,6 +57,20 @@
 //!   on-wire object id after every annotation has been allocated),
 //!   plus the `/Open` initial-visibility flag.
 //!
+//! Round 238 folds the **embedded-file marker** subtype into the
+//! generic annotation surface so callers no longer have to drop down
+//! to the round-33 attachments writer when they only need one file
+//! pinned to a page:
+//!
+//! * **`/FileAttachment`** (§12.5.6.15, Table 184) —
+//!   [`AnnotationKind::FileAttachment`]: writer additionally emits a
+//!   `/Type /EmbeddedFile` stream (§7.11.4 Table 45) + a
+//!   `/Type /Filespec` dict (§7.11.3 Table 44) + a catalog
+//!   `/Names → /EmbeddedFiles` entry (§7.7.4 + §7.9.6) per
+//!   FileAttachment annotation, then wires the annotation's `/FS`
+//!   entry to the filespec. The round-33 `read_pdf_attachments`
+//!   enumerator therefore sees the same files round-tripped.
+//!
 //! The writer also carries every cross-subtype Table 164 field
 //! ([`Annotation::author`], `/M` modified-date, `/F` flags, `/C`
 //! colour, `/Border`).
@@ -68,6 +82,9 @@
 
 use oxideav_scene::Scene;
 
+use crate::attachments::{
+    emit_embedded_file_stream, emit_embedded_files_name_tree, emit_filespec_dict, Attachment,
+};
 use crate::error::PdfError;
 use crate::info::{build_info_dict, has_metadata};
 use crate::objects::{Dict, Document, Object, ObjectId};
@@ -311,6 +328,39 @@ pub enum AnnotationKind {
         /// reader yields the same "absent → false" shape.
         open: bool,
     },
+    /// `/Subtype /FileAttachment` — embedded-file marker (§12.5.6.15
+    /// Table 184, round 238). The on-page paperclip / push-pin icon
+    /// for a file embedded inside the PDF.
+    ///
+    /// Writing one of these causes the writer to additionally emit
+    /// (a) a `/Type /EmbeddedFile` stream object carrying
+    /// `file_bytes` (FlateDecode-compressed when smaller),
+    /// (b) a `/Type /Filespec` dictionary naming `file_name` and
+    /// pointing at the stream via `/EF`, and (c) a catalog
+    /// `/Names → /EmbeddedFiles` name tree entry keyed on
+    /// `file_name` so the round-33 `read_pdf_attachments` enumerator
+    /// surfaces the same file. The annotation's `/FS` entry holds
+    /// the indirect reference to the filespec dict per Table 184.
+    FileAttachment {
+        /// `/Name` icon identifier — Table 184 enumerates
+        /// `PushPin` (default), `GraphPushPin`, `PaperclipTag`, and
+        /// the more general `Graph` / `Paperclip` / `Tag` names.
+        /// `None` ⇒ writer emits `/PushPin`.
+        icon: Option<String>,
+        /// User-visible file name written into the filespec's `/F`
+        /// (PDFDocEncoded literal when ASCII) and `/UF` (UTF-16BE
+        /// hex with BOM) entries per §7.11.2 Table 43, and used as
+        /// the name-tree key per §7.7.4 + §7.9.6.
+        file_name: String,
+        /// Body of the `/Type /EmbeddedFile` stream object — the
+        /// raw bytes the viewer will save when the user extracts
+        /// the attachment.
+        file_bytes: Vec<u8>,
+        /// `/Subtype` on the embedded-file stream (a MIME type per
+        /// §7.11.4 Table 45) + `/Desc` text on the filespec dict.
+        /// `None` ⇒ neither entry emitted.
+        mime_type: Option<String>,
+    },
 }
 
 /// `/Sy` symbol selector for [`AnnotationKind::Caret`] (ISO 32000-1
@@ -443,6 +493,56 @@ pub fn write_pdf_with_annotations(
     //              on-wire id of its parent markup annotation.
     let annotation_ids: Vec<ObjectId> = (0..annotations.len()).map(|_| doc.allocate_id()).collect();
 
+    // ---- Pre-pass: emit one `/Type /EmbeddedFile` stream + one
+    //                `/Type /Filespec` dict per [`AnnotationKind::FileAttachment`]
+    //                (§12.5.6.15 Table 184) so the annotation dict's `/FS`
+    //                entry can resolve to a real indirect reference. The
+    //                catalog `/Names → /EmbeddedFiles` name tree is
+    //                materialised after every filespec is in place
+    //                (§7.7.4 + §7.9.6).
+    let mut filespec_ids: Vec<Option<ObjectId>> = vec![None; annotations.len()];
+    let mut name_tree_entries: Vec<(String, ObjectId)> = Vec::new();
+    for (i, annot) in annotations.iter().enumerate() {
+        if let AnnotationKind::FileAttachment {
+            file_name,
+            file_bytes,
+            mime_type,
+            ..
+        } = &annot.kind
+        {
+            // Build a transient Attachment so we can re-use the round-33
+            // stream + filespec emitters byte-for-byte. The annotation
+            // marker (`annotation_*` fields) is unused here because this
+            // path already builds the /Subtype /FileAttachment dict
+            // itself via `build_annotation_dict`.
+            let mut attach = Attachment::new(file_name.clone(), file_bytes.clone());
+            if let Some(mime) = mime_type {
+                attach = attach.with_mime_type(mime.clone());
+            }
+            let stream_id = emit_embedded_file_stream(&mut doc, &attach);
+            let filespec_id = emit_filespec_dict(&mut doc, &attach, stream_id);
+            filespec_ids[i] = Some(filespec_id);
+            name_tree_entries.push((file_name.clone(), filespec_id));
+        }
+    }
+    // §7.7.4 + §7.9.6 — wire the name tree onto the catalog when at
+    // least one /FileAttachment annotation contributed a filespec.
+    if !name_tree_entries.is_empty() {
+        let names_dict_id = emit_embedded_files_name_tree(&mut doc, &mut name_tree_entries);
+        let catalog = doc.object_mut(pages_build.catalog_id).ok_or_else(|| {
+            PdfError::other(
+                "write_pdf_with_annotations: catalog id missing for /Names patch (FileAttachment)",
+            )
+        })?;
+        if let Object::Dict(d) = catalog {
+            d.set("Names", Object::Reference(names_dict_id));
+        } else {
+            return Err(PdfError::other(
+                "write_pdf_with_annotations: catalog object is not a Dict",
+            ));
+        }
+    }
+
     // ---- Pass 2: build each annotation dict + commit it under its
     //              pre-allocated id, bucketing by source page so the
     //              `/Annots` array can be patched onto each page after.
@@ -452,6 +552,7 @@ pub fn write_pdf_with_annotations(
             annot,
             pages_build.page_ids[annot.source_page_index],
             &annotation_ids,
+            filespec_ids[i],
         )?;
         doc.add_object(annotation_ids[i], Object::Dict(dict));
         by_page[annot.source_page_index].push(annotation_ids[i]);
@@ -600,6 +701,18 @@ fn validate_annotations(annotations: &[Annotation], n_pages: usize) -> Result<()
                     )));
                 }
             }
+            // §12.5.6.15 Table 184 — every /FileAttachment carries a
+            // mandatory /FS filespec; an empty `file_name` would
+            // produce a filespec whose /F + /UF are zero-length text
+            // strings, which §7.11.2 forbids (a file name must
+            // identify a file). The byte buffer itself MAY be empty
+            // (a zero-byte attachment is valid per Table 45).
+            AnnotationKind::FileAttachment { file_name, .. } if file_name.is_empty() => {
+                return Err(PdfError::other(format!(
+                    "write_pdf_with_annotations: annotation #{i} /FileAttachment \
+                     file_name is empty (§7.11.2 requires a non-empty file name)",
+                )));
+            }
             _ => {}
         }
     }
@@ -648,6 +761,7 @@ fn build_annotation_dict(
     annot: &Annotation,
     page_id: ObjectId,
     annotation_ids: &[ObjectId],
+    filespec_id: Option<ObjectId>,
 ) -> Result<Dict, PdfError> {
     let mut d = Dict::new()
         .with("Type", Object::Name("Annot".into()))
@@ -887,6 +1001,26 @@ fn build_annotation_dict(
                 d.set("Open", Object::Bool(true));
             }
         }
+        AnnotationKind::FileAttachment { icon, .. } => {
+            // §12.5.6.15 Table 184.
+            d.set("Subtype", Object::Name("FileAttachment".into()));
+            // /FS — indirect reference to the filespec dict materialised
+            // in the pre-pass above. The unwrap is safe because the
+            // pre-pass populates `filespec_id` for every FileAttachment
+            // before this dispatch runs; a None here would signal a
+            // skipped pre-pass and is treated as a hard internal error
+            // rather than silently emitting an incomplete dict.
+            let fs = filespec_id.ok_or_else(|| {
+                PdfError::other(
+                    "build_annotation_dict: /FileAttachment is missing its filespec id \
+                     (pre-pass skipped?)",
+                )
+            })?;
+            d.set("FS", Object::Reference(fs));
+            // /Name — defaults to /PushPin per Table 184.
+            let icon_name = icon.clone().unwrap_or_else(|| "PushPin".into());
+            d.set("Name", Object::Name(icon_name));
+        }
     }
 
     Ok(d)
@@ -1054,7 +1188,8 @@ mod tests {
                 symbol: CaretSymbol::None,
             },
         };
-        let d = build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)]).unwrap();
+        let d =
+            build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)], None).unwrap();
         let subtype = d
             .entries()
             .iter()
@@ -1082,7 +1217,8 @@ mod tests {
                 symbol: CaretSymbol::Paragraph,
             },
         };
-        let d = build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)]).unwrap();
+        let d =
+            build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)], None).unwrap();
         let sy = d
             .entries()
             .iter()
@@ -1164,7 +1300,7 @@ mod tests {
         // (index 1) and the parent markup is at index 0 ⇒ /Parent
         // should resolve to id 41.
         let pre_allocated = vec![ObjectId::new(41), ObjectId::new(42)];
-        let d = build_annotation_dict(&annot, ObjectId::new(3), &pre_allocated).unwrap();
+        let d = build_annotation_dict(&annot, ObjectId::new(3), &pre_allocated, None).unwrap();
         let parent = d
             .entries()
             .iter()
@@ -1200,7 +1336,8 @@ mod tests {
                 open: false,
             },
         };
-        let d = build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)]).unwrap();
+        let d =
+            build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)], None).unwrap();
         assert!(!d.entries().iter().any(|(k, _)| k == "Open"));
         // No parent supplied ⇒ /Parent absent (the tolerant-reader
         // contract surfaces the dict; the spec considers this
@@ -1305,7 +1442,8 @@ mod tests {
                 intent: None,
             },
         };
-        let d = build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)]).unwrap();
+        let d =
+            build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)], None).unwrap();
         // /L present with four reals.
         let l = d
             .entries()

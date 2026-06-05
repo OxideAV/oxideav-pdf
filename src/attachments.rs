@@ -506,7 +506,7 @@ pub fn write_pdf_with_annotations_and_attachments(
 
 /// Emit one `/Type /EmbeddedFile` stream object (§7.11.4 Table 45).
 /// Body is FlateDecode-compressed when that shrinks; otherwise raw.
-fn emit_embedded_file_stream(doc: &mut Document, attachment: &Attachment) -> ObjectId {
+pub(crate) fn emit_embedded_file_stream(doc: &mut Document, attachment: &Attachment) -> ObjectId {
     let raw = &attachment.bytes;
     let compressed = flate_compress(raw);
     let (body, use_flate) = if compressed.len() < raw.len() {
@@ -541,7 +541,7 @@ fn emit_embedded_file_stream(doc: &mut Document, attachment: &Attachment) -> Obj
 /// Emit one `/Type /Filespec` dictionary (§7.11.3 Table 44 + §3.10).
 /// Carries `/F` (PDFDocEncoded name), `/UF` (UTF-16BE name), and `/EF`
 /// (Embedded files dict) referring to the supplied stream id.
-fn emit_filespec_dict(
+pub(crate) fn emit_filespec_dict(
     doc: &mut Document,
     attachment: &Attachment,
     stream_id: ObjectId,
@@ -592,7 +592,7 @@ fn emit_filespec_dict(
 /// order — §7.9.6.2). For a small handful of attachments, a single leaf
 /// is well within the spec's "every node has between 1 and ~64 entries"
 /// guidance — branching is only required for very large name tables.
-fn emit_embedded_files_name_tree(
+pub(crate) fn emit_embedded_files_name_tree(
     doc: &mut Document,
     entries: &mut [(String, ObjectId)],
 ) -> ObjectId {

@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- annotations (round 238): one new `/Subtype` encoder in the
+  round-32 writer (`write_pdf_with_annotations`) — **FileAttachment**
+  (§12.5.6.15 Table 184), closing the writer-side symmetry for the
+  embedded-file marker the round-197 reader already decodes through
+  the round-33 `read_pdf_attachments` enumerator. The new
+  `WriterAnnotationKind::FileAttachment` variant carries the file
+  name, raw bytes, an optional `mime_type`, and an optional `/Name`
+  icon (default `/PushPin` per Table 184). The writer now emits a
+  pre-pass that materialises one `/Type /EmbeddedFile` stream
+  (§7.11.4 Table 45 — FlateDecode-compressed when smaller), one
+  `/Type /Filespec` dict (§7.11.3 Table 44 — `/F` PDFDocEncoded,
+  `/UF` UTF-16BE-with-BOM, `/EF` pointing at the stream), and one
+  catalog `/Names → /EmbeddedFiles` name-tree leaf entry (§7.7.4 +
+  §7.9.6.2 — keys sorted byte-wise) per FileAttachment annotation,
+  before the annotation dict itself emits `/FS` resolving to the
+  filespec. Validation rejects an empty `file_name` (§7.11.2
+  requires a non-empty name on every filespec). Round-tripped
+  through `read_pdf_annotations` (matching `icon`, `file_name`,
+  `filespec` ObjectId) and through `read_pdf_attachments` (matching
+  body bytes). Three attachment-side helpers
+  (`emit_embedded_file_stream`, `emit_filespec_dict`,
+  `emit_embedded_files_name_tree`) are now `pub(crate)` so the
+  annotations module reuses the round-33 byte shape verbatim
+  instead of duplicating Table-44 / Table-45 layout logic.
+
 - annotations (round 232): two new `/Subtype` encoders in the
   round-32 writer (`write_pdf_with_annotations`) — **Caret**
   (§12.5.6.11 Table 180) and **Popup** (§12.5.6.14 Table 183),
