@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/OxideAV/oxideav-pdf/compare/v0.1.3...v0.1.4) - 2026-06-06
+
+### Other
+
+- round-242 — §13.7.2 Table 333 /RichMedia annotation subtype
+- add /FileAttachment writer (round 238, §12.5.6.15 Table 184)
+- round-232 — Caret + Popup §12.5.6 annotation subtypes
+- round-227 — three §12.5.6 line-family annotation subtypes (Line/Polygon/PolyLine)
+- round-220 — §13.6.2 /3D annotation subtype (Table 298 + Table 299)
+- round-215 — two §12.5.6 annotation subtypes (PrinterMark/TrapNet)
+- round-209 — three §12.5.6 annotation subtypes (Sound/Movie/Screen)
+- round-204 — two §12.5.6 annotation subtypes (Watermark/Redact)
+- round-197 — six §12.5.6 annotation subtypes (Line/Polygon/PolyLine/Ink/Caret/Popup/FileAttachment)
+
 ### Added
 
 - annotations (round 242): one new `/Subtype` decoder in the
