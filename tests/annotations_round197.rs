@@ -472,24 +472,25 @@ fn unknown_subtype_still_falls_through_to_other() {
     // Other fallback for subtypes that still aren't structurally
     // decoded. Round-204 lifted /Redact + /Watermark out; round-209
     // lifted /Sound + /Movie + /Screen; round-215 lifted /PrinterMark +
-    // /TrapNet; round-220 lifted /3D (§13.6.2 Table 298). The
-    // remaining long-tail subtype that needs cross-crate plumbing
-    // (PDF 1.7 Adobe extension /RichMedia) is still surfaced as
-    // AnnotationKind::Other so callers walking forensic / archival
-    // PDFs get a complete enumeration even for the long tail.
+    // /TrapNet; round-220 lifted /3D (§13.6.2 Table 298); round-242
+    // lifted /RichMedia (ISO 32000-2 §13.7.2 Table 333). The remaining
+    // long-tail subtype (/Projection) and any authoring-tool extension
+    // are still surfaced as AnnotationKind::Other so callers walking
+    // forensic / archival PDFs get a complete enumeration even for the
+    // long tail.
     let pdf = synth_pdf_with_annotations(&[
-        "<< /Type /Annot /Subtype /RichMedia /Rect [0 0 30 30] >>",
         "<< /Type /Annot /Subtype /Projection /Rect [0 0 30 30] >>",
+        "<< /Type /Annot /Subtype /CustomToolExt /Rect [0 0 30 30] >>",
     ]);
     let mut r = DocumentReader::open(&pdf).unwrap();
     let anns = read_pdf_annotations(&mut r).unwrap();
     assert_eq!(anns.len(), 2);
     match &anns[0].kind {
-        AnnotationKind::Other { subtype } => assert_eq!(subtype, "RichMedia"),
-        other => panic!("expected Other(RichMedia), got {other:?}"),
-    }
-    match &anns[1].kind {
         AnnotationKind::Other { subtype } => assert_eq!(subtype, "Projection"),
         other => panic!("expected Other(Projection), got {other:?}"),
+    }
+    match &anns[1].kind {
+        AnnotationKind::Other { subtype } => assert_eq!(subtype, "CustomToolExt"),
+        other => panic!("expected Other(CustomToolExt), got {other:?}"),
     }
 }

@@ -852,13 +852,16 @@ values in `/A` / `/AIS` / `/D` / `/DIS` pass through verbatim so
 a forensic walk sees what the producer wrote (the spec
 enumerations are open-ended in practice). The actual 3D
 artwork payload stays out of scope — this crate does not bundle
-a 3D-graphics decoder. The remaining long-tail subtypes
-(RichMedia, Projection) still surface as
-`AnnotationKind::Other { subtype }` — they need cross-crate
-plumbing (ISO 32000-2 §13.7 rich-media) the round-26 reader
-doesn't reach. Common Table 164 fields (`/Rect`, `/Contents`,
-`/NM`, `/M`, `/F`, `/C`, `/Border`) are decoded for every
-subtype.
+a 3D-graphics decoder. Round 242 adds the §13.7.2 Table 333
+**RichMedia** annotation (PDF 2.0): the `/RichMediaContent`
+(Table 341) and `/RichMediaSettings` (Table 334) sub-dictionaries
+surface as `ObjectId` references on
+`AnnotationKind::RichMedia { content, settings }` so callers can
+enumerate / re-resolve rich-media payloads without the round-26
+reader pulling a playback pipeline into the crate. Projection
+remains in the long-tail `Other` slot. Common Table 164 fields
+(`/Rect`, `/Contents`, `/NM`, `/M`, `/F`, `/C`, `/Border`) are
+decoded for every subtype.
 
 ```rust,ignore
 use oxideav_pdf::{reader::DocumentReader, AnnotationKind};

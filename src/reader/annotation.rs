@@ -105,11 +105,21 @@
 //!   annotation's target coordinate system — the caller computes that
 //!   from the outer `PdfAnnotation::rect` field when the entry is
 //!   absent).
+//! * **`/RichMedia`** (ISO 32000-2 §13.7.2 Table 333, round 242) —
+//!   PDF 2.0 rich-media annotation (video / audio / animation /
+//!   embedded multimedia). Table 333 has only three entries
+//!   (`/Subtype`, `/RichMediaContent`, `/RichMediaSettings`); this
+//!   reader preserves the two payload references as [`ObjectId`]s
+//!   so callers can re-resolve the §13.7.2.3 RichMediaContent
+//!   dictionary (assets, configurations) and the §13.7.2.2
+//!   RichMediaSettings dictionary (activation, deactivation,
+//!   default rendering) through their own walker — actual rich-media
+//!   playback is out of scope for this crate.
 //!
 //! Unknown subtypes still come back as [`AnnotationKind::Other`] with
 //! the raw `/Subtype` name — callers walking forensic / archival PDFs
-//! get a complete enumeration even for the long tail (RichMedia,
-//! Projection, …).
+//! get a complete enumeration even for the long tail (Projection,
+//! authoring-tool extensions, …).
 //!
 //! Pages without `/Annots` contribute zero entries; a malformed annot
 //! dict is skipped (best-effort enumeration matches the round-21
@@ -577,6 +587,36 @@ pub enum AnnotationKind {
         /// which the caller can compute from the outer
         /// `PdfAnnotation::rect` field if needed.
         view_box: Option<[f32; 4]>,
+    },
+    /// `/Subtype /RichMedia` — PDF 2.0 rich-media annotation
+    /// (ISO 32000-2 §13.7.2 Table 333, round 242). Surfaces the
+    /// required `/RichMediaContent` (Table 341) reference and the
+    /// optional `/RichMediaSettings` (Table 334) reference; both are
+    /// preserved as [`ObjectId`]s rather than decoded — this crate
+    /// does not bundle a rich-media playback pipeline and the §13.7
+    /// content / settings sub-dictionary tree (RichMediaActivation,
+    /// RichMediaDeactivation, RichMediaWindow, RichMediaAnimation,
+    /// RichMediaPosition, RichMediaPresentation, Assets,
+    /// Configurations, Instances …) is best resolved by the caller's
+    /// own walker.
+    RichMedia {
+        /// `/RichMediaContent` — Table 341 dictionary carrying the
+        /// rich-media assets + configurations + instances. Required
+        /// per Table 333; preserved as `ObjectId` when carried as an
+        /// indirect reference (the conventional shape since the
+        /// content dict is meant to be shared across multiple
+        /// annotations). `None` when the producer inlined the dict
+        /// or omitted the entry — the round-26 reader's tolerance
+        /// contract surfaces the annotation even if Table 333's
+        /// "Required" is violated.
+        content: Option<ObjectId>,
+        /// `/RichMediaSettings` — Table 334 dictionary carrying the
+        /// per-annotation activation / deactivation conditions and
+        /// initial state. Optional per Table 333; preserved as
+        /// `ObjectId` when carried as an indirect reference, `None`
+        /// when absent (Table 333 default: "the first configuration
+        /// is loaded") or when inlined as a direct dict.
+        settings: Option<ObjectId>,
     },
     /// Subtype this round doesn't decode — name surfaced verbatim.
     Other { subtype: String },
@@ -1132,6 +1172,22 @@ fn decode_annotation(
                 font_fauxing,
             }
         }
+        // Round 242 — ISO 32000-2 §13.7.2 RichMedia (Table 333). The
+        // /RichMediaContent (Table 341) and /RichMediaSettings (Table
+        // 334) sub-dictionaries are preserved as ObjectId references
+        // — this crate does not decode rich-media playback (audio /
+        // video / animation pipelines), but a forensic walk still
+        // enumerates the annotation skeleton.
+        "RichMedia" => AnnotationKind::RichMedia {
+            content: match find_entry(annot, "RichMediaContent") {
+                Some(Object::Reference(id)) => Some(*id),
+                _ => None,
+            },
+            settings: match find_entry(annot, "RichMediaSettings") {
+                Some(Object::Reference(id)) => Some(*id),
+                _ => None,
+            },
+        },
         other => AnnotationKind::Other {
             subtype: other.to_string(),
         },

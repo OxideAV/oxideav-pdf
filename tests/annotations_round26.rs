@@ -305,14 +305,15 @@ fn widget_annotation_decodes_field_trio() {
 #[test]
 fn unknown_subtype_falls_through_to_other() {
     // /Movie was lifted into a structured variant in round-209;
-    // /3D was lifted in round-220; pick a subtype still in the long
-    // tail (PDF 1.7 Adobe extension /RichMedia needs cross-crate
-    // plumbing).
-    let pdf =
-        synth_pdf_with_annotations(&["<< /Type /Annot /Subtype /RichMedia /Rect [0 0 100 100] >>"]);
+    // /3D was lifted in round-220; /RichMedia was lifted in round-242
+    // (ISO 32000-2 §13.7.2 Table 333). Pick a subtype still in the
+    // long tail (/Projection still needs cross-crate plumbing).
+    let pdf = synth_pdf_with_annotations(&[
+        "<< /Type /Annot /Subtype /Projection /Rect [0 0 100 100] >>",
+    ]);
     let mut r = DocumentReader::open(&pdf).unwrap();
     match &read_pdf_annotations(&mut r).unwrap()[0].kind {
-        AnnotationKind::Other { subtype } => assert_eq!(subtype, "RichMedia"),
+        AnnotationKind::Other { subtype } => assert_eq!(subtype, "Projection"),
         other => panic!("expected Other, got {other:?}"),
     }
 }

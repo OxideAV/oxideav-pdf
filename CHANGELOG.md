@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- annotations (round 242): one new `/Subtype` decoder in the
+  round-26 annotation reader — **RichMedia** (ISO 32000-2 §13.7.2
+  Table 333, PDF 2.0). Previously the `/Subtype /RichMedia`
+  rich-media annotation (the PDF 2.0 successor to the deprecated
+  §13.3 Sound / §13.4 Movie / §12.5.6.18 Screen annotations,
+  providing a common framework for video, audio, animation, and
+  other interactive multimedia) fell through to
+  `AnnotationKind::Other { subtype: "RichMedia" }`, forcing
+  forensic / archival walks to special-case the stringly-typed
+  name and re-resolve the two Table-333 payload entries
+  themselves. The reader now surfaces a dedicated
+  `AnnotationKind::RichMedia { content, settings }` variant
+  preserving the `/RichMediaContent` (Table 341 — assets,
+  configurations, instances) and `/RichMediaSettings` (Table 334
+  — activation / deactivation conditions, initial state) entries
+  as `ObjectId` references when carried as indirect refs (the
+  conventional shape, since the content dict is meant to be
+  shared across rich-media annotations). Round-26 tolerance
+  contract preserved: a malformed annot missing the
+  Table-333-Required `/RichMediaContent` still surfaces as
+  `RichMedia { content: None, .. }` rather than being dropped or
+  re-routed through `Other`. Five tests cover the four shapes
+  (content-only, content + settings, both missing, inline-dict
+  shape ⇒ `None`) plus a sibling-annot enumeration regression.
+  The §13.7 RichMediaContent / RichMediaSettings sub-dictionary
+  trees (RichMediaActivation, RichMediaDeactivation,
+  RichMediaWindow, RichMediaAnimation, RichMediaPosition,
+  RichMediaPresentation, Assets, Configurations, Instances …)
+  stay out of scope — this crate does not bundle a rich-media
+  playback pipeline, but a caller's own walker can re-resolve
+  the preserved ObjectIds through `DocumentReader`. Projection
+  is now the only ISO 32000-2 §12.5.6 / §13.x annotation subtype
+  still surfaced through `AnnotationKind::Other`.
+
 - annotations (round 238): one new `/Subtype` encoder in the
   round-32 writer (`write_pdf_with_annotations`) — **FileAttachment**
   (§12.5.6.15 Table 184), closing the writer-side symmetry for the
