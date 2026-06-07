@@ -71,6 +71,23 @@
 //!   entry to the filespec. The round-33 `read_pdf_attachments`
 //!   enumerator therefore sees the same files round-tripped.
 //!
+//! Round 245 closes the writer-side symmetry for the round-209
+//! reader's **multimedia-anchor** family by adding the simpler of the
+//! three subtypes — the §13.3 sound object is a self-describing
+//! stream + metadata dict, and a `/Sound` annotation is just a pinned
+//! reference to one:
+//!
+//! * **`/Sound`** (§12.5.6.16, Table 185) —
+//!   [`AnnotationKind::Sound`]: writer additionally emits a
+//!   `/Type /Sound` stream object (§13.3, Table 294) carrying the raw
+//!   sample bytes plus the `/R` sample rate, `/C` channel count, `/B`
+//!   bits-per-sample, and `/E` encoding metadata; the annotation's
+//!   `/Sound` entry resolves to that stream's indirect reference, and
+//!   the `/Name` icon (`Speaker` default per Table 185) selects the
+//!   on-page glyph the viewer renders. The round-209
+//!   `read_pdf_annotations` enumerator surfaces the same dict back
+//!   verbatim.
+//!
 //! The writer also carries every cross-subtype Table 164 field
 //! ([`Annotation::author`], `/M` modified-date, `/F` flags, `/C`
 //! colour, `/Border`).
@@ -361,6 +378,77 @@ pub enum AnnotationKind {
         /// `None` ⇒ neither entry emitted.
         mime_type: Option<String>,
     },
+    /// `/Subtype /Sound` — sound annotation (§12.5.6.16 Table 185,
+    /// round 245). The annotation pins a `/Sound` stream object to a
+    /// page; activation plays the sample data through the viewer's
+    /// audio output. The §13.3 stream (Table 294) is materialised by
+    /// the writer's pre-pass, and the annotation's `/Sound` entry
+    /// resolves to that stream's indirect reference.
+    Sound {
+        /// `/Name` icon identifier — Table 185 names `Speaker`
+        /// (default) and `Mic`. Authoring tools may extend this set;
+        /// `None` ⇒ writer emits `/Speaker`.
+        icon: Option<String>,
+        /// `/R` sampling rate, in samples per second per channel
+        /// (§13.3 Table 294). Required. Common conforming values per
+        /// the §13.3 portability guidance are `8000`, `11025`, and
+        /// `22050`; the writer accepts any positive value.
+        sampling_rate: f32,
+        /// `/C` number of channels (§13.3 Table 294). Default value
+        /// `1`. The §13.3 portability guidance recommends `1` or `2`;
+        /// the writer accepts any value ≥ 1 and omits the entry when
+        /// it equals the spec default to round-trip an
+        /// absent-equals-default reader contract.
+        channels: u32,
+        /// `/B` bits per sample value per channel (§13.3 Table 294).
+        /// Default value `8`. The writer accepts any value ≥ 1 and
+        /// omits the entry when it equals the spec default.
+        bits_per_sample: u32,
+        /// `/E` encoding format for the sample data (§13.3 Table 294).
+        /// Default value [`SoundEncoding::Raw`]. The writer omits the
+        /// entry when this variant is set so a write-then-read cycle
+        /// surfaces an absent-equals-default reader shape.
+        encoding: SoundEncoding,
+        /// Raw sample bytes that form the §13.3 stream body. Byte
+        /// order is big-endian for samples larger than 8 bits per
+        /// the §13.3 packing rule (caller responsibility — the writer
+        /// passes the buffer through verbatim). For stereo samples,
+        /// the caller interleaves left then right per channel per the
+        /// §13.3 interleave rule.
+        sound_samples: Vec<u8>,
+    },
+}
+
+/// `/E` encoding selector for [`AnnotationKind::Sound`] sample data
+/// (ISO 32000-1 §13.3 Table 294). Table 294 lists four values; the
+/// default is [`Self::Raw`] (unsigned in the range 0..=2^B − 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SoundEncoding {
+    /// `/E /Raw` — unsigned values in the range 0..=2^B − 1
+    /// (default per Table 294). The writer omits the `/E` entry on
+    /// this variant so a write-then-read cycle through the round-209
+    /// reader yields the same "absent → Raw" branch.
+    #[default]
+    Raw,
+    /// `/E /Signed` — two's-complement signed values.
+    Signed,
+    /// `/E /muLaw` — μ-law encoded samples (§13.3 portability
+    /// guidance pairs this with `R=8000`, `C=1`, `B=8`).
+    MuLaw,
+    /// `/E /ALaw` — A-law encoded samples.
+    ALaw,
+}
+
+impl SoundEncoding {
+    fn as_name(self) -> Option<&'static str> {
+        match self {
+            // Default per Table 294 — omit the /E entry.
+            Self::Raw => None,
+            Self::Signed => Some("Signed"),
+            Self::MuLaw => Some("muLaw"),
+            Self::ALaw => Some("ALaw"),
+        }
+    }
 }
 
 /// `/Sy` symbol selector for [`AnnotationKind::Caret`] (ISO 32000-1
@@ -500,29 +588,56 @@ pub fn write_pdf_with_annotations(
     //                catalog `/Names → /EmbeddedFiles` name tree is
     //                materialised after every filespec is in place
     //                (§7.7.4 + §7.9.6).
+    //
+    // The same pre-pass emits one `/Type /Sound` stream per
+    // [`AnnotationKind::Sound`] (§12.5.6.16 + §13.3 Table 294) so the
+    // annotation dict's `/Sound` entry resolves to a real indirect
+    // reference. The two emit branches are unrelated wire-wise but
+    // share the pre-pass slot so a single iteration covers both.
     let mut filespec_ids: Vec<Option<ObjectId>> = vec![None; annotations.len()];
+    let mut sound_stream_ids: Vec<Option<ObjectId>> = vec![None; annotations.len()];
     let mut name_tree_entries: Vec<(String, ObjectId)> = Vec::new();
     for (i, annot) in annotations.iter().enumerate() {
-        if let AnnotationKind::FileAttachment {
-            file_name,
-            file_bytes,
-            mime_type,
-            ..
-        } = &annot.kind
-        {
-            // Build a transient Attachment so we can re-use the round-33
-            // stream + filespec emitters byte-for-byte. The annotation
-            // marker (`annotation_*` fields) is unused here because this
-            // path already builds the /Subtype /FileAttachment dict
-            // itself via `build_annotation_dict`.
-            let mut attach = Attachment::new(file_name.clone(), file_bytes.clone());
-            if let Some(mime) = mime_type {
-                attach = attach.with_mime_type(mime.clone());
+        match &annot.kind {
+            AnnotationKind::FileAttachment {
+                file_name,
+                file_bytes,
+                mime_type,
+                ..
+            } => {
+                // Build a transient Attachment so we can re-use the round-33
+                // stream + filespec emitters byte-for-byte. The annotation
+                // marker (`annotation_*` fields) is unused here because this
+                // path already builds the /Subtype /FileAttachment dict
+                // itself via `build_annotation_dict`.
+                let mut attach = Attachment::new(file_name.clone(), file_bytes.clone());
+                if let Some(mime) = mime_type {
+                    attach = attach.with_mime_type(mime.clone());
+                }
+                let stream_id = emit_embedded_file_stream(&mut doc, &attach);
+                let filespec_id = emit_filespec_dict(&mut doc, &attach, stream_id);
+                filespec_ids[i] = Some(filespec_id);
+                name_tree_entries.push((file_name.clone(), filespec_id));
             }
-            let stream_id = emit_embedded_file_stream(&mut doc, &attach);
-            let filespec_id = emit_filespec_dict(&mut doc, &attach, stream_id);
-            filespec_ids[i] = Some(filespec_id);
-            name_tree_entries.push((file_name.clone(), filespec_id));
+            AnnotationKind::Sound {
+                sampling_rate,
+                channels,
+                bits_per_sample,
+                encoding,
+                sound_samples,
+                ..
+            } => {
+                let stream_id = emit_sound_stream(
+                    &mut doc,
+                    *sampling_rate,
+                    *channels,
+                    *bits_per_sample,
+                    *encoding,
+                    sound_samples.clone(),
+                );
+                sound_stream_ids[i] = Some(stream_id);
+            }
+            _ => {}
         }
     }
     // §7.7.4 + §7.9.6 — wire the name tree onto the catalog when at
@@ -553,6 +668,7 @@ pub fn write_pdf_with_annotations(
             pages_build.page_ids[annot.source_page_index],
             &annotation_ids,
             filespec_ids[i],
+            sound_stream_ids[i],
         )?;
         doc.add_object(annotation_ids[i], Object::Dict(dict));
         by_page[annot.source_page_index].push(annotation_ids[i]);
@@ -713,6 +829,52 @@ fn validate_annotations(annotations: &[Annotation], n_pages: usize) -> Result<()
                      file_name is empty (§7.11.2 requires a non-empty file name)",
                 )));
             }
+            // §13.3 Table 294 — /R sampling rate is required and the
+            // §13.3 text requires it to be a positive samples-per-
+            // second count. /C and /B carry defaults (1 and 8) but
+            // values of 0 would describe a zero-channel or zero-bit
+            // stream that has no playable content. The sample buffer
+            // itself is required (§12.5.6.16 Table 185 marks /Sound
+            // mandatory and §13.3 describes the stream as containing
+            // sample values that define the sound — an empty buffer
+            // would describe a zero-second silence rather than a
+            // playable sound).
+            AnnotationKind::Sound {
+                sampling_rate,
+                channels,
+                bits_per_sample,
+                sound_samples,
+                ..
+            } => {
+                // Use `<=` (rather than `!( > 0.0)`) so the comparison
+                // covers NaN — `NaN <= 0.0` is false, but a NaN sample
+                // rate is non-finite and should still be rejected;
+                // add an explicit `is_finite` guard alongside.
+                if !sampling_rate.is_finite() || *sampling_rate <= 0.0 {
+                    return Err(PdfError::other(format!(
+                        "write_pdf_with_annotations: annotation #{i} /Sound sampling_rate \
+                         must be a positive finite value (got {sampling_rate}) — §13.3 /R is samples/sec",
+                    )));
+                }
+                if *channels == 0 {
+                    return Err(PdfError::other(format!(
+                        "write_pdf_with_annotations: annotation #{i} /Sound channels must be \
+                         ≥ 1 (§13.3 /C is the channel count)",
+                    )));
+                }
+                if *bits_per_sample == 0 {
+                    return Err(PdfError::other(format!(
+                        "write_pdf_with_annotations: annotation #{i} /Sound bits_per_sample \
+                         must be ≥ 1 (§13.3 /B is bits per sample value)",
+                    )));
+                }
+                if sound_samples.is_empty() {
+                    return Err(PdfError::other(format!(
+                        "write_pdf_with_annotations: annotation #{i} /Sound sound_samples is \
+                         empty (§12.5.6.16 /Sound stream carries the sample data)",
+                    )));
+                }
+            }
             _ => {}
         }
     }
@@ -762,6 +924,7 @@ fn build_annotation_dict(
     page_id: ObjectId,
     annotation_ids: &[ObjectId],
     filespec_id: Option<ObjectId>,
+    sound_stream_id: Option<ObjectId>,
 ) -> Result<Dict, PdfError> {
     let mut d = Dict::new()
         .with("Type", Object::Name("Annot".into()))
@@ -1021,9 +1184,73 @@ fn build_annotation_dict(
             let icon_name = icon.clone().unwrap_or_else(|| "PushPin".into());
             d.set("Name", Object::Name(icon_name));
         }
+        AnnotationKind::Sound { icon, .. } => {
+            // §12.5.6.16 Table 185.
+            d.set("Subtype", Object::Name("Sound".into()));
+            // /Sound — indirect reference to the §13.3 sound stream
+            // materialised in the pre-pass. Same defensive contract as
+            // the FileAttachment /FS handling: a None here would mean
+            // the pre-pass was skipped and a silent omission would
+            // produce a malformed annotation per Table 185.
+            let snd = sound_stream_id.ok_or_else(|| {
+                PdfError::other(
+                    "build_annotation_dict: /Sound is missing its stream id \
+                     (pre-pass skipped?)",
+                )
+            })?;
+            d.set("Sound", Object::Reference(snd));
+            // /Name — defaults to /Speaker per Table 185.
+            let icon_name = icon.clone().unwrap_or_else(|| "Speaker".into());
+            d.set("Name", Object::Name(icon_name));
+        }
     }
 
     Ok(d)
+}
+
+/// Emit one `/Type /Sound` stream object per §13.3 Table 294 carrying
+/// the raw sample bytes plus the `/R` sample rate, `/C` channels,
+/// `/B` bits per sample, and `/E` encoding metadata. Returns the
+/// stream's indirect-reference id for the caller to wire onto the
+/// annotation dict's `/Sound` entry.
+///
+/// Default-value omissions per Table 294:
+/// * `/C` is omitted when it equals 1.
+/// * `/B` is omitted when it equals 8.
+/// * `/E` is omitted on [`SoundEncoding::Raw`] (the spec default).
+///
+/// The omissions keep a write-then-read cycle through the round-209
+/// `read_pdf_annotations` enumerator on the same "absent → default"
+/// branch the reader uses for producer files that left the defaults
+/// implicit.
+fn emit_sound_stream(
+    doc: &mut Document,
+    sampling_rate: f32,
+    channels: u32,
+    bits_per_sample: u32,
+    encoding: SoundEncoding,
+    sound_samples: Vec<u8>,
+) -> ObjectId {
+    let mut dict = Dict::new()
+        .with("Type", Object::Name("Sound".into()))
+        // /R is required per Table 294 — always emitted.
+        .with("R", Object::Real(sampling_rate as f64));
+    // /C default is 1 ⇒ omit when it equals the default.
+    if channels != 1 {
+        dict.set("C", Object::Integer(channels as i64));
+    }
+    // /B default is 8 ⇒ omit when it equals the default.
+    if bits_per_sample != 8 {
+        dict.set("B", Object::Integer(bits_per_sample as i64));
+    }
+    // /E default is /Raw ⇒ omit when it equals the default.
+    if let Some(name) = encoding.as_name() {
+        dict.set("E", Object::Name(name.into()));
+    }
+    doc.add(Object::Stream(crate::objects::Stream::new(
+        dict,
+        sound_samples,
+    )))
 }
 
 /// Encode a two-element line-ending name pair (§12.5.6.7 Table 176)
@@ -1188,8 +1415,8 @@ mod tests {
                 symbol: CaretSymbol::None,
             },
         };
-        let d =
-            build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)], None).unwrap();
+        let d = build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)], None, None)
+            .unwrap();
         let subtype = d
             .entries()
             .iter()
@@ -1217,8 +1444,8 @@ mod tests {
                 symbol: CaretSymbol::Paragraph,
             },
         };
-        let d =
-            build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)], None).unwrap();
+        let d = build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)], None, None)
+            .unwrap();
         let sy = d
             .entries()
             .iter()
@@ -1300,7 +1527,8 @@ mod tests {
         // (index 1) and the parent markup is at index 0 ⇒ /Parent
         // should resolve to id 41.
         let pre_allocated = vec![ObjectId::new(41), ObjectId::new(42)];
-        let d = build_annotation_dict(&annot, ObjectId::new(3), &pre_allocated, None).unwrap();
+        let d =
+            build_annotation_dict(&annot, ObjectId::new(3), &pre_allocated, None, None).unwrap();
         let parent = d
             .entries()
             .iter()
@@ -1336,8 +1564,8 @@ mod tests {
                 open: false,
             },
         };
-        let d =
-            build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)], None).unwrap();
+        let d = build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)], None, None)
+            .unwrap();
         assert!(!d.entries().iter().any(|(k, _)| k == "Open"));
         // No parent supplied ⇒ /Parent absent (the tolerant-reader
         // contract surfaces the dict; the spec considers this
@@ -1442,8 +1670,8 @@ mod tests {
                 intent: None,
             },
         };
-        let d =
-            build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)], None).unwrap();
+        let d = build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)], None, None)
+            .unwrap();
         // /L present with four reals.
         let l = d
             .entries()
@@ -1456,5 +1684,259 @@ mod tests {
         }
         // /Cap absent (default false per Table 175).
         assert!(!d.entries().iter().any(|(k, _)| k == "Cap"));
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // §12.5.6.16 + §13.3 Sound annotation (Table 185 + Table 294).
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sound_encoding_default_is_raw_and_omits_e_entry() {
+        // §13.3 Table 294 — /E default is /Raw.
+        assert_eq!(SoundEncoding::default(), SoundEncoding::Raw);
+        assert!(SoundEncoding::Raw.as_name().is_none());
+        assert_eq!(SoundEncoding::Signed.as_name(), Some("Signed"));
+        assert_eq!(SoundEncoding::MuLaw.as_name(), Some("muLaw"));
+        assert_eq!(SoundEncoding::ALaw.as_name(), Some("ALaw"));
+    }
+
+    #[test]
+    fn sound_writer_emits_subtype_and_name_default_speaker() {
+        // §12.5.6.16 Table 185 — bare Sound annotation: /Sound stream
+        // ref (synthesised here with a dummy id since the unit test
+        // skips the pre-pass) plus /Name defaulting to /Speaker.
+        let annot = Annotation {
+            source_page_index: 0,
+            rect: [10.0, 20.0, 30.0, 40.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Sound {
+                icon: None,
+                sampling_rate: 22050.0,
+                channels: 1,
+                bits_per_sample: 8,
+                encoding: SoundEncoding::Raw,
+                sound_samples: vec![0x80; 64],
+            },
+        };
+        let d = build_annotation_dict(
+            &annot,
+            ObjectId::new(3),
+            &[ObjectId::new(99)],
+            None,
+            Some(ObjectId::new(77)),
+        )
+        .unwrap();
+        let subtype = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Subtype")
+            .expect("/Subtype emitted");
+        assert!(matches!(&subtype.1, Object::Name(n) if n == "Sound"));
+        let snd = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Sound")
+            .expect("/Sound emitted");
+        assert!(matches!(&snd.1, Object::Reference(id) if id.number == 77));
+        let name = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Name")
+            .expect("/Name emitted");
+        assert!(matches!(&name.1, Object::Name(n) if n == "Speaker"));
+    }
+
+    #[test]
+    fn sound_writer_emits_custom_icon_when_supplied() {
+        // §12.5.6.16 Table 185 — /Name /Mic for a microphone-recorded
+        // sound annotation.
+        let annot = Annotation {
+            source_page_index: 0,
+            rect: [10.0, 20.0, 30.0, 40.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Sound {
+                icon: Some("Mic".into()),
+                sampling_rate: 8000.0,
+                channels: 1,
+                bits_per_sample: 8,
+                encoding: SoundEncoding::MuLaw,
+                sound_samples: vec![0xFF; 16],
+            },
+        };
+        let d = build_annotation_dict(
+            &annot,
+            ObjectId::new(3),
+            &[ObjectId::new(99)],
+            None,
+            Some(ObjectId::new(42)),
+        )
+        .unwrap();
+        let name = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Name")
+            .expect("/Name emitted");
+        assert!(matches!(&name.1, Object::Name(n) if n == "Mic"));
+    }
+
+    #[test]
+    fn sound_writer_errors_when_sound_stream_id_missing() {
+        // Defensive guard — a pre-pass that skipped allocating the
+        // sound stream must surface a hard error rather than emit a
+        // dict whose /Sound entry points at nothing.
+        let annot = Annotation {
+            source_page_index: 0,
+            rect: [10.0, 20.0, 30.0, 40.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Sound {
+                icon: None,
+                sampling_rate: 8000.0,
+                channels: 1,
+                bits_per_sample: 8,
+                encoding: SoundEncoding::Raw,
+                sound_samples: vec![0; 4],
+            },
+        };
+        let res = build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)], None, None);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn sound_validation_rejects_zero_sampling_rate() {
+        let annots = vec![Annotation {
+            source_page_index: 0,
+            rect: [0.0, 0.0, 100.0, 100.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Sound {
+                icon: None,
+                sampling_rate: 0.0,
+                channels: 1,
+                bits_per_sample: 8,
+                encoding: SoundEncoding::Raw,
+                sound_samples: vec![0; 4],
+            },
+        }];
+        let err = validate_annotations(&annots, 1).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("sampling_rate"), "error mentions rate: {msg}");
+    }
+
+    #[test]
+    fn sound_validation_rejects_zero_channels() {
+        let annots = vec![Annotation {
+            source_page_index: 0,
+            rect: [0.0, 0.0, 100.0, 100.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Sound {
+                icon: None,
+                sampling_rate: 8000.0,
+                channels: 0,
+                bits_per_sample: 8,
+                encoding: SoundEncoding::Raw,
+                sound_samples: vec![0; 4],
+            },
+        }];
+        let err = validate_annotations(&annots, 1).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("channels"), "error mentions channels: {msg}");
+    }
+
+    #[test]
+    fn sound_validation_rejects_zero_bits_per_sample() {
+        let annots = vec![Annotation {
+            source_page_index: 0,
+            rect: [0.0, 0.0, 100.0, 100.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Sound {
+                icon: None,
+                sampling_rate: 8000.0,
+                channels: 1,
+                bits_per_sample: 0,
+                encoding: SoundEncoding::Raw,
+                sound_samples: vec![0; 4],
+            },
+        }];
+        let err = validate_annotations(&annots, 1).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("bits_per_sample"),
+            "error mentions bits: {msg}"
+        );
+    }
+
+    #[test]
+    fn sound_validation_rejects_empty_sample_buffer() {
+        let annots = vec![Annotation {
+            source_page_index: 0,
+            rect: [0.0, 0.0, 100.0, 100.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Sound {
+                icon: None,
+                sampling_rate: 8000.0,
+                channels: 1,
+                bits_per_sample: 8,
+                encoding: SoundEncoding::Raw,
+                sound_samples: Vec::new(),
+            },
+        }];
+        let err = validate_annotations(&annots, 1).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("sound_samples"),
+            "error mentions buffer: {msg}"
+        );
+    }
+
+    #[test]
+    fn sound_validation_rejects_negative_sampling_rate() {
+        // §13.3 /R is samples/sec — must be positive.
+        let annots = vec![Annotation {
+            source_page_index: 0,
+            rect: [0.0, 0.0, 100.0, 100.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Sound {
+                icon: None,
+                sampling_rate: -22050.0,
+                channels: 1,
+                bits_per_sample: 8,
+                encoding: SoundEncoding::Raw,
+                sound_samples: vec![0; 4],
+            },
+        }];
+        let err = validate_annotations(&annots, 1).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("sampling_rate"), "error mentions rate: {msg}");
     }
 }

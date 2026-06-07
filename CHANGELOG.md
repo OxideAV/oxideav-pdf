@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- annotations (round 245): one new `/Subtype` encoder in the
+  round-32 writer (`write_pdf_with_annotations`) — **Sound**
+  (§12.5.6.16 Table 185 + §13.3 Table 294), closing the writer-side
+  symmetry for the multimedia-anchor pair the round-209 reader
+  already decodes. The new `WriterAnnotationKind::Sound` variant
+  carries the raw sample bytes, the sampling rate, channel count,
+  bits-per-sample, encoding selector, and an optional `/Name` icon
+  (default `/Speaker` per Table 185). The writer's pre-pass now
+  materialises one `/Type /Sound` stream object per Sound annotation
+  with the `/R` rate (required), `/C` channel count, `/B`
+  bits-per-sample, and `/E` encoding entries, emitting only the
+  non-default values so the round-209 reader's
+  absent-equals-default contract is preserved on round-trip. A new
+  `SoundEncoding` enum exposes the §13.3 Table 294 encoding choices
+  (`Raw` default, `Signed`, `MuLaw`, `ALaw`). Validation rejects a
+  non-finite sample rate, a non-positive sample rate, zero channels,
+  zero bits-per-sample, and an empty sample buffer (all four
+  produce a stream that would carry no playable content per §13.3).
+  Round-tripped through `read_pdf_annotations` (matching `icon` and
+  the `/Sound` stream `ObjectId`). Adds 10 new tests in
+  `tests/annotations_writer_round245.rs` covering the
+  default-fields-omitted bare form, the µ-law 8 kHz mono telephony
+  configuration, a stereo 16-bit signed configuration that exercises
+  every explicit Table 294 entry, A-law encoding, six validation
+  rejects (zero rate, NaN rate, zero channels, zero bits,
+  empty-buffer, negative rate is covered as a unit test), and a
+  cross-subtype composite (Text + Sound + FileAttachment on one
+  page); +10 unit tests in `src/annotations.rs` covering the
+  `SoundEncoding::as_name` helper, the per-annotation
+  pre-pass-allocated stream-id resolution in the Sound arm,
+  default-icon emission, the defensive-error path on a missing
+  sound-stream id, and every validation branch.
+
 - annotations (round 238): one new `/Subtype` encoder in the
   round-32 writer (`write_pdf_with_annotations`) — **FileAttachment**
   (§12.5.6.15 Table 184), closing the writer-side symmetry for the

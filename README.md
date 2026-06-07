@@ -1307,6 +1307,60 @@ document each contribute one filespec to the shared name tree, which
 the round-33 `read_pdf_attachments` enumerator surfaces in byte-wise
 lexicographic order.
 
+**Round 245** extends the writer with `/Subtype /Sound` (§12.5.6.16
+Table 185 + §13.3 Table 294) so callers can pin an embedded audio
+clip to a page alongside the existing Text / Stamp / Highlight
+markup. The new `WriterAnnotationKind::Sound` variant takes the raw
+sample bytes plus the §13.3 stream metadata (sampling rate, channel
+count, bits-per-sample, and a `SoundEncoding` selector covering the
+four Table 294 values — `Raw` default, `Signed`, `MuLaw`, `ALaw`)
+plus an optional `/Name` icon defaulting to `/Speaker` per Table 185.
+The writer's pre-pass materialises one `/Type /Sound` stream object
+per Sound annotation, emitting each Table 294 field at its
+non-default value only (so a write-then-read cycle through
+`read_pdf_annotations` yields the same absent-equals-default branch
+the round-209 reader exercises on producer files), and the
+annotation's `/Sound` entry resolves to that stream's indirect
+reference.
+
+```rust,ignore
+use oxideav_pdf::{
+    write_pdf_with_annotations, Annotation, SoundEncoding, WriterAnnotationKind,
+};
+
+let samples: Vec<u8> = telephony_recording_mulaw_8khz_mono();
+let annots = vec![
+    Annotation {
+        source_page_index: 0,
+        rect: [10.0, 20.0, 30.0, 40.0],
+        author: Some("Voice memo".into()),
+        modified: None,
+        flags: None,
+        colour: None,
+        border: None,
+        kind: WriterAnnotationKind::Sound {
+            icon: Some("Mic".into()),
+            sampling_rate: 8000.0,
+            channels: 1,
+            bits_per_sample: 8,
+            encoding: SoundEncoding::MuLaw,
+            sound_samples: samples,
+        },
+    },
+];
+let pdf = write_pdf_with_annotations(&scene, &annots)?;
+# Ok::<(), oxideav_pdf::PdfError>(())
+```
+
+Validation rejects a non-finite sample rate, a non-positive sample
+rate, zero channels, zero bits-per-sample, and an empty sample
+buffer (the four shapes that would produce a §13.3 stream carrying
+no playable content). The §13.3 portability guidance for sample
+rate / channels / bits / encoding combinations is the writer's
+intended target, but every Table 294 value is accepted on the
+positive-validation path so authoring tools that produce, e.g.,
+44.1 kHz stereo 16-bit `Signed` recordings round-trip too.
+
 ## Embedded file attachments (round 33)
 
 `write_pdf_with_attachments(scene, &[Attachment])` embeds arbitrary
