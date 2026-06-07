@@ -88,6 +88,23 @@
 //!   `read_pdf_annotations` enumerator surfaces the same dict back
 //!   verbatim.
 //!
+//! Round 252 closes the writer-side symmetry for the round-204 reader's
+//! **fixed-print** annotation:
+//!
+//! * **`/Watermark`** (§12.5.6.22, Table 190 + Table 191) —
+//!   [`AnnotationKind::Watermark`]: writer emits the bare
+//!   `/Subtype /Watermark` annotation plus an optional `/FixedPrint`
+//!   sub-dict (`/Type /FixedPrint` + `/Matrix` six-number affine
+//!   transform + `/H` / `/V` printed-media translation percentages).
+//!   Table 191 makes every entry but `/Type` optional with explicit
+//!   defaults (`/Matrix` = identity, `/H` = `/V` = 0); the writer omits
+//!   the defaults so a round-trip through the round-204
+//!   `read_pdf_annotations` enumerator yields the same
+//!   "absent → default" reader contract producer files use. The
+//!   sub-dict is emitted inline (no separate indirect object) because
+//!   Table 191 doesn't require it to be indirect and inline keeps the
+//!   wire bytes smaller for the common fixed-print marker.
+//!
 //! The writer also carries every cross-subtype Table 164 field
 //! ([`Annotation::author`], `/M` modified-date, `/F` flags, `/C`
 //! colour, `/Border`).
@@ -417,6 +434,24 @@ pub enum AnnotationKind {
         /// §13.3 interleave rule.
         sound_samples: Vec<u8>,
     },
+    /// `/Subtype /Watermark` — fixed-print graphics (§12.5.6.22
+    /// Table 190, round 252). Used for content that prints at a fixed
+    /// size + position regardless of the dimensions of the printed
+    /// page — page-number stamps, copyright marks, "DRAFT" overlays
+    /// laid out per Table 191's media-relative geometry.
+    ///
+    /// Per Table 190 the only sub-entry is the optional `/FixedPrint`
+    /// dict (carried here as [`FixedPrintSpec`]). `None` leaves the
+    /// `/FixedPrint` entry off the annotation dict, matching the
+    /// Table 190 wording: *"If this entry is not present, the
+    /// annotation shall be drawn without any special consideration for
+    /// the dimensions of the target media."*
+    Watermark {
+        /// `/FixedPrint` sub-dict (§12.5.6.22 Table 191). `None` ⇒
+        /// entry omitted (the watermark draws without media-relative
+        /// positioning, per Table 190).
+        fixed_print: Option<FixedPrintSpec>,
+    },
 }
 
 /// `/E` encoding selector for [`AnnotationKind::Sound`] sample data
@@ -449,6 +484,37 @@ impl SoundEncoding {
             Self::ALaw => Some("ALaw"),
         }
     }
+}
+
+/// `/FixedPrint` sub-dict for [`AnnotationKind::Watermark`] (ISO 32000-1
+/// §12.5.6.22 Table 191, round 252). Every field is optional with an
+/// explicit Table 191 default; the writer omits each entry whose value
+/// equals the default so a write-then-read cycle through the round-204
+/// `read_pdf_annotations` enumerator yields the same
+/// "absent → default" reader shape producer files use.
+///
+/// Mirrors the reader-side [`crate::FixedPrint`] decoded struct shape
+/// so callers can copy fields directly between the two when manipulating
+/// existing watermarks.
+///
+/// Default-constructed (`FixedPrintSpec::default()`) sets every entry
+/// to `None` so the writer emits the bare `/Type /FixedPrint` marker
+/// dict — the most-minimal way to opt a Watermark in to media-relative
+/// rendering without overriding any geometry.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FixedPrintSpec {
+    /// `/Matrix [a b c d e f]` — affine transform applied to the
+    /// annotation rectangle before rendering. `None` ⇒ writer omits
+    /// the entry (Table 191 default is the identity matrix
+    /// `[1 0 0 1 0 0]`).
+    pub matrix: Option<[f32; 6]>,
+    /// `/H` — horizontal translation as a fraction of the target media
+    /// width (`1.0` = 100 %, `0.0` = 0 %). `None` ⇒ writer omits the
+    /// entry (Table 191 default `0`).
+    pub h: Option<f32>,
+    /// `/V` — vertical translation as a fraction of the target media
+    /// height. `None` ⇒ writer omits the entry (Table 191 default `0`).
+    pub v: Option<f32>,
 }
 
 /// `/Sy` symbol selector for [`AnnotationKind::Caret`] (ISO 32000-1
@@ -875,6 +941,46 @@ fn validate_annotations(annotations: &[Annotation], n_pages: usize) -> Result<()
                     )));
                 }
             }
+            // §12.5.6.22 Table 191 — every /FixedPrint sub-dict value is
+            // optional with an explicit numeric default. The spec is
+            // explicit that negative /H or /V values "should not be
+            // used, since they may cause content to be drawn off the
+            // page" — we surface that producer guidance as a hard
+            // writer reject so a downstream PDF renderer sees only
+            // in-range fixed-print metadata. /Matrix entries that are
+            // non-finite would produce an undefined affine transform
+            // (the §8.3.4 transform composition assumes finite reals),
+            // so a NaN or infinity in any /Matrix slot is also rejected.
+            AnnotationKind::Watermark {
+                fixed_print: Some(fp),
+            } => {
+                if let Some(m) = fp.matrix {
+                    if m.iter().any(|v| !v.is_finite()) {
+                        return Err(PdfError::other(format!(
+                            "write_pdf_with_annotations: annotation #{i} /Watermark \
+                             /FixedPrint /Matrix entries must all be finite (got {m:?})",
+                        )));
+                    }
+                }
+                if let Some(h) = fp.h {
+                    if !h.is_finite() || h < 0.0 {
+                        return Err(PdfError::other(format!(
+                            "write_pdf_with_annotations: annotation #{i} /Watermark \
+                             /FixedPrint /H must be a finite non-negative number \
+                             (got {h}) — §12.5.6.22 Table 191 negative-values warning",
+                        )));
+                    }
+                }
+                if let Some(v) = fp.v {
+                    if !v.is_finite() || v < 0.0 {
+                        return Err(PdfError::other(format!(
+                            "write_pdf_with_annotations: annotation #{i} /Watermark \
+                             /FixedPrint /V must be a finite non-negative number \
+                             (got {v}) — §12.5.6.22 Table 191 negative-values warning",
+                        )));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1203,9 +1309,54 @@ fn build_annotation_dict(
             let icon_name = icon.clone().unwrap_or_else(|| "Speaker".into());
             d.set("Name", Object::Name(icon_name));
         }
+        AnnotationKind::Watermark { fixed_print } => {
+            // §12.5.6.22 Table 190.
+            d.set("Subtype", Object::Name("Watermark".into()));
+            // /FixedPrint — optional inline sub-dict (§12.5.6.22
+            // Table 191). Per Table 190 the absence of the entry means
+            // the watermark renders without media-relative geometry —
+            // a None here therefore leaves /FixedPrint off the
+            // annotation dict.
+            if let Some(fp) = fixed_print {
+                d.set("FixedPrint", Object::Dict(build_fixed_print_dict(fp)));
+            }
+        }
     }
 
     Ok(d)
+}
+
+/// Build the inline `/FixedPrint` sub-dict (§12.5.6.22 Table 191) for a
+/// [`AnnotationKind::Watermark`]. Default-value omissions per Table 191:
+/// * `/Matrix` is omitted when the caller passes `None` (Table 191
+///   default identity); a `Some([1,0,0,1,0,0])` is treated as an
+///   explicit identity opt-in and the entry is still emitted, since the
+///   caller distinguished "absent" from "explicitly identity".
+/// * `/H` is omitted when the caller passes `None` (Table 191 default
+///   `0`); a `Some(0.0)` is emitted verbatim.
+/// * `/V` is omitted when the caller passes `None` (Table 191 default
+///   `0`); a `Some(0.0)` is emitted verbatim.
+///
+/// The omissions keep a write-then-read cycle through the round-204
+/// `read_pdf_annotations` enumerator on the same "absent → default"
+/// branch the reader uses for producer files that left the defaults
+/// implicit. The `/Type /FixedPrint` marker is required per Table 191
+/// and always emitted.
+fn build_fixed_print_dict(fp: &FixedPrintSpec) -> Dict {
+    let mut d = Dict::new().with("Type", Object::Name("FixedPrint".into()));
+    if let Some(m) = fp.matrix {
+        d.set(
+            "Matrix",
+            Object::Array(m.iter().map(|v| Object::Real(*v as f64)).collect()),
+        );
+    }
+    if let Some(h) = fp.h {
+        d.set("H", Object::Real(h as f64));
+    }
+    if let Some(v) = fp.v {
+        d.set("V", Object::Real(v as f64));
+    }
+    d
 }
 
 /// Emit one `/Type /Sound` stream object per §13.3 Table 294 carrying
@@ -1938,5 +2089,260 @@ mod tests {
         let err = validate_annotations(&annots, 1).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("sampling_rate"), "error mentions rate: {msg}");
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Round 252 — §12.5.6.22 Watermark (Table 190) + §12.5.6.22
+    // FixedPrint sub-dict (Table 191).
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn fixed_print_spec_default_is_all_absent() {
+        // The default-constructed FixedPrintSpec has every per-field
+        // override set to None so the writer emits only the
+        // `/Type /FixedPrint` marker entry.
+        let fp = FixedPrintSpec::default();
+        assert!(fp.matrix.is_none());
+        assert!(fp.h.is_none());
+        assert!(fp.v.is_none());
+        let d = build_fixed_print_dict(&fp);
+        // Exactly one entry — `/Type /FixedPrint`.
+        assert_eq!(d.entries().len(), 1);
+        let (k, v) = &d.entries()[0];
+        assert_eq!(k, "Type");
+        assert!(matches!(v, Object::Name(n) if n == "FixedPrint"));
+    }
+
+    #[test]
+    fn watermark_writer_emits_subtype_and_omits_fixed_print_when_none() {
+        // §12.5.6.22 Table 190 — bare Watermark annotation with no
+        // /FixedPrint sub-dict. Per Table 190 the entry "shall be
+        // drawn without any special consideration for the dimensions
+        // of the target media" — surface that as the entry being
+        // absent.
+        let annot = Annotation {
+            source_page_index: 0,
+            rect: [10.0, 20.0, 30.0, 40.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Watermark { fixed_print: None },
+        };
+        let d = build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)], None, None)
+            .unwrap();
+        let subtype = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Subtype")
+            .expect("/Subtype emitted");
+        assert!(matches!(&subtype.1, Object::Name(n) if n == "Watermark"));
+        assert!(
+            d.entries().iter().all(|(k, _)| k != "FixedPrint"),
+            "/FixedPrint should be omitted when fixed_print is None",
+        );
+    }
+
+    #[test]
+    fn watermark_writer_emits_fixed_print_with_overrides() {
+        // §12.5.6.22 Table 191 — explicit /Matrix + /H + /V overrides
+        // round-trip into a /FixedPrint sub-dict where each entry
+        // appears verbatim.
+        let annot = Annotation {
+            source_page_index: 0,
+            rect: [10.0, 20.0, 30.0, 40.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Watermark {
+                fixed_print: Some(FixedPrintSpec {
+                    matrix: Some([2.0, 0.0, 0.0, 2.0, 36.0, 72.0]),
+                    h: Some(0.5),
+                    v: Some(0.25),
+                }),
+            },
+        };
+        let d = build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)], None, None)
+            .unwrap();
+        let fp_obj = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "FixedPrint")
+            .map(|(_, v)| v)
+            .expect("/FixedPrint emitted");
+        let Object::Dict(fp) = fp_obj else {
+            panic!("/FixedPrint should be an inline dict, got {fp_obj:?}");
+        };
+        // /Type /FixedPrint marker required per Table 191.
+        let t = fp
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Type")
+            .expect("/Type emitted");
+        assert!(matches!(&t.1, Object::Name(n) if n == "FixedPrint"));
+        // /Matrix six-real array.
+        let m = fp
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Matrix")
+            .expect("/Matrix emitted");
+        let Object::Array(items) = &m.1 else {
+            panic!("/Matrix should be an array, got {:?}", m.1);
+        };
+        assert_eq!(items.len(), 6);
+        // /H + /V emitted as reals.
+        assert!(fp
+            .entries()
+            .iter()
+            .any(|(k, v)| k == "H" && matches!(v, Object::Real(r) if (*r - 0.5).abs() < 1e-6)));
+        assert!(fp
+            .entries()
+            .iter()
+            .any(|(k, v)| k == "V" && matches!(v, Object::Real(r) if (*r - 0.25).abs() < 1e-6)));
+    }
+
+    #[test]
+    fn watermark_writer_minimum_fixed_print_emits_type_marker_only() {
+        // §12.5.6.22 Table 191 — a Some(FixedPrintSpec::default()) is
+        // the minimal opt-in to media-relative rendering and emits
+        // exactly the `/Type /FixedPrint` marker (no /Matrix, /H, or
+        // /V overrides).
+        let annot = Annotation {
+            source_page_index: 0,
+            rect: [10.0, 20.0, 30.0, 40.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Watermark {
+                fixed_print: Some(FixedPrintSpec::default()),
+            },
+        };
+        let d = build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)], None, None)
+            .unwrap();
+        let fp_obj = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "FixedPrint")
+            .map(|(_, v)| v)
+            .expect("/FixedPrint emitted");
+        let Object::Dict(fp) = fp_obj else {
+            panic!("/FixedPrint should be an inline dict, got {fp_obj:?}");
+        };
+        assert_eq!(fp.entries().len(), 1);
+        assert!(fp
+            .entries()
+            .iter()
+            .all(|(k, _)| !matches!(k.as_str(), "Matrix" | "H" | "V")));
+    }
+
+    #[test]
+    fn watermark_validation_rejects_negative_h() {
+        // Table 191 "negative values should not be used" — surface as
+        // a writer reject.
+        let annots = vec![Annotation {
+            source_page_index: 0,
+            rect: [0.0, 0.0, 100.0, 100.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Watermark {
+                fixed_print: Some(FixedPrintSpec {
+                    matrix: None,
+                    h: Some(-0.1),
+                    v: None,
+                }),
+            },
+        }];
+        let err = validate_annotations(&annots, 1).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("/H") && msg.contains("non-negative"),
+            "error mentions /H non-negative requirement: {msg}",
+        );
+    }
+
+    #[test]
+    fn watermark_validation_rejects_negative_v() {
+        let annots = vec![Annotation {
+            source_page_index: 0,
+            rect: [0.0, 0.0, 100.0, 100.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Watermark {
+                fixed_print: Some(FixedPrintSpec {
+                    matrix: None,
+                    h: None,
+                    v: Some(-1.0),
+                }),
+            },
+        }];
+        let err = validate_annotations(&annots, 1).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("/V") && msg.contains("non-negative"),
+            "error mentions /V non-negative requirement: {msg}",
+        );
+    }
+
+    #[test]
+    fn watermark_validation_rejects_non_finite_matrix() {
+        let annots = vec![Annotation {
+            source_page_index: 0,
+            rect: [0.0, 0.0, 100.0, 100.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Watermark {
+                fixed_print: Some(FixedPrintSpec {
+                    matrix: Some([1.0, 0.0, 0.0, f32::NAN, 0.0, 0.0]),
+                    h: None,
+                    v: None,
+                }),
+            },
+        }];
+        let err = validate_annotations(&annots, 1).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("/Matrix") && msg.contains("finite"),
+            "error mentions /Matrix finite requirement: {msg}",
+        );
+    }
+
+    #[test]
+    fn watermark_validation_rejects_non_finite_h() {
+        let annots = vec![Annotation {
+            source_page_index: 0,
+            rect: [0.0, 0.0, 100.0, 100.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::Watermark {
+                fixed_print: Some(FixedPrintSpec {
+                    matrix: None,
+                    h: Some(f32::INFINITY),
+                    v: None,
+                }),
+            },
+        }];
+        let err = validate_annotations(&annots, 1).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("/H") && msg.contains("finite"),
+            "error mentions /H finite requirement: {msg}",
+        );
     }
 }

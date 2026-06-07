@@ -67,7 +67,7 @@ pub use acroform::{
 };
 pub use annotations::{
     write_pdf_with_annotations, Annotation, AnnotationKind as WriterAnnotationKind, CaretSymbol,
-    FreeTextQuadding, SoundEncoding,
+    FixedPrintSpec, FreeTextQuadding, SoundEncoding,
 };
 pub use attachments::{
     write_pdf_with_annotations_and_attachments, write_pdf_with_attachments, AfRelationship,

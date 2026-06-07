@@ -1361,6 +1361,68 @@ intended target, but every Table 294 value is accepted on the
 positive-validation path so authoring tools that produce, e.g.,
 44.1 kHz stereo 16-bit `Signed` recordings round-trip too.
 
+**Round 252** extends the writer with `/Subtype /Watermark`
+(§12.5.6.22 Table 190 + Table 191), closing the writer-side symmetry
+for the fixed-print annotation the round-204 reader already decodes.
+The new `WriterAnnotationKind::Watermark` variant carries an optional
+`FixedPrintSpec` sub-dict mirroring the round-204 reader-side
+`FixedPrint` shape — `/Matrix` six-number affine transform, `/H` and
+`/V` printed-media translation percentages. Each `FixedPrintSpec`
+field is `Option<…>`; the writer omits any entry whose value is
+`None`, so a `Some(FixedPrintSpec::default())` produces the minimal
+`/Type /FixedPrint` marker dict (no per-field overrides) and a
+write-then-read cycle through `read_pdf_annotations` lands on the
+same "absent → default" reader branch producer files use. Watermarks
+constructed with `fixed_print: None` skip the `/FixedPrint` entry
+entirely, matching the Table 190 wording: *"If this entry is not
+present, the annotation shall be drawn without any special
+consideration for the dimensions of the target media."*
+
+```rust,ignore
+use oxideav_pdf::{
+    write_pdf_with_annotations, Annotation, FixedPrintSpec, WriterAnnotationKind,
+};
+
+let annots = vec![
+    // Bare watermark — printed without media-relative positioning.
+    Annotation {
+        source_page_index: 0,
+        rect: [10.0, 20.0, 30.0, 40.0],
+        author: Some("Approval mark".into()),
+        modified: None,
+        flags: None,
+        colour: None,
+        border: None,
+        kind: WriterAnnotationKind::Watermark { fixed_print: None },
+    },
+    // Page-number stamp pinned to 50 % across, 5 % down the printed
+    // media.
+    Annotation {
+        source_page_index: 0,
+        rect: [50.0, 60.0, 70.0, 80.0],
+        author: None,
+        modified: None,
+        flags: None,
+        colour: None,
+        border: None,
+        kind: WriterAnnotationKind::Watermark {
+            fixed_print: Some(FixedPrintSpec {
+                matrix: None,
+                h: Some(0.5),
+                v: Some(0.05),
+            }),
+        },
+    },
+];
+let pdf = write_pdf_with_annotations(&scene, &annots)?;
+# Ok::<(), oxideav_pdf::PdfError>(())
+```
+
+Validation rejects negative `/H` / `/V` (Table 191 wording: *"Negative
+values should not be used, since they may cause content to be drawn
+off the page"*) and any `/Matrix` slot that is not finite (NaN or
+infinity would describe an undefined affine transform per §8.3.4).
+
 ## Embedded file attachments (round 33)
 
 `write_pdf_with_attachments(scene, &[Attachment])` embeds arbitrary

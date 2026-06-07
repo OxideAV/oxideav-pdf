@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- annotations (round 252): one new `/Subtype` encoder in the
+  round-32 writer (`write_pdf_with_annotations`) — **Watermark**
+  (§12.5.6.22 Table 190 + Table 191), closing the writer-side
+  symmetry for the fixed-print annotation the round-204 reader
+  already decodes. The new `WriterAnnotationKind::Watermark` variant
+  carries an optional `FixedPrintSpec` sub-dict mirroring the
+  round-204 reader-side `FixedPrint` shape — `/Matrix` six-number
+  affine transform, `/H` and `/V` printed-media translation
+  percentages. Each `FixedPrintSpec` field is `Option<…>`; the writer
+  omits any entry whose value is `None`, so a
+  `Some(FixedPrintSpec::default())` produces the minimal
+  `/Type /FixedPrint` marker dict and a write-then-read cycle through
+  `read_pdf_annotations` lands on the same "absent → default" reader
+  branch producer files use. Watermarks constructed with
+  `fixed_print: None` skip the `/FixedPrint` entry entirely, matching
+  the Table 190 wording: "If this entry is not present, the
+  annotation shall be drawn without any special consideration for the
+  dimensions of the target media." Validation rejects negative `/H`
+  / `/V` (Table 191 "negative values should not be used") and any
+  `/Matrix` slot that is not finite (NaN or infinity would describe
+  an undefined affine transform per §8.3.4). Round-tripped through
+  `read_pdf_annotations` (matching `FixedPrint.matrix`, `h`, `v`).
+  Adds 7 new tests in `tests/annotations_writer_round252.rs` covering
+  the bare no-`/FixedPrint` round-trip, the
+  `Some(FixedPrintSpec::default())` minimum opt-in (writer emits only
+  the `/Type /FixedPrint` marker; reader returns Table 191 defaults),
+  a full `/Matrix` + `/H` + `/V` override round-trip, a two-page
+  composite (Watermark with no `FixedPrint` on page 0, Watermark with
+  `/H` = `/V` = 0.5 on page 1), and three validation rejects
+  (negative `/H`, negative `/V`, NaN-in-`/Matrix`); +8 unit tests in
+  `src/annotations.rs` covering the `FixedPrintSpec::default()`
+  all-absent shape, the `/Subtype` + `/FixedPrint` omission shapes,
+  the marker-only / full-override emission shapes, and every
+  validation branch.
+
 - annotations (round 245): one new `/Subtype` encoder in the
   round-32 writer (`write_pdf_with_annotations`) — **Sound**
   (§12.5.6.16 Table 185 + §13.3 Table 294), closing the writer-side
