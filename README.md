@@ -1423,6 +1423,62 @@ values should not be used, since they may cause content to be drawn
 off the page"*) and any `/Matrix` slot that is not finite (NaN or
 infinity would describe an undefined affine transform per §8.3.4).
 
+**Round 257** extends the writer with `/Subtype /PrinterMark`
+(§12.5.6.20 Table 362), closing the writer-side symmetry for the
+production-printer-mark annotation the round-215 reader already
+decodes. The new `WriterAnnotationKind::PrinterMark` variant carries
+the optional `/MN` (mark-name) `Name` selector identifying the kind
+of mark — common Table 362 values include `/ColorBar`,
+`/RegistrationTarget`, `/CutMark`, and `/PageInformation`, but the
+spec does not enumerate a closed set so any caller-supplied `Name`
+passes through verbatim. A `None` omits the `/MN` entry entirely so a
+write-then-read cycle through `read_pdf_annotations` lands on the
+round-215 reader's absent-equals-`None` branch.
+
+```rust,ignore
+use oxideav_pdf::{write_pdf_with_annotations, Annotation, WriterAnnotationKind};
+
+let annots = vec![
+    // Colour-bar production mark along the bottom of the sheet.
+    Annotation {
+        source_page_index: 0,
+        rect: [0.0, 0.0, 300.0, 12.0],
+        author: None,
+        modified: None,
+        flags: None,
+        colour: None,
+        border: None,
+        kind: WriterAnnotationKind::PrinterMark {
+            mark_name: Some("ColorBar".into()),
+        },
+    },
+    // Registration-target crosshair top-left corner.
+    Annotation {
+        source_page_index: 0,
+        rect: [4.0, 286.0, 16.0, 298.0],
+        author: None,
+        modified: None,
+        flags: None,
+        colour: None,
+        border: None,
+        kind: WriterAnnotationKind::PrinterMark {
+            mark_name: Some("RegistrationTarget".into()),
+        },
+    },
+];
+let pdf = write_pdf_with_annotations(&scene, &annots)?;
+# Ok::<(), oxideav_pdf::PdfError>(())
+```
+
+Validation rejects `Some(String::new())` per §7.3.5 (a `Name` token
+must be at least one byte; a zero-byte mark name would serialise as
+a bare `/` token that round-trips as the absent-entry case). The
+Table-363 `/MarkStyle` and `/Colorants` entries hang off the form-
+XObject appearance stream referenced from `/AP /N` (not the
+annotation dict itself), and stay routed through the §8.10 Form
+XObject walker — out of scope for this round just as they are for
+the round-215 reader.
+
 ## Embedded file attachments (round 33)
 
 `write_pdf_with_attachments(scene, &[Attachment])` embeds arbitrary

@@ -105,6 +105,25 @@
 //!   Table 191 doesn't require it to be indirect and inline keeps the
 //!   wire bytes smaller for the common fixed-print marker.
 //!
+//! Round 257 closes the writer-side symmetry for the round-215 reader's
+//! **production-printer-mark** annotation:
+//!
+//! * **`/PrinterMark`** (§12.5.6.20, Table 362) —
+//!   [`AnnotationKind::PrinterMark`]: writer emits the bare
+//!   `/Subtype /PrinterMark` annotation plus the optional `/MN`
+//!   mark-name Name (`ColorBar` / `RegistrationTarget` / `CutMark` /
+//!   `PageInformation`, …). Table 362 makes `/MN` optional; the
+//!   writer omits the entry when the caller passes `None` so a
+//!   round-trip through the round-215 `read_pdf_annotations`
+//!   enumerator yields the same "absent → None" reader shape. An
+//!   empty `Some(String::new())` is rejected at validation time per
+//!   §7.3.5 (Name tokens must be at least one byte). The Table-363
+//!   `/MarkStyle` and `/Colorants` entries hang off the form-XObject
+//!   appearance stream referenced from `/AP /N` (not the annotation
+//!   dict itself), and stay routed through the §8.10 Form XObject
+//!   walker — out of scope for this round just as they are for the
+//!   round-215 reader.
+//!
 //! The writer also carries every cross-subtype Table 164 field
 //! ([`Annotation::author`], `/M` modified-date, `/F` flags, `/C`
 //! colour, `/Border`).
@@ -433,6 +452,44 @@ pub enum AnnotationKind {
         /// the caller interleaves left then right per channel per the
         /// §13.3 interleave rule.
         sound_samples: Vec<u8>,
+    },
+    /// `/Subtype /PrinterMark` — production printer's mark
+    /// (§12.5.6.20 Table 362, round 257). PDF 1.4. The on-page
+    /// registration target, colour bar, cut mark, or page-information
+    /// bar a print-production tool stamps onto every output sheet.
+    ///
+    /// Per Table 362 the only annotation-dict-local entry is the
+    /// optional `/MN` (mark-name) Name identifying the type of mark
+    /// (e.g. `ColorBar`, `RegistrationTarget`, `CutMark`,
+    /// `PageInformation`). The actual mark graphics live in the
+    /// form-XObject appearance stream referenced from `/AP /N`; the
+    /// `/MarkStyle` and `/Colorants` entries in Table 363 hang off
+    /// that form XObject, not the annot dict — so they are out of
+    /// scope for the round-257 writer just as they are for the
+    /// round-215 reader.
+    ///
+    /// `None` ⇒ writer omits `/MN` entirely, matching the spec's
+    /// "optional" wording and the round-215 reader's "absent → None"
+    /// shape. Per Table 362 a PrinterMark annotation should additionally
+    /// carry `/Type /PrinterMark` (in addition to the §12.5.2 Table 164
+    /// `/Type /Annot`) — the writer emits that marker via the
+    /// `/Subtype` slot, which is what every observed producer relies
+    /// on (the second `/Type` entry is rarely emitted in the wild
+    /// because the §12.5.2 `/Type /Annot` slot already designates the
+    /// dictionary as an annotation).
+    PrinterMark {
+        /// `/MN` — arbitrary Name identifying the kind of mark
+        /// (Table 362). `None` ⇒ entry omitted (the spec makes it
+        /// optional). Common values include `ColorBar`,
+        /// `RegistrationTarget`, `CutMark`, `PageInformation`; the
+        /// spec does not enumerate a closed set, so the writer
+        /// passes any caller-supplied Name through verbatim.
+        ///
+        /// An empty `Some(String::new())` is rejected at validation
+        /// time — a Name token is required to be at least one byte
+        /// per §7.3.5, and a zero-byte mark name would not identify
+        /// any taxonomy entry.
+        mark_name: Option<String>,
     },
     /// `/Subtype /Watermark` — fixed-print graphics (§12.5.6.22
     /// Table 190, round 252). Used for content that prints at a fixed
@@ -981,6 +1038,19 @@ fn validate_annotations(annotations: &[Annotation], n_pages: usize) -> Result<()
                     }
                 }
             }
+            // §12.5.6.20 Table 362 — /MN is a PDF Name. §7.3.5 requires
+            // a Name to be at least one byte; an empty mark name would
+            // not identify any taxonomy entry and would serialise as a
+            // bare `/` token that round-trips as the absent-entry case
+            // (silently dropping the caller's intent). Reject it.
+            AnnotationKind::PrinterMark {
+                mark_name: Some(name),
+            } if name.is_empty() => {
+                return Err(PdfError::other(format!(
+                    "write_pdf_with_annotations: annotation #{i} /PrinterMark \
+                     /MN mark name must be non-empty (§7.3.5 / §12.5.6.20 Table 362)",
+                )));
+            }
             _ => {}
         }
     }
@@ -1308,6 +1378,31 @@ fn build_annotation_dict(
             // /Name — defaults to /Speaker per Table 185.
             let icon_name = icon.clone().unwrap_or_else(|| "Speaker".into());
             d.set("Name", Object::Name(icon_name));
+        }
+        AnnotationKind::PrinterMark { mark_name } => {
+            // §12.5.6.20 Table 362. Two `/Type`-style markers are
+            // associated with a PrinterMark dictionary: the outer
+            // `/Type /Annot` (§12.5.2 Table 164, already set above)
+            // identifies the dictionary as an annotation, and the
+            // `/Subtype /PrinterMark` set here selects the §12.5.6.20
+            // sub-kind. Table 362 lists a *second* `/Type
+            // /PrinterMark` slot on the dict alongside `/Subtype`; in
+            // practice no producer emits both because the §12.5.2
+            // `/Type /Annot` already designates the dictionary as an
+            // annotation and `/Subtype /PrinterMark` distinguishes it
+            // — the round-215 reader's `find_entry(annot, "MN")` lookup
+            // is the wire contract we round-trip, so we omit the
+            // redundant `/Type /PrinterMark` Table-362 slot and emit
+            // only `/Subtype`.
+            d.set("Subtype", Object::Name("PrinterMark".into()));
+            // /MN — optional mark-name Name (`ColorBar`,
+            // `RegistrationTarget`, `CutMark`, `PageInformation`, …).
+            // When `None` the entry is omitted so the round-215
+            // reader's `match find_entry(annot, "MN")` falls into the
+            // `_ => None` branch — the absent → None contract.
+            if let Some(name) = mark_name {
+                d.set("MN", Object::Name(name.clone()));
+            }
         }
         AnnotationKind::Watermark { fixed_print } => {
             // §12.5.6.22 Table 190.
@@ -2344,5 +2439,121 @@ mod tests {
             msg.contains("/H") && msg.contains("finite"),
             "error mentions /H finite requirement: {msg}",
         );
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Round 257 — §12.5.6.20 PrinterMark (Table 362).
+    // ────────────────────────────────────────────────────────────────
+
+    fn printer_mark_annot(mark_name: Option<&str>) -> Annotation {
+        Annotation {
+            source_page_index: 0,
+            rect: [10.0, 20.0, 30.0, 40.0],
+            author: None,
+            modified: None,
+            flags: None,
+            colour: None,
+            border: None,
+            kind: AnnotationKind::PrinterMark {
+                mark_name: mark_name.map(str::to_string),
+            },
+        }
+    }
+
+    #[test]
+    fn printer_mark_writer_emits_subtype_and_omits_mn_when_none() {
+        // §12.5.6.20 Table 362 — bare PrinterMark annotation with no
+        // /MN entry. The round-215 reader's `match find_entry(annot,
+        // "MN")` lookup falls into `_ => None` when /MN is absent;
+        // emit the absent-equals-None shape.
+        let annot = printer_mark_annot(None);
+        let d = build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)], None, None)
+            .unwrap();
+        let subtype = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Subtype")
+            .expect("/Subtype emitted");
+        assert!(matches!(&subtype.1, Object::Name(n) if n == "PrinterMark"));
+        assert!(
+            d.entries().iter().all(|(k, _)| k != "MN"),
+            "/MN should be omitted when mark_name is None",
+        );
+        // §12.5.6.20 Table 362's redundant `/Type /PrinterMark` slot
+        // is intentionally NOT emitted — the §12.5.2 `/Type /Annot`
+        // already designates the dictionary as an annotation, and the
+        // /Subtype lookup is what every observed producer + the
+        // round-215 reader rely on.
+        let type_entries: Vec<&Object> = d
+            .entries()
+            .iter()
+            .filter_map(|(k, v)| if k == "Type" { Some(v) } else { None })
+            .collect();
+        assert_eq!(type_entries.len(), 1, "exactly one /Type entry");
+        assert!(matches!(type_entries[0], Object::Name(n) if n == "Annot"));
+    }
+
+    #[test]
+    fn printer_mark_writer_emits_mn_when_some() {
+        // §12.5.6.20 Table 362 — `/MN /ColorBar` colour-bar variant.
+        let annot = printer_mark_annot(Some("ColorBar"));
+        let d = build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)], None, None)
+            .unwrap();
+        let mn = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "MN")
+            .expect("/MN emitted");
+        assert!(matches!(&mn.1, Object::Name(n) if n == "ColorBar"));
+    }
+
+    #[test]
+    fn printer_mark_writer_passes_arbitrary_mark_name_through_verbatim() {
+        // Table 362 lists no closed taxonomy — pass any caller-supplied
+        // Name through unchanged so a colour-management tool can match
+        // its own private mark vocabulary.
+        let annot = printer_mark_annot(Some("MyProductionTool_CornerCalibrator"));
+        let d = build_annotation_dict(&annot, ObjectId::new(3), &[ObjectId::new(99)], None, None)
+            .unwrap();
+        let mn = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "MN")
+            .expect("/MN emitted");
+        assert!(
+            matches!(&mn.1, Object::Name(n) if n == "MyProductionTool_CornerCalibrator"),
+            "/MN passes any Name through verbatim",
+        );
+    }
+
+    #[test]
+    fn printer_mark_validation_rejects_empty_mark_name() {
+        // §7.3.5 + §12.5.6.20 Table 362 — a /MN Name token must be at
+        // least one byte; an empty Some("") would serialise as a bare
+        // `/` token that round-trips as the absent-entry case.
+        let annots = vec![printer_mark_annot(Some(""))];
+        let err = validate_annotations(&annots, 1).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("/PrinterMark") && msg.contains("/MN"),
+            "error mentions /PrinterMark /MN: {msg}",
+        );
+        assert!(
+            msg.contains("non-empty"),
+            "error mentions non-empty requirement: {msg}",
+        );
+    }
+
+    #[test]
+    fn printer_mark_validation_accepts_none_and_non_empty_some() {
+        // The validation guard fires only on `Some(empty)`. Both
+        // `None` and `Some("CutMark")` pass.
+        let annots = vec![
+            printer_mark_annot(None),
+            printer_mark_annot(Some("CutMark")),
+            printer_mark_annot(Some("RegistrationTarget")),
+            printer_mark_annot(Some("PageInformation")),
+        ];
+        validate_annotations(&annots, 1).expect("all four PrinterMark variants validate");
     }
 }

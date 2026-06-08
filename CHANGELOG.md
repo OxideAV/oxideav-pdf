@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- annotations (round 257): one new `/Subtype` encoder in the
+  round-32 writer (`write_pdf_with_annotations`) — **PrinterMark**
+  (§12.5.6.20 Table 362), closing the writer-side symmetry for the
+  production-printer-mark annotation the round-215 reader already
+  decodes. The new `WriterAnnotationKind::PrinterMark` variant
+  carries the optional `/MN` (mark-name) `Name` selector — common
+  Table 362 values include `/ColorBar`, `/RegistrationTarget`,
+  `/CutMark`, `/PageInformation`, but the spec does not enumerate a
+  closed set so any caller-supplied Name passes through verbatim.
+  `mark_name: None` omits the `/MN` entry entirely (round-215
+  reader's `find_entry(annot, "MN")` lookup falls into `_ => None`
+  on absent), mirroring the absent-equals-default reader contract
+  every other round-32 writer subtype uses. Validation rejects
+  `Some(String::new())` per §7.3.5 (a `Name` token must be at least
+  one byte; a zero-byte mark name would serialise as a bare `/`
+  token round-tripping as the absent case). The Table-363
+  `/MarkStyle` and `/Colorants` entries hang off the form-XObject
+  appearance stream referenced from `/AP /N` (not the annotation
+  dict), and stay routed through the §8.10 Form XObject walker —
+  out of scope for this round just as they are for the round-215
+  reader. Round-tripped through `read_pdf_annotations` (matching
+  `mark_name` across the four `ColorBar` / `RegistrationTarget` /
+  `CutMark` / `PageInformation` Table-362 examples, plus a bespoke
+  `MyProductionTool_Marks_v3` value, and the absent-`/MN` `None`
+  case). Adds 9 new tests in `tests/annotations_writer_round257.rs`
+  covering the bare no-`/MN` round-trip, each of the four Table-362
+  taxonomy values (`ColorBar` / `RegistrationTarget` / `CutMark` /
+  `PageInformation`), a bespoke arbitrary-Name round-trip, a
+  two-page composite (three `PrinterMark`s on page 0, an absent-`/MN`
+  `PrinterMark` on page 1), a cross-subtype composite
+  (`PrinterMark` + `Watermark` on one page exercising the
+  round-215 reader's subtype dispatch), and the empty-`/MN`
+  validation reject; +5 unit tests in `src/annotations.rs` covering
+  the `Subtype` + redundant-`/Type` omission shape, the `/MN`
+  emission for `Some`, the arbitrary-Name passthrough, the
+  empty-string reject branch, and the `None` + non-empty `Some`
+  acceptance set.
+
 - annotations (round 252): one new `/Subtype` encoder in the
   round-32 writer (`write_pdf_with_annotations`) — **Watermark**
   (§12.5.6.22 Table 190 + Table 191), closing the writer-side
