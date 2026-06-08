@@ -108,7 +108,7 @@ use crate::objects::{Dict, Object};
 /// [`parse_content_stream_full`] with a resolved `/Resources /Font`
 /// dictionary attached.
 pub fn parse_content_stream(input: &[u8]) -> Result<Group, PdfError> {
-    let mut state = State::new(None, None);
+    let mut state = State::new(None, None, None);
     state.parse(input)?;
     Ok(state.finish().root)
 }
@@ -131,7 +131,7 @@ pub fn parse_content_stream_with_resources(
     input: &[u8],
     ext_gstate: Option<&Dict>,
 ) -> Result<Group, PdfError> {
-    let mut state = State::new(ext_gstate, None);
+    let mut state = State::new(ext_gstate, None, None);
     state.parse(input)?;
     Ok(state.finish().root)
 }
@@ -157,7 +157,38 @@ pub fn parse_content_stream_full(
     ext_gstate: Option<&Dict>,
     font_resources: Option<&Dict>,
 ) -> Result<ParsedContent, PdfError> {
-    let mut state = State::new(ext_gstate, font_resources);
+    parse_content_stream_full_with_shading(input, ext_gstate, font_resources, None)
+}
+
+/// Parse a content-stream with the page's resolved `/Resources
+/// /ExtGState`, `/Resources /Font`, and `/Resources /Shading`
+/// subdictionaries attached. Same as [`parse_content_stream_full`]
+/// plus dispatch for the §8.7.4.5 `name sh` operator: each `sh`
+/// records one [`ContentShading`] event into
+/// [`ParsedContent::shadings`] capturing the shading resource name,
+/// the resolved shading dictionary from `/Resources /Shading`, the
+/// effective CTM at the moment of the paint, and the current clip
+/// path (the `W`/`W*`-committed region for the active `q` frame).
+///
+/// The shading dictionary is not interpreted — its `ShadingType`,
+/// `ColorSpace`, `Coords`, `Function`, etc. (§8.7.4.5 Tables 78..86)
+/// stay verbatim so the caller can either route them through a
+/// dedicated shading-resolver or attach them to a downstream IR.
+///
+/// `shading_resources` follows the same one-hop-indirect contract as
+/// `ext_gstate` and `font_resources`: callers go through
+/// [`crate::reader::document::resolve_shading_resources`] to get a
+/// resolved dict whose per-name entries are direct `Object::Dict`
+/// values. When `shading_resources` is `None` or doesn't contain the
+/// `sh`-named key, the event still fires but its `shading_dict` is
+/// `None` so the consumer knows the resource wasn't resolved.
+pub fn parse_content_stream_full_with_shading(
+    input: &[u8],
+    ext_gstate: Option<&Dict>,
+    font_resources: Option<&Dict>,
+    shading_resources: Option<&Dict>,
+) -> Result<ParsedContent, PdfError> {
+    let mut state = State::new(ext_gstate, font_resources, shading_resources);
     state.parse(input)?;
     Ok(state.finish())
 }
@@ -178,6 +209,14 @@ pub struct ParsedContent {
     /// operators for tooling that wants something narrower than the
     /// full text-extraction pipeline.
     pub text_shows: Vec<ContentTextShow>,
+    /// Every `name sh` shading-paint event surfaced by
+    /// [`parse_content_stream_full_with_shading`] when
+    /// `/Resources /Shading` is plumbed in. One entry per `sh`
+    /// operator in stream order. Empty when no `sh` operator fired
+    /// or when the legacy entry points (`parse_content_stream`,
+    /// `parse_content_stream_with_resources`, the no-shading
+    /// `parse_content_stream_full`) are used.
+    pub shadings: Vec<ContentShading>,
 }
 
 /// One `Tj`/`TJ`/`'`/`"` text-show event surfaced by
@@ -228,6 +267,48 @@ pub enum TextShowOp {
     /// `"`a_w a_c string"`` — set word + char spacing, move to next
     /// line, then show.
     DoubleQuote,
+}
+
+/// One `name sh` shading-paint event surfaced by
+/// [`parse_content_stream_full_with_shading`]. ISO 32000-1 §8.7.4.5
+/// defines `sh` as "paint the shape and colour shading described by
+/// a shading dictionary, subject to the current clipping path". This
+/// surface captures every input that determines the painted region
+/// and colour:
+///
+/// * `name` — the shading-resource key the operator named (leading
+///   `/` stripped).
+/// * `shading_dict` — the resolved shading dictionary from
+///   `/Resources /Shading /<name>`, or `None` when the caller didn't
+///   plumb in `shading_resources` (or when the name wasn't a key in
+///   the supplied resources).
+/// * `ctm` — the composed current transformation matrix at the
+///   moment of the paint (every `cm` in every enclosing `q` frame,
+///   composed root-to-leaf). All coordinates inside `shading_dict`
+///   are interpreted relative to this transform per §8.7.4.5
+///   ("interpreted relative to the current user space").
+/// * `clip` — the most recent `W`/`W*`-committed clip path in the
+///   active `q` frame, or `None` when no clip is in force. The
+///   shading is subject to this region (§8.7.4.5 "subject to the
+///   current clipping path").
+#[derive(Clone, Debug)]
+pub struct ContentShading {
+    /// Shading-resource key the `sh` operator named, with the
+    /// leading `/` stripped (e.g. `"Sh1"`). Empty when the operator
+    /// was issued without a `/Name` operand (malformed but
+    /// tolerated, mirroring the round-128 `Tj`-without-`Tf` stance).
+    pub name: String,
+    /// Resolved shading dictionary from `/Resources /Shading
+    /// /<name>`, or `None` when the caller didn't plumb in
+    /// `shading_resources` (the legacy entry points) or when the
+    /// name wasn't a key in the supplied resources.
+    pub shading_dict: Option<Dict>,
+    /// Effective CTM at the moment of the paint — composed of every
+    /// `cm` operator in every enclosing `q` frame, root-to-leaf.
+    pub ctm: Transform2D,
+    /// Active clip path from the current `q` frame's most recent
+    /// `W`/`W*`. `None` when no clip is in force.
+    pub clip: Option<Path>,
 }
 
 // ───────────────────────── parser state ─────────────────────────
@@ -287,6 +368,17 @@ struct State<'a> {
     /// [`ContentTextShow`] events; when it's `None`, text-show
     /// operators stay round-3-no-op.
     font_resources: Option<&'a Dict>,
+    /// Page's `/Resources /Shading` subdictionary, if the caller
+    /// went through [`parse_content_stream_full_with_shading`] —
+    /// `None` otherwise. Each per-name entry should already be a
+    /// direct `Object::Dict` (single-hop indirect references
+    /// dereferenced by `reader::document::resolve_shading_resources`).
+    /// When this is `Some`, a `sh` operator emits a
+    /// [`ContentShading`] with `shading_dict` populated; when it's
+    /// `None`, the event still fires (so the consumer sees the
+    /// operator + name + CTM + clip) but `shading_dict` stays
+    /// `None`.
+    shading_resources: Option<&'a Dict>,
     /// Currently-selected font: name (Tf operand, leading `/`
     /// stripped) + size. Reset on each `Tf`. Cleared when no `Tf`
     /// has been seen yet — `Tj` then emits with an empty `font_name`
@@ -313,6 +405,9 @@ struct State<'a> {
     /// Stream-order text-show events accumulated for the round-128
     /// [`ParsedContent::text_shows`] return slot.
     text_shows: Vec<ContentTextShow>,
+    /// Stream-order `sh`-paint events accumulated for the round-259
+    /// [`ParsedContent::shadings`] return slot.
+    shadings: Vec<ContentShading>,
 }
 
 struct Frame {
@@ -407,7 +502,11 @@ impl ColorSpaceKind {
 }
 
 impl<'a> State<'a> {
-    fn new(ext_gstate: Option<&'a Dict>, font_resources: Option<&'a Dict>) -> Self {
+    fn new(
+        ext_gstate: Option<&'a Dict>,
+        font_resources: Option<&'a Dict>,
+        shading_resources: Option<&'a Dict>,
+    ) -> Self {
         Self {
             operands: Vec::new(),
             stack: vec![Frame::new()],
@@ -426,12 +525,14 @@ impl<'a> State<'a> {
             stroke_alpha: 1.0,
             ext_gstate,
             font_resources,
+            shading_resources,
             current_font: None,
             text_matrix: Transform2D::identity(),
             text_line_matrix: Transform2D::identity(),
             text_leading: 0.0,
             in_text_object: false,
             text_shows: Vec::new(),
+            shadings: Vec::new(),
         }
     }
 
@@ -452,6 +553,7 @@ impl<'a> State<'a> {
                 ..Group::default()
             },
             text_shows: self.text_shows,
+            shadings: self.shadings,
         }
     }
 
@@ -977,12 +1079,80 @@ impl<'a> State<'a> {
                 self.operands.clear();
             }
 
+            // Shading paint (§8.7.4.5) -----------------------------
+            b"sh" => {
+                // `name sh` — paint the shape and colour shading
+                // described by a shading dictionary, subject to the
+                // current clipping path. The current colour in the
+                // graphics state is neither used nor altered.
+                //
+                // We record one [`ContentShading`] event per `sh` so
+                // a downstream consumer can resolve the shading
+                // dictionary's `ShadingType` / `ColorSpace` /
+                // `Coords` / `Function` (Tables 78..86) into a
+                // concrete paint. The walker does NOT interpret the
+                // shading dictionary itself — that would require
+                // colour-space resolution + function evaluation
+                // (§7.10) + the per-type geometry rules (axial /
+                // radial / Gouraud / Coons / tensor), all of which
+                // belong in a dedicated shading-resolver crate or
+                // module.
+                let name = match self.operands.last() {
+                    Some(Operand::Name(n)) => n.clone(),
+                    _ => String::new(),
+                };
+                let shading_dict = match (self.shading_resources, name.as_str()) {
+                    (Some(res), n) if !n.is_empty() => lookup_dict(res, n).cloned(),
+                    _ => None,
+                };
+                let ctm = self.effective_ctm();
+                let clip = self.current_clip();
+                self.shadings.push(ContentShading {
+                    name,
+                    shading_dict,
+                    ctm,
+                    clip,
+                });
+                self.operands.clear();
+            }
+
             // Marked-content + everything else ---------------------
             _ => {
                 self.operands.clear();
             }
         }
         Ok(())
+    }
+
+    /// Compose every frame's `transform` from the root down to the
+    /// current top frame. PDF's CTM is the accumulated product of
+    /// every `cm` since the start of the content stream (across `q`
+    /// frames — a `Q` pops the frame and discards its transform, but
+    /// while the frame is live its transform composes with the
+    /// ancestor frames').
+    ///
+    /// Mirrors the convention `commit_path` uses when it emits a
+    /// `Node::Path` into the current frame: the path's coordinates
+    /// are in the local frame's space; the frame's transform is the
+    /// `cm` accumulation since the most recent `q`. To get user-space
+    /// coordinates we have to compose root-to-leaf, which is what
+    /// this helper returns.
+    fn effective_ctm(&self) -> Transform2D {
+        let mut acc = Transform2D::identity();
+        for frame in &self.stack {
+            acc = compose(acc, frame.transform);
+        }
+        acc
+    }
+
+    /// Return a clone of the most recent `W`/`W*`-committed clip
+    /// path in the active frame. `None` when the current frame has
+    /// no clip in force (in PDF the clip is per-`q` — a `Q` restores
+    /// the parent frame's clip; we expose only the current frame's
+    /// clip because the parent's was already in force before we
+    /// entered the child `q`).
+    fn current_clip(&self) -> Option<Path> {
+        self.stack.last().and_then(|f| f.clip.clone())
     }
 
     fn commit_path(&mut self, fill: bool, stroke: bool, rule: FillRule) {
@@ -2521,5 +2691,201 @@ mod tests {
     fn hex_string_skips_whitespace_and_is_case_insensitive() {
         let (_end, bytes) = read_hex_string(b"<4a 5C>", 0).unwrap();
         assert_eq!(bytes, vec![0x4A, 0x5C]);
+    }
+
+    // ── `sh` shading-paint event (round 259, ISO 32000-1 §8.7.4.5) ──
+
+    /// Helper: build a `/Resources /Shading` dictionary with one
+    /// named shading. Mirrors `font_res_with` for the round-259
+    /// shading-resources plumbing.
+    fn shading_res_with(name: &str, dict: Dict) -> Dict {
+        Dict::new().with(name, Object::Dict(dict))
+    }
+
+    fn parse_with_shading(
+        input: &[u8],
+        ext: Option<&Dict>,
+        fonts: Option<&Dict>,
+        shadings: Option<&Dict>,
+    ) -> ParsedContent {
+        parse_content_stream_full_with_shading(input, ext, fonts, shadings).unwrap()
+    }
+
+    /// `/Sh1 sh` with `/Resources /Shading /Sh1 = << /ShadingType 2 … >>`
+    /// surfaces one [`ContentShading`] with the name + resolved dict.
+    #[test]
+    fn sh_emits_one_shading_event_with_resolved_dict() {
+        // A minimal Type 2 (axial) shading dict per §8.7.4.5.3
+        // Table 80 — we only check the dispatch surfaces it
+        // verbatim; the round-259 walker doesn't interpret entries.
+        let sh1 = Dict::new()
+            .with("ShadingType", Object::Integer(2))
+            .with("ColorSpace", Object::Name("DeviceRGB".into()))
+            .with(
+                "Coords",
+                Object::Array(vec![
+                    Object::Real(0.0),
+                    Object::Real(0.0),
+                    Object::Real(100.0),
+                    Object::Real(0.0),
+                ]),
+            );
+        let shadings = shading_res_with("Sh1", sh1);
+        // `q ... /Sh1 sh ... Q` — paint the shading in the current
+        // user space (no `cm`, so CTM = identity).
+        let bytes = b"q /Sh1 sh Q\n";
+        let p = parse_with_shading(bytes, None, None, Some(&shadings));
+        assert_eq!(p.shadings.len(), 1);
+        let s = &p.shadings[0];
+        assert_eq!(s.name, "Sh1");
+        let dict = s.shading_dict.as_ref().expect("resolved");
+        // ShadingType entry made it through.
+        let st = dict
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "ShadingType")
+            .map(|(_, v)| v.clone());
+        assert!(matches!(st, Some(Object::Integer(2))));
+        // CTM is identity (no `cm` issued).
+        assert!((s.ctm.a - 1.0).abs() < 1e-6);
+        assert!((s.ctm.d - 1.0).abs() < 1e-6);
+        assert!(s.ctm.b.abs() < 1e-6);
+        assert!(s.ctm.c.abs() < 1e-6);
+        assert!(s.ctm.e.abs() < 1e-6);
+        assert!(s.ctm.f.abs() < 1e-6);
+        // No clip in force.
+        assert!(s.clip.is_none());
+    }
+
+    /// `cm` issued before `sh` is captured in the event's CTM. The
+    /// spec example in §8.7.4.5.4 paints `/Sh1 sh` after a
+    /// `27.7843 0.0000 0.0000 -27.7843 310.2461 121.1521 cm` — the
+    /// CTM is the composed matrix at the moment of paint.
+    #[test]
+    fn sh_captures_effective_ctm_from_cm() {
+        let sh1 = Dict::new().with("ShadingType", Object::Integer(2));
+        let shadings = shading_res_with("Sh1", sh1);
+        // q ... cm ... /Sh1 sh ... Q
+        let bytes = b"q 27.7843 0.0 0.0 -27.7843 310.2461 121.1521 cm /Sh1 sh Q\n";
+        let p = parse_with_shading(bytes, None, None, Some(&shadings));
+        assert_eq!(p.shadings.len(), 1);
+        let s = &p.shadings[0];
+        assert!((s.ctm.a - 27.7843).abs() < 1e-3);
+        assert!(s.ctm.b.abs() < 1e-3);
+        assert!(s.ctm.c.abs() < 1e-3);
+        assert!((s.ctm.d - -27.7843).abs() < 1e-3);
+        assert!((s.ctm.e - 310.2461).abs() < 1e-3);
+        assert!((s.ctm.f - 121.1521).abs() < 1e-3);
+    }
+
+    /// `cm` operators in nested `q` frames compose root-to-leaf —
+    /// the event's CTM reflects every transform in force.
+    #[test]
+    fn sh_composes_nested_cm_across_q_frames() {
+        let sh1 = Dict::new();
+        let shadings = shading_res_with("Sh1", sh1);
+        // Outer q: translate(10, 20). Inner q: translate(5, 0).
+        // Effective CTM at `sh`: translate(15, 20).
+        let bytes = b"q 1 0 0 1 10 20 cm q 1 0 0 1 5 0 cm /Sh1 sh Q Q\n";
+        let p = parse_with_shading(bytes, None, None, Some(&shadings));
+        assert_eq!(p.shadings.len(), 1);
+        let s = &p.shadings[0];
+        assert!((s.ctm.e - 15.0).abs() < 1e-3);
+        assert!((s.ctm.f - 20.0).abs() < 1e-3);
+        assert!((s.ctm.a - 1.0).abs() < 1e-3);
+        assert!((s.ctm.d - 1.0).abs() < 1e-3);
+    }
+
+    /// A `W n` clip committed before `sh` is captured in the
+    /// event's `clip` slot.
+    #[test]
+    fn sh_captures_active_clip_path() {
+        let sh1 = Dict::new();
+        let shadings = shading_res_with("Sh1", sh1);
+        // q ... 0 0 100 50 re W n /Sh1 sh Q — a rectangle clip
+        // committed before the paint.
+        let bytes = b"q 0 0 100 50 re W n /Sh1 sh Q\n";
+        let p = parse_with_shading(bytes, None, None, Some(&shadings));
+        assert_eq!(p.shadings.len(), 1);
+        let s = &p.shadings[0];
+        let clip = s.clip.as_ref().expect("clip in force");
+        // The `re` operator expands into MoveTo + 3 LineTo + Close.
+        assert!(!clip.commands.is_empty());
+    }
+
+    /// `sh` against a shading name not in the resources dict still
+    /// emits the event — `shading_dict` is `None` so the consumer
+    /// knows the resource wasn't resolved. Mirrors the
+    /// `Tj`-with-unknown-font tolerance contract.
+    #[test]
+    fn sh_with_unknown_name_still_emits_event_with_none_dict() {
+        let shadings = shading_res_with("Sh1", Dict::new());
+        let bytes = b"q /Other sh Q\n";
+        let p = parse_with_shading(bytes, None, None, Some(&shadings));
+        assert_eq!(p.shadings.len(), 1);
+        let s = &p.shadings[0];
+        assert_eq!(s.name, "Other");
+        assert!(s.shading_dict.is_none());
+    }
+
+    /// Without `shading_resources` plumbed in (the legacy entry
+    /// points), `sh` still surfaces the event so callers see the
+    /// operator + name + CTM + clip — only `shading_dict` is `None`.
+    #[test]
+    fn sh_without_shading_resources_emits_event_with_none_dict() {
+        let bytes = b"q 1 0 0 1 50 60 cm /Sh1 sh Q\n";
+        let p = parse_with_shading(bytes, None, None, None);
+        assert_eq!(p.shadings.len(), 1);
+        let s = &p.shadings[0];
+        assert_eq!(s.name, "Sh1");
+        assert!(s.shading_dict.is_none());
+        assert!((s.ctm.e - 50.0).abs() < 1e-3);
+        assert!((s.ctm.f - 60.0).abs() < 1e-3);
+    }
+
+    /// Multiple `sh` events in stream order all surface; each
+    /// event's CTM reflects the matrix at *its* moment of paint.
+    #[test]
+    fn sh_multiple_events_surface_in_stream_order() {
+        let shadings = Dict::new()
+            .with("Sh1", Object::Dict(Dict::new()))
+            .with("Sh2", Object::Dict(Dict::new()));
+        // Two `sh`s in two different `q` frames with different
+        // transforms.
+        let bytes = b"q 1 0 0 1 10 20 cm /Sh1 sh Q q 1 0 0 1 30 40 cm /Sh2 sh Q\n";
+        let p = parse_with_shading(bytes, None, None, Some(&shadings));
+        assert_eq!(p.shadings.len(), 2);
+        assert_eq!(p.shadings[0].name, "Sh1");
+        assert!((p.shadings[0].ctm.e - 10.0).abs() < 1e-3);
+        assert!((p.shadings[0].ctm.f - 20.0).abs() < 1e-3);
+        assert_eq!(p.shadings[1].name, "Sh2");
+        assert!((p.shadings[1].ctm.e - 30.0).abs() < 1e-3);
+        assert!((p.shadings[1].ctm.f - 40.0).abs() < 1e-3);
+    }
+
+    /// `parse_content_stream_full` (no shading resources) keeps its
+    /// existing surface — the new `shadings` slot is populated only
+    /// when a `sh` operator fires, and the resolved dict slot stays
+    /// `None` because the caller didn't plumb resources.
+    #[test]
+    fn parse_content_stream_full_still_drops_sh_with_none_dict() {
+        // Goes through the legacy entry point — no shading
+        // resources.
+        let bytes = b"q /Sh1 sh Q\n";
+        let p = parse_content_stream_full(bytes, None, None).unwrap();
+        assert_eq!(p.shadings.len(), 1);
+        assert_eq!(p.shadings[0].name, "Sh1");
+        assert!(p.shadings[0].shading_dict.is_none());
+    }
+
+    /// Content streams without any `sh` operator surface an empty
+    /// `shadings` slot regardless of whether resources were
+    /// plumbed in.
+    #[test]
+    fn shadings_empty_when_no_sh_operator() {
+        let shadings = shading_res_with("Sh1", Dict::new());
+        let bytes = b"q 100 100 m 200 200 l S Q\n";
+        let p = parse_with_shading(bytes, None, None, Some(&shadings));
+        assert!(p.shadings.is_empty());
     }
 }

@@ -35,7 +35,7 @@ use crate::objects::{Dict, Object, ObjectId, Stream};
 use crate::pubsec::{
     open_with_certificate, open_with_certificate_and_trust_store, PubSecCredential, TrustStore,
 };
-use crate::reader::content::parse_content_stream_full;
+use crate::reader::content::parse_content_stream_full_with_shading;
 use crate::reader::parse::Parser;
 use crate::reader::xref::{parse_xref, XrefEntry, XrefTable};
 
@@ -1200,11 +1200,17 @@ fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Pag
     } else {
         None
     };
+    let shading_dict = if let Some(rdict) = resources_dict.as_ref() {
+        resolve_shading_resources(reader, rdict)?
+    } else {
+        None
+    };
 
-    let parsed = parse_content_stream_full(
+    let parsed = parse_content_stream_full_with_shading(
         &content_bytes,
         ext_gstate_dict.as_ref(),
         fonts_dict.as_ref(),
+        shading_dict.as_ref(),
     )?;
     let root = parsed.root;
     let mut page = Page::new(width, height);
@@ -1305,6 +1311,64 @@ fn resolve_font_resources(
             other => other.clone(),
         };
         if let Object::Dict(d) = resolved {
+            out.set(name, Object::Dict(d));
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Resolve a page's `/Resources /Shading` subdictionary into a
+/// fully-dereferenced [`Dict`] (each per-name `/Shx` value is itself
+/// resolved into a direct `Object::Dict` if it was an indirect
+/// reference, *and* indirect `Object::Stream` values are surfaced
+/// as their stream dictionary — Type 4..7 shadings are stream
+/// objects per §8.7.4.5 Tables 82..86 whose dictionary holds the
+/// Table 78 + per-type entries).
+///
+/// Returns `Ok(None)` when the resources dict carries no `/Shading`
+/// entry — the most common case for documents that don't use the
+/// `sh` operator (gradients via `Pattern Type 2` go through
+/// `/Resources /Pattern` instead).
+///
+/// Mirrors [`resolve_ext_gstate`] / [`resolve_font_resources`] —
+/// single-hop indirect dereference, malformed entries silently
+/// dropped so a `sh` against the missing name still emits the event
+/// with `shading_dict = None`.
+fn resolve_shading_resources(
+    reader: &mut DocumentReader<'_>,
+    resources: &Dict,
+) -> Result<Option<Dict>, PdfError> {
+    let shading_obj = resources
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Shading")
+        .map(|(_, v)| v.clone());
+    let shading_obj = match shading_obj {
+        Some(Object::Reference(id)) => reader.resolve(id)?,
+        Some(other) => other,
+        None => return Ok(None),
+    };
+    let Object::Dict(shading_dict) = shading_obj else {
+        return Ok(None);
+    };
+    let mut out = Dict::new();
+    for (name, value) in shading_dict.entries() {
+        let resolved = match value {
+            Object::Reference(id) => reader.resolve(*id)?,
+            other => other.clone(),
+        };
+        // Type 1..3 shadings are bare dictionaries (§8.7.4.5.2..4);
+        // Type 4..7 shadings are streams whose dictionary holds the
+        // same Table 78 + per-type entries plus the geometry payload
+        // in the stream body. Surface either shape as the per-name
+        // entry's resolved `Dict` — the consumer can re-fetch the
+        // stream body via the original object reference if needed.
+        let d = match resolved {
+            Object::Dict(d) => Some(d),
+            Object::Stream(s) => Some(s.dict),
+            _ => None,
+        };
+        if let Some(d) = d {
             out.set(name, Object::Dict(d));
         }
     }

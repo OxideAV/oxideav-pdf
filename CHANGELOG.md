@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- reader (round 259): one new content-stream operator in the §8
+  walker — `sh` (ISO 32000-1 §8.7.4.5, "Paint the shape and colour
+  shading described by a shading dictionary"). The walker now
+  dispatches `name sh` rather than dropping it through the
+  unknown-operator catch-all: each `sh` records one
+  `ContentShading` event into a new `ParsedContent::shadings` slot
+  capturing the shading-resource name (operand, leading `/`
+  stripped), the resolved shading dictionary from
+  `/Resources /Shading /<name>` (or `None` when unresolved), the
+  effective CTM at the moment of paint (composed product of every
+  enclosing `q` frame's `cm` accumulation, root-to-leaf), and the
+  active `W`/`W*`-committed clip path (or `None`). The walker does
+  **not** interpret the shading dictionary itself — `ShadingType`,
+  `ColorSpace`, `Coords`, `Function`, etc. (§8.7.4.5 Tables 78..86)
+  stay verbatim on the surface so a downstream consumer can route
+  them through a dedicated shading-resolver. New public entry point
+  `parse_content_stream_full_with_shading(content, ext_gstate,
+  font_resources, shading_resources)` plumbs the page's resolved
+  `/Resources /Shading` subdictionary in alongside the round-125
+  `/ExtGState` and round-128 `/Font` resource paths; existing
+  `parse_content_stream_full` forwards through it with `None`
+  shading_resources so callers that don't care about shading paint
+  see no behavioural change (their `parsed.shadings` slot still
+  populates for every `sh` they encounter, just with
+  `shading_dict = None`). Document-level page loading
+  (`read_pdf_to_scene` and its password/certificate-bearing
+  siblings) automatically plumbs the shading resources into the
+  content-stream walker via the new `resolve_shading_resources`
+  helper, mirroring the `resolve_ext_gstate` /
+  `resolve_font_resources` one-hop-indirect contract: each per-name
+  shading entry is resolved into a direct `Object::Dict`, with
+  `Object::Stream` shading objects (Type 4..7 — free-form Gouraud,
+  lattice Gouraud, Coons, and tensor-product patches — are
+  stream-shaped per §8.7.4.5.5..8) surfacing their stream `dict` so
+  the Table 78 + per-type entries stay reachable. Coordinates inside
+  the shading dictionary are interpreted relative to the captured
+  `ctm` (§8.7.4.5 NOTE 1: "All coordinates in the shading dictionary
+  are interpreted relative to the current user space"), and the
+  painted region is bounded by the captured `clip` per §8.7.4.5
+  ("subject to the current clipping path"). Adds 9 new in-module
+  tests in `src/reader/content.rs` covering the resolved-dict
+  round-trip with a Type 2 (axial) shading shape, CTM capture from a
+  single `cm` (spec §8.7.4.5.4 worked example numerics), nested-`q`
+  CTM composition root-to-leaf, active-clip capture via a `re W n`
+  sequence, the unknown-name `shading_dict = None` tolerance branch
+  mirroring the round-128 unknown-`Tf` contract, the no-resources
+  tolerance branch (legacy entry point still sees the event with
+  populated CTM but `None` dict), stream-order multi-event ordering
+  with per-event independent CTMs, the
+  `parse_content_stream_full`-compat surface, and the no-`sh`
+  empty-slot return shape. The new `ContentShading` /
+  `parse_content_stream_full_with_shading` symbols re-exported from
+  `crate::reader`.
+
 - annotations (round 257): one new `/Subtype` encoder in the
   round-32 writer (`write_pdf_with_annotations`) — **PrinterMark**
   (§12.5.6.20 Table 362), closing the writer-side symmetry for the
