@@ -23,8 +23,8 @@
 //! | `k` / `K`            | DeviceCMYK fill / stroke — converted to RGB per §10.3.5 |
 //! | `w` / `J` / `j` / `M`| stroke width / cap / join / miter limit  |
 //! | `d`                  | dash array + offset                      |
-//! | `cs` / `CS`          | select nonstroking / stroking colour space (device families resolved; resource keys → Unknown) |
-//! | `sc` / `scn` / `SC` / `SCN` | colour value in the current space — DeviceGray / DeviceRGB / DeviceCMYK components honoured (§8.6.8) |
+//! | `cs` / `CS`          | select nonstroking / stroking colour space (device families resolved directly; round 275 resolves `/Resources /ColorSpace` keys that reduce to an ICCBased or Indexed device fallback) |
+//! | `sc` / `scn` / `SC` / `SCN` | colour value in the current space — DeviceGray / DeviceRGB / DeviceCMYK components honoured (§8.6.8); round 275 adds Indexed-table index lookup (§8.6.6.3) |
 //! | `gs`                 | ExtGState resource lookup — round 125 resolves `LW` / `LC` / `LJ` / `ML` / `D` / `CA` / `ca` from the page's `/Resources /ExtGState` dict |
 //!
 //! ExtGState lookup (round 125): when a page's `/Resources /ExtGState`
@@ -108,7 +108,7 @@ use crate::objects::{Dict, Object};
 /// [`parse_content_stream_full`] with a resolved `/Resources /Font`
 /// dictionary attached.
 pub fn parse_content_stream(input: &[u8]) -> Result<Group, PdfError> {
-    let mut state = State::new(None, None, None);
+    let mut state = State::new(None, None, None, None);
     state.parse(input)?;
     Ok(state.finish().root)
 }
@@ -131,7 +131,7 @@ pub fn parse_content_stream_with_resources(
     input: &[u8],
     ext_gstate: Option<&Dict>,
 ) -> Result<Group, PdfError> {
-    let mut state = State::new(ext_gstate, None, None);
+    let mut state = State::new(ext_gstate, None, None, None);
     state.parse(input)?;
     Ok(state.finish().root)
 }
@@ -188,7 +188,64 @@ pub fn parse_content_stream_full_with_shading(
     font_resources: Option<&Dict>,
     shading_resources: Option<&Dict>,
 ) -> Result<ParsedContent, PdfError> {
-    let mut state = State::new(ext_gstate, font_resources, shading_resources);
+    parse_content_stream_full_with_color_space(
+        input,
+        ext_gstate,
+        font_resources,
+        shading_resources,
+        None,
+    )
+}
+
+/// Parse a content-stream with the page's resolved `/Resources`
+/// `/ExtGState`, `/Font`, `/Shading`, **and `/ColorSpace`**
+/// subdictionaries attached. Same as
+/// [`parse_content_stream_full_with_shading`] plus round-275
+/// colour-space resolution: a `cs` / `CS` operator naming a key in the
+/// `/Resources /ColorSpace` dict (rather than a bare device family
+/// `/DeviceGray` / `/DeviceRGB` / `/DeviceCMYK`) is resolved against it
+/// per ISO 32000-1 §8.6.8 Table 74 + §8.6.5 + §8.6.6.
+///
+/// Two non-CIE resource colour-space families reduce to a device
+/// fallback the round-118 parser previously collapsed to black:
+///
+/// * **`ICCBased`** (§8.6.5.5) — the `/Alternate` device space is used
+///   when present, otherwise the profile's `/N` component count selects
+///   DeviceGray (1) / DeviceRGB (3) / DeviceCMYK (4). The ICC profile
+///   bytes themselves are not interpreted (the spec authorises exactly
+///   this fallback for a reader that does not process the profile).
+/// * **`Indexed`** (§8.6.6.3) — when the base reduces to a device
+///   family, a subsequent `sc`/`scn` index selects the corresponding
+///   `m`-byte entry from the resolved colour table (index rounded to
+///   nearest, clamped into `0..=hival`, each byte scaled `0..255 →`
+///   the component range).
+///
+/// CalRGB / CalGray / Lab (CIE-based, need a gamut-mapping pass),
+/// Separation / DeviceN (need tint-transform function evaluation), and
+/// `/Pattern` keep the conservative black fallback.
+///
+/// `color_space_resources` follows the same one-hop-resolved contract
+/// as the other resource dicts: callers go through
+/// [`crate::reader::document::resolve_color_space_resources`] to get a
+/// dict whose per-name entries are resolved colour-space `Object`s
+/// (ICC profile streams replaced by their dictionaries, Indexed lookup
+/// streams replaced by their decoded bytes). When
+/// `color_space_resources` is `None` or doesn't contain the named key,
+/// a non-device `cs`/`CS` stays `Unknown` and `sc`/`scn` keeps the
+/// black fallback, matching round-118 behaviour.
+pub fn parse_content_stream_full_with_color_space(
+    input: &[u8],
+    ext_gstate: Option<&Dict>,
+    font_resources: Option<&Dict>,
+    shading_resources: Option<&Dict>,
+    color_space_resources: Option<&Dict>,
+) -> Result<ParsedContent, PdfError> {
+    let mut state = State::new(
+        ext_gstate,
+        font_resources,
+        shading_resources,
+        color_space_resources,
+    );
     state.parse(input)?;
     Ok(state.finish())
 }
@@ -379,6 +436,19 @@ struct State<'a> {
     /// operator + name + CTM + clip) but `shading_dict` stays
     /// `None`.
     shading_resources: Option<&'a Dict>,
+    /// Page's `/Resources /ColorSpace` subdictionary, if the caller
+    /// went through [`parse_content_stream_full_with_color_space`] —
+    /// `None` otherwise. Each per-name entry is the resolved
+    /// colour-space `Object` (a bare device `/Name`, an `[/ICCBased
+    /// <dict>]` array with the ICC profile stream replaced by its
+    /// dictionary, or an `[/Indexed base hival lookup]` array with the
+    /// lookup stream replaced by its decoded bytes), produced by
+    /// [`crate::reader::document::resolve_color_space_resources`]. When
+    /// this is `Some`, a `cs`/`CS` naming a key in it resolves against
+    /// it (§8.6.5.5 ICCBased + §8.6.6.3 Indexed device fallbacks); when
+    /// it's `None`, a non-device `cs`/`CS` name stays `Unknown`,
+    /// matching the round-118 conservative black fallback.
+    color_space_resources: Option<&'a Dict>,
     /// Currently-selected font: name (Tf operand, leading `/`
     /// stripped) + size. Reset on each `Tf`. Cleared when no `Tf`
     /// has been seen yet — `Tj` then emits with an empty `font_name`
@@ -453,14 +523,19 @@ enum ArrayElem {
 
 /// Which colour space the current `sc`/`scn` (or `SC`/`SCN`) operands
 /// are interpreted in, as established by the most recent `cs` / `CS`
-/// operator (ISO 32000-1 §8.6.8 Table 74). Only the device families
+/// operator (ISO 32000-1 §8.6.8 Table 74). The three device families
 /// — whose component counts are fixed and whose component → RGB
-/// mapping needs no `/Resources` lookup — are tracked; every other
-/// space (Pattern, CIE-based, Indexed, Separation, DeviceN, or a
-/// `/Resources /ColorSpace` key the round-3 parser can't resolve)
+/// mapping needs no `/Resources` lookup — are tracked directly. When
+/// the page's `/Resources /ColorSpace` subdictionary is plumbed in
+/// (round 275, [`parse_content_stream_full_with_color_space`]), a
+/// named key resolving to an `ICCBased` stream maps to its device
+/// alternate (§8.6.5.5) and a named key resolving to an `Indexed`
+/// array carries its base + colour table for `sc`/`scn` index lookups
+/// (§8.6.6.3). Every other space (Pattern, CIE-based CalRGB/CalGray/
+/// Lab, Separation, DeviceN, or any key the parser can't resolve)
 /// collapses to `Unknown`, for which `sc`/`scn` keep the conservative
 /// black fallback.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 enum ColorSpaceKind {
     /// `/DeviceGray` — one component (§8.6.4.2).
     DeviceGray,
@@ -468,17 +543,31 @@ enum ColorSpaceKind {
     DeviceRgb,
     /// `/DeviceCMYK` — four components (§8.6.4.4).
     DeviceCmyk,
-    /// Any space the parser doesn't resolve to a device family — a
-    /// `/Resources /ColorSpace` key, `/Pattern`, or a CIE-based /
-    /// Indexed / Separation / DeviceN name.
+    /// An `/Indexed` space (§8.6.6.3): a single index component selects
+    /// a `base`-space colour from `table`. `base` is the device family
+    /// the table entries are interpreted in; `hival` is the maximum
+    /// valid index; `table` is the `(hival+1) * base.components()`
+    /// resolved lookup bytes (each scaled 0..255 → component range).
+    Indexed {
+        base: Box<ColorSpaceKind>,
+        hival: u32,
+        table: Vec<u8>,
+    },
+    /// Any space the parser doesn't resolve to a device family or a
+    /// device-based Indexed space — `/Pattern`, a CIE-based CalRGB /
+    /// CalGray / Lab space, a Separation / DeviceN space, or a
+    /// `/Resources /ColorSpace` key whose definition the parser can't
+    /// reduce to a device fallback.
     Unknown,
 }
 
 impl ColorSpaceKind {
-    /// Map a `cs` / `CS` name operand to a tracked colour space. The
-    /// three device-family names are recognised directly (§8.6.4.1);
-    /// everything else — including `/Pattern` and any resource key —
-    /// is `Unknown`.
+    /// Map a `cs` / `CS` name operand to a tracked colour space without
+    /// consulting `/Resources`. The three device-family names are
+    /// recognised directly (§8.6.4.1); everything else — including
+    /// `/Pattern` and any resource key — is `Unknown` until
+    /// [`resolve_with_resources`](Self::resolve_with_resources) gets a
+    /// chance to look the key up.
     fn from_name(name: &str) -> Self {
         match name {
             "DeviceGray" | "G" => ColorSpaceKind::DeviceGray,
@@ -489,15 +578,134 @@ impl ColorSpaceKind {
     }
 
     /// Number of numeric components an `sc`/`scn` carries in this
-    /// space, or `None` for `Unknown` (where the count is unknowable
+    /// space. `Indexed` always carries a single index component
+    /// (§8.6.6.3). `None` for `Unknown` (where the count is unknowable
     /// without resolving the resource definition).
-    fn components(self) -> Option<usize> {
+    fn components(&self) -> Option<usize> {
         match self {
             ColorSpaceKind::DeviceGray => Some(1),
             ColorSpaceKind::DeviceRgb => Some(3),
             ColorSpaceKind::DeviceCmyk => Some(4),
+            ColorSpaceKind::Indexed { .. } => Some(1),
             ColorSpaceKind::Unknown => None,
         }
+    }
+
+    /// Resolve a `cs` / `CS` name against the page's `/Resources
+    /// /ColorSpace` subdictionary (when one is plumbed in). The three
+    /// device-family names short-circuit to themselves (a resource key
+    /// can't shadow them per §8.6.8 Table 74). Otherwise the named
+    /// entry's resolved `Object` is interpreted per
+    /// [`color_space_from_object`]; an absent key (or one this round
+    /// can't reduce to a device fallback) stays `Unknown`, preserving
+    /// the conservative black fallback.
+    fn resolve_with_resources(name: &str, resources: Option<&Dict>) -> Self {
+        let direct = ColorSpaceKind::from_name(name);
+        if direct != ColorSpaceKind::Unknown {
+            return direct;
+        }
+        let Some(res) = resources else {
+            return ColorSpaceKind::Unknown;
+        };
+        match res.entries().iter().find(|(k, _)| k == name) {
+            Some((_, obj)) => color_space_from_object(obj),
+            None => ColorSpaceKind::Unknown,
+        }
+    }
+}
+
+/// Interpret a resolved `/Resources /ColorSpace` entry (already
+/// fully-dereferenced by
+/// [`crate::reader::document::resolve_color_space_resources`]) as a
+/// tracked [`ColorSpaceKind`].
+///
+/// Recognised, all reducible to a device family without CIE colour
+/// science:
+///
+/// * A bare device name (`/DeviceGray` / `/DeviceRGB` / `/DeviceCMYK`).
+/// * `[ /ICCBased << /N n /Alternate alt … >> ]` — §8.6.5.5: the
+///   `/Alternate` space is used when present, otherwise `/N` (1/3/4)
+///   selects DeviceGray / DeviceRGB / DeviceCMYK exactly as the spec's
+///   "if this entry is omitted … the colour space that shall be used
+///   is DeviceGray, DeviceRGB, or DeviceCMYK, depending on whether the
+///   value of N is 1, 3, or 4" fallback prescribes. The ICC profile
+///   bytes themselves are not interpreted.
+/// * `[ /Indexed base hival lookup ]` — §8.6.6.3: when `base` reduces
+///   to a device family, the resolved lookup bytes are carried so
+///   `sc`/`scn` can index the table.
+///
+/// CalRGB / CalGray / Lab (CIE-based, need a gamut-mapping pass),
+/// Separation / DeviceN (need tint-transform function evaluation), and
+/// `/Pattern` all stay `Unknown`.
+fn color_space_from_object(obj: &Object) -> ColorSpaceKind {
+    match obj {
+        Object::Name(n) => ColorSpaceKind::from_name(n),
+        Object::Array(items) => match items.first() {
+            Some(Object::Name(family)) if family == "ICCBased" => icc_based_from_array(items),
+            Some(Object::Name(family)) if family == "Indexed" => indexed_from_array(items),
+            _ => ColorSpaceKind::Unknown,
+        },
+        _ => ColorSpaceKind::Unknown,
+    }
+}
+
+/// Reduce `[ /ICCBased << /N n /Alternate alt … >> ]` to its device
+/// fallback per §8.6.5.5. The stream's dictionary is surfaced as the
+/// second array element (the document-level resolver replaces the ICC
+/// profile stream with its dictionary). `/Alternate` wins when it
+/// itself reduces to a device family; otherwise `/N` selects the
+/// device space.
+fn icc_based_from_array(items: &[Object]) -> ColorSpaceKind {
+    let Some(Object::Dict(dict)) = items.get(1) else {
+        return ColorSpaceKind::Unknown;
+    };
+    if let Some((_, alt)) = dict.entries().iter().find(|(k, _)| k == "Alternate") {
+        let resolved = color_space_from_object(alt);
+        if resolved != ColorSpaceKind::Unknown {
+            return resolved;
+        }
+    }
+    match dict.entries().iter().find(|(k, _)| k == "N") {
+        Some((_, Object::Integer(1))) => ColorSpaceKind::DeviceGray,
+        Some((_, Object::Integer(3))) => ColorSpaceKind::DeviceRgb,
+        Some((_, Object::Integer(4))) => ColorSpaceKind::DeviceCmyk,
+        _ => ColorSpaceKind::Unknown,
+    }
+}
+
+/// Reduce `[ /Indexed base hival lookup ]` to a tracked `Indexed`
+/// space per §8.6.6.3. The base must itself reduce to a device family
+/// (the only families whose table entries this round can interpret);
+/// `hival` must be a non-negative integer ≤ 255; the lookup parameter
+/// must be a resolved byte string (the document-level resolver
+/// replaces a lookup *stream* with its decoded bytes as a
+/// `HexString`). Any deviation collapses to `Unknown`.
+fn indexed_from_array(items: &[Object]) -> ColorSpaceKind {
+    if items.len() < 4 {
+        return ColorSpaceKind::Unknown;
+    }
+    let base = color_space_from_object(&items[1]);
+    // The base must reduce to a device family — `components()` is `None`
+    // for `Unknown`, and §8.6.6.3 forbids an Indexed (or Pattern) base,
+    // so a nested `Indexed` is rejected too. The table's per-entry byte
+    // count `m` follows from the base at lookup time (`indexed_color`);
+    // a short table is tolerated by returning no colour for an
+    // out-of-range slot rather than rejecting the whole space here.
+    if base.components().is_none() || matches!(base, ColorSpaceKind::Indexed { .. }) {
+        return ColorSpaceKind::Unknown;
+    }
+    let hival = match &items[2] {
+        Object::Integer(n) if *n >= 0 && *n <= 255 => *n as u32,
+        _ => return ColorSpaceKind::Unknown,
+    };
+    let table = match &items[3] {
+        Object::LiteralString(b) | Object::HexString(b) => b.clone(),
+        _ => return ColorSpaceKind::Unknown,
+    };
+    ColorSpaceKind::Indexed {
+        base: Box::new(base),
+        hival,
+        table,
     }
 }
 
@@ -506,6 +714,7 @@ impl<'a> State<'a> {
         ext_gstate: Option<&'a Dict>,
         font_resources: Option<&'a Dict>,
         shading_resources: Option<&'a Dict>,
+        color_space_resources: Option<&'a Dict>,
     ) -> Self {
         Self {
             operands: Vec::new(),
@@ -526,6 +735,7 @@ impl<'a> State<'a> {
             ext_gstate,
             font_resources,
             shading_resources,
+            color_space_resources,
             current_font: None,
             text_matrix: Transform2D::identity(),
             text_line_matrix: Transform2D::identity(),
@@ -794,7 +1004,7 @@ impl<'a> State<'a> {
                 // (Pattern, an unresolved resource colour space, or a
                 // trailing `/Name` pattern operand) keep the round-3
                 // conservative black fallback.
-                let paint = self.color_from_components(self.fill_cs);
+                let paint = self.color_from_components(&self.fill_cs.clone());
                 self.fill_paint = paint.or_else(|| {
                     self.fill_paint
                         .clone()
@@ -803,7 +1013,7 @@ impl<'a> State<'a> {
                 self.operands.clear();
             }
             b"SC" | b"SCN" => {
-                let paint = self.color_from_components(self.stroke_cs);
+                let paint = self.color_from_components(&self.stroke_cs.clone());
                 self.stroke_paint = paint.or_else(|| {
                     self.stroke_paint
                         .clone()
@@ -819,12 +1029,12 @@ impl<'a> State<'a> {
                 // black/zero value per §8.6.4.2..4 ("Setting … shall
                 // initialize the corresponding current colour to 0.0").
                 self.fill_cs = self.take_color_space_name();
-                self.fill_paint = initial_color_for(self.fill_cs);
+                self.fill_paint = initial_color_for(&self.fill_cs);
                 self.operands.clear();
             }
             b"CS" => {
                 self.stroke_cs = self.take_color_space_name();
-                self.stroke_paint = initial_color_for(self.stroke_cs);
+                self.stroke_paint = initial_color_for(&self.stroke_cs);
                 self.operands.clear();
             }
 
@@ -1338,7 +1548,7 @@ impl<'a> State<'a> {
     /// or when the numeric-operand count doesn't match the device
     /// family's component count. In those cases the caller falls back
     /// to the conservative black behaviour.
-    fn color_from_components(&self, cs: ColorSpaceKind) -> Option<Paint> {
+    fn color_from_components(&self, cs: &ColorSpaceKind) -> Option<Paint> {
         let want = cs.components()?;
         // A trailing `/Name` operand marks a Pattern fill — no device
         // colour to read.
@@ -1368,16 +1578,23 @@ impl<'a> State<'a> {
             ColorSpaceKind::DeviceCmyk => {
                 Paint::Solid(rgb_from_cmyk(comps[0], comps[1], comps[2], comps[3]))
             }
+            ColorSpaceKind::Indexed { base, hival, table } => {
+                return indexed_color(base, *hival, table, comps[0])
+            }
             ColorSpaceKind::Unknown => unreachable!("components() returned Some"),
         })
     }
 
     /// Pop the trailing `/Name` operand of a `cs` / `CS` operator and
-    /// map it to a tracked colour space. A `cs` with no name operand
-    /// (malformed) leaves the space `Unknown`.
+    /// map it to a tracked colour space, consulting the page's
+    /// `/Resources /ColorSpace` subdictionary (round 275) for
+    /// non-device names. A `cs` with no name operand (malformed) leaves
+    /// the space `Unknown`.
     fn take_color_space_name(&mut self) -> ColorSpaceKind {
         match self.operands.last() {
-            Some(Operand::Name(n)) => ColorSpaceKind::from_name(n),
+            Some(Operand::Name(n)) => {
+                ColorSpaceKind::resolve_with_resources(n, self.color_space_resources)
+            }
             _ => ColorSpaceKind::Unknown,
         }
     }
@@ -1528,13 +1745,54 @@ fn rgb_from_unit(r: f32, g: f32, b: f32) -> Rgba {
 /// `0 0 0 1`-equivalent — also black — for CMYK). For an unresolved
 /// space we leave the paint cleared so the existing black fallback in
 /// `commit_path` applies if nothing further is set.
-fn initial_color_for(cs: ColorSpaceKind) -> Option<Paint> {
+fn initial_color_for(cs: &ColorSpaceKind) -> Option<Paint> {
     match cs {
         ColorSpaceKind::DeviceGray | ColorSpaceKind::DeviceRgb | ColorSpaceKind::DeviceCmyk => {
             Some(Paint::Solid(Rgba::opaque(0, 0, 0)))
         }
+        // §8.6.6.3: "Setting the current … colour space to an Indexed
+        // colour space shall initialize the corresponding current
+        // colour to 0" — i.e. table entry 0.
+        ColorSpaceKind::Indexed { base, hival, table } => indexed_color(base, *hival, table, 0.0),
         ColorSpaceKind::Unknown => None,
     }
+}
+
+/// Resolve a single `sc`/`scn` index against an `/Indexed` colour
+/// table per ISO 32000-1 §8.6.6.3. The `index` operand is rounded to
+/// the nearest integer and clamped into `0..=hival` ("If the value is
+/// a real number, it shall be rounded to the nearest integer; if it is
+/// outside the range 0 to hival, it shall be adjusted to the nearest
+/// value within that range"). Each of the base space's `m` components
+/// is one table byte scaled `0..255 → 0.0..1.0`, then mapped to RGB
+/// through the base device family. Returns `None` when the table is
+/// too short to hold the selected entry (a malformed/truncated lookup)
+/// so the conservative black fallback applies.
+fn indexed_color(base: &ColorSpaceKind, hival: u32, table: &[u8], index: f32) -> Option<Paint> {
+    let m = base.components()?;
+    // Round to nearest, clamp into [0, hival].
+    let idx = if index.is_finite() {
+        let r = index.round();
+        r.clamp(0.0, hival as f32) as u32
+    } else {
+        0
+    };
+    let start = (idx as usize).checked_mul(m)?;
+    let entry = table.get(start..start + m)?;
+    let unit = |i: usize| entry[i] as f32 / 255.0;
+    Some(match base {
+        ColorSpaceKind::DeviceGray => Paint::Solid(rgb_from_unit(unit(0), unit(0), unit(0))),
+        ColorSpaceKind::DeviceRgb => Paint::Solid(rgb_from_unit(unit(0), unit(1), unit(2))),
+        ColorSpaceKind::DeviceCmyk => {
+            Paint::Solid(rgb_from_cmyk(unit(0), unit(1), unit(2), unit(3)))
+        }
+        // `indexed_from_array` rejects a non-device base, and a nested
+        // `Indexed` base is forbidden by §8.6.6.3, so these are
+        // unreachable in practice; fall back to black for total safety.
+        ColorSpaceKind::Indexed { .. } | ColorSpaceKind::Unknown => {
+            Paint::Solid(Rgba::opaque(0, 0, 0))
+        }
+    })
 }
 
 /// Convert a DeviceCMYK colour value to DeviceRGB per ISO 32000-1
@@ -2223,6 +2481,221 @@ mod tests {
             ColorSpaceKind::Unknown
         );
         assert_eq!(ColorSpaceKind::from_name("CS0"), ColorSpaceKind::Unknown);
+    }
+
+    // ── Resource colour-space resolution (round 275) ──────────────
+
+    /// Helper: parse with a `/Resources /ColorSpace` dict plumbed in,
+    /// return the first painted path's fill RGB.
+    fn first_fill_with_cs(bytes: &[u8], cs: &Dict) -> (u8, u8, u8) {
+        let parsed =
+            parse_content_stream_full_with_color_space(bytes, None, None, None, Some(cs)).unwrap();
+        let Node::Group(g) = &parsed.root.children[0] else {
+            panic!("expected group");
+        };
+        let Node::Path(p) = &g.children[0] else {
+            panic!("expected path");
+        };
+        match &p.fill {
+            Some(Paint::Solid(c)) => (c.r, c.g, c.b),
+            other => panic!("unexpected fill: {other:?}"),
+        }
+    }
+
+    /// `[ /ICCBased << /N 3 >> ]` with no `/Alternate` reduces to
+    /// DeviceRGB per §8.6.5.5; a following `sc` reads three components.
+    #[test]
+    fn icc_based_n3_resolves_devicergb() {
+        let arr = Object::Array(vec![
+            Object::Name("ICCBased".into()),
+            Object::Dict(Dict::new().with("N", Object::Integer(3))),
+        ]);
+        assert_eq!(color_space_from_object(&arr), ColorSpaceKind::DeviceRgb);
+
+        let cs = Dict::new().with("CS0", arr);
+        let bytes = b"q /CS0 cs 1 0 0 sc 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (255, 0, 0));
+    }
+
+    /// `/N 1` → DeviceGray, `/N 4` → DeviceCMYK (§8.6.5.5 fallback).
+    #[test]
+    fn icc_based_n1_and_n4_resolve_gray_and_cmyk() {
+        let gray = Object::Array(vec![
+            Object::Name("ICCBased".into()),
+            Object::Dict(Dict::new().with("N", Object::Integer(1))),
+        ]);
+        assert_eq!(color_space_from_object(&gray), ColorSpaceKind::DeviceGray);
+        let cmyk = Object::Array(vec![
+            Object::Name("ICCBased".into()),
+            Object::Dict(Dict::new().with("N", Object::Integer(4))),
+        ]);
+        assert_eq!(color_space_from_object(&cmyk), ColorSpaceKind::DeviceCmyk);
+
+        // End-to-end: N=4 CMYK pure cyan → (0,255,255).
+        let cs = Dict::new().with("CS0", cmyk);
+        let bytes = b"q /CS0 cs 1 0 0 0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (0, 255, 255));
+    }
+
+    /// `/Alternate` overrides the `/N` fallback when present and
+    /// reducible (§8.6.5.5 — "an alternate colour space that shall be
+    /// used in case the one specified in the stream data is not
+    /// supported").
+    #[test]
+    fn icc_based_alternate_wins_over_n() {
+        // N says 3 but /Alternate names DeviceCMYK (a deliberately
+        // mismatched fixture to prove the Alternate path is taken).
+        let arr = Object::Array(vec![
+            Object::Name("ICCBased".into()),
+            Object::Dict(
+                Dict::new()
+                    .with("N", Object::Integer(3))
+                    .with("Alternate", Object::Name("DeviceCMYK".into())),
+            ),
+        ]);
+        assert_eq!(color_space_from_object(&arr), ColorSpaceKind::DeviceCmyk);
+    }
+
+    /// An ICCBased dict with no `/N` and no reducible `/Alternate`
+    /// stays `Unknown` (the round-118 black fallback).
+    #[test]
+    fn icc_based_without_n_is_unknown() {
+        let arr = Object::Array(vec![
+            Object::Name("ICCBased".into()),
+            Object::Dict(Dict::new()),
+        ]);
+        assert_eq!(color_space_from_object(&arr), ColorSpaceKind::Unknown);
+    }
+
+    /// `[ /Indexed /DeviceRGB 2 <000000 FF0000 00FF00> ]` — the
+    /// §8.6.6.3 Example 1 shape. `1 sc` selects entry 1 (red).
+    #[test]
+    fn indexed_devicergb_index_selects_table_entry() {
+        // hival 2 → 3 entries × 3 bytes = 9 bytes.
+        let table = vec![
+            0x00, 0x00, 0x00, // entry 0 = black
+            0xFF, 0x00, 0x00, // entry 1 = red
+            0x00, 0xFF, 0x00, // entry 2 = green
+        ];
+        let arr = Object::Array(vec![
+            Object::Name("Indexed".into()),
+            Object::Name("DeviceRGB".into()),
+            Object::Integer(2),
+            Object::HexString(table),
+        ]);
+        let cs = Dict::new().with("CS0", arr);
+
+        // index 1 → red.
+        let bytes = b"q /CS0 cs 1 sc 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (255, 0, 0));
+    }
+
+    /// Bare `cs` to an Indexed space initialises the colour to table
+    /// entry 0 per §8.6.6.3 ("shall initialize the corresponding
+    /// current colour to 0").
+    #[test]
+    fn indexed_bare_cs_uses_entry_zero() {
+        let table = vec![0x10, 0x20, 0x30, 0xFF, 0xFF, 0xFF];
+        let arr = Object::Array(vec![
+            Object::Name("Indexed".into()),
+            Object::Name("DeviceRGB".into()),
+            Object::Integer(1),
+            Object::HexString(table),
+        ]);
+        let cs = Dict::new().with("CS0", arr);
+        // No `sc` — bare `cs` should leave the entry-0 colour in force.
+        let bytes = b"q /CS0 cs 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (0x10, 0x20, 0x30));
+    }
+
+    /// An out-of-range index is clamped to `0..=hival` and a fractional
+    /// index rounds to nearest (§8.6.6.3).
+    #[test]
+    fn indexed_index_rounds_and_clamps() {
+        let table = vec![
+            0x00, 0x00, 0x00, // 0
+            0x40, 0x40, 0x40, // 1
+            0x80, 0x80, 0x80, // 2
+        ];
+        let mk = |arr| Dict::new().with("CS0", arr);
+        let arr = || {
+            Object::Array(vec![
+                Object::Name("Indexed".into()),
+                Object::Name("DeviceRGB".into()),
+                Object::Integer(2),
+                Object::HexString(table.clone()),
+            ])
+        };
+        // 1.6 rounds to 2 → 0x80.
+        let bytes = b"q /CS0 cs 1.6 sc 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &mk(arr())), (0x80, 0x80, 0x80));
+        // 9 clamps to hival=2 → 0x80.
+        let bytes = b"q /CS0 cs 9 sc 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &mk(arr())), (0x80, 0x80, 0x80));
+        // -3 clamps to 0 → black.
+        let bytes = b"q /CS0 cs -3 sc 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &mk(arr())), (0x00, 0x00, 0x00));
+    }
+
+    /// An Indexed base that doesn't reduce to a device family (here a
+    /// CIE-based `/Lab`) stays `Unknown` — no table lookup is possible.
+    #[test]
+    fn indexed_nondevice_base_is_unknown() {
+        let arr = Object::Array(vec![
+            Object::Name("Indexed".into()),
+            Object::Name("Lab".into()),
+            Object::Integer(1),
+            Object::HexString(vec![0, 0, 0, 1, 1, 1]),
+        ]);
+        assert_eq!(color_space_from_object(&arr), ColorSpaceKind::Unknown);
+    }
+
+    /// A truncated Indexed table (too short for the selected entry)
+    /// produces no colour, so the prior colour is retained — here the
+    /// entry-0 colour the bare `cs` initialised — rather than reading
+    /// past the buffer. `indexed_color` returns `None` for the missing
+    /// slot.
+    #[test]
+    fn indexed_truncated_table_returns_none_for_missing_slot() {
+        // hival 2 declared but only entry 0 (black) is present.
+        let table = vec![0x00, 0x00, 0x00];
+        let base = ColorSpaceKind::DeviceRgb;
+        // Entry 0 resolves.
+        assert!(indexed_color(&base, 2, &table, 0.0).is_some());
+        // Entry 2 is past the buffer → None (no out-of-bounds read).
+        assert!(indexed_color(&base, 2, &table, 2.0).is_none());
+
+        // End-to-end: bare `cs` sets entry 0 (black); the truncated
+        // `2 sc` returns None so the fill stays the entry-0 black.
+        let arr = Object::Array(vec![
+            Object::Name("Indexed".into()),
+            Object::Name("DeviceRGB".into()),
+            Object::Integer(2),
+            Object::HexString(table),
+        ]);
+        let cs = Dict::new().with("CS0", arr);
+        let bytes = b"q /CS0 cs 2 sc 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (0, 0, 0));
+    }
+
+    /// A device family name in `cs` still resolves directly even when a
+    /// `/Resources /ColorSpace` dict is present (a resource key cannot
+    /// shadow a device family per §8.6.8 Table 74).
+    #[test]
+    fn device_name_resolves_without_consulting_resources() {
+        let cs = Dict::new().with("DeviceRGB", Object::Name("DeviceGray".into()));
+        let bytes = b"q /DeviceRGB cs 1 0 0 sc 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (255, 0, 0));
+    }
+
+    /// Without a plumbed-in `/ColorSpace` dict, a resource key stays
+    /// `Unknown` (round-118 behaviour preserved).
+    #[test]
+    fn resource_key_without_resources_stays_unknown() {
+        assert_eq!(
+            ColorSpaceKind::resolve_with_resources("CS0", None),
+            ColorSpaceKind::Unknown
+        );
     }
 
     // ── ExtGState `gs` resolution (round 125, ISO 32000-1 §8.4.5) ──

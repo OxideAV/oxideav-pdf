@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- reader (round 275): content-stream `cs` / `CS` operators now resolve
+  `/Resources /ColorSpace` keys that reduce to a device fallback,
+  closing two cases the round-118 parser collapsed to opaque black
+  (ISO 32000-1 §8.6.8 Table 74). **`ICCBased`** (§8.6.5.5) maps to its
+  `/Alternate` device space when present, otherwise to the profile's
+  `/N` component count → DeviceGray (1) / DeviceRGB (3) / DeviceCMYK
+  (4) — the exact fallback the spec authorises for a reader that does
+  not process the embedded ICC profile (the profile bytes are never
+  interpreted). **`Indexed`** (§8.6.6.3) with a device base lets a
+  subsequent `sc`/`scn` index select an `m`-byte colour-table entry
+  (index rounded to nearest + clamped into `0..=hival`; each byte
+  scaled `0..255` → the base component range; bare `cs` initialises to
+  entry 0). The new
+  `reader::content::parse_content_stream_full_with_color_space` entry
+  point takes the resolved `/ColorSpace` dict; a new document-level
+  `resolve_color_space_resources` helper dereferences it one hop,
+  replacing an ICC profile stream with its dictionary and an Indexed
+  lookup stream (PDF 1.2) with its decoded bytes so the parser sees a
+  self-contained value. CalRGB / CalGray / Lab (CIE-based) and
+  Separation / DeviceN keep the black fallback — they need a
+  gamut-mapping pass or tint-transform evaluation this round doesn't
+  carry. The legacy entry points keep their round-118 behaviour.
 - reader (round 267): text rendering mode (`Tr`) is now tracked by the
   text-extraction walker and surfaced on every `TextRun`
   (ISO 32000-1 §9.3.6, Table 106). A new typed `TextRenderMode` enum

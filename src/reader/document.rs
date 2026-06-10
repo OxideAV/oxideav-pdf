@@ -35,7 +35,7 @@ use crate::objects::{Dict, Object, ObjectId, Stream};
 use crate::pubsec::{
     open_with_certificate, open_with_certificate_and_trust_store, PubSecCredential, TrustStore,
 };
-use crate::reader::content::parse_content_stream_full_with_shading;
+use crate::reader::content::parse_content_stream_full_with_color_space;
 use crate::reader::parse::Parser;
 use crate::reader::xref::{parse_xref, XrefEntry, XrefTable};
 
@@ -1205,12 +1205,18 @@ fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Pag
     } else {
         None
     };
+    let color_space_dict = if let Some(rdict) = resources_dict.as_ref() {
+        resolve_color_space_resources(reader, rdict)?
+    } else {
+        None
+    };
 
-    let parsed = parse_content_stream_full_with_shading(
+    let parsed = parse_content_stream_full_with_color_space(
         &content_bytes,
         ext_gstate_dict.as_ref(),
         fonts_dict.as_ref(),
         shading_dict.as_ref(),
+        color_space_dict.as_ref(),
     )?;
     let root = parsed.root;
     let mut page = Page::new(width, height);
@@ -1373,6 +1379,152 @@ fn resolve_shading_resources(
         }
     }
     Ok(Some(out))
+}
+
+/// Resolve a page's `/Resources /ColorSpace` subdictionary into a
+/// fully-dereferenced [`Dict`] whose per-name entries are resolved
+/// colour-space `Object`s the round-275 content parser interprets
+/// (ISO 32000-1 §8.6.8 Table 74 + §8.6.5 + §8.6.6).
+///
+/// Returns `Ok(None)` when the resources dict carries no `/ColorSpace`
+/// entry — the common case for documents that paint only in the
+/// implicit device families (`rg` / `g` / `k`) or name the device
+/// families directly in `cs` / `CS`.
+///
+/// Each per-name value is resolved so the parser never has to touch
+/// the reader:
+///
+/// * A bare device `/Name` passes through verbatim.
+/// * An `[ /ICCBased <stream-ref> ]` array (§8.6.5.5) has the ICC
+///   profile stream replaced by its **dictionary** — the parser reads
+///   `/N` + `/Alternate` from it to pick the device fallback; the ICC
+///   profile bytes are never interpreted, so they are dropped.
+/// * An `[ /Indexed base hival lookup ]` array (§8.6.6.3) has a lookup
+///   *stream* (PDF 1.2 allows a stream or a byte string) replaced by
+///   its decoded bytes as a `HexString` so the parser sees a
+///   self-contained colour table; a base that is itself an indirect
+///   reference is dereferenced one hop.
+///
+/// Any other shape (CalRGB / CalGray / Lab / Separation / DeviceN /
+/// Pattern, or a malformed entry) is surfaced verbatim — the parser's
+/// [`crate::reader::content`] interpreter reduces what it can and
+/// leaves the rest `Unknown` (the round-118 black fallback).
+fn resolve_color_space_resources(
+    reader: &mut DocumentReader<'_>,
+    resources: &Dict,
+) -> Result<Option<Dict>, PdfError> {
+    let cs_obj = resources
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "ColorSpace")
+        .map(|(_, v)| v.clone());
+    let cs_obj = match cs_obj {
+        Some(Object::Reference(id)) => reader.resolve(id)?,
+        Some(other) => other,
+        None => return Ok(None),
+    };
+    let Object::Dict(cs_dict) = cs_obj else {
+        return Ok(None);
+    };
+    let mut out = Dict::new();
+    for (name, value) in cs_dict.entries() {
+        let resolved = match value {
+            Object::Reference(id) => reader.resolve(*id)?,
+            other => other.clone(),
+        };
+        let prepared = prepare_color_space_object(reader, resolved)?;
+        out.set(name, prepared);
+    }
+    Ok(Some(out))
+}
+
+/// Recursively dereference + simplify a colour-space `Object` so the
+/// content parser sees a self-contained value: ICC profile streams
+/// become their dictionaries, Indexed lookup streams become their
+/// decoded bytes, and nested base spaces / indirect references are
+/// resolved one element at a time. Plain values pass through.
+fn prepare_color_space_object(
+    reader: &mut DocumentReader<'_>,
+    obj: Object,
+) -> Result<Object, PdfError> {
+    match obj {
+        Object::Reference(id) => {
+            let target = reader.resolve(id)?;
+            prepare_color_space_object(reader, target)
+        }
+        Object::Array(items) => {
+            let family = items.first().and_then(|o| match o {
+                Object::Name(n) => Some(n.clone()),
+                _ => None,
+            });
+            match family.as_deref() {
+                Some("ICCBased") => {
+                    // [ /ICCBased stream ] — replace the profile stream
+                    // with its dictionary so the parser reads /N +
+                    // /Alternate. §8.6.5.5.
+                    let mut out = vec![Object::Name("ICCBased".into())];
+                    let stream_obj = match items.into_iter().nth(1) {
+                        Some(Object::Reference(id)) => reader.resolve(id)?,
+                        Some(other) => other,
+                        None => return Ok(Object::Array(out)),
+                    };
+                    match stream_obj {
+                        Object::Stream(s) => {
+                            // /Alternate may itself be an indirect ref
+                            // or a nested array — prepare it too.
+                            let mut dict = s.dict;
+                            if let Some((_, alt)) = dict
+                                .entries()
+                                .iter()
+                                .find(|(k, _)| k == "Alternate")
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                            {
+                                let prepared_alt = prepare_color_space_object(reader, alt)?;
+                                dict.set("Alternate", prepared_alt);
+                            }
+                            out.push(Object::Dict(dict));
+                        }
+                        Object::Dict(d) => out.push(Object::Dict(d)),
+                        _ => {}
+                    }
+                    Ok(Object::Array(out))
+                }
+                Some("Indexed") => {
+                    // [ /Indexed base hival lookup ] — §8.6.6.3.
+                    let mut it = items.into_iter();
+                    let _family = it.next();
+                    let base = match it.next() {
+                        Some(b) => prepare_color_space_object(reader, b)?,
+                        None => return Ok(Object::Array(vec![Object::Name("Indexed".into())])),
+                    };
+                    let hival = it.next().unwrap_or(Object::Null);
+                    let hival = match hival {
+                        Object::Reference(id) => reader.resolve(id)?,
+                        other => other,
+                    };
+                    let lookup = match it.next() {
+                        Some(Object::Reference(id)) => reader.resolve(id)?,
+                        Some(other) => other,
+                        None => Object::Null,
+                    };
+                    // A lookup stream (PDF 1.2) → decode to a byte
+                    // string. A literal/hex string passes through.
+                    let lookup = match lookup {
+                        Object::Stream(s) => Object::HexString(decode_stream(&s)?),
+                        other => other,
+                    };
+                    Ok(Object::Array(vec![
+                        Object::Name("Indexed".into()),
+                        base,
+                        hival,
+                        lookup,
+                    ]))
+                }
+                _ => Ok(Object::Array(items)),
+            }
+        }
+        other => Ok(other),
+    }
 }
 
 fn extract_stream_data(reader: &mut DocumentReader<'_>, id: ObjectId) -> Result<Vec<u8>, PdfError> {

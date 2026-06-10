@@ -1633,11 +1633,45 @@ implicit-space operators (`g`/`rg`/`k`, `G`/`RG`/`K`) also record
 their space so a subsequent bare `sc`/`scn` resolves correctly, and a
 bare `cs`/`CS` initialises the colour to black per §8.6.4.2..4.
 
-`/Pattern`, a trailing `/Name` pattern operand (§8.7.3.3), CIE-based /
-Indexed / Separation / DeviceN spaces, and any unresolved `/Resources
-/ColorSpace` key keep the conservative black fallback — resolving
-non-device spaces needs the page's `/Resources` dict, which this layer
-doesn't yet reach.
+`/Pattern`, a trailing `/Name` pattern operand (§8.7.3.3), CIE-based
+(CalRGB / CalGray / Lab) and Separation / DeviceN spaces keep the
+conservative black fallback — they need a gamut-mapping pass or a
+tint-transform function evaluation this layer doesn't yet carry.
+
+### Resource colour spaces: `ICCBased` + `Indexed` (round 275)
+
+Round 275 plumbs the page's resolved `/Resources /ColorSpace`
+subdictionary into the content parser so a `cs` / `CS` naming a
+resource key (rather than a bare device family) resolves against it
+(ISO 32000-1 §8.6.8 Table 74). Two non-CIE families reduce to a device
+fallback the round-118 parser previously collapsed to black:
+
+- **`ICCBased`** (§8.6.5.5) — the `/Alternate` device space is used
+  when present, otherwise the profile's `/N` component count selects
+  `DeviceGray` (1) / `DeviceRGB` (3) / `DeviceCMYK` (4), exactly the
+  fallback the spec authorises for a reader that does not process the
+  embedded profile ("if this entry is omitted and the conforming
+  reader does not understand the ICC profile data, the colour space
+  that shall be used is DeviceGray, DeviceRGB, or DeviceCMYK …"). The
+  ICC profile bytes are never interpreted.
+- **`Indexed`** (§8.6.6.3) — when the base reduces to a device family,
+  a subsequent `sc`/`scn` index selects the corresponding `m`-byte
+  table entry. The index is rounded to the nearest integer and clamped
+  into `0..=hival`; each byte is scaled `0..255` → the base component
+  range; a bare `cs` initialises the colour to table entry 0. A base
+  that is itself Indexed (forbidden by §8.6.6.3) or non-device, a
+  truncated table, or an out-of-range index falls back gracefully
+  without an out-of-bounds read.
+
+The document-level [`resolve_color_space_resources`] helper mirrors the
+round-125 `gs` / round-128 font / round-259 shading resolvers: it
+dereferences the `/ColorSpace` dict one hop, replaces an ICC profile
+*stream* with its dictionary (so `/N` + `/Alternate` are reachable) and
+an Indexed lookup *stream* (PDF 1.2) with its decoded bytes (so the
+table is self-contained). The new
+[`parse_content_stream_full_with_color_space`] entry point takes the
+resolved dict; the legacy entry points keep their round-118 behaviour
+(non-device names stay `Unknown`, `sc`/`scn` keeps the black fallback).
 
 ## Content-stream `Tj` / `TJ` text-show with `/Resources /Font` (round 128)
 
