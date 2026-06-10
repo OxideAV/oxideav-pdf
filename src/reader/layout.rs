@@ -342,12 +342,14 @@ mod tests {
                     position: (0.0, 0.0),
                     font_name: "F0".into(),
                     font_size: 12.0,
+                    render_mode: crate::reader::text::TextRenderMode::Fill,
                 },
                 TextRun {
                     text: "World".into(),
                     position: (40.0, 0.0),
                     font_name: "F0".into(),
                     font_size: 12.0,
+                    render_mode: crate::reader::text::TextRenderMode::Fill,
                 },
             ],
         };

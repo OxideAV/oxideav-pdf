@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- reader (round 267): text rendering mode (`Tr`) is now tracked by the
+  text-extraction walker and surfaced on every `TextRun`
+  (ISO 32000-1 §9.3.6, Table 106). A new typed `TextRenderMode` enum
+  (`Fill` / `Stroke` / `FillStroke` / `Invisible` / `FillClip` /
+  `StrokeClip` / `FillStrokeClip` / `Clip`) carries the mode in force
+  at the moment of each show, defaulting to `Fill` per the §9.3.1
+  default text state. The load-bearing case is `Invisible` (`3 Tr`),
+  the unpainted OCR text layer scanned PDFs stack behind a page image:
+  `TextRun::render_mode` lets a keyword-search consumer keep it while a
+  "what the eye sees" consumer drops it via
+  `TextRenderMode::paints_glyphs()` (false only for the `Invisible` and
+  clip-only `Clip` modes). The mode persists across `BT`/`ET` (Table
+  105 — `Tr` is a graphics-state text parameter, not a text-object
+  parameter) and is saved / restored by `q`/`Q`.
+  `TextRenderMode::from_operand` maps the Table 106 operand `0..=7` to
+  its variant, falling back to `Fill` for out-of-range values.
 - reader (round 259): one new content-stream operator in the §8
   walker — `sh` (ISO 32000-1 §8.7.4.5, "Paint the shape and colour
   shading described by a shading dictionary"). The walker now

@@ -536,6 +536,23 @@ break, a leading adjustment emits no dangling space, and a fragment
 already ending in a space is not doubled. Adds six end-to-end tests in
 `tests/tj_word_break_round188.rs`.
 
+Round 267 surfaces the **text rendering mode** (`Tr`, §9.3.6 Table
+106) on every [`TextRun`]. Before this round the walker dropped the
+`Tr` operand, so a text-extraction consumer could not tell visible
+body text apart from the *invisible* (`3 Tr`) OCR text layer scanned
+PDFs stack behind a page image. The new typed `TextRenderMode` enum
+(`Fill` / `Stroke` / `FillStroke` / `Invisible` / `FillClip` /
+`StrokeClip` / `FillStrokeClip` / `Clip`) carries the mode in force at
+the moment of each show, defaulting to `Fill` per the §9.3.1 default
+text state. `TextRun::render_mode` lets a keyword-search consumer keep
+the OCR layer while a "what the eye sees" consumer drops it via
+`render_mode.paints_glyphs()` (false only for the `Invisible` and
+clip-only `Clip` modes — the two that add nothing to the page raster).
+The mode persists across `BT`/`ET` (Table 105 — `Tr` is a
+graphics-state text parameter, not a text-object parameter) and is
+saved / restored by `q`/`Q`. Adds seven end-to-end tests in
+`tests/text_render_mode_round267.rs`.
+
 ```rust,ignore
 use oxideav_pdf::reader::DocumentReader;
 

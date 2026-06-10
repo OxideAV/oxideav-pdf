@@ -76,6 +76,73 @@ pub struct TextRun {
     pub font_name: String,
     /// Font size as supplied to the `Tf` operator.
     pub font_size: f32,
+    /// Text rendering mode in force at the moment of the show — the
+    /// most recent `Tr` operand (ISO 32000-1 §9.3.6, Table 106),
+    /// defaulting to [`TextRenderMode::Fill`] when no `Tr` preceded
+    /// the show. The load-bearing case for extraction consumers is
+    /// [`TextRenderMode::Invisible`] (`3 Tr`): the unpainted OCR text
+    /// layer scanners stack behind a page image. A keyword-search
+    /// consumer keeps it; a "what the human sees" consumer drops it.
+    pub render_mode: TextRenderMode,
+}
+
+/// Text rendering mode — the integer argument to the `Tr` operator
+/// (ISO 32000-1 §9.3.6, Table 106). Determines whether the glyphs of a
+/// text run are filled, stroked, used as a clipping boundary, or left
+/// unpainted entirely. Surfaced on every [`TextRun`] so an extraction
+/// consumer can distinguish visible body text from the invisible
+/// (`3 Tr`) OCR layer that scanned PDFs hide behind a page image, and
+/// from the clip-only (`7 Tr`) modes that paint no marks at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TextRenderMode {
+    /// `0` — fill text (the default when no `Tr` is issued).
+    #[default]
+    Fill,
+    /// `1` — stroke text.
+    Stroke,
+    /// `2` — fill, then stroke text.
+    FillStroke,
+    /// `3` — neither fill nor stroke (invisible). The OCR text layer
+    /// behind a scanned-page image uses this so the glyphs are
+    /// searchable / selectable but never painted.
+    Invisible,
+    /// `4` — fill text and add to the path for clipping.
+    FillClip,
+    /// `5` — stroke text and add to the path for clipping.
+    StrokeClip,
+    /// `6` — fill, then stroke text and add to the path for clipping.
+    FillStrokeClip,
+    /// `7` — add text to the path for clipping (no fill, no stroke).
+    Clip,
+}
+
+impl TextRenderMode {
+    /// Resolve a `Tr` operand integer to its typed mode. Table 106
+    /// enumerates exactly `0..=7`; out-of-range values are tolerated by
+    /// mapping back to [`TextRenderMode::Fill`] (the §9.3.1 default
+    /// text state), matching the reader's lenient stance elsewhere.
+    pub fn from_operand(n: i64) -> Self {
+        match n {
+            0 => Self::Fill,
+            1 => Self::Stroke,
+            2 => Self::FillStroke,
+            3 => Self::Invisible,
+            4 => Self::FillClip,
+            5 => Self::StrokeClip,
+            6 => Self::FillStrokeClip,
+            7 => Self::Clip,
+            _ => Self::Fill,
+        }
+    }
+
+    /// Whether glyphs in this mode paint any visible marks. `false`
+    /// only for [`TextRenderMode::Invisible`] (`3`) and
+    /// [`TextRenderMode::Clip`] (`7`) — the two modes that add nothing
+    /// to the page raster. Lets a "visible text only" consumer filter
+    /// the OCR layer out in one call.
+    pub fn paints_glyphs(self) -> bool {
+        !matches!(self, Self::Invisible | Self::Clip)
+    }
 }
 
 /// One [`TextRun`] together with the marked-content tag stack it was
@@ -1193,6 +1260,12 @@ struct TextWalker {
     tlm: [f32; 6],
     /// Leading (Tl) — distance between baselines. Used by T* and "/'.
     leading: f32,
+    /// Text rendering mode (`Tr`) — §9.3.6 Table 106. Persists across
+    /// show operators and is reset to the §9.3.1 default
+    /// ([`TextRenderMode::Fill`]) only by an explicit `0 Tr`, never by
+    /// `BT` (Table 105: `Tr` is a graphics-state text parameter, not a
+    /// text-object parameter). Saved / restored by `q` / `Q`.
+    render_mode: TextRenderMode,
     /// Saved text states — one entry per `q`. We don't push the whole
     /// graphics state (paint, transform, etc.) since the path walker
     /// already covers those; just the text-relevant slots.
@@ -1244,6 +1317,7 @@ struct SavedTextState {
     tm: [f32; 6],
     tlm: [f32; 6],
     leading: f32,
+    render_mode: TextRenderMode,
 }
 
 impl TextWalker {
@@ -1259,6 +1333,7 @@ impl TextWalker {
             tm: identity(),
             tlm: identity(),
             leading: 0.0,
+            render_mode: TextRenderMode::Fill,
             saved: Vec::new(),
             track_mcid: false,
             mcid_stack: Vec::new(),
@@ -1395,6 +1470,7 @@ impl TextWalker {
                     tm: self.tm,
                     tlm: self.tlm,
                     leading: self.leading,
+                    render_mode: self.render_mode,
                 });
                 self.operands.clear();
             }
@@ -1405,6 +1481,7 @@ impl TextWalker {
                     self.tm = s.tm;
                     self.tlm = s.tlm;
                     self.leading = s.leading;
+                    self.render_mode = s.render_mode;
                 }
                 self.operands.clear();
             }
@@ -1495,8 +1572,22 @@ impl TextWalker {
                 self.tm = self.tlm;
                 self.emit_show(&s);
             }
+            b"Tr" => {
+                // render mode Tr — §9.3.6 Table 106. The single integer
+                // operand selects fill / stroke / clip / invisible. We
+                // record it so each emitted run carries the mode in force
+                // (extraction consumers filter the `3 Tr` OCR layer on
+                // it); the actual fill/stroke/clip painting it implies is
+                // a renderer concern this extraction walker doesn't reach.
+                if let Some(n) = self.pop_num() {
+                    self.render_mode = TextRenderMode::from_operand(n as i64);
+                }
+                self.operands.clear();
+            }
             // Other text-state operators we record-but-don't-act-on.
-            b"Tc" | b"Tw" | b"Tz" | b"Tr" | b"Ts" => {
+            // Char / word spacing, horizontal scale, and rise only shift
+            // glyph geometry, not the decoded text or the run's mode.
+            b"Tc" | b"Tw" | b"Tz" | b"Ts" => {
                 self.operands.clear();
             }
             // Marked-content operators (ISO 32000-1 §14.6).
@@ -1693,6 +1784,7 @@ impl TextWalker {
             position: (self.tm[4], self.tm[5]),
             font_name: self.cur_font.clone(),
             font_size: self.cur_size,
+            render_mode: self.render_mode,
         });
         // Stamp the current MCID (top of stack) onto the run.
         let cur_mcid = self.mcid_stack.last().copied().unwrap_or(None);
@@ -2018,12 +2110,14 @@ mod tests {
                     position: (0.0, 0.0),
                     font_name: "F0".into(),
                     font_size: 12.0,
+                    render_mode: TextRenderMode::Fill,
                 },
                 TextRun {
                     text: "World".into(),
                     position: (40.0, 0.0),
                     font_name: "F0".into(),
                     font_size: 12.0,
+                    render_mode: TextRenderMode::Fill,
                 },
             ],
         };

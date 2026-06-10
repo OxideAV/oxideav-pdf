@@ -98,7 +98,7 @@ pub use reader::{
     MovieActivation, OutlineNode, PdfACatalogSignals, PdfAConformance, PdfAction, PdfAnnotation,
     PdfAttachment, PdfDocTimestamp, PdfImageXObject, PdfInlineImage, PdfLink, PdfLinkTarget,
     PdfMarkedTextExtraction, PdfOutline, PdfSignature, PdfTextExtraction, ReadingOrderText,
-    TextMarkupVariant, TextRun, ThreeDActivation, ThreeDViewSelector, XmpPacket,
+    TextMarkupVariant, TextRenderMode, TextRun, ThreeDActivation, ThreeDViewSelector, XmpPacket,
 };
 pub use sig::{
     add_document_timestamp, build_tst_info, pkcs7_wrap_signed_data, sign_pdf_from_scene,
