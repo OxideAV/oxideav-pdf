@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- reader (round 285, depth-mode profiling): content-stream numeric
+  operands now convert straight from the scanned bytes through an
+  exact-arithmetic fast path instead of the UTF-8 validation +
+  general-purpose `str::parse::<f32>` round trip. A §7.3.3 number is
+  `sign? digits? ("." digits?)?` — no exponent — so its value is
+  `significand / 10^frac`; when the significand is < 2^24 (exact in
+  f32) and the fraction is ≤ 10 digits (10^10 = 5^10·2^10 with 5^10 <
+  2^24, so the divisor is exact in f32), IEEE-754 division of two
+  exact operands is correctly rounded and therefore bit-identical to
+  the general parser's result. Wider inputs fall back to `str::parse`
+  unchanged, and a 2000-case generated parity test asserts the
+  bit-identity contract. Sampling profile of the bytes→Scene path on
+  120-page / ~220-segment-per-page writer-emitted documents ranked
+  decimal→f32 conversion as the top hotspot (~33% of samples:
+  `str::from_utf8` + the generic decimal-float parser); the fast path
+  cuts whole-document `read_pdf_to_scene` wall-clock by ≈ 29–31%
+  across all three container flavours (classic xref 2.91 → 2.06
+  ms/doc, xref-stream 2.96 → 2.05, ObjStm 3.02 → 2.11) with
+  byte-identical parsed-scene serialization and extracted-text hashes
+  on the fixture corpus. The reproducible harness is
+  `examples/profile_read.rs` (prints per-scenario wall-clock + FNV-1a
+  output fingerprints; run before/after any reader change).
+
 ### Added
 
 - reader (round 275): content-stream `cs` / `CS` operators now resolve

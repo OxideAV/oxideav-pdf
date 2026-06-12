@@ -1652,45 +1652,40 @@ impl<'a> State<'a> {
                 continue;
             }
             if matches!(b, b'+' | b'-' | b'.' | b'0'..=b'9') {
-                // Number operand.
-                let mut end = i;
-                if matches!(input[end], b'+' | b'-') {
-                    end += 1;
-                }
-                let mut saw_digit = false;
-                let mut saw_dot = false;
-                while end < input.len() {
-                    let c = input[end];
-                    if c.is_ascii_digit() {
-                        end += 1;
-                        saw_digit = true;
-                    } else if c == b'.' && !saw_dot {
-                        end += 1;
-                        saw_dot = true;
-                    } else {
-                        break;
+                // Number operand — exact-arithmetic fast conversion
+                // with a `str::parse` fallback for out-of-range
+                // significands (see `scan_number`).
+                match scan_number(input, i) {
+                    NumScan::Fast(end, f) => {
+                        self.operands.push(Operand::Number(f));
+                        i = end;
+                        continue;
+                    }
+                    NumScan::Slow(end) => {
+                        let s = str::from_utf8(&input[i..end]).map_err(|_| {
+                            PdfError::other(format!(
+                                "PDF content parser: non-UTF-8 number at byte {i}"
+                            ))
+                        })?;
+                        let f: f32 = s.parse().map_err(|_| {
+                            PdfError::other(format!(
+                                "PDF content parser: invalid number `{s}` at byte {i}"
+                            ))
+                        })?;
+                        self.operands.push(Operand::Number(f));
+                        i = end;
+                        continue;
+                    }
+                    NumScan::NotANumber => {
+                        // Bare sign / dot — fall through to keyword
+                        // handling.
+                        let kw_end = scan_keyword_end(input, i);
+                        let kw = &input[i..kw_end];
+                        self.dispatch(kw)?;
+                        i = kw_end;
+                        continue;
                     }
                 }
-                if !saw_digit {
-                    // Bare sign / dot — fall through to keyword
-                    // handling.
-                    let kw_end = scan_keyword_end(input, i);
-                    let kw = &input[i..kw_end];
-                    self.dispatch(kw)?;
-                    i = kw_end;
-                    continue;
-                }
-                let s = str::from_utf8(&input[i..end]).map_err(|_| {
-                    PdfError::other(format!("PDF content parser: non-UTF-8 number at byte {i}"))
-                })?;
-                let f: f32 = s.parse().map_err(|_| {
-                    PdfError::other(format!(
-                        "PDF content parser: invalid number `{s}` at byte {i}"
-                    ))
-                })?;
-                self.operands.push(Operand::Number(f));
-                i = end;
-                continue;
             }
             // Anything else is a keyword (operator).
             let kw_end = scan_keyword_end(input, i);
@@ -1847,6 +1842,83 @@ fn scan_keyword_end(input: &[u8], start: usize) -> usize {
         end += 1;
     }
     end
+}
+
+/// Exact f32 powers of ten for the fast decimal→binary path. Every
+/// entry is exactly representable: 10^k = 5^k·2^k and 5^10 =
+/// 9 765 625 < 2^24, so the table stops at 10^10.
+const POW10_F32: [f32; 11] = [1.0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10];
+
+/// Result of scanning one §7.3.3 numeric operand in a content stream.
+enum NumScan {
+    /// No digit was consumed — the bytes at `start` are a bare sign /
+    /// dot keyword, not a number. The cursor is unchanged.
+    NotANumber,
+    /// Number scanned **and** converted on the exact-arithmetic fast
+    /// path; the first field is the byte after the number.
+    Fast(usize, f32),
+    /// Number scanned but outside the fast-path range (significand ≥
+    /// 2^24 or more than 10 fractional digits); the payload is the
+    /// byte after the number — the caller re-parses the scanned bytes
+    /// through `str::parse` with its own error policy.
+    Slow(usize),
+}
+
+/// Scan a numeric operand starting at `start` (whose byte must be
+/// `+` / `-` / `.` / digit) and convert it without the UTF-8 +
+/// general-purpose float-parse round trip when exact arithmetic
+/// allows.
+///
+/// A content-stream number is `sign? digits? ("." digits?)?` — no
+/// exponent (§7.3.3) — so its value is `significand / 10^frac`. When
+/// the significand is `< 2^24` (exact in f32) and `frac ≤ 10` (the
+/// divisor is exact in f32, see [`POW10_F32`]), IEEE-754 division of
+/// two exact operands is correctly rounded, and the correctly rounded
+/// result is unique — bit-identical to what `str::parse::<f32>`
+/// returns for the same bytes. Anything wider falls back to
+/// [`NumScan::Slow`].
+fn scan_number(input: &[u8], start: usize) -> NumScan {
+    let mut end = start;
+    let neg = input[end] == b'-';
+    if matches!(input[end], b'+' | b'-') {
+        end += 1;
+    }
+    let mut mant: u64 = 0;
+    let mut frac: usize = 0;
+    let mut saw_digit = false;
+    let mut saw_dot = false;
+    // Set once the significand stops being tracked exactly (≥ ~17
+    // digits); forces the slow path.
+    let mut wide = false;
+    while end < input.len() {
+        let c = input[end];
+        if c.is_ascii_digit() {
+            saw_digit = true;
+            if mant < (1 << 56) {
+                mant = mant * 10 + (c - b'0') as u64;
+            } else {
+                wide = true;
+            }
+            if saw_dot {
+                frac += 1;
+            }
+            end += 1;
+        } else if c == b'.' && !saw_dot {
+            saw_dot = true;
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    if !saw_digit {
+        return NumScan::NotANumber;
+    }
+    if !wide && mant < (1 << 24) && frac <= 10 {
+        let q = mant as f32 / POW10_F32[frac];
+        NumScan::Fast(end, if neg { -q } else { q })
+    } else {
+        NumScan::Slow(end)
+    }
 }
 
 /// Decode a PDF literal string `( … )` per ISO 32000-1 §7.3.4.2 —
@@ -2102,21 +2174,27 @@ fn read_array(input: &[u8], start: usize) -> Result<(usize, Vec<ArrayElem>), Pdf
         }
         if matches!(b, b'+' | b'-' | b'.' | b'0'..=b'9') {
             let nstart = end;
-            if matches!(b, b'+' | b'-') {
-                end += 1;
-            }
-            let mut saw_dot = false;
-            while end < input.len()
-                && (input[end].is_ascii_digit() || (input[end] == b'.' && !saw_dot))
-            {
-                if input[end] == b'.' {
-                    saw_dot = true;
-                }
-                end += 1;
-            }
-            if let Ok(s) = str::from_utf8(&input[nstart..end]) {
-                if let Ok(f) = s.parse::<f32>() {
+            match scan_number(input, nstart) {
+                NumScan::Fast(next, f) => {
                     items.push(ArrayElem::Number(f));
+                    end = next;
+                }
+                NumScan::Slow(next) => {
+                    // Tolerant: a number `str::parse` rejects is
+                    // dropped, matching the historical policy.
+                    if let Ok(s) = str::from_utf8(&input[nstart..next]) {
+                        if let Ok(f) = s.parse::<f32>() {
+                            items.push(ArrayElem::Number(f));
+                        }
+                    }
+                    end = next;
+                }
+                NumScan::NotANumber => {
+                    // Bare sign / dot — historical behaviour consumed
+                    // the sign byte(s) scanned so far and dropped
+                    // them; re-create that by advancing past the
+                    // non-number prefix one byte at a time.
+                    end = nstart + 1;
                 }
             }
             continue;
@@ -2136,6 +2214,145 @@ mod tests {
 
     fn parse(input: &[u8]) -> Group {
         parse_content_stream(input).unwrap()
+    }
+
+    /// `scan_number` must be **bit-identical** to `str::parse::<f32>`
+    /// on every byte string the §7.3.3 number grammar admits — that's
+    /// the contract that lets the content tokenizer skip the UTF-8 +
+    /// general-float-parse round trip.
+    #[test]
+    fn scan_number_matches_str_parse_bitwise() {
+        let mut cases: Vec<String> = vec![
+            "0",
+            "-0",
+            "+0",
+            "5",
+            "-5",
+            "+5",
+            "5.",
+            "-5.",
+            ".5",
+            "-.5",
+            "+.5",
+            "0.5",
+            "595.0",
+            "842.75",
+            "0.0001",
+            "-0.0001",
+            "123456",
+            "-123456",
+            "16777215",
+            "16777216",
+            "16777217",
+            "-16777216",
+            "999999999",
+            "0.1234567890",
+            "0.12345678901",
+            "3.14159265358979",
+            "1000000.25",
+            "-1000000.25",
+            "0.000000001",
+            "99999999999999999999",
+            "-99999999999999999999.5",
+            "00042",
+            "-00042.50",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        // Deterministic generated sweep: every digit count 1..=12 on
+        // both sides of the dot, signed and unsigned.
+        let mut state = 0x1234_5678u32;
+        let mut xs = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for _ in 0..2000 {
+            let int_len = (xs() % 13) as usize;
+            let frac_len = (xs() % 13) as usize;
+            if int_len == 0 && frac_len == 0 {
+                continue;
+            }
+            let mut s = String::new();
+            match xs() % 3 {
+                0 => s.push('-'),
+                1 => s.push('+'),
+                _ => {}
+            }
+            for _ in 0..int_len {
+                s.push(char::from(b'0' + (xs() % 10) as u8));
+            }
+            if frac_len > 0 {
+                s.push('.');
+                for _ in 0..frac_len {
+                    s.push(char::from(b'0' + (xs() % 10) as u8));
+                }
+            }
+            cases.push(s);
+        }
+        for case in &cases {
+            let bytes = case.as_bytes();
+            let expected: f32 = case.parse().unwrap_or_else(|_| panic!("parse {case}"));
+            match scan_number(bytes, 0) {
+                NumScan::Fast(end, got) => {
+                    assert_eq!(end, bytes.len(), "consumed all of `{case}`");
+                    assert_eq!(
+                        got.to_bits(),
+                        expected.to_bits(),
+                        "`{case}`: fast {got} vs parse {expected}"
+                    );
+                }
+                NumScan::Slow(end) => {
+                    assert_eq!(end, bytes.len(), "consumed all of `{case}`");
+                    // Slow path re-parses through str::parse — identical
+                    // by construction.
+                }
+                NumScan::NotANumber => panic!("`{case}` should scan as a number"),
+            }
+        }
+    }
+
+    #[test]
+    fn scan_number_rejects_bare_sign_and_dot() {
+        for case in [&b"-"[..], b"+", b".", b"-.", b"+.", b"-x", b".)"] {
+            assert!(
+                matches!(scan_number(case, 0), NumScan::NotANumber),
+                "{case:?} must not scan as a number"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_number_stops_at_delimiters_and_whitespace() {
+        // `]` after a TJ adjustment, space between operands, an
+        // operator straight after the digits.
+        let input = b"-12.5]";
+        match scan_number(input, 0) {
+            NumScan::Fast(end, v) => {
+                assert_eq!(end, 5);
+                assert_eq!(v.to_bits(), (-12.5f32).to_bits());
+            }
+            _ => panic!("expected fast scan"),
+        }
+        let input = b"7 0 R";
+        match scan_number(input, 0) {
+            NumScan::Fast(end, v) => {
+                assert_eq!(end, 1);
+                assert_eq!(v, 7.0);
+            }
+            _ => panic!("expected fast scan"),
+        }
+        // Second dot terminates the number (next token starts at it).
+        let input = b"1.2.3";
+        match scan_number(input, 0) {
+            NumScan::Fast(end, v) => {
+                assert_eq!(end, 3);
+                assert_eq!(v.to_bits(), (1.2f32).to_bits());
+            }
+            _ => panic!("expected fast scan"),
+        }
     }
 
     #[test]

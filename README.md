@@ -1852,6 +1852,55 @@ cargo bench -p oxideav-pdf --bench xref
 cargo bench -p oxideav-pdf --bench content_stream
 ```
 
+## Round-285 profiling — content-stream number conversion
+
+Depth-mode profiling round on the bytes → `Scene` read path.
+`examples/profile_read.rs` is the reproducible harness: it emits
+three heavy writer-produced documents (120 pages × ~220 path
+segments, alternating solid / gradient fills) through the classic
+§7.5.4 xref-table, §7.5.8 xref-stream, and §7.5.7 ObjStm writer
+entry points, loops `read_pdf_to_scene`, and prints per-scenario
+wall-clock plus FNV-1a fingerprints of the parsed-scene `{:?}`
+serialization and of the fixture corpus (scene + extracted text) so
+any reader change can be A/B'd for output identity.
+
+Sampling-profiler ranking on the round-285 host (macOS-aarch64,
+release + debuginfo, ~7.7k samples):
+
+1. decimal→`f32` conversion of content-stream numeric operands —
+   ≈ 33% of all samples (`str::from_utf8` validation + the
+   general-purpose decimal-float parser behind `str::parse`);
+2. allocator traffic from per-operator operand `Vec` churn
+   (`malloc`/`free` ≈ 20%);
+3. the content tokenizer loop proper;
+4. everything else (object parser / lexer / xref) under 2% each.
+
+The round lands a fast path for hotspot #1: a §7.3.3 number is
+`sign? digits? ("." digits?)?` — no exponent — so its value is
+`significand / 10^frac`. When the significand is < 2²⁴ (exact in
+`f32`) and the fraction is ≤ 10 digits (10¹⁰ = 5¹⁰·2¹⁰ and 5¹⁰ <
+2²⁴, so the divisor is exact too), IEEE-754 division of two exact
+operands is correctly rounded — and the correctly rounded result is
+unique, hence bit-identical to `str::parse::<f32>` on the same
+bytes. Wider inputs fall back to `str::parse`; a 2000-case generated
+parity test pins the bit-identity contract. Both content-stream
+number sites (operand scanner + `TJ`/dash-array reader) share the
+new `scan_number`.
+
+Measured on the harness (1500 iterations/scenario, sequential):
+
+| scenario             | before      | after       | Δ        |
+|----------------------|-------------|-------------|----------|
+| `classic_xref_120p`  | 2.910 ms/doc | 2.063 ms/doc | −29.1% |
+| `xref_stream_120p`   | 2.955 ms/doc | 2.050 ms/doc | −30.6% |
+| `objstm_120p`        | 3.019 ms/doc | 2.109 ms/doc | −30.1% |
+
+Output identity: all three scenario scene-hashes and every fixture
+scene/text fingerprint are byte-identical before vs after. Next
+hotspot (deferred): operand-`Vec` allocation churn in the
+content-stream dispatcher (`take_numbers` + per-operator
+`operands` reallocation), now ≈ 20% of samples.
+
 ## Deferred
 
 - **Text emission** — writer-side `BT … Tj … ET` for `Node::Text`
