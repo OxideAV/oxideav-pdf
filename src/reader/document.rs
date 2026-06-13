@@ -35,7 +35,7 @@ use crate::objects::{Dict, Object, ObjectId, Stream};
 use crate::pubsec::{
     open_with_certificate, open_with_certificate_and_trust_store, PubSecCredential, TrustStore,
 };
-use crate::reader::content::parse_content_stream_full_with_color_space;
+use crate::reader::content::parse_content_stream_full_with_properties;
 use crate::reader::parse::Parser;
 use crate::reader::xref::{parse_xref, XrefEntry, XrefTable};
 
@@ -1210,13 +1210,19 @@ fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Pag
     } else {
         None
     };
+    let properties_dict = if let Some(rdict) = resources_dict.as_ref() {
+        resolve_properties_resources(reader, rdict)?
+    } else {
+        None
+    };
 
-    let parsed = parse_content_stream_full_with_color_space(
+    let parsed = parse_content_stream_full_with_properties(
         &content_bytes,
         ext_gstate_dict.as_ref(),
         fonts_dict.as_ref(),
         shading_dict.as_ref(),
         color_space_dict.as_ref(),
+        properties_dict.as_ref(),
     )?;
     let root = parsed.root;
     let mut page = Page::new(width, height);
@@ -1434,6 +1440,59 @@ fn resolve_color_space_resources(
         };
         let prepared = prepare_color_space_object(reader, resolved)?;
         out.set(name, prepared);
+    }
+    Ok(Some(out))
+}
+
+/// Resolve a page's `/Resources /Properties` subdictionary into a
+/// fully-dereferenced [`Dict`] (each per-name property-list value is
+/// itself resolved into a direct `Object::Dict` if it was an indirect
+/// reference). Returns `Ok(None)` when the resources dict carries no
+/// `/Properties` entry — the common case for documents that use no
+/// `DP`/`BDC` marked-content operator, or that only ever write their
+/// property lists inline (§14.6.2).
+///
+/// Mirrors [`resolve_ext_gstate`] / [`resolve_font_resources`] /
+/// [`resolve_shading_resources`] — single-hop indirect dereference,
+/// malformed entries silently dropped so a `DP`/`BDC` naming the
+/// missing key still emits its event with `properties = None` (ISO
+/// 32000-1 §14.6.2 + §7.8.3 Table 33 for the `/Resources /Properties`
+/// shape).
+fn resolve_properties_resources(
+    reader: &mut DocumentReader<'_>,
+    resources: &Dict,
+) -> Result<Option<Dict>, PdfError> {
+    let props_obj = resources
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Properties")
+        .map(|(_, v)| v.clone());
+    let props_obj = match props_obj {
+        Some(Object::Reference(id)) => reader.resolve(id)?,
+        Some(other) => other,
+        None => return Ok(None),
+    };
+    let Object::Dict(props_dict) = props_obj else {
+        return Ok(None);
+    };
+    let mut out = Dict::new();
+    for (name, value) in props_dict.entries() {
+        let resolved = match value {
+            Object::Reference(id) => reader.resolve(*id)?,
+            other => other.clone(),
+        };
+        // A property list may also be carried as a stream object (e.g.
+        // an /OCG membership dict referenced indirectly is a dict, but
+        // some producers wrap larger lists in streams). Surface either
+        // shape as the per-name entry's resolved `Dict`.
+        let d = match resolved {
+            Object::Dict(d) => Some(d),
+            Object::Stream(s) => Some(s.dict),
+            _ => None,
+        };
+        if let Some(d) = d {
+            out.set(name, Object::Dict(d));
+        }
     }
     Ok(Some(out))
 }

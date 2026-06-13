@@ -108,7 +108,7 @@ use crate::objects::{Dict, Object};
 /// [`parse_content_stream_full`] with a resolved `/Resources /Font`
 /// dictionary attached.
 pub fn parse_content_stream(input: &[u8]) -> Result<Group, PdfError> {
-    let mut state = State::new(None, None, None, None);
+    let mut state = State::new(None, None, None, None, None);
     state.parse(input)?;
     Ok(state.finish().root)
 }
@@ -131,7 +131,7 @@ pub fn parse_content_stream_with_resources(
     input: &[u8],
     ext_gstate: Option<&Dict>,
 ) -> Result<Group, PdfError> {
-    let mut state = State::new(ext_gstate, None, None, None);
+    let mut state = State::new(ext_gstate, None, None, None, None);
     state.parse(input)?;
     Ok(state.finish().root)
 }
@@ -240,11 +240,58 @@ pub fn parse_content_stream_full_with_color_space(
     shading_resources: Option<&Dict>,
     color_space_resources: Option<&Dict>,
 ) -> Result<ParsedContent, PdfError> {
+    parse_content_stream_full_with_properties(
+        input,
+        ext_gstate,
+        font_resources,
+        shading_resources,
+        color_space_resources,
+        None,
+    )
+}
+
+/// Parse a content-stream with the page's resolved `/Resources`
+/// `/ExtGState`, `/Font`, `/Shading`, `/ColorSpace`, **and
+/// `/Properties`** subdictionaries attached. Same as
+/// [`parse_content_stream_full_with_color_space`] plus dispatch for the
+/// §14.6 marked-content operators (Table 320):
+///
+/// * `tag MP` / `tag properties DP` — a marked-content **point**.
+/// * `tag BMC` / `tag properties BDC` — **begin** a marked-content
+///   sequence, terminated by a balancing `EMC`.
+/// * `EMC` — **end** the most recent `BMC`/`BDC` sequence.
+///
+/// Each operator records one [`ContentMarkedContent`] into
+/// [`ParsedContent::marked_content`] in stream order, carrying the
+/// operator discriminator, the `tag` name, the resolved property list
+/// (`DP`/`BDC` only), and the sequence-nesting depth. The walker does
+/// not interpret the property list — its entries (`/OC`, `/MCID`,
+/// `/ActualText`, `/Alt`, …) stay verbatim for a downstream consumer.
+///
+/// The `properties` operand of `DP`/`BDC` is resolved per §14.6.2:
+/// an inline `<< … >>` dictionary is captured directly; a `/Name`
+/// operand is looked up in `properties_resources` (the page's resolved
+/// `/Resources /Properties` subdictionary). `properties_resources`
+/// follows the same one-hop-indirect contract as the other resource
+/// dicts: callers go through
+/// [`crate::reader::document::resolve_properties_resources`] to get a
+/// dict whose per-name entries are direct `Object::Dict` values. When
+/// `properties_resources` is `None` or doesn't contain the named key,
+/// the event still fires but its `properties` stays `None`.
+pub fn parse_content_stream_full_with_properties(
+    input: &[u8],
+    ext_gstate: Option<&Dict>,
+    font_resources: Option<&Dict>,
+    shading_resources: Option<&Dict>,
+    color_space_resources: Option<&Dict>,
+    properties_resources: Option<&Dict>,
+) -> Result<ParsedContent, PdfError> {
     let mut state = State::new(
         ext_gstate,
         font_resources,
         shading_resources,
         color_space_resources,
+        properties_resources,
     );
     state.parse(input)?;
     Ok(state.finish())
@@ -274,6 +321,20 @@ pub struct ParsedContent {
     /// `parse_content_stream_with_resources`, the no-shading
     /// `parse_content_stream_full`) are used.
     pub shadings: Vec<ContentShading>,
+    /// Every marked-content operator (`MP`/`DP`/`BMC`/`BDC`/`EMC`,
+    /// §14.6 Table 320) seen by the walker, in stream order. One entry
+    /// per operator. Like [`text_shows`](Self::text_shows) and
+    /// [`shadings`](Self::shadings), these events surface from every
+    /// `ParsedContent`-returning entry point — `MP`/`BMC`/`EMC` carry
+    /// no property list, and a `DP`/`BDC` whose `properties` operand is
+    /// a `/Name` simply lands with `properties = None` unless
+    /// `/Resources /Properties` was plumbed in via
+    /// [`parse_content_stream_full_with_properties`]. Inline `<< … >>`
+    /// property lists are captured regardless of the entry point. The
+    /// `Group`-returning legacy entries (`parse_content_stream`,
+    /// `parse_content_stream_with_resources`) discard the whole
+    /// `ParsedContent`, so the events are unobservable there.
+    pub marked_content: Vec<ContentMarkedContent>,
 }
 
 /// One `Tj`/`TJ`/`'`/`"` text-show event surfaced by
@@ -368,6 +429,65 @@ pub struct ContentShading {
     pub clip: Option<Path>,
 }
 
+/// One marked-content operator surfaced by
+/// [`parse_content_stream_full_with_properties`]. ISO 32000-1 §14.6
+/// defines five marked-content operators (Table 320) that fall into
+/// two shapes:
+///
+/// * **Points** — `MP` (`tag`) and `DP` (`tag properties`) designate a
+///   single marked-content point in the stream.
+/// * **Sequences** — `BMC` (`tag`) and `BDC` (`tag properties`) begin a
+///   sequence terminated by a balancing `EMC`.
+///
+/// One [`ContentMarkedContent`] is recorded per operator in stream
+/// order, so a downstream consumer can reconstruct the marked-content
+/// tree (e.g. to find an `/OC` membership tag for optional content,
+/// §8.11.3.2, or an `/ActualText` / `/Alt` accessibility entry,
+/// §14.9.4). The walker does **not** interpret the property list — its
+/// entries stay verbatim in `properties` so a downstream consumer can
+/// resolve `/OC`, `/MCID`, `/ActualText`, etc. as it sees fit.
+#[derive(Clone, Debug)]
+pub struct ContentMarkedContent {
+    /// Which marked-content operator produced this event.
+    pub operator: MarkedContentOp,
+    /// The `tag` operand — a `Name` indicating the role or significance
+    /// of the marked content (e.g. `"OC"`, `"Span"`, `"P"`), leading
+    /// `/` stripped. `EMC` carries no tag, so its `tag` is empty.
+    pub tag: String,
+    /// The resolved property list for `DP` / `BDC` (§14.6.2): either the
+    /// inline `<< … >>` dictionary written directly after the tag, or
+    /// the dictionary named in `/Resources /Properties` when the
+    /// operand was a `/Name`. `None` for `MP` / `BMC` / `EMC` (which
+    /// carry no property list) and for a `DP` / `BDC` whose `/Name`
+    /// operand wasn't resolvable against the supplied
+    /// `properties_resources`.
+    pub properties: Option<Dict>,
+    /// Nesting depth at the moment the operator fired, counting
+    /// `BMC`/`BDC`-opened sequences only (`MP`/`DP` points do not nest).
+    /// `BMC`/`BDC` report the depth of the sequence they open (0 for a
+    /// top-level sequence); the matching `EMC` reports the same depth;
+    /// `MP`/`DP` report the depth of the sequence that encloses them
+    /// (0 when not inside any). An unbalanced `EMC` (no open sequence)
+    /// reports depth 0 and is tolerated.
+    pub depth: u32,
+}
+
+/// Discriminator for [`ContentMarkedContent::operator`] (ISO 32000-1
+/// §14.6 Table 320).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkedContentOp {
+    /// `tag MP` — designate a marked-content point.
+    Mp,
+    /// `tag properties DP` — marked-content point with a property list.
+    Dp,
+    /// `tag BMC` — begin a marked-content sequence.
+    Bmc,
+    /// `tag properties BDC` — begin a sequence with a property list.
+    Bdc,
+    /// `EMC` — end the most recent `BMC`/`BDC` sequence.
+    Emc,
+}
+
 // ───────────────────────── parser state ─────────────────────────
 
 /// Per-graphics-state tracker. Pushed on `q`, popped on `Q`. The
@@ -449,6 +569,25 @@ struct State<'a> {
     /// it's `None`, a non-device `cs`/`CS` name stays `Unknown`,
     /// matching the round-118 conservative black fallback.
     color_space_resources: Option<&'a Dict>,
+    /// Page's `/Resources /Properties` subdictionary, if the caller
+    /// went through [`parse_content_stream_full_with_properties`] —
+    /// `None` otherwise. A `DP` / `BDC` whose `properties` operand is a
+    /// `/Name` (rather than an inline `<< … >>` dictionary, §14.6.2)
+    /// looks the name up here. Each per-name entry should already be a
+    /// direct `Object::Dict` (single-hop indirect references
+    /// dereferenced by
+    /// `reader::document::resolve_properties_resources`). When this is
+    /// `None` or doesn't contain the named key, the marked-content
+    /// event still fires but its `properties` stays `None`.
+    properties_resources: Option<&'a Dict>,
+    /// Open `BMC`/`BDC` sequence count (§14.6). Incremented after a
+    /// `BMC`/`BDC`, decremented before a matching `EMC` (saturating at
+    /// 0 so an unbalanced `EMC` is tolerated). Reported as the
+    /// `ContentMarkedContent::depth` of each event.
+    mc_depth: u32,
+    /// Stream-order marked-content events accumulated for the
+    /// [`ParsedContent::marked_content`] return slot.
+    marked_content: Vec<ContentMarkedContent>,
     /// Currently-selected font: name (Tf operand, leading `/`
     /// stripped) + size. Reset on each `Tf`. Cleared when no `Tf`
     /// has been seen yet — `Tj` then emits with an empty `font_name`
@@ -507,6 +646,12 @@ enum Operand {
     /// bytes (escape-decoded for literal strings, hex-pair-decoded
     /// for hex strings); consumed by `Tj` / `'` / `"`.
     String(Vec<u8>),
+    /// Inline dictionary `<< … >>`. The only content-stream operators
+    /// that take one are the §14.6.2 property-list carriers `DP` /
+    /// `BDC` (the `properties` operand may be written inline when every
+    /// value is a direct object). Held verbatim so the marked-content
+    /// dispatcher can surface it as `ContentMarkedContent::properties`.
+    Dict(Dict),
 }
 
 /// One element of a PDF content-stream array operand `[ ... ]`. PDF
@@ -715,6 +860,7 @@ impl<'a> State<'a> {
         font_resources: Option<&'a Dict>,
         shading_resources: Option<&'a Dict>,
         color_space_resources: Option<&'a Dict>,
+        properties_resources: Option<&'a Dict>,
     ) -> Self {
         Self {
             operands: Vec::new(),
@@ -736,6 +882,9 @@ impl<'a> State<'a> {
             font_resources,
             shading_resources,
             color_space_resources,
+            properties_resources,
+            mc_depth: 0,
+            marked_content: Vec::new(),
             current_font: None,
             text_matrix: Transform2D::identity(),
             text_line_matrix: Transform2D::identity(),
@@ -764,6 +913,7 @@ impl<'a> State<'a> {
             },
             text_shows: self.text_shows,
             shadings: self.shadings,
+            marked_content: self.marked_content,
         }
     }
 
@@ -1326,12 +1476,138 @@ impl<'a> State<'a> {
                 self.operands.clear();
             }
 
-            // Marked-content + everything else ---------------------
+            // Marked content (§14.6 Table 320) ---------------------
+            b"MP" => {
+                // `tag MP` — marked-content point. The point sits
+                // inside whatever sequence is currently open, so its
+                // reported depth is the current open-sequence count.
+                let tag = self.last_name_operand();
+                let depth = self.mc_depth;
+                self.marked_content.push(ContentMarkedContent {
+                    operator: MarkedContentOp::Mp,
+                    tag,
+                    properties: None,
+                    depth,
+                });
+                self.operands.clear();
+            }
+            b"DP" => {
+                // `tag properties DP` — marked-content point with a
+                // property list. `properties` is the operand after the
+                // tag (an inline dict or a /Name into /Properties).
+                let (tag, properties) = self.marked_content_tag_props();
+                let depth = self.mc_depth;
+                self.marked_content.push(ContentMarkedContent {
+                    operator: MarkedContentOp::Dp,
+                    tag,
+                    properties,
+                    depth,
+                });
+                self.operands.clear();
+            }
+            b"BMC" => {
+                // `tag BMC` — begin a marked-content sequence. The
+                // sequence's own depth is the current count *before*
+                // we open it; the count then increments.
+                let tag = self.last_name_operand();
+                let depth = self.mc_depth;
+                self.marked_content.push(ContentMarkedContent {
+                    operator: MarkedContentOp::Bmc,
+                    tag,
+                    properties: None,
+                    depth,
+                });
+                self.mc_depth = self.mc_depth.saturating_add(1);
+                self.operands.clear();
+            }
+            b"BDC" => {
+                // `tag properties BDC` — begin a sequence with a
+                // property list.
+                let (tag, properties) = self.marked_content_tag_props();
+                let depth = self.mc_depth;
+                self.marked_content.push(ContentMarkedContent {
+                    operator: MarkedContentOp::Bdc,
+                    tag,
+                    properties,
+                    depth,
+                });
+                self.mc_depth = self.mc_depth.saturating_add(1);
+                self.operands.clear();
+            }
+            b"EMC" => {
+                // End the most recent `BMC`/`BDC` sequence. Decrement
+                // first (saturating, so an unbalanced `EMC` reports
+                // depth 0 and is tolerated) and report the depth of the
+                // sequence it closes.
+                self.mc_depth = self.mc_depth.saturating_sub(1);
+                let depth = self.mc_depth;
+                self.marked_content.push(ContentMarkedContent {
+                    operator: MarkedContentOp::Emc,
+                    tag: String::new(),
+                    properties: None,
+                    depth,
+                });
+                self.operands.clear();
+            }
+
+            // Everything else --------------------------------------
             _ => {
                 self.operands.clear();
             }
         }
         Ok(())
+    }
+
+    /// The most-recent `Name` operand (leading `/` already stripped at
+    /// scan time), or empty when none was pushed. Used by the no-
+    /// property marked-content operators `MP` / `BMC` whose only
+    /// operand is the tag name.
+    fn last_name_operand(&self) -> String {
+        self.operands
+            .iter()
+            .rev()
+            .find_map(|o| match o {
+                Operand::Name(n) => Some(n.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Resolve the `tag properties` operand pair for `DP` / `BDC`
+    /// (§14.6 Table 320). The operands are `tag` then `properties` in
+    /// stream order, so on the stack `properties` is last and `tag` is
+    /// the `Name` before it.
+    ///
+    /// * `tag` — the first `Name` operand.
+    /// * `properties` — resolved per §14.6.2: an inline `Operand::Dict`
+    ///   is captured directly; an `Operand::Name` is looked up in the
+    ///   `/Resources /Properties` subdictionary (`properties_resources`)
+    ///   and dereferenced one hop into a `Dict`. `None` when the operand
+    ///   is absent, isn't a dict/name, or the name doesn't resolve.
+    fn marked_content_tag_props(&self) -> (String, Option<Dict>) {
+        // tag is the first Name from the bottom; properties is the last
+        // operand. A well-formed `tag properties` pair has the tag as
+        // the earliest Name operand.
+        let tag = self
+            .operands
+            .iter()
+            .find_map(|o| match o {
+                Operand::Name(n) => Some(n.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let properties = match self.operands.last() {
+            Some(Operand::Dict(d)) => Some(d.clone()),
+            // A `/Name` properties operand — but only when it isn't the
+            // tag itself (a bare `tag BDC`-shaped misuse with no real
+            // property operand should resolve to `None`, not loop the
+            // tag name back through /Properties).
+            Some(Operand::Name(n)) if self.operands.len() >= 2 => self
+                .properties_resources
+                .and_then(|res| lookup_dict(res, n).cloned()),
+            _ => None,
+        };
+        (tag, properties)
     }
 
     /// Compose every frame's `transform` from the root down to the
@@ -1621,6 +1897,29 @@ impl<'a> State<'a> {
                 self.operands.push(Operand::String(bytes));
                 i = end;
                 continue;
+            }
+            if b == b'<' && input.get(i + 1) == Some(&b'<') {
+                // Inline dictionary `<< … >>` operand — the §14.6.2
+                // property list a `DP`/`BDC` may carry directly. Reuse
+                // the object parser over the tail so nested arrays /
+                // dicts / strings inside the property list are handled
+                // by the same battle-tested code the body parser uses;
+                // `position()` tells us how many bytes it consumed.
+                let mut p = crate::reader::parse::Parser::new(&input[i..]);
+                match p.parse_object() {
+                    Ok(Some(Object::Dict(d))) => {
+                        self.operands.push(Operand::Dict(d));
+                        i += p.position();
+                        continue;
+                    }
+                    // A malformed or non-dict `<<` — skip the opening
+                    // delimiter and resync rather than abort the whole
+                    // stream (mirrors the round-3 salvage stance).
+                    _ => {
+                        i += 2;
+                        continue;
+                    }
+                }
             }
             if b == b'<' && input.get(i + 1) != Some(&b'<') {
                 // Hex-string operand — decode pairs into bytes.

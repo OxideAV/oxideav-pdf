@@ -49,9 +49,10 @@ pub use annotation::{
 };
 pub use attachments::{attachments, PdfAttachment};
 pub use content::{
-    parse_content_stream, parse_content_stream_full, parse_content_stream_full_with_shading,
-    parse_content_stream_with_resources, ContentShading, ContentTextShow, ParsedContent,
-    TextShowOp,
+    parse_content_stream, parse_content_stream_full, parse_content_stream_full_with_color_space,
+    parse_content_stream_full_with_properties, parse_content_stream_full_with_shading,
+    parse_content_stream_with_resources, ContentMarkedContent, ContentShading, ContentTextShow,
+    MarkedContentOp, ParsedContent, TextShowOp,
 };
 pub use document::{
     read_pdf_to_scene, read_pdf_to_scene_with_certificate,

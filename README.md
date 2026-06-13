@@ -1673,6 +1673,49 @@ table is self-contained). The new
 resolved dict; the legacy entry points keep their round-118 behaviour
 (non-device names stay `Unknown`, `sc`/`scn` keeps the black fallback).
 
+### Marked-content operators (`BMC`/`BDC`/`EMC`/`MP`/`DP`, round 292)
+
+Round 292 surfaces the five **marked-content operators** of ISO
+32000-1 §14.6 (Table 320), which the round-3 parser previously
+collapsed into the catch-all no-op. They fall into two shapes:
+
+- **Points** — `tag MP` and `tag properties DP` designate a single
+  marked-content point in the stream.
+- **Sequences** — `tag BMC` and `tag properties BDC` begin a sequence
+  terminated by a balancing `EMC`.
+
+The new [`parse_content_stream_full_with_properties`] entry point (and
+the page walker) emit one [`ContentMarkedContent`] per operator into
+[`ParsedContent::marked_content`] in stream order, each carrying the
+operator discriminator ([`MarkedContentOp`]), the `tag` Name, the
+resolved property list (`DP`/`BDC` only), and the sequence-nesting
+`depth`. A downstream consumer can rebuild the marked-content tree —
+e.g. to read an `/OC` optional-content membership tag (§8.11.3.2) or an
+`/ActualText` / `/Alt` accessibility entry (§14.9.4) off the property
+list.
+
+The `properties` operand is resolved per §14.6.2: when every value is a
+direct object it may be written inline as `<< … >>` (a new
+content-stream inline-dictionary operand, parsed by the same object
+parser the body uses) and is captured verbatim; otherwise it is a
+`/Name` looked up one hop in the page's `/Resources /Properties`
+subdictionary (`resolve_properties_resources`, mirroring the round-125
+`gs` / round-128 font / round-259 shading / round-275 colour-space
+resolvers). The walker never interprets the property list — `/OC`,
+`/MCID`, `/ActualText`, `/Alt`, etc. stay verbatim.
+
+Nesting depth is tracked with a saturating counter across
+`BMC`/`BDC`/`EMC`: a `BMC`/`BDC` reports the depth of the sequence it
+opens (0 for top-level), the matching `EMC` reports the same depth, and
+an `MP`/`DP` point reports the depth of the sequence enclosing it. An
+unbalanced `EMC` (no open sequence) saturates at depth 0 and is
+tolerated, matching the parser's salvage stance. Like the round-128
+`text_shows` and round-259 `shadings`, marked-content events surface
+from every `ParsedContent`-returning entry point; named-property
+resolution and the page-walker plumbing are what the new entry adds.
+The graphics bracketed by a sequence still paint normally — the
+marked-content operators annotate, they do not suppress.
+
 ## Content-stream `Tj` / `TJ` text-show with `/Resources /Font` (round 128)
 
 The content-stream parser now resolves text-show operators against the

@@ -34,6 +34,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- reader (round 292): content-stream **marked-content operators**
+  (ISO 32000-1 §14.6 Table 320) are now surfaced. The new
+  [`parse_content_stream_full_with_properties`] entry point and the
+  page walker dispatch `MP` (`tag`) / `DP` (`tag properties`)
+  marked-content **points** and `BMC` (`tag`) / `BDC`
+  (`tag properties`) / `EMC` sequence **brackets**, emitting one
+  [`ContentMarkedContent`] per operator into
+  [`ParsedContent::marked_content`] in stream order — carrying the
+  operator discriminator ([`MarkedContentOp`]), the `tag` Name, the
+  resolved property list (`DP`/`BDC` only), and the sequence-nesting
+  depth. The `properties` operand is resolved per §14.6.2: an inline
+  `<< … >>` dictionary is captured directly (a new content-stream
+  inline-dictionary operand, parsed via the same object parser the
+  body uses), and a `/Name` operand is dereferenced one hop through
+  the page's `/Resources /Properties` subdictionary
+  (`resolve_properties_resources`). The walker does not interpret the
+  property list — its entries (`/OC`, `/MCID`, `/ActualText`, `/Alt`,
+  …) stay verbatim so a downstream consumer can route optional-content
+  membership or accessibility metadata as it sees fit. Nesting depth is
+  tracked across `BMC`/`BDC`/`EMC` with a saturating counter so an
+  unbalanced `EMC` is tolerated at depth 0. Like the round-128
+  `text_shows` and round-259 `shadings`, the events surface from every
+  `ParsedContent`-returning entry point; named-property resolution and
+  the page-walker plumbing are what the new entry adds.
 - reader (round 275): content-stream `cs` / `CS` operators now resolve
   `/Resources /ColorSpace` keys that reduce to a device fallback,
   closing two cases the round-118 parser collapsed to opaque black
