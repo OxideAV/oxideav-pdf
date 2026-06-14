@@ -6,8 +6,6 @@
 //! with a single empty Page — so the test exercises the xref-stream
 //! reader without needing the full content-stream decoder.
 
-use std::io::Write;
-
 use oxideav_pdf::read_pdf_to_scene;
 
 /// Build a hand-rolled XRef-stream-protected PDF. The xref data is
@@ -113,9 +111,8 @@ fn build_compressed_xref_stream_pdf_with_predictor() -> Vec<u8> {
         prev = *entry;
     }
     // FlateDecode-compress the predictor input.
-    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(&predictor_input).unwrap();
-    let compressed = enc.finish().unwrap();
+    let compressed =
+        compcol::vec::compress_to_vec::<compcol::zlib::Zlib>(&predictor_input).unwrap();
 
     let xref_dict_str = format!(
         "<< /Type /XRef /Size 5 /Index [0 5] /W [1 4 2] /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 7 >> /Root 1 0 R /Length {} >>\n",

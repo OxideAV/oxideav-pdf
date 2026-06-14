@@ -15,8 +15,6 @@
 //! page object + its content + its resource dict into one ObjStm,
 //! so the resolver hits the same container ~150 times during open.
 
-use std::io::Write;
-
 use oxideav_core::time::TimeBase;
 use oxideav_core::vector::{
     FillRule, Group, Node, Paint, Path, PathCommand, PathNode, Point, Rgba, VectorFrame,
@@ -143,9 +141,7 @@ fn build_two_slot_objstm() -> Vec<u8> {
     payload.extend_from_slice(body1);
     payload.extend_from_slice(body2);
 
-    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(&payload).unwrap();
-    let compressed = enc.finish().unwrap();
+    let compressed = compcol::vec::compress_to_vec::<compcol::zlib::Zlib>(&payload).unwrap();
 
     offsets[5] = bytes.len() as u64;
     bytes.extend_from_slice(b"5 0 obj\n");

@@ -32,13 +32,7 @@ use crate::error::PdfError;
 /// `/Predictor` > 1 in the parameter dict (`decode_stream` chains the
 /// two automatically as of round 104).
 pub fn flate_decompress(input: &[u8]) -> Result<Vec<u8>, PdfError> {
-    use flate2::read::ZlibDecoder;
-    use std::io::Read;
-    let mut out = Vec::new();
-    let mut dec = ZlibDecoder::new(input);
-    dec.read_to_end(&mut out)
-        .map_err(|e| PdfError::other(format!("PDF filter: FlateDecode failed: {e}")))?;
-    Ok(out)
+    crate::zlib::flate_decompress(input)
 }
 
 /// ASCII85Decode (§7.4.3) — five base-85 ASCII characters in the

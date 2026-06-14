@@ -506,13 +506,7 @@ fn build_image_xobject(doc: &mut Document, img: &ImageResource) -> ObjectId {
 }
 
 fn flate_compress(input: &[u8]) -> Vec<u8> {
-    use flate2::write::ZlibEncoder;
-    use flate2::Compression;
-    use std::io::Write;
-    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-    enc.write_all(input)
-        .expect("zlib compression cannot fail on Vec");
-    enc.finish().expect("zlib finish cannot fail on Vec")
+    crate::zlib::flate_compress(input)
 }
 
 #[cfg(test)]

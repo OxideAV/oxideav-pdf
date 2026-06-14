@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- compression (round 306): `/FlateDecode` (ISO 32000-1 §7.4.4) now
+  runs on `compcol`, the workspace-wide DEFLATE/zlib backend (the
+  same crate png/tiff/mov/id3 already use), replacing the third-party
+  `flate2`/`miniz_oxide` dependency. Every FlateDecode site — the
+  reader's content-stream and cross-reference-stream inflate paths,
+  and the writer's image-XObject, object-stream, cross-reference-
+  stream, and embedded-file-stream deflate paths — routes through a
+  single private `zlib` module (`flate_compress` / `flate_decompress`).
+  Output is byte-identical across the swap: all 1061 tests, including
+  the full write→read round-trip suite, pass unchanged.
+
 ### Added
 
 - reader (round 299): text rise (`Ts`, ISO 32000-1 §9.4.4 + §9.3.7

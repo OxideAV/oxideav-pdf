@@ -95,12 +95,8 @@ fn reader_resolves_indirect_length_with_flate_filter() {
     // FlateDecode-compressed content stream — the writer-emitted shape
     // for one-pass producers that can't predict the compressed length
     // until after deflating the body.
-    use flate2::write::ZlibEncoder;
-    use flate2::Compression;
     let raw = b"BT /F1 12 Tf 72 700 Td (Hello indirect length) Tj ET";
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(raw).unwrap();
-    let compressed = encoder.finish().unwrap();
+    let compressed = compcol::vec::compress_to_vec::<compcol::zlib::Zlib>(raw).unwrap();
 
     // Assemble manually so the stream dict carries both /Length 5 0 R
     // and /Filter /FlateDecode.

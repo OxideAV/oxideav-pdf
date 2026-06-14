@@ -761,12 +761,7 @@ impl Document {
 /// future stream-compression call sites in this module. Keeping it
 /// inline avoids a circular import on `resources::flate_compress`.
 fn flate_compress(input: &[u8]) -> Vec<u8> {
-    use flate2::write::ZlibEncoder;
-    use flate2::Compression;
-    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-    enc.write_all(input)
-        .expect("zlib compression cannot fail on Vec");
-    enc.finish().expect("zlib finish cannot fail on Vec")
+    crate::zlib::flate_compress(input)
 }
 
 /// Recursively encrypt every literal/hex string and stream payload in

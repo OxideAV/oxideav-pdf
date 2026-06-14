@@ -17,8 +17,6 @@
 //!   integers separated by whitespace) followed by the concatenated
 //!   object bodies (without `n gen obj` / `endobj` wrappers).
 
-use std::io::Write;
-
 use oxideav_pdf::read_pdf_to_scene;
 
 /// Build a PDF where the Catalog (object 1) lives inside an ObjStm
@@ -61,9 +59,7 @@ fn build_pdf_with_objstm_catalog() -> Vec<u8> {
 
     // FlateDecode-compress the payload to exercise the same code
     // path the real-world writers use.
-    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(&payload).unwrap();
-    let compressed = enc.finish().unwrap();
+    let compressed = compcol::vec::compress_to_vec::<compcol::zlib::Zlib>(&payload).unwrap();
 
     offsets[5] = bytes.len() as u64;
     bytes.extend_from_slice(b"5 0 obj\n");
@@ -168,9 +164,7 @@ fn build_pdf_with_objstm_header_mismatch() -> Vec<u8> {
     payload.extend_from_slice(&header_bytes);
     payload.extend_from_slice(body1);
     payload.extend_from_slice(body2);
-    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(&payload).unwrap();
-    let compressed = enc.finish().unwrap();
+    let compressed = compcol::vec::compress_to_vec::<compcol::zlib::Zlib>(&payload).unwrap();
 
     offsets[5] = bytes.len() as u64;
     bytes.extend_from_slice(b"5 0 obj\n");

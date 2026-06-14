@@ -26,8 +26,6 @@
 //!   two non-contiguous subsections (`/Index [0 1 5 4]`) so the index
 //!   walker has to honour the per-subsection starting object number.
 
-use std::io::Write;
-
 use oxideav_pdf::read_pdf_to_scene;
 
 /// Lay out a minimal `1 Catalog → 2 Pages → 3 Page` body and return
@@ -246,9 +244,7 @@ fn flate_without_predictor_decodes_predictor_1_default() {
     raw.extend_from_slice(&make(1, offsets[3] as u32, 0));
     raw.extend_from_slice(&make(1, offsets[4] as u32, 0));
 
-    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(&raw).unwrap();
-    let compressed = enc.finish().unwrap();
+    let compressed = compcol::vec::compress_to_vec::<compcol::zlib::Zlib>(&raw).unwrap();
 
     // Note: no /DecodeParms — Predictor 1 is the default per §7.4.4.4.
     let dict = format!(

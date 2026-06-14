@@ -652,7 +652,6 @@ fn parse_xref_stream_at(input: &[u8], xref_pos: usize) -> Result<XrefTable, PdfE
 
 /// Apply the stream's `/Filter` to recover the raw xref bytes.
 fn decode_xref_stream_body(stream: &crate::objects::Stream) -> Result<Vec<u8>, PdfError> {
-    use std::io::Read;
     let filter = stream
         .dict
         .entries()
@@ -661,14 +660,10 @@ fn decode_xref_stream_body(stream: &crate::objects::Stream) -> Result<Vec<u8>, P
         .map(|(_, v)| v.clone());
     match filter {
         None => Ok(stream.data.clone()),
-        Some(Object::Name(n)) if n == "FlateDecode" => {
-            let mut dec = flate2::read::ZlibDecoder::new(stream.data.as_slice());
-            let mut out = Vec::new();
-            dec.read_to_end(&mut out).map_err(|e| {
+        Some(Object::Name(n)) if n == "FlateDecode" => crate::zlib::flate_decompress(&stream.data)
+            .map_err(|e| {
                 PdfError::other(format!("PDF reader: XRef stream FlateDecode failed: {e}"))
-            })?;
-            Ok(out)
-        }
+            }),
         Some(Object::Array(items)) => {
             // Filter chain — only FlateDecode is supported here.
             let mut data = stream.data.clone();
@@ -683,12 +678,9 @@ fn decode_xref_stream_body(stream: &crate::objects::Stream) -> Result<Vec<u8>, P
                         "PDF reader: XRef stream filter `{n}` not supported"
                     )));
                 }
-                let mut dec = flate2::read::ZlibDecoder::new(data.as_slice());
-                let mut out = Vec::new();
-                dec.read_to_end(&mut out).map_err(|e| {
+                data = crate::zlib::flate_decompress(&data).map_err(|e| {
                     PdfError::other(format!("PDF reader: XRef stream FlateDecode failed: {e}"))
                 })?;
-                data = out;
             }
             Ok(data)
         }

@@ -1964,6 +1964,22 @@ hotspot (deferred): operand-`Vec` allocation churn in the
 content-stream dispatcher (`take_numbers` + per-operator
 `operands` reallocation), now ≈ 20% of samples.
 
+## Round-306 — `/FlateDecode` backend on the workspace `compcol`
+
+The crate's RFC 1950 (zlib) / RFC 1951 (DEFLATE) layer behind
+`/FlateDecode` (ISO 32000-1 §7.4.4) now runs on `compcol`, Karpelès
+Lab's compression collection — the same workspace-wide DEFLATE/zlib
+backend the sibling format crates (png, tiff, mov, id3) already use.
+The previous third-party `flate2`/`miniz_oxide` dependency is dropped.
+
+Every FlateDecode site routes through one private `zlib` module
+(`flate_compress` / `flate_decompress`): the reader's content-stream
+and cross-reference-stream inflate paths, and the writer's image-
+XObject, object-stream, cross-reference-stream, and embedded-file-
+stream deflate paths. All 1061 tests pass unchanged — including the
+full write→read round-trip suite — confirming byte-level output
+identity across the swap.
+
 ## Deferred
 
 - **Text emission** — writer-side `BT … Tj … ET` for `Node::Text`

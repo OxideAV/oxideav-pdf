@@ -21,11 +21,13 @@ oxideav-core = "0.1"
 # never rasterises, so we don't need the raster fallback.
 oxideav-scene = { version = "0.1", default-features = false }
 # Pure-Rust DEFLATE for FlateDecode-compressed content streams and
-# embedded RGBA image XObjects. Same crate the wider workspace already
-# uses (oxideav-png pulls in miniz_oxide; flate2 is the higher-level
-# wrapper crate that ships pure-Rust miniz_oxide as its default backend
-# — see flate2's `rust_backend` feature, which is on by default).
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# embedded RGBA image XObjects. `compcol` is Karpelès Lab's compression
+# collection — the workspace-wide DEFLATE/zlib backend the sibling
+# format crates (png, tiff, mov, id3) already use — so the PDF crate
+# links no third-party compression backend of its own. The `zlib`
+# feature gates the RFC 1950 (zlib) + RFC 1951 (DEFLATE) codec that
+# `/FlateDecode` (ISO 32000-1 §7.4.4) needs.
+compcol = { version = "0.6", default-features = false, features = ["zlib"] }
 # Pure-Rust AES (RustCrypto). Round-4 reader uses AES-128/256 in CBC
 # mode for ISO 32000-1 §7.6 standard-handler decryption (R=4 / R=5 /
 # R=6). The `aes` crate is a pure-Rust constant-time implementation

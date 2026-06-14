@@ -665,13 +665,7 @@ fn file_name_string(name: &str, as_utf16: bool) -> Object {
 /// stream encoder use. Local copy keeps the attachments module
 /// self-contained.
 fn flate_compress(input: &[u8]) -> Vec<u8> {
-    use flate2::write::ZlibEncoder;
-    use flate2::Compression;
-    use std::io::Write;
-    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-    enc.write_all(input)
-        .expect("zlib compression cannot fail on Vec");
-    enc.finish().expect("zlib finish cannot fail on Vec")
+    crate::zlib::flate_compress(input)
 }
 
 #[cfg(test)]
@@ -770,13 +764,9 @@ mod tests {
 
     #[test]
     fn flate_compress_roundtrips_through_inflate() {
-        use flate2::read::ZlibDecoder;
-        use std::io::Read;
         let input = b"hello world hello world hello world".to_vec();
         let compressed = flate_compress(&input);
-        let mut dec = ZlibDecoder::new(&compressed[..]);
-        let mut roundtrip = Vec::new();
-        dec.read_to_end(&mut roundtrip).unwrap();
+        let roundtrip = crate::zlib::flate_decompress(&compressed).unwrap();
         assert_eq!(roundtrip, input);
     }
 }

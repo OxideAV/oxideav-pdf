@@ -60,6 +60,7 @@ pub mod reader;
 pub mod resources;
 pub mod sig;
 pub mod writer;
+mod zlib;
 
 pub use acroform::{
     write_pdf_with_form, FieldJustification, FormField, FormFieldCheckbox, FormFieldChoice,

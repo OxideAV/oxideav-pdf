@@ -2086,10 +2086,6 @@ mod tests {
     /// pre-predictor sample bytes.
     #[test]
     fn decode_stream_applies_flate_png_predictor() {
-        use flate2::write::ZlibEncoder;
-        use flate2::Compression;
-        use std::io::Write;
-
         // Two rows of 3 single-byte samples (Colors=1, BPC=8,
         // Columns=3): [10,20,30] and [11,22,33]. PNG-encoded with a
         // None tag on row 0 and an Up tag (deltas) on row 1.
@@ -2097,9 +2093,7 @@ mod tests {
             0, 10, 20, 30, // row 0: tag None
             2, 1, 2, 3, // row 1: tag Up
         ];
-        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(predicted).unwrap();
-        let compressed = enc.finish().unwrap();
+        let compressed = crate::zlib::flate_compress(predicted);
 
         let dict = Dict::new()
             .with("Filter", Object::Name("FlateDecode".into()))
@@ -2121,14 +2115,8 @@ mod tests {
     /// no-op there.
     #[test]
     fn decode_stream_flate_without_predictor_is_passthrough() {
-        use flate2::write::ZlibEncoder;
-        use flate2::Compression;
-        use std::io::Write;
-
         let raw = b"hello predictor-free world";
-        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(raw).unwrap();
-        let compressed = enc.finish().unwrap();
+        let compressed = crate::zlib::flate_compress(raw);
 
         let dict = Dict::new().with("Filter", Object::Name("FlateDecode".into()));
         let stream = Stream::new(dict, compressed);

@@ -371,15 +371,7 @@ fn flate_decoded_xobject_is_skipped() {
     // FlateDecode-only XObject (no DCTDecode tail) must not appear in
     // the JPEG passthrough surface — the round-23 walker is JPEG-only.
     let payload: Vec<u8> = (0u8..16).cycle().take(64).collect();
-    let mut compressed = Vec::new();
-    {
-        use flate2::write::ZlibEncoder;
-        use flate2::Compression;
-        use std::io::Write;
-        let mut enc = ZlibEncoder::new(&mut compressed, Compression::default());
-        enc.write_all(&payload).unwrap();
-        enc.finish().unwrap();
-    }
+    let compressed = compcol::vec::compress_to_vec::<compcol::zlib::Zlib>(&payload).unwrap();
     let pdf = build_pdf_with_xobjects(
         &[(
             "Im0",
