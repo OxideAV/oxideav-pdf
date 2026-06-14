@@ -66,8 +66,14 @@ pub struct TextRun {
     /// byte / CID through the font's `/ToUnicode` CMap (or the
     /// identity / WinAnsi fallbacks documented above).
     pub text: String,
-    /// `(x, y)` in PDF user space — the text-matrix origin at the
-    /// moment of the show.
+    /// `(x, y)` in PDF user space — the origin at which the run's
+    /// glyphs begin. This is the text-matrix origin adjusted by the
+    /// text rise `Ts` (ISO 32000-1 §9.4.4): per the text-rendering
+    /// matrix the rise translates the rendering origin by `Trise`
+    /// along the text matrix's vertical basis, so a `4 Ts` superscript
+    /// reports a `position` shifted up from the surrounding baseline
+    /// rather than colliding with it. When no `Ts` is in force the
+    /// rise is `0` and the position is the bare text-matrix origin.
     pub position: (f32, f32),
     /// The PDF resource name of the font (`/F0`, `/F12`, etc.) — the
     /// `/Tf` operand, with the leading `/` stripped. Empty when the
@@ -84,6 +90,16 @@ pub struct TextRun {
     /// layer scanners stack behind a page image. A keyword-search
     /// consumer keeps it; a "what the human sees" consumer drops it.
     pub render_mode: TextRenderMode,
+    /// Text rise in force at the moment of the show — the most recent
+    /// `Ts` operand (ISO 32000-1 §9.4.4 + §9.3.7, Table 105),
+    /// expressed in unscaled text-space units, defaulting to `0.0`
+    /// when no `Ts` preceded the show. A positive rise raises the
+    /// baseline (superscript); a negative rise lowers it (subscript).
+    /// The geometric effect is already folded into [`Self::position`];
+    /// this raw value lets a layout / accessibility consumer classify
+    /// a run as super/subscript without reverse-engineering the offset
+    /// from the position delta.
+    pub text_rise: f32,
 }
 
 /// Text rendering mode — the integer argument to the `Tr` operator
@@ -1266,6 +1282,12 @@ struct TextWalker {
     /// `BT` (Table 105: `Tr` is a graphics-state text parameter, not a
     /// text-object parameter). Saved / restored by `q` / `Q`.
     render_mode: TextRenderMode,
+    /// Text rise (`Ts`) — §9.4.4 + §9.3.7 Table 105, in unscaled
+    /// text-space units. Persists across show operators and is reset
+    /// to the §9.3.1 default `0.0` only by an explicit `0 Ts`, never by
+    /// `BT` (Table 105: `Ts` is a graphics-state text parameter, not a
+    /// text-object parameter). Saved / restored by `q` / `Q`.
+    text_rise: f32,
     /// Saved text states — one entry per `q`. We don't push the whole
     /// graphics state (paint, transform, etc.) since the path walker
     /// already covers those; just the text-relevant slots.
@@ -1318,6 +1340,7 @@ struct SavedTextState {
     tlm: [f32; 6],
     leading: f32,
     render_mode: TextRenderMode,
+    text_rise: f32,
 }
 
 impl TextWalker {
@@ -1334,6 +1357,7 @@ impl TextWalker {
             tlm: identity(),
             leading: 0.0,
             render_mode: TextRenderMode::Fill,
+            text_rise: 0.0,
             saved: Vec::new(),
             track_mcid: false,
             mcid_stack: Vec::new(),
@@ -1471,6 +1495,7 @@ impl TextWalker {
                     tlm: self.tlm,
                     leading: self.leading,
                     render_mode: self.render_mode,
+                    text_rise: self.text_rise,
                 });
                 self.operands.clear();
             }
@@ -1482,6 +1507,7 @@ impl TextWalker {
                     self.tlm = s.tlm;
                     self.leading = s.leading;
                     self.render_mode = s.render_mode;
+                    self.text_rise = s.text_rise;
                 }
                 self.operands.clear();
             }
@@ -1584,10 +1610,23 @@ impl TextWalker {
                 }
                 self.operands.clear();
             }
+            b"Ts" => {
+                // rise Ts — §9.4.4 + §9.3.7 Table 105. The single
+                // number operand shifts the text-rendering origin
+                // vertically (superscript / subscript) in unscaled
+                // text-space units. We record it so each emitted run's
+                // origin reflects the rise (see `push_run`); a `0 Ts`
+                // restores the baseline per the §9.3.1 default.
+                if let Some(n) = self.pop_num() {
+                    self.text_rise = n;
+                }
+                self.operands.clear();
+            }
             // Other text-state operators we record-but-don't-act-on.
-            // Char / word spacing, horizontal scale, and rise only shift
-            // glyph geometry, not the decoded text or the run's mode.
-            b"Tc" | b"Tw" | b"Tz" | b"Ts" => {
+            // Char / word spacing and horizontal scale only shift glyph
+            // geometry, not the decoded text, the run's mode, or its
+            // origin.
+            b"Tc" | b"Tw" | b"Tz" => {
                 self.operands.clear();
             }
             // Marked-content operators (ISO 32000-1 §14.6).
@@ -1779,12 +1818,22 @@ impl TextWalker {
     /// Append a decoded run at the current text position + font, stamping
     /// the in-scope MCID.
     fn push_run(&mut self, text: String) {
+        // §9.4.4 — the text-rendering origin is the text-space point
+        // `(0, Trise)` mapped through the text matrix `Tm`. With
+        // `tm = [a b c d e f]` the bare origin `(0,0)` maps to
+        // `(e, f)`; adding the rise along `Tm`'s vertical basis gives
+        // `(c·Trise + e, d·Trise + f)`. For the common axis-aligned
+        // `Tm` (`c == 0`, `d == 1`) this is simply `(e, f + Trise)`.
+        let rise = self.text_rise;
+        let x = self.tm[2] * rise + self.tm[4];
+        let y = self.tm[3] * rise + self.tm[5];
         self.runs.push(TextRun {
             text,
-            position: (self.tm[4], self.tm[5]),
+            position: (x, y),
             font_name: self.cur_font.clone(),
             font_size: self.cur_size,
             render_mode: self.render_mode,
+            text_rise: rise,
         });
         // Stamp the current MCID (top of stack) onto the run.
         let cur_mcid = self.mcid_stack.last().copied().unwrap_or(None);
@@ -2111,6 +2160,7 @@ mod tests {
                     font_name: "F0".into(),
                     font_size: 12.0,
                     render_mode: TextRenderMode::Fill,
+                    text_rise: 0.0,
                 },
                 TextRun {
                     text: "World".into(),
@@ -2118,6 +2168,7 @@ mod tests {
                     font_name: "F0".into(),
                     font_size: 12.0,
                     render_mode: TextRenderMode::Fill,
+                    text_rise: 0.0,
                 },
             ],
         };

@@ -553,6 +553,26 @@ graphics-state text parameter, not a text-object parameter) and is
 saved / restored by `q`/`Q`. Adds seven end-to-end tests in
 `tests/text_render_mode_round267.rs`.
 
+Round 299 folds the **text rise** (`Ts`, §9.4.4 + §9.3.7 Table 105)
+into every [`TextRun`] origin. Before this round the walker dropped the
+`Ts` operand (batched with `Tc`/`Tw`/`Tz` as geometry-only state), so a
+`4 Ts` superscript footnote marker reported the same `position` as the
+surrounding baseline text — a layout / accessibility consumer could not
+tell them apart. The walker now tracks the most-recent `Ts` and applies
+it to each run's origin per the §9.4.4 text-rendering matrix: the rise
+translates the rendering origin by `Trise` along the text matrix's
+vertical basis `(c, d)`, so the reported origin is
+`(c·Trise + e, d·Trise + f)`. For the common axis-aligned `Tm` this is
+simply the baseline shifted up (superscript) or down (subscript) in y;
+for a rotated `Tm` the offset follows the rotated basis. The raw rise
+is also surfaced on `TextRun::text_rise` so a consumer can classify a
+run as super/subscript without reverse-engineering the offset from the
+position delta. `Ts` persists across `BT`/`ET` (Table 105 — a
+graphics-state text parameter, not a text-object parameter) and is
+saved / restored by `q`/`Q`; an explicit `0 Ts` restores the §9.3.1
+default baseline. Adds seven end-to-end tests in
+`tests/text_rise_round299.rs`.
+
 ```rust,ignore
 use oxideav_pdf::reader::DocumentReader;
 

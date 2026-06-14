@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- reader (round 299): text rise (`Ts`, ISO 32000-1 §9.4.4 + §9.3.7
+  Table 105) is now folded into every `TextRun` returned by
+  `DocumentReader::text_extraction`. The walker previously dropped the
+  `Ts` operand (batched with `Tc`/`Tw`/`Tz` as geometry-only state),
+  so a `4 Ts` superscript reported the same `position` as the
+  surrounding baseline text. The walker now tracks the most-recent
+  `Ts` and applies it to each run's origin per the text-rendering
+  matrix — the rise translates the rendering origin by `Trise` along
+  the text matrix's vertical basis `(c, d)`, so for the common
+  axis-aligned matrix `position.1` is the baseline plus the rise, and
+  for a rotated `Tm` the offset follows the rotated basis. The raw
+  rise is also surfaced on the new `TextRun::text_rise` field so a
+  layout / accessibility consumer can classify a run as
+  super/subscript without reverse-engineering the offset. `Ts`
+  persists across `BT`/`ET` (Table 105 — graphics-state text
+  parameter) and is saved / restored by `q`/`Q`; an explicit `0 Ts`
+  restores the §9.3.1 default baseline. Adds seven end-to-end tests in
+  `tests/text_rise_round299.rs`. `TextRun` gains the `text_rise`
+  field (additive).
+
 ### Changed
 
 - reader (round 285, depth-mode profiling): content-stream numeric

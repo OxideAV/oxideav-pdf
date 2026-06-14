@@ -343,6 +343,7 @@ mod tests {
                     font_name: "F0".into(),
                     font_size: 12.0,
                     render_mode: crate::reader::text::TextRenderMode::Fill,
+                    text_rise: 0.0,
                 },
                 TextRun {
                     text: "World".into(),
@@ -350,6 +351,7 @@ mod tests {
                     font_name: "F0".into(),
                     font_size: 12.0,
                     render_mode: crate::reader::text::TextRenderMode::Fill,
+                    text_rise: 0.0,
                 },
             ],
         };
