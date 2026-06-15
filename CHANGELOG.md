@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/OxideAV/oxideav-pdf/compare/v0.1.3...v0.1.4) - 2026-06-15
+
+### Other
+
+- evaluate /Separation colour space with Type 2/3 tint transforms (§8.6.6.4 + §7.10)
+- round-306 — /FlateDecode on workspace compcol, drop flate2
+- round-299 — text rise (Ts) folded into TextRun origin (§9.4.4)
+- round-292 — marked-content operators (§14.6 Table 320)
+- round-285 depth-mode profiling — exact-arithmetic fast path for content-stream numbers (§7.3.3)
+- reader r275: resolve ICCBased + Indexed /Resources /ColorSpace in cs/CS
+- round-267 — text render mode (Tr) on every TextRun (§9.3.6 Table 106)
+- round-259 — sh shading-paint operator (§8.7.4.5)
+- round-257 — /PrinterMark §12.5.6.20 writer (Table 362)
+- round-252 — /Watermark §12.5.6.22 writer (Table 190 + Table 191 FixedPrint)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- round-245 — /Sound §12.5.6.16 + §13.3 writer subtype
+- add /FileAttachment writer (round 238, §12.5.6.15 Table 184)
+- round-232 — Caret + Popup §12.5.6 annotation subtypes
+- round-227 — three §12.5.6 line-family annotation subtypes (Line/Polygon/PolyLine)
+- round-220 — §13.6.2 /3D annotation subtype (Table 298 + Table 299)
+- round-215 — two §12.5.6 annotation subtypes (PrinterMark/TrapNet)
+- round-209 — three §12.5.6 annotation subtypes (Sound/Movie/Screen)
+- round-204 — two §12.5.6 annotation subtypes (Watermark/Redact)
+- round-197 — six §12.5.6 annotation subtypes (Line/Polygon/PolyLine/Ink/Caret/Popup/FileAttachment)
+
 ### Added
 
 - reader (round 311): the `/Separation` colour space (ISO 32000-1
