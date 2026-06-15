@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- reader (round 311): the `/Separation` colour space (ISO 32000-1
+  §8.6.6.4) is now evaluated when its alternate reduces to a device
+  family. A single tint component (`0.0..=1.0`) is run through the
+  space's tint-transform function (§7.10) to the alternate space's
+  components, which render to RGB; the round-118 parser collapsed every
+  Separation `sc`/`scn` to black. This adds a self-contained evaluator
+  for the dictionary-shaped **Type 2** (exponential interpolation,
+  §7.10.3 — `f(x) = C0 + x^N · (C1 − C0)`) and **Type 3** (stitching,
+  §7.10.4 — `k` subdomains partitioned by `Bounds`, each child reached
+  after the `Encode`/`Interpolate` input remap) functions, honouring
+  the §7.10.1 Table 38 `Domain` (input clip) and optional `Range`
+  (per-output clip). The Separation tint is clamped into the §8.6.6.4
+  colour range, the initial colour is tint `1.0` per the spec, and the
+  special colorant names `/All` and `/None` are recognised (`/None`
+  produces no visible output). A Separation with a non-device alternate
+  (CIE-based / Indexed / another special space) or a Type 0 (sampled) /
+  Type 4 (PostScript-calculator) tint transform stays unevaluated with
+  the conservative black fallback. The document-level resolver
+  normalises `[ /Separation name alt tintTransform ]` (alternate
+  prepared recursively, tint-transform dereferenced and — for Type 3 —
+  its `/Functions` sub-functions prepared in turn) so the content
+  parser sees a self-contained array, mirroring the round-275
+  `ICCBased` / `Indexed` normalisation. Adds thirteen tests covering
+  the function evaluator and the end-to-end Separation paths. DeviceN
+  (multi-input tint transforms) and Type 0/4 functions remain a
+  follow-up.
+
 ### Changed
 
 - compression (round 306): `/FlateDecode` (ISO 32000-1 §7.4.4) now

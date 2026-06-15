@@ -1579,11 +1579,90 @@ fn prepare_color_space_object(
                         lookup,
                     ]))
                 }
+                Some("Separation") => {
+                    // [ /Separation name alternateSpace tintTransform ]
+                    // — §8.6.6.4. Resolve the colorant name, prepare the
+                    // alternate space recursively (it may be a device
+                    // name, an ICCBased/Indexed array, or an indirect
+                    // ref), and prepare the tint-transform function so
+                    // the content parser sees a self-contained 4-element
+                    // array. The function object is normalised by
+                    // `prepare_function_object` (Type 0/4 streams keep
+                    // their dictionary; Type 3 sub-functions recurse).
+                    let mut it = items.into_iter();
+                    let _family = it.next();
+                    let name = match it.next() {
+                        Some(Object::Reference(id)) => reader.resolve(id)?,
+                        Some(other) => other,
+                        None => return Ok(Object::Array(vec![Object::Name("Separation".into())])),
+                    };
+                    let alt = match it.next() {
+                        Some(a) => prepare_color_space_object(reader, a)?,
+                        None => Object::Null,
+                    };
+                    let tint = match it.next() {
+                        Some(f) => prepare_function_object(reader, f)?,
+                        None => Object::Null,
+                    };
+                    Ok(Object::Array(vec![
+                        Object::Name("Separation".into()),
+                        name,
+                        alt,
+                        tint,
+                    ]))
+                }
                 _ => Ok(Object::Array(items)),
             }
         }
         other => Ok(other),
     }
+}
+
+/// Normalise a PDF function object (§7.10) into a self-contained value
+/// the content parser can interpret without further document access.
+///
+/// A function may be a dictionary (Type 2 / Type 3) or a stream (Type 0
+/// sampled / Type 4 PostScript-calculator). This round's content parser
+/// evaluates only the dictionary-shaped Type 2 (exponential, §7.10.3)
+/// and Type 3 (stitching, §7.10.4) functions, so:
+///
+/// * An indirect reference is dereferenced one hop.
+/// * A stream's dictionary is surfaced (Type 0/4 keep their parameters
+///   reachable; the sample / calculator body is not interpreted this
+///   round, so the parser will treat such a tint transform as
+///   unevaluable and fall back to black).
+/// * A Type 3 stitching dictionary's `/Functions` array is prepared
+///   element-by-element so each sub-function is itself self-contained.
+fn prepare_function_object(
+    reader: &mut DocumentReader<'_>,
+    obj: Object,
+) -> Result<Object, PdfError> {
+    let obj = match obj {
+        Object::Reference(id) => reader.resolve(id)?,
+        other => other,
+    };
+    // Surface a stream as its dictionary so common Table 38 entries
+    // (/FunctionType, /Domain, /Range) stay reachable.
+    let mut dict = match obj {
+        Object::Stream(s) => s.dict,
+        Object::Dict(d) => d,
+        other => return Ok(other),
+    };
+    // A Type 3 stitching function references sub-functions in its
+    // `/Functions` array; recurse so each is self-contained.
+    if let Some((_, Object::Array(funcs))) = dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Functions")
+        .map(|(k, v)| (k.clone(), v.clone()))
+    {
+        let mut prepared = Vec::with_capacity(funcs.len());
+        for f in funcs {
+            prepared.push(prepare_function_object(reader, f)?);
+        }
+        dict.set("Functions", Object::Array(prepared));
+    }
+    Ok(Object::Dict(dict))
 }
 
 fn extract_stream_data(reader: &mut DocumentReader<'_>, id: ObjectId) -> Result<Vec<u8>, PdfError> {

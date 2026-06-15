@@ -666,6 +666,217 @@ enum ArrayElem {
     String(Vec<u8>),
 }
 
+/// A PDF function (ISO 32000-1 §7.10) reduced to the two
+/// dictionary-shaped types this content parser can evaluate without a
+/// sample-table or PostScript-calculator interpreter:
+///
+/// * **Type 2** (exponential interpolation, §7.10.3) —
+///   `f(x) = C0 + x^N · (C1 − C0)`, one input, `n` outputs.
+/// * **Type 3** (stitching, §7.10.4) — a 1-input function partitioned
+///   across `k` subdomains, each evaluated by a child [`PdfFunction`].
+///
+/// Both carry the §7.10.1 Table 38 `Domain` (always 1-input here) and
+/// the optional `Range` (clip the outputs when present). A Type 0
+/// (sampled) or Type 4 (PostScript-calculator) function — which arrive
+/// as streams — is not represented; the resolver surfaces only their
+/// dictionary, so [`PdfFunction::parse`] returns `None` and the owning
+/// Separation space stays `Unknown` (conservative black fallback).
+#[derive(Clone, Debug, PartialEq)]
+enum PdfFunction {
+    /// §7.10.3 Type 2: exponential interpolation between `c0` and `c1`
+    /// with exponent `n`. `domain` is `[d0, d1]` (input clip);
+    /// `range`, when present, is `2·outputs` output-clip bounds.
+    Exponential {
+        domain: [f32; 2],
+        range: Option<Vec<f32>>,
+        c0: Vec<f32>,
+        c1: Vec<f32>,
+        n: f32,
+    },
+    /// §7.10.4 Type 3: stitching. `domain` is `[d0, d1]`; `functions`
+    /// are the `k` child functions; `bounds` are the `k−1` interior
+    /// partition points; `encode` is the `2·k` per-subdomain input
+    /// remapping. `range`, when present, clips the final outputs.
+    Stitching {
+        domain: [f32; 2],
+        range: Option<Vec<f32>>,
+        functions: Vec<PdfFunction>,
+        bounds: Vec<f32>,
+        encode: Vec<f32>,
+    },
+}
+
+impl PdfFunction {
+    /// Parse a resolved function dictionary (already normalised by
+    /// `prepare_function_object`) into an evaluable [`PdfFunction`].
+    /// Returns `None` for a Type 0/4 function (only its dictionary is
+    /// reachable here), a missing/invalid `/FunctionType`, or a
+    /// malformed Type 2/3 dictionary — every such case leaves the
+    /// owning Separation space unevaluable.
+    fn parse(obj: &Object) -> Option<PdfFunction> {
+        let Object::Dict(dict) = obj else {
+            return None;
+        };
+        let get = |key: &str| {
+            dict.entries()
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v)
+        };
+        let domain = get("Domain").and_then(read_num_pair)?;
+        let range = get("Range").and_then(read_num_array);
+        match get("FunctionType").and_then(number_as_i64) {
+            Some(2) => {
+                // §7.10.3 Table 40. C0 defaults to [0.0], C1 to [1.0].
+                let c0 = get("C0")
+                    .and_then(read_num_array)
+                    .unwrap_or_else(|| vec![0.0]);
+                let c1 = get("C1")
+                    .and_then(read_num_array)
+                    .unwrap_or_else(|| vec![1.0]);
+                let n = get("N").and_then(number_as_f32)?;
+                if c0.len() != c1.len() || c0.is_empty() {
+                    return None;
+                }
+                Some(PdfFunction::Exponential {
+                    domain,
+                    range,
+                    c0,
+                    c1,
+                    n,
+                })
+            }
+            Some(3) => {
+                // §7.10.4 Table 41.
+                let Some(Object::Array(fs)) = get("Functions") else {
+                    return None;
+                };
+                let functions: Vec<PdfFunction> =
+                    fs.iter().map(PdfFunction::parse).collect::<Option<_>>()?;
+                if functions.is_empty() {
+                    return None;
+                }
+                let bounds = get("Bounds").and_then(read_num_array).unwrap_or_default();
+                let encode = get("Encode").and_then(read_num_array)?;
+                // k functions ⇒ k−1 bounds and 2·k encode pairs.
+                if bounds.len() + 1 != functions.len() || encode.len() != 2 * functions.len() {
+                    return None;
+                }
+                Some(PdfFunction::Stitching {
+                    domain,
+                    range,
+                    functions,
+                    bounds,
+                    encode,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Evaluate this 1-input function at `x`, returning the output
+    /// component vector. The input is clipped to `Domain` and the
+    /// outputs are clipped to `Range` when present (§7.10.1).
+    fn eval(&self, x: f32) -> Vec<f32> {
+        match self {
+            PdfFunction::Exponential {
+                domain,
+                range,
+                c0,
+                c1,
+                n,
+            } => {
+                let xc = x.clamp(domain[0], domain[1]);
+                // y_j = C0_j + x^N · (C1_j − C0_j), §7.10.3 Table 40.
+                let xn = xc.powf(*n);
+                let mut out: Vec<f32> = c0
+                    .iter()
+                    .zip(c1.iter())
+                    .map(|(&a, &b)| a + xn * (b - a))
+                    .collect();
+                clip_to_range(&mut out, range.as_deref());
+                out
+            }
+            PdfFunction::Stitching {
+                domain,
+                range,
+                functions,
+                bounds,
+                encode,
+            } => {
+                let xc = x.clamp(domain[0], domain[1]);
+                // Find subdomain i: the half-open interval [b_{i-1}, b_i)
+                // (the last is closed on the right), §7.10.4. b_{-1} =
+                // Domain0, b_{k-1} = Domain1.
+                let k = functions.len();
+                let mut i = 0;
+                while i < bounds.len() && xc >= bounds[i] {
+                    i += 1;
+                }
+                let lo = if i == 0 { domain[0] } else { bounds[i - 1] };
+                let hi = if i == k - 1 { domain[1] } else { bounds[i] };
+                // Encode x into the child function's domain. If the
+                // subdomain is degenerate (lo == hi, the §7.10.4
+                // last-bound-equals-Domain1 case), use Encode_{2i}.
+                let xprime = if (hi - lo).abs() < f32::EPSILON {
+                    encode[2 * i]
+                } else {
+                    interpolate(xc, lo, hi, encode[2 * i], encode[2 * i + 1])
+                };
+                let mut out = functions[i].eval(xprime);
+                clip_to_range(&mut out, range.as_deref());
+                out
+            }
+        }
+    }
+}
+
+/// §7.10.2 / §7.10.4 linear `Interpolate`: the `y` value on the line
+/// through `(xmin, ymin)` and `(xmax, ymax)`. A zero-width input
+/// interval maps to `ymin` (avoids a divide-by-zero; callers handle the
+/// degenerate stitching case before calling).
+fn interpolate(x: f32, xmin: f32, xmax: f32, ymin: f32, ymax: f32) -> f32 {
+    if (xmax - xmin).abs() < f32::EPSILON {
+        return ymin;
+    }
+    ymin + (x - xmin) * (ymax - ymin) / (xmax - xmin)
+}
+
+/// Clip each output value into its `Range` pair (§7.10.1): output `j` is
+/// clamped into `[Range_{2j}, Range_{2j+1}]`. A `None` range leaves the
+/// outputs unclipped.
+fn clip_to_range(out: &mut [f32], range: Option<&[f32]>) {
+    if let Some(r) = range {
+        for (j, v) in out.iter_mut().enumerate() {
+            if let (Some(&lo), Some(&hi)) = (r.get(2 * j), r.get(2 * j + 1)) {
+                *v = v.clamp(lo, hi);
+            }
+        }
+    }
+}
+
+/// Read a `[a b]` two-number array (a function `/Domain` for a 1-input
+/// function, §7.10.1 Table 38).
+fn read_num_pair(obj: &Object) -> Option<[f32; 2]> {
+    let Object::Array(items) = obj else {
+        return None;
+    };
+    if items.len() != 2 {
+        return None;
+    }
+    Some([number_as_f32(&items[0])?, number_as_f32(&items[1])?])
+}
+
+/// Read an all-numeric array into a `Vec<f32>` (function `/C0`, `/C1`,
+/// `/Range`, `/Bounds`, `/Encode`). Returns `None` if the object isn't
+/// an array or any element isn't a number.
+fn read_num_array(obj: &Object) -> Option<Vec<f32>> {
+    let Object::Array(items) = obj else {
+        return None;
+    };
+    items.iter().map(number_as_f32).collect()
+}
+
 /// Which colour space the current `sc`/`scn` (or `SC`/`SCN`) operands
 /// are interpreted in, as established by the most recent `cs` / `CS`
 /// operator (ISO 32000-1 §8.6.8 Table 74). The three device families
@@ -698,9 +909,26 @@ enum ColorSpaceKind {
         hival: u32,
         table: Vec<u8>,
     },
-    /// Any space the parser doesn't resolve to a device family or a
-    /// device-based Indexed space — `/Pattern`, a CIE-based CalRGB /
-    /// CalGray / Lab space, a Separation / DeviceN space, or a
+    /// A `/Separation` space (§8.6.6.4): a single tint component in
+    /// `0.0..=1.0` is mapped through `tint` (the tint-transform
+    /// function, §7.10) into `alt`-space component values, which `alt`
+    /// then renders to RGB. `alt` is the alternate device family (the
+    /// only families this round renders); `tint` is the evaluable
+    /// function (Type 2 / Type 3). The special colorant names `All` and
+    /// `None` are folded in at resolve time (`None` → no paint, `All`
+    /// applied through the alternate as a single tint).
+    Separation {
+        alt: Box<ColorSpaceKind>,
+        tint: PdfFunction,
+        /// `true` for the special `/None` colorant — painting produces
+        /// no visible output (§8.6.6.4), so `sc`/`scn` yields no paint.
+        none_colorant: bool,
+    },
+    /// Any space the parser doesn't resolve to a device family, a
+    /// device-based Indexed space, or a device-alternate Separation —
+    /// `/Pattern`, a CIE-based CalRGB / CalGray / Lab space, a DeviceN
+    /// space, a Separation whose tint transform isn't an evaluable
+    /// Type 2/3 function or whose alternate isn't a device family, or a
     /// `/Resources /ColorSpace` key whose definition the parser can't
     /// reduce to a device fallback.
     Unknown,
@@ -732,6 +960,9 @@ impl ColorSpaceKind {
             ColorSpaceKind::DeviceRgb => Some(3),
             ColorSpaceKind::DeviceCmyk => Some(4),
             ColorSpaceKind::Indexed { .. } => Some(1),
+            // §8.6.6.4: a Separation colour value is a single tint
+            // component, regardless of the alternate space's arity.
+            ColorSpaceKind::Separation { .. } => Some(1),
             ColorSpaceKind::Unknown => None,
         }
     }
@@ -788,6 +1019,7 @@ fn color_space_from_object(obj: &Object) -> ColorSpaceKind {
         Object::Array(items) => match items.first() {
             Some(Object::Name(family)) if family == "ICCBased" => icc_based_from_array(items),
             Some(Object::Name(family)) if family == "Indexed" => indexed_from_array(items),
+            Some(Object::Name(family)) if family == "Separation" => separation_from_array(items),
             _ => ColorSpaceKind::Unknown,
         },
         _ => ColorSpaceKind::Unknown,
@@ -851,6 +1083,68 @@ fn indexed_from_array(items: &[Object]) -> ColorSpaceKind {
         base: Box::new(base),
         hival,
         table,
+    }
+}
+
+/// Reduce `[ /Separation name alternateSpace tintTransform ]` to a
+/// tracked `Separation` space per ISO 32000-1 §8.6.6.4.
+///
+/// The space resolves only when the alternate reduces to a device
+/// family (DeviceGray / DeviceRGB / DeviceCMYK — the families this
+/// round renders) and the tint transform parses as an evaluable Type 2
+/// / Type 3 function ([`PdfFunction::parse`]). A non-device alternate
+/// (CIE-based / Indexed / another special space — the latter forbidden
+/// by §8.6.6.4 anyway) or a Type 0 / Type 4 tint transform collapses to
+/// `Unknown`, preserving the conservative black fallback.
+///
+/// The special colorant names `All` and `None` (§8.6.6.4): for these a
+/// conforming reader ignores the alternate and tint transform. `None`
+/// produces no visible output, so it is tracked as a Separation whose
+/// `none_colorant` flag suppresses any paint. `All` applies a single
+/// tint to all colorants; with no per-colorant device model here, it is
+/// approximated through the alternate exactly like a named colorant
+/// when one is supplied, otherwise it stays `Unknown`.
+fn separation_from_array(items: &[Object]) -> ColorSpaceKind {
+    if items.len() < 4 {
+        return ColorSpaceKind::Unknown;
+    }
+    let none_colorant = matches!(&items[1], Object::Name(n) if n == "None");
+    let alt = color_space_from_object(&items[2]);
+    // §8.6.6.4: the alternate "may not be another special colour space
+    // (Pattern, Indexed, Separation, or DeviceN)" — `components()` is
+    // `None` for `Unknown`, and an Indexed/Separation alternate is
+    // rejected by matching their variants.
+    if alt.components().is_none()
+        || matches!(
+            alt,
+            ColorSpaceKind::Indexed { .. } | ColorSpaceKind::Separation { .. }
+        )
+    {
+        // A `/None` colorant ignores the alternate entirely (no visible
+        // output), so it still resolves even with a degenerate
+        // alternate; everything else needs a renderable alternate.
+        if none_colorant {
+            return ColorSpaceKind::Separation {
+                alt: Box::new(ColorSpaceKind::DeviceGray),
+                tint: PdfFunction::Exponential {
+                    domain: [0.0, 1.0],
+                    range: None,
+                    c0: vec![0.0],
+                    c1: vec![0.0],
+                    n: 1.0,
+                },
+                none_colorant: true,
+            };
+        }
+        return ColorSpaceKind::Unknown;
+    }
+    let Some(tint) = PdfFunction::parse(&items[3]) else {
+        return ColorSpaceKind::Unknown;
+    };
+    ColorSpaceKind::Separation {
+        alt: Box::new(alt),
+        tint,
+        none_colorant,
     }
 }
 
@@ -1857,6 +2151,11 @@ impl<'a> State<'a> {
             ColorSpaceKind::Indexed { base, hival, table } => {
                 return indexed_color(base, *hival, table, comps[0])
             }
+            ColorSpaceKind::Separation {
+                alt,
+                tint,
+                none_colorant,
+            } => return separation_color(alt, tint, *none_colorant, comps[0]),
             ColorSpaceKind::Unknown => unreachable!("components() returned Some"),
         })
     }
@@ -2048,6 +2347,14 @@ fn initial_color_for(cs: &ColorSpaceKind) -> Option<Paint> {
         // colour space shall initialize the corresponding current
         // colour to 0" — i.e. table entry 0.
         ColorSpaceKind::Indexed { base, hival, table } => indexed_color(base, *hival, table, 0.0),
+        // §8.6.6.4: "The initial value for both the stroking and
+        // nonstroking colour in the graphics state shall be 1.0" — i.e.
+        // the maximum tint, evaluated through the tint transform.
+        ColorSpaceKind::Separation {
+            alt,
+            tint,
+            none_colorant,
+        } => separation_color(alt, tint, *none_colorant, 1.0),
         ColorSpaceKind::Unknown => None,
     }
 }
@@ -2081,12 +2388,56 @@ fn indexed_color(base: &ColorSpaceKind, hival: u32, table: &[u8], index: f32) ->
             Paint::Solid(rgb_from_cmyk(unit(0), unit(1), unit(2), unit(3)))
         }
         // `indexed_from_array` rejects a non-device base, and a nested
-        // `Indexed` base is forbidden by §8.6.6.3, so these are
+        // An `Indexed` or `Separation` base is forbidden by §8.6.6.3
+        // (and rejected by `indexed_from_array`), so these are
         // unreachable in practice; fall back to black for total safety.
-        ColorSpaceKind::Indexed { .. } | ColorSpaceKind::Unknown => {
-            Paint::Solid(Rgba::opaque(0, 0, 0))
-        }
+        ColorSpaceKind::Indexed { .. }
+        | ColorSpaceKind::Separation { .. }
+        | ColorSpaceKind::Unknown => Paint::Solid(Rgba::opaque(0, 0, 0)),
     })
+}
+
+/// Resolve a single `sc`/`scn` tint operand against a `/Separation`
+/// colour space per ISO 32000-1 §8.6.6.4. The tint is clamped into the
+/// `0.0..=1.0` colour range, run through the tint-transform function to
+/// produce the alternate space's component values, then those
+/// components are rendered to RGB through the alternate device family.
+///
+/// A `/None` colorant produces no visible output (`None` paint, so the
+/// caller leaves the path unpainted). A component-count mismatch between
+/// the tint transform's output and the alternate family — a malformed
+/// space — yields `None` (conservative black fallback).
+fn separation_color(
+    alt: &ColorSpaceKind,
+    tint: &PdfFunction,
+    none_colorant: bool,
+    tint_value: f32,
+) -> Option<Paint> {
+    if none_colorant {
+        return None;
+    }
+    let t = tint_value.clamp(0.0, 1.0);
+    let comps = tint.eval(t);
+    paint_from_device_components(alt, &comps)
+}
+
+/// Render a device colour space's component values to a [`Paint`].
+/// Returns `None` when the count doesn't match the family's arity (a
+/// non-device family is also rejected — only the three device families
+/// have a direct component → RGB mapping).
+fn paint_from_device_components(cs: &ColorSpaceKind, comps: &[f32]) -> Option<Paint> {
+    match cs {
+        ColorSpaceKind::DeviceGray if comps.len() == 1 => {
+            Some(Paint::Solid(rgb_from_unit(comps[0], comps[0], comps[0])))
+        }
+        ColorSpaceKind::DeviceRgb if comps.len() == 3 => {
+            Some(Paint::Solid(rgb_from_unit(comps[0], comps[1], comps[2])))
+        }
+        ColorSpaceKind::DeviceCmyk if comps.len() == 4 => Some(Paint::Solid(rgb_from_cmyk(
+            comps[0], comps[1], comps[2], comps[3],
+        ))),
+        _ => None,
+    }
 }
 
 /// Convert a DeviceCMYK colour value to DeviceRGB per ISO 32000-1
@@ -3212,6 +3563,226 @@ mod tests {
             ColorSpaceKind::resolve_with_resources("CS0", None),
             ColorSpaceKind::Unknown
         );
+    }
+
+    // ── PDF functions §7.10 + Separation colour space §8.6.6.4 ──
+
+    fn num_arr(vals: &[f32]) -> Object {
+        Object::Array(vals.iter().map(|v| Object::Real(*v as f64)).collect())
+    }
+
+    /// A Type 2 exponential dict (§7.10.3): `f(x)=C0+x^N·(C1−C0)`.
+    fn type2(c0: &[f32], c1: &[f32], n: f32) -> Object {
+        Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(2))
+                .with("Domain", num_arr(&[0.0, 1.0]))
+                .with("C0", num_arr(c0))
+                .with("C1", num_arr(c1))
+                .with("N", Object::Real(n as f64)),
+        )
+    }
+
+    /// `f(x)=C0+x^N·(C1−C0)` at x=0 is C0, at x=1 is C1, and at the
+    /// midpoint for N=1 it is the average (§7.10.3 Table 40).
+    #[test]
+    fn type2_exponential_interpolates() {
+        let f = PdfFunction::parse(&type2(&[0.0, 0.0, 0.0, 0.0], &[1.0, 0.0, 0.0, 0.0], 1.0))
+            .expect("type 2 parses");
+        assert_eq!(f.eval(0.0), vec![0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(f.eval(1.0), vec![1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(f.eval(0.5), vec![0.5, 0.0, 0.0, 0.0]);
+    }
+
+    /// N=2 makes the interpolation quadratic in x: at x=0.5, x^N=0.25.
+    #[test]
+    fn type2_exponent_two_is_quadratic() {
+        let f = PdfFunction::parse(&type2(&[0.0], &[1.0], 2.0)).expect("parses");
+        assert!((f.eval(0.5)[0] - 0.25).abs() < 1e-6);
+    }
+
+    /// `/Range` clips each output into `[Range_2j, Range_2j+1]`
+    /// (§7.10.1): a C1 of 2.0 with Range `[0 1]` clips to 1.0 at x=1.
+    #[test]
+    fn type2_range_clips_output() {
+        let dict = Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(2))
+                .with("Domain", num_arr(&[0.0, 1.0]))
+                .with("Range", num_arr(&[0.0, 1.0]))
+                .with("C0", num_arr(&[0.0]))
+                .with("C1", num_arr(&[2.0]))
+                .with("N", Object::Integer(1)),
+        );
+        let f = PdfFunction::parse(&dict).expect("parses");
+        assert_eq!(f.eval(1.0), vec![1.0]);
+    }
+
+    /// A Type 3 stitching function (§7.10.4): two Type 2 children split
+    /// at Bounds=0.5, each Encode'd onto `[0 1]`. The §7.10.4 EXAMPLE
+    /// `g(x)=f(1−x)` shape (Encode `[1 0]`) is exercised on the first
+    /// child to prove the per-subdomain input remap.
+    #[test]
+    fn type3_stitching_routes_to_subdomain() {
+        // child 0: f0(x)=x (C0=0,C1=1,N=1); child 1: f1(x)=1−x via
+        // C0=1,C1=0. Bounds [0.5], Encode [0 1 0 1] (identity remap).
+        let dict = Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(3))
+                .with("Domain", num_arr(&[0.0, 1.0]))
+                .with(
+                    "Functions",
+                    Object::Array(vec![type2(&[0.0], &[1.0], 1.0), type2(&[1.0], &[0.0], 1.0)]),
+                )
+                .with("Bounds", num_arr(&[0.5]))
+                .with("Encode", num_arr(&[0.0, 1.0, 0.0, 1.0])),
+        );
+        let f = PdfFunction::parse(&dict).expect("type 3 parses");
+        // x=0.25 → subdomain 0, remapped onto [0,1]: Interpolate(0.25,
+        // 0, 0.5, 0, 1) = 0.5 → f0(0.5)=0.5.
+        assert!((f.eval(0.25)[0] - 0.5).abs() < 1e-6);
+        // x=0.75 → subdomain 1, Interpolate(0.75, 0.5, 1, 0, 1)=0.5 →
+        // f1(0.5)=0.5.
+        assert!((f.eval(0.75)[0] - 0.5).abs() < 1e-6);
+        // x=1.0 (last subdomain, closed on the right) → f1(1.0)=0.0.
+        assert!(f.eval(1.0)[0].abs() < 1e-6);
+    }
+
+    /// A Type 0 (sampled) or Type 4 (calculator) dictionary is not
+    /// evaluable here — `parse` returns `None`.
+    #[test]
+    fn type0_and_type4_are_not_evaluable() {
+        let t0 = Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(0))
+                .with("Domain", num_arr(&[0.0, 1.0])),
+        );
+        assert!(PdfFunction::parse(&t0).is_none());
+        let t4 = Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(4))
+                .with("Domain", num_arr(&[0.0, 1.0])),
+        );
+        assert!(PdfFunction::parse(&t4).is_none());
+    }
+
+    /// Build a `[ /Separation name alt tint ]` array (§8.6.6.4).
+    fn separation(name: &str, alt: Object, tint: Object) -> Object {
+        Object::Array(vec![
+            Object::Name("Separation".into()),
+            Object::Name(name.into()),
+            alt,
+            tint,
+        ])
+    }
+
+    /// §8.6.6.4 EXAMPLE 2 shape: a Separation over DeviceCMYK with a
+    /// linear tint transform mapping tint → CMYK. At tint=1.0 the
+    /// alternate components are the full C1; rendered through §10.3.5.
+    #[test]
+    fn separation_cmyk_tint_maps_through_alternate() {
+        // tint transform: pure cyan at full tint (C1 = [1 0 0 0]).
+        let tint = type2(&[0.0, 0.0, 0.0, 0.0], &[1.0, 0.0, 0.0, 0.0], 1.0);
+        let arr = separation("LogoGreen", Object::Name("DeviceCMYK".into()), tint);
+        let cs = Dict::new().with("CS0", arr);
+        // 1.0 scn → CMYK (1,0,0,0) → §10.3.5 → (0,255,255) cyan.
+        let bytes = b"q /CS0 cs 1 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (0, 255, 255));
+        // 0.0 scn → CMYK (0,0,0,0) → white.
+        let bytes = b"q /CS0 cs 0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (255, 255, 255));
+    }
+
+    /// §8.6.6.4: the initial Separation colour is tint 1.0 — a bare
+    /// `cs` with no `scn` paints the full-tint colour, not black.
+    #[test]
+    fn separation_bare_cs_uses_full_tint() {
+        let tint = type2(&[1.0], &[0.0], 1.0); // gray: tint 1 → 0.0 (black)
+        let arr = separation("Spot", Object::Name("DeviceGray".into()), tint);
+        let cs = Dict::new().with("CS0", arr);
+        // Bare cs → tint 1.0 → gray 0.0 → black.
+        let bytes = b"q /CS0 cs 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (0, 0, 0));
+        // Explicit 0 scn → gray 1.0 → white, proving 1.0 was the default.
+        let bytes = b"q /CS0 cs 0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (255, 255, 255));
+    }
+
+    /// A Type 3 stitching tint transform drives a Separation end-to-end.
+    #[test]
+    fn separation_with_type3_tint() {
+        let tint = Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(3))
+                .with("Domain", num_arr(&[0.0, 1.0]))
+                .with(
+                    "Functions",
+                    Object::Array(vec![type2(&[0.0], &[0.5], 1.0), type2(&[0.5], &[1.0], 1.0)]),
+                )
+                .with("Bounds", num_arr(&[0.5]))
+                .with("Encode", num_arr(&[0.0, 1.0, 0.0, 1.0])),
+        );
+        let arr = separation("Spot", Object::Name("DeviceGray".into()), tint);
+        let cs = Dict::new().with("CS0", arr);
+        // tint 0.75 → subdomain 1, x'=0.5 → f1(0.5)=0.75 gray → 191.
+        let bytes = b"q /CS0 cs 0.75 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        let (r, g, b) = first_fill_with_cs(bytes, &cs);
+        let expect = (0.75f32 * 255.0).round() as u8;
+        assert_eq!((r, g, b), (expect, expect, expect));
+    }
+
+    /// The special `/None` colorant produces no visible output
+    /// (§8.6.6.4): `scn` yields no paint, so the prior (default black)
+    /// fill stands and no spurious colour is read.
+    #[test]
+    fn separation_none_colorant_produces_no_paint() {
+        let arr = separation(
+            "None",
+            Object::Name("DeviceGray".into()),
+            type2(&[0.0], &[1.0], 1.0),
+        );
+        let cs = Dict::new().with("CS0", arr);
+        let bytes = b"q /CS0 cs 0.5 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        // No paint from the None colorant → commit_path's black fallback.
+        assert_eq!(first_fill_with_cs(bytes, &cs), (0, 0, 0));
+    }
+
+    /// A Separation whose alternate is a non-device (CIE-based) space
+    /// stays `Unknown` — this round renders only device alternates, so
+    /// the conservative black fallback applies.
+    #[test]
+    fn separation_nondevice_alternate_is_unknown() {
+        let arr = separation(
+            "Spot",
+            Object::Name("Lab".into()),
+            type2(&[0.0], &[1.0], 1.0),
+        );
+        assert_eq!(color_space_from_object(&arr), ColorSpaceKind::Unknown);
+    }
+
+    /// A Separation whose tint transform is a Type 0/4 (unevaluable
+    /// here) stays `Unknown`.
+    #[test]
+    fn separation_unevaluable_tint_is_unknown() {
+        let t4 = Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(4))
+                .with("Domain", num_arr(&[0.0, 1.0])),
+        );
+        let arr = separation("Spot", Object::Name("DeviceGray".into()), t4);
+        assert_eq!(color_space_from_object(&arr), ColorSpaceKind::Unknown);
+    }
+
+    /// A Separation tint operand outside `0.0..=1.0` is clamped into the
+    /// colour range before the transform (§8.6.6.4).
+    #[test]
+    fn separation_tint_clamped_to_unit_range() {
+        let tint = type2(&[0.0], &[1.0], 1.0); // gray identity
+        let arr = separation("Spot", Object::Name("DeviceGray".into()), tint);
+        let cs = Dict::new().with("CS0", arr);
+        // 5.0 clamps to 1.0 → gray 1.0 → white.
+        let bytes = b"q /CS0 cs 5 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (255, 255, 255));
     }
 
     // ── ExtGState `gs` resolution (round 125, ISO 32000-1 §8.4.5) ──

@@ -1654,9 +1654,11 @@ their space so a subsequent bare `sc`/`scn` resolves correctly, and a
 bare `cs`/`CS` initialises the colour to black per §8.6.4.2..4.
 
 `/Pattern`, a trailing `/Name` pattern operand (§8.7.3.3), CIE-based
-(CalRGB / CalGray / Lab) and Separation / DeviceN spaces keep the
-conservative black fallback — they need a gamut-mapping pass or a
-tint-transform function evaluation this layer doesn't yet carry.
+(CalRGB / CalGray / Lab) and DeviceN spaces keep the conservative black
+fallback — they need a gamut-mapping pass or a multi-input
+tint-transform evaluation this layer doesn't yet carry. (Single-input
+`Separation` tint transforms over a device alternate are evaluated as
+of round 311 — see below.)
 
 ### Resource colour spaces: `ICCBased` + `Indexed` (round 275)
 
@@ -1692,6 +1694,57 @@ table is self-contained). The new
 [`parse_content_stream_full_with_color_space`] entry point takes the
 resolved dict; the legacy entry points keep their round-118 behaviour
 (non-device names stay `Unknown`, `sc`/`scn` keeps the black fallback).
+
+### Separation colour space + Type 2/3 tint transforms (round 311)
+
+Round 311 evaluates the `/Separation` colour space (ISO 32000-1
+§8.6.6.4) when its alternate reduces to a device family. A Separation
+space carries a single **tint** component in `0.0..=1.0`; setting it as
+the current space and painting via `sc`/`scn` runs the tint through the
+space's **tint-transform function** (§7.10) to produce the alternate
+device space's component values, which are then rendered to RGB. The
+round-118 parser collapsed every Separation `sc`/`scn` to black; a
+document painting a spot colour such as the §8.6.6.4 EXAMPLE 2
+`[ /Separation /LogoGreen /DeviceCMYK 12 0 R ]` now reconstructs the
+approximated colour.
+
+This round adds a self-contained evaluator for the two
+dictionary-shaped function types §7.10 defines that are common as tint
+transforms:
+
+- **Type 2** — exponential interpolation (§7.10.3 Table 40):
+  `f(x) = C0 + x^N · (C1 − C0)`, one input, `n` outputs. `C0` / `C1`
+  default to `[0.0]` / `[1.0]`; `N` is the interpolation exponent.
+- **Type 3** — stitching (§7.10.4 Table 41): a 1-input function
+  partitioned across `k` subdomains by `Bounds`, each child function
+  reached after the §7.10.4 `Encode`/`Interpolate` input remap (the
+  half-open `[b_{i-1}, b_i)` intervals, last closed on the right,
+  including the degenerate last-bound-equals-`Domain1` case).
+
+Both honour the §7.10.1 Table 38 `Domain` (input clip) and optional
+`Range` (per-output clip). The Separation tint itself is clamped into
+the §8.6.6.4 `0.0..=1.0` colour range first, and the initial colour is
+tint `1.0` ("The initial value … shall be 1.0"), so a bare `cs` paints
+the full-tint colour rather than black. The special colorant names
+`/All` and `/None` are recognised — `/None` produces no visible output
+(no paint), and `/All` is approximated through the alternate.
+
+A Separation whose alternate isn't a device family (CIE-based / Indexed
+/ another special space — the latter forbidden by §8.6.6.4), or whose
+tint transform is a Type 0 (sampled) or Type 4 (PostScript-calculator)
+function (which arrive as streams, not evaluated this round), stays
+`Unknown` with the conservative black fallback. The document-level
+resolver normalises `[ /Separation name alt tintTransform ]` so the
+content parser sees a self-contained array (the alternate prepared
+recursively, the tint-transform function dereferenced and — for Type 3
+— its `/Functions` sub-functions prepared in turn), mirroring the
+round-275 `ICCBased` / `Indexed` normalisation. Thirteen tests cover
+the function evaluator (Type 2 interpolation / exponent / range clip,
+Type 3 subdomain routing, Type 0/4 rejection) and the end-to-end
+Separation paths (CMYK / Gray alternates, Type 3 tint, `/None`, full-
+tint default, out-of-range clamp, non-device-alternate and
+unevaluable-tint fallbacks). DeviceN (multi-input tint transforms) and
+Type 0/4 functions remain a follow-up.
 
 ### Marked-content operators (`BMC`/`BDC`/`EMC`/`MP`/`DP`, round 292)
 
