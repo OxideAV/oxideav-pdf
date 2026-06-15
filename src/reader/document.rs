@@ -1622,15 +1622,22 @@ fn prepare_color_space_object(
 /// the content parser can interpret without further document access.
 ///
 /// A function may be a dictionary (Type 2 / Type 3) or a stream (Type 0
-/// sampled / Type 4 PostScript-calculator). This round's content parser
-/// evaluates only the dictionary-shaped Type 2 (exponential, §7.10.3)
-/// and Type 3 (stitching, §7.10.4) functions, so:
+/// sampled / Type 4 PostScript-calculator). This content parser
+/// evaluates the dictionary-shaped Type 2 (exponential, §7.10.3) and
+/// Type 3 (stitching, §7.10.4) functions, plus the stream-shaped Type 0
+/// (sampled, §7.10.2) function, so:
 ///
 /// * An indirect reference is dereferenced one hop.
-/// * A stream's dictionary is surfaced (Type 0/4 keep their parameters
-///   reachable; the sample / calculator body is not interpreted this
-///   round, so the parser will treat such a tint transform as
-///   unevaluable and fall back to black).
+/// * A stream's dictionary is surfaced so the common Table 38 entries
+///   (`/FunctionType`, `/Domain`, `/Range`) and the Table 39 Type 0
+///   entries (`/Size`, `/BitsPerSample`, `/Encode`, `/Decode`) stay
+///   reachable. For a Type 0 function the decoded sample body is also
+///   carried into the dictionary under the synthetic `__Samples` key (a
+///   `HexString`), mirroring the Indexed-space lookup-stream handling,
+///   so the content parser sees a self-contained sampled function.
+///   A Type 4 (PostScript-calculator) body is not interpreted, so the
+///   parser treats such a tint transform as unevaluable and falls back
+///   to black.
 /// * A Type 3 stitching dictionary's `/Functions` array is prepared
 ///   element-by-element so each sub-function is itself self-contained.
 fn prepare_function_object(
@@ -1642,9 +1649,30 @@ fn prepare_function_object(
         other => other,
     };
     // Surface a stream as its dictionary so common Table 38 entries
-    // (/FunctionType, /Domain, /Range) stay reachable.
+    // (/FunctionType, /Domain, /Range) stay reachable. A Type 0 sampled
+    // function's decoded body is folded in under `__Samples` (§7.10.2);
+    // any other stream body is dropped (only its parameters are needed).
     let mut dict = match obj {
-        Object::Stream(s) => s.dict,
+        Object::Stream(s) => {
+            let is_sampled = s
+                .dict
+                .entries()
+                .iter()
+                .find(|(k, _)| k == "FunctionType")
+                .and_then(|(_, v)| match v {
+                    Object::Integer(n) => Some(*n),
+                    _ => None,
+                })
+                == Some(0);
+            if is_sampled {
+                let samples = decode_stream(&s)?;
+                let mut d = s.dict;
+                d.set("__Samples", Object::HexString(samples));
+                d
+            } else {
+                s.dict
+            }
+        }
         Object::Dict(d) => d,
         other => return Ok(other),
     };

@@ -667,20 +667,24 @@ enum ArrayElem {
 }
 
 /// A PDF function (ISO 32000-1 §7.10) reduced to the two
-/// dictionary-shaped types this content parser can evaluate without a
-/// sample-table or PostScript-calculator interpreter:
+/// function types this content parser can evaluate at a 1-input call
+/// site (Separation tint transforms, §8.6.6.4):
 ///
+/// * **Type 0** (sampled, §7.10.2) — a sample table read from the
+///   stream body, with the §7.10.2 Encode/Decode linear mappings and
+///   Order-1 linear interpolation between adjacent samples.
 /// * **Type 2** (exponential interpolation, §7.10.3) —
 ///   `f(x) = C0 + x^N · (C1 − C0)`, one input, `n` outputs.
 /// * **Type 3** (stitching, §7.10.4) — a 1-input function partitioned
 ///   across `k` subdomains, each evaluated by a child [`PdfFunction`].
 ///
-/// Both carry the §7.10.1 Table 38 `Domain` (always 1-input here) and
-/// the optional `Range` (clip the outputs when present). A Type 0
-/// (sampled) or Type 4 (PostScript-calculator) function — which arrive
-/// as streams — is not represented; the resolver surfaces only their
-/// dictionary, so [`PdfFunction::parse`] returns `None` and the owning
-/// Separation space stays `Unknown` (conservative black fallback).
+/// All carry the §7.10.1 Table 38 `Domain` (always 1-input here) and,
+/// for Type 0, the required `Range` (Type 2/3 clip outputs only when
+/// `Range` is present). A Type 4 (PostScript-calculator) function —
+/// which arrives as a stream — is not represented; the resolver
+/// surfaces only its dictionary, so [`PdfFunction::parse`] returns
+/// `None` and the owning Separation space stays `Unknown` (conservative
+/// black fallback).
 #[derive(Clone, Debug, PartialEq)]
 enum PdfFunction {
     /// §7.10.3 Type 2: exponential interpolation between `c0` and `c1`
@@ -704,15 +708,37 @@ enum PdfFunction {
         bounds: Vec<f32>,
         encode: Vec<f32>,
     },
+    /// §7.10.2 Type 0: a sampled function. Restricted here to a single
+    /// input dimension (`m = 1`), the only shape reachable from a
+    /// 1-input call site (Separation tint transforms). `domain` is the
+    /// `[d0, d1]` input clip; `range` is the required `2·n` output clip;
+    /// `size` is the number of samples along the single input axis;
+    /// `n` is the output dimensionality; `encode` is the `[e0, e1]`
+    /// input→table mapping (default `[0, size−1]`); `decode` is the
+    /// `2·n` sample→output mapping (default `= range`); `samples` holds
+    /// each sample value already widened to `f32` in storage order
+    /// (output `j` of input index `i` at `i·n + j`), normalised out of
+    /// the `[0, 2^BitsPerSample − 1]` integer interval before Decode.
+    Sampled {
+        domain: [f32; 2],
+        range: Vec<f32>,
+        size: usize,
+        n: usize,
+        encode: [f32; 2],
+        decode: Vec<f32>,
+        samples: Vec<f32>,
+    },
 }
 
 impl PdfFunction {
     /// Parse a resolved function dictionary (already normalised by
     /// `prepare_function_object`) into an evaluable [`PdfFunction`].
-    /// Returns `None` for a Type 0/4 function (only its dictionary is
-    /// reachable here), a missing/invalid `/FunctionType`, or a
-    /// malformed Type 2/3 dictionary — every such case leaves the
-    /// owning Separation space unevaluable.
+    /// Type 0 reads its decoded sample body from the `__Samples` entry
+    /// `prepare_function_object` folds in; Type 2/3 are pure dictionary
+    /// forms. Returns `None` for a Type 4 function (only its dictionary
+    /// is reachable here), a Type 0 with more than one input dimension,
+    /// a missing/invalid `/FunctionType`, or a malformed dictionary —
+    /// every such case leaves the owning Separation space unevaluable.
     fn parse(obj: &Object) -> Option<PdfFunction> {
         let Object::Dict(dict) = obj else {
             return None;
@@ -726,6 +752,60 @@ impl PdfFunction {
         let domain = get("Domain").and_then(read_num_pair)?;
         let range = get("Range").and_then(read_num_array);
         match get("FunctionType").and_then(number_as_i64) {
+            Some(0) => {
+                // §7.10.2 Table 39. Restrict to one input dimension —
+                // the only shape a 1-input call site (Separation tint
+                // transform) ever evaluates. /Range is required and
+                // gives the output dimensionality n.
+                let range = range?;
+                if range.is_empty() || range.len() % 2 != 0 {
+                    return None;
+                }
+                let n = range.len() / 2;
+                // /Size is an array of m positive integers; m must be 1.
+                let size_arr = get("Size").and_then(read_num_array)?;
+                if size_arr.len() != 1 {
+                    return None;
+                }
+                let size = size_arr[0];
+                if !(size.is_finite()) || size < 1.0 {
+                    return None;
+                }
+                let size = size as usize;
+                // /BitsPerSample ∈ {1,2,4,8,12,16,24,32}.
+                let bps = get("BitsPerSample").and_then(number_as_i64)?;
+                if !matches!(bps, 1 | 2 | 4 | 8 | 12 | 16 | 24 | 32) {
+                    return None;
+                }
+                let bps = bps as u32;
+                // /Encode default [0 (Size−1)]; /Decode default = Range.
+                let encode = match get("Encode").and_then(read_num_pair) {
+                    Some(e) => e,
+                    None => [0.0, (size as f32) - 1.0],
+                };
+                let decode = get("Decode")
+                    .and_then(read_num_array)
+                    .unwrap_or_else(|| range.clone());
+                if decode.len() != 2 * n {
+                    return None;
+                }
+                // Sample body folded in by `prepare_function_object`.
+                let raw = match get("__Samples") {
+                    Some(Object::HexString(bytes)) => bytes.as_slice(),
+                    _ => return None,
+                };
+                let count = size.checked_mul(n)?;
+                let samples = unpack_samples(raw, bps, count)?;
+                Some(PdfFunction::Sampled {
+                    domain,
+                    range,
+                    size,
+                    n,
+                    encode,
+                    decode,
+                    samples,
+                })
+            }
             Some(2) => {
                 // §7.10.3 Table 40. C0 defaults to [0.0], C1 to [1.0].
                 let c0 = get("C0")
@@ -827,6 +907,40 @@ impl PdfFunction {
                 clip_to_range(&mut out, range.as_deref());
                 out
             }
+            PdfFunction::Sampled {
+                domain,
+                range,
+                size,
+                n,
+                encode,
+                decode,
+                samples,
+            } => {
+                // §7.10.2. Clip the input to Domain, encode into the
+                // sample-table axis, clip to [0, Size−1].
+                let xc = x.clamp(domain[0], domain[1]);
+                let e = interpolate(xc, domain[0], domain[1], encode[0], encode[1]);
+                let e = e.clamp(0.0, (*size as f32) - 1.0);
+                // Order-1 (linear) interpolation between the two nearest
+                // surrounding samples. A single-sample axis (Size == 1)
+                // maps every input to index 0.
+                let i0 = e.floor() as usize;
+                let i1 = (i0 + 1).min(size - 1);
+                let frac = e - (i0 as f32);
+                let mut out = Vec::with_capacity(*n);
+                for j in 0..*n {
+                    let s0 = samples[i0 * n + j];
+                    let s1 = samples[i1 * n + j];
+                    // Samples are pre-normalised to [0, 1] (raw code ÷
+                    // (2^BitsPerSample − 1); see `samples` doc); linearly
+                    // blend, then Decode maps [0, 1] → output range.
+                    let s = s0 + frac * (s1 - s0);
+                    let y = interpolate(s, 0.0, 1.0, decode[2 * j], decode[2 * j + 1]);
+                    out.push(y);
+                }
+                clip_to_range(&mut out, Some(range));
+                out
+            }
         }
     }
 }
@@ -865,6 +979,35 @@ fn read_num_pair(obj: &Object) -> Option<[f32; 2]> {
         return None;
     }
     Some([number_as_f32(&items[0])?, number_as_f32(&items[1])?])
+}
+
+/// Unpack `count` sample values of `bps` bits each from a §7.10.2
+/// sample stream, normalising each raw integer code into `[0.0, 1.0]`
+/// by dividing by `2^bps − 1`. The bytes form a continuous bit stream
+/// with the high-order bit of each byte first and no padding at value
+/// boundaries; values run output-fastest then input-axis (storage
+/// order). Returns `None` if the stream is too short to hold `count`
+/// values. `bps` is one of {1,2,4,8,12,16,24,32}, so a value never
+/// spans more than 32 bits.
+fn unpack_samples(raw: &[u8], bps: u32, count: usize) -> Option<Vec<f32>> {
+    let total_bits = (count as u64).checked_mul(bps as u64)?;
+    if (raw.len() as u64) * 8 < total_bits {
+        return None;
+    }
+    let max_code = ((1u64 << bps) - 1) as f32;
+    let mut out = Vec::with_capacity(count);
+    let mut bit_pos: u64 = 0;
+    for _ in 0..count {
+        let mut code: u64 = 0;
+        for _ in 0..bps {
+            let byte = raw[(bit_pos / 8) as usize];
+            let bit = (byte >> (7 - (bit_pos % 8) as u32)) & 1;
+            code = (code << 1) | (bit as u64);
+            bit_pos += 1;
+        }
+        out.push((code as f32) / max_code);
+    }
+    Some(out)
 }
 
 /// Read an all-numeric array into a `Vec<f32>` (function `/C0`, `/C1`,
@@ -914,7 +1057,7 @@ enum ColorSpaceKind {
     /// function, §7.10) into `alt`-space component values, which `alt`
     /// then renders to RGB. `alt` is the alternate device family (the
     /// only families this round renders); `tint` is the evaluable
-    /// function (Type 2 / Type 3). The special colorant names `All` and
+    /// function (Type 0 sampled / Type 2 / Type 3). The special colorant names `All` and
     /// `None` are folded in at resolve time (`None` → no paint, `All`
     /// applied through the alternate as a single tint).
     Separation {
@@ -928,7 +1071,7 @@ enum ColorSpaceKind {
     /// device-based Indexed space, or a device-alternate Separation —
     /// `/Pattern`, a CIE-based CalRGB / CalGray / Lab space, a DeviceN
     /// space, a Separation whose tint transform isn't an evaluable
-    /// Type 2/3 function or whose alternate isn't a device family, or a
+    /// Type 0/2/3 function or whose alternate isn't a device family, or a
     /// `/Resources /ColorSpace` key whose definition the parser can't
     /// reduce to a device fallback.
     Unknown,
@@ -1091,11 +1234,11 @@ fn indexed_from_array(items: &[Object]) -> ColorSpaceKind {
 ///
 /// The space resolves only when the alternate reduces to a device
 /// family (DeviceGray / DeviceRGB / DeviceCMYK — the families this
-/// round renders) and the tint transform parses as an evaluable Type 2
-/// / Type 3 function ([`PdfFunction::parse`]). A non-device alternate
-/// (CIE-based / Indexed / another special space — the latter forbidden
-/// by §8.6.6.4 anyway) or a Type 0 / Type 4 tint transform collapses to
-/// `Unknown`, preserving the conservative black fallback.
+/// round renders) and the tint transform parses as an evaluable Type 0
+/// (sampled) / Type 2 / Type 3 function ([`PdfFunction::parse`]). A
+/// non-device alternate (CIE-based / Indexed / another special space —
+/// the latter forbidden by §8.6.6.4 anyway) or a Type 4 tint transform
+/// collapses to `Unknown`, preserving the conservative black fallback.
 ///
 /// The special colorant names `All` and `None` (§8.6.6.4): for these a
 /// conforming reader ignores the alternate and tint transform. `None`
@@ -3648,15 +3791,20 @@ mod tests {
         assert!(f.eval(1.0)[0].abs() < 1e-6);
     }
 
-    /// A Type 0 (sampled) or Type 4 (calculator) dictionary is not
-    /// evaluable here — `parse` returns `None`.
+    /// A Type 0 dictionary stripped of its sample body (`__Samples`)
+    /// and a Type 4 (calculator) dictionary are not evaluable here —
+    /// `parse` returns `None`.
     #[test]
-    fn type0_and_type4_are_not_evaluable() {
+    fn type0_without_samples_and_type4_are_not_evaluable() {
         let t0 = Object::Dict(
             Dict::new()
                 .with("FunctionType", Object::Integer(0))
-                .with("Domain", num_arr(&[0.0, 1.0])),
+                .with("Domain", num_arr(&[0.0, 1.0]))
+                .with("Range", num_arr(&[0.0, 1.0]))
+                .with("Size", num_arr(&[2.0]))
+                .with("BitsPerSample", Object::Integer(8)),
         );
+        // No __Samples entry → parse cannot reach the sample table.
         assert!(PdfFunction::parse(&t0).is_none());
         let t4 = Object::Dict(
             Dict::new()
@@ -3664,6 +3812,118 @@ mod tests {
                 .with("Domain", num_arr(&[0.0, 1.0])),
         );
         assert!(PdfFunction::parse(&t4).is_none());
+    }
+
+    /// Build a self-contained Type 0 sampled function dictionary with an
+    /// 8-bit, single-input, single-output sample table whose decoded
+    /// body lives under `__Samples` (the shape `prepare_function_object`
+    /// produces). `codes` are the raw 0..=255 sample codes in input
+    /// order.
+    fn type0_8bit(domain: &[f32], range: &[f32], codes: &[u8]) -> Object {
+        Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(0))
+                .with("Domain", num_arr(domain))
+                .with("Range", num_arr(range))
+                .with("Size", num_arr(&[codes.len() as f32]))
+                .with("BitsPerSample", Object::Integer(8))
+                .with("__Samples", Object::HexString(codes.to_vec())),
+        )
+    }
+
+    /// §7.10.2: an 8-bit two-sample identity table over `[0,1] → [0,1]`
+    /// evaluates by linear interpolation between the endpoints, and the
+    /// endpoints decode exactly (0 → 0.0, 255 → 1.0).
+    #[test]
+    fn type0_8bit_linear_identity() {
+        let f = PdfFunction::parse(&type0_8bit(&[0.0, 1.0], &[0.0, 1.0], &[0, 255]))
+            .expect("type0 parses");
+        assert!((f.eval(0.0)[0] - 0.0).abs() < 1e-6);
+        assert!((f.eval(1.0)[0] - 1.0).abs() < 1e-6);
+        // Midpoint: e = Interpolate(0.5, 0,1, 0, 1) = 0.5, blend of the
+        // two codes (0.0 and 1.0) → 0.5.
+        assert!((f.eval(0.5)[0] - 0.5).abs() < 1e-6);
+    }
+
+    /// §7.10.2 Decode: a non-default `/Decode` remaps the [0,1] sample
+    /// codes into the output range. With Decode [0 10] the 255 code
+    /// decodes to 10.0, the 0 code to 0.0, midpoint 5.0.
+    #[test]
+    fn type0_decode_remaps_outputs() {
+        let f = PdfFunction::parse(&Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(0))
+                .with("Domain", num_arr(&[0.0, 1.0]))
+                .with("Range", num_arr(&[0.0, 10.0]))
+                .with("Size", num_arr(&[2.0]))
+                .with("BitsPerSample", Object::Integer(8))
+                .with("Decode", num_arr(&[0.0, 10.0]))
+                .with("__Samples", Object::HexString(vec![0, 255])),
+        ))
+        .expect("type0 parses");
+        assert!((f.eval(0.0)[0] - 0.0).abs() < 1e-5);
+        assert!((f.eval(1.0)[0] - 10.0).abs() < 1e-5);
+        assert!((f.eval(0.5)[0] - 5.0).abs() < 1e-5);
+    }
+
+    /// §7.10.2 multi-output: a single-sample (Size 1) table with two
+    /// outputs maps every input to the lone sample, decoded per output.
+    #[test]
+    fn type0_single_sample_multi_output() {
+        let f = PdfFunction::parse(&Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(0))
+                .with("Domain", num_arr(&[0.0, 1.0]))
+                .with("Range", num_arr(&[0.0, 1.0, 0.0, 1.0]))
+                .with("Size", num_arr(&[1.0]))
+                .with("BitsPerSample", Object::Integer(8))
+                // one input index, two outputs: codes 255, 0.
+                .with("__Samples", Object::HexString(vec![255, 0])),
+        ))
+        .expect("type0 parses");
+        let out = f.eval(0.42);
+        assert_eq!(out.len(), 2);
+        assert!((out[0] - 1.0).abs() < 1e-5);
+        assert!((out[1] - 0.0).abs() < 1e-5);
+    }
+
+    /// §7.10.2 1-bit packing: a 4-sample 1-bit table reads the
+    /// high-order bit of the byte first (codes 1,0,1,0 → 0x A0 = 1010
+    /// 0000) and interpolates between adjacent samples.
+    #[test]
+    fn type0_1bit_packing_msb_first() {
+        let f = PdfFunction::parse(&Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(0))
+                .with("Domain", num_arr(&[0.0, 1.0]))
+                .with("Range", num_arr(&[0.0, 1.0]))
+                .with("Size", num_arr(&[4.0]))
+                .with("BitsPerSample", Object::Integer(1))
+                .with("Encode", num_arr(&[0.0, 3.0]))
+                .with("__Samples", Object::HexString(vec![0b1010_0000])),
+        ))
+        .expect("type0 parses");
+        // index 0 → code 1 → 1.0; index 1 → code 0 → 0.0; index 2 → 1.0.
+        assert!((f.eval(0.0)[0] - 1.0).abs() < 1e-6);
+        assert!((f.eval(1.0 / 3.0)[0] - 0.0).abs() < 1e-5);
+        assert!((f.eval(2.0 / 3.0)[0] - 1.0).abs() < 1e-5);
+    }
+
+    /// §7.10.2 with more than one input dimension is not reachable from
+    /// a 1-input call site — `parse` returns `None`.
+    #[test]
+    fn type0_multidim_input_is_not_evaluable() {
+        let t0 = Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(0))
+                .with("Domain", num_arr(&[0.0, 1.0, 0.0, 1.0]))
+                .with("Range", num_arr(&[0.0, 1.0]))
+                .with("Size", num_arr(&[2.0, 2.0]))
+                .with("BitsPerSample", Object::Integer(8))
+                .with("__Samples", Object::HexString(vec![0, 255, 128, 64])),
+        );
+        // Domain has 2 input dims → read_num_pair rejects it.
+        assert!(PdfFunction::parse(&t0).is_none());
     }
 
     /// Build a `[ /Separation name alt tint ]` array (§8.6.6.4).
@@ -3731,6 +3991,25 @@ mod tests {
         assert_eq!((r, g, b), (expect, expect, expect));
     }
 
+    /// A Type 0 (sampled) tint transform drives a Separation over
+    /// DeviceGray end-to-end through the content parser. The two-sample
+    /// 8-bit table maps tint 1.0 → gray 0.0 (black), proving the
+    /// `__Samples`-folded sampled function is evaluated by `scn`.
+    #[test]
+    fn separation_with_type0_tint() {
+        // tint → gray, inverted: code at index 0 is 255 (gray 1.0),
+        // index 1 is 0 (gray 0.0). Encode default [0 1].
+        let tint = type0_8bit(&[0.0, 1.0], &[0.0, 1.0], &[255, 0]);
+        let arr = separation("Spot", Object::Name("DeviceGray".into()), tint);
+        let cs = Dict::new().with("CS0", arr);
+        // tint 1.0 → gray 0.0 → black.
+        let bytes = b"q /CS0 cs 1 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (0, 0, 0));
+        // tint 0.0 → gray 1.0 → white.
+        let bytes = b"q /CS0 cs 0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (255, 255, 255));
+    }
+
     /// The special `/None` colorant produces no visible output
     /// (§8.6.6.4): `scn` yields no paint, so the prior (default black)
     /// fill stands and no spurious colour is read.
@@ -3760,8 +4039,8 @@ mod tests {
         assert_eq!(color_space_from_object(&arr), ColorSpaceKind::Unknown);
     }
 
-    /// A Separation whose tint transform is a Type 0/4 (unevaluable
-    /// here) stays `Unknown`.
+    /// A Separation whose tint transform is a Type 4 (unevaluable here)
+    /// stays `Unknown`.
     #[test]
     fn separation_unevaluable_tint_is_unknown() {
         let t4 = Object::Dict(
