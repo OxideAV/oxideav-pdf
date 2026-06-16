@@ -677,14 +677,17 @@ enum ArrayElem {
 ///   `f(x) = C0 + x^N · (C1 − C0)`, one input, `n` outputs.
 /// * **Type 3** (stitching, §7.10.4) — a 1-input function partitioned
 ///   across `k` subdomains, each evaluated by a child [`PdfFunction`].
+/// * **Type 4** (PostScript calculator, §7.10.5) — a small stack
+///   machine over the §7.10.5 / Annex B operator subset. The program
+///   text is folded into the dictionary under `__Program` by
+///   `prepare_function_object`; [`PdfFunction::parse`] tokenises it into
+///   a nested expression tree and [`PdfFunction::eval`] runs it with the
+///   1-input call site's argument seeded on the operand stack.
 ///
-/// All carry the §7.10.1 Table 38 `Domain` (always 1-input here) and,
-/// for Type 0, the required `Range` (Type 2/3 clip outputs only when
-/// `Range` is present). A Type 4 (PostScript-calculator) function —
-/// which arrives as a stream — is not represented; the resolver
-/// surfaces only its dictionary, so [`PdfFunction::parse`] returns
-/// `None` and the owning Separation space stays `Unknown` (conservative
-/// black fallback).
+/// All carry the §7.10.1 Table 38 `Domain` (always 1-input here) and the
+/// `Range` — required for Type 0 and Type 4, optional output-clip for
+/// Type 2/3. A malformed program leaves the owning Separation space
+/// `Unknown` (conservative black fallback).
 #[derive(Clone, Debug, PartialEq)]
 enum PdfFunction {
     /// §7.10.3 Type 2: exponential interpolation between `c0` and `c1`
@@ -728,6 +731,145 @@ enum PdfFunction {
         decode: Vec<f32>,
         samples: Vec<f32>,
     },
+    /// §7.10.5 Type 4: a PostScript-calculator program. `domain` is the
+    /// `[d0, d1]` 1-input clip; `range` is the required `2·n` output clip
+    /// (its length also fixes the number of output components taken off
+    /// the final operand stack); `program` is the parsed top-level
+    /// expression (the body inside the outermost `{ }`).
+    Calculator {
+        domain: [f32; 2],
+        range: Vec<f32>,
+        program: Vec<PsToken>,
+    },
+}
+
+/// One token in a parsed Type 4 (PostScript-calculator) program
+/// (§7.10.5). The language has no strings, arrays, names, procedures, or
+/// variables — only numbers, booleans, the Table 42 operators, and brace
+/// blocks used as the operands of `if` / `ifelse`.
+#[derive(Clone, Debug, PartialEq)]
+enum PsToken {
+    /// A numeric literal (integer or real; both stored as `f32`).
+    Number(f32),
+    /// The `true` / `false` boolean literals.
+    Bool(bool),
+    /// One of the Table 42 operators, stored as its lower-case keyword.
+    Op(PsOp),
+    /// A `{ … }` brace block — a procedure operand for `if` / `ifelse`.
+    /// Never executed directly; only consumed by the conditional
+    /// operators that follow it.
+    Block(Vec<PsToken>),
+}
+
+/// The §7.10.5 Table 42 / Annex B operator set permitted in a Type 4
+/// function. `if` / `ifelse` are handled structurally against preceding
+/// [`PsToken::Block`]s, so they are part of this set too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PsOp {
+    // B.2 Arithmetic.
+    Abs,
+    Add,
+    Atan,
+    Ceiling,
+    Cos,
+    Cvi,
+    Cvr,
+    Div,
+    Exp,
+    Floor,
+    Idiv,
+    Ln,
+    Log,
+    Mod,
+    Mul,
+    Neg,
+    Round,
+    Sin,
+    Sqrt,
+    Sub,
+    Truncate,
+    // B.3 Relational / boolean / bitwise.
+    And,
+    Bitshift,
+    Eq,
+    Ge,
+    Gt,
+    Le,
+    Lt,
+    Ne,
+    Not,
+    Or,
+    Xor,
+    // B.4 Conditional.
+    If,
+    Ifelse,
+    // B.5 Stack.
+    Copy,
+    Dup,
+    Exch,
+    Index,
+    Pop,
+    Roll,
+}
+
+impl PsOp {
+    /// Map a lower-case operator keyword to its [`PsOp`], or `None` for
+    /// an unknown token (a syntax error, §7.10.5.2).
+    fn from_keyword(kw: &str) -> Option<PsOp> {
+        Some(match kw {
+            "abs" => PsOp::Abs,
+            "add" => PsOp::Add,
+            "atan" => PsOp::Atan,
+            "ceiling" => PsOp::Ceiling,
+            "cos" => PsOp::Cos,
+            "cvi" => PsOp::Cvi,
+            "cvr" => PsOp::Cvr,
+            "div" => PsOp::Div,
+            "exp" => PsOp::Exp,
+            "floor" => PsOp::Floor,
+            "idiv" => PsOp::Idiv,
+            "ln" => PsOp::Ln,
+            "log" => PsOp::Log,
+            "mod" => PsOp::Mod,
+            "mul" => PsOp::Mul,
+            "neg" => PsOp::Neg,
+            "round" => PsOp::Round,
+            "sin" => PsOp::Sin,
+            "sqrt" => PsOp::Sqrt,
+            "sub" => PsOp::Sub,
+            "truncate" => PsOp::Truncate,
+            "and" => PsOp::And,
+            "bitshift" => PsOp::Bitshift,
+            "eq" => PsOp::Eq,
+            "ge" => PsOp::Ge,
+            "gt" => PsOp::Gt,
+            "le" => PsOp::Le,
+            "lt" => PsOp::Lt,
+            "ne" => PsOp::Ne,
+            "not" => PsOp::Not,
+            "or" => PsOp::Or,
+            "xor" => PsOp::Xor,
+            "if" => PsOp::If,
+            "ifelse" => PsOp::Ifelse,
+            "copy" => PsOp::Copy,
+            "dup" => PsOp::Dup,
+            "exch" => PsOp::Exch,
+            "index" => PsOp::Index,
+            "pop" => PsOp::Pop,
+            "roll" => PsOp::Roll,
+            _ => return None,
+        })
+    }
+}
+
+/// A value on the Type 4 operand stack: a number or a boolean (§7.10.5
+/// permits integers, reals, and booleans only). Integers and reals are
+/// both held as `f32`; the few integer-only operators (`idiv`, `mod`,
+/// bitwise ops) convert on demand.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PsValue {
+    Num(f32),
+    Bool(bool),
 }
 
 impl PdfFunction {
@@ -850,6 +992,26 @@ impl PdfFunction {
                     encode,
                 })
             }
+            Some(4) => {
+                // §7.10.5 Table 38: Domain and Range are both required;
+                // Range also fixes the output dimensionality n.
+                let range = range?;
+                if range.is_empty() || range.len() % 2 != 0 {
+                    return None;
+                }
+                // The decoded program source, folded in by
+                // `prepare_function_object` under `__Program`.
+                let src = match get("__Program") {
+                    Some(Object::HexString(bytes)) => bytes.as_slice(),
+                    _ => return None,
+                };
+                let program = parse_ps_program(src)?;
+                Some(PdfFunction::Calculator {
+                    domain,
+                    range,
+                    program,
+                })
+            }
             _ => None,
         }
     }
@@ -941,7 +1103,516 @@ impl PdfFunction {
                 clip_to_range(&mut out, Some(range));
                 out
             }
+            PdfFunction::Calculator {
+                domain,
+                range,
+                program,
+            } => {
+                // §7.10.5: the input variables form the initial operand
+                // stack. This is a 1-input call site, so seed the single
+                // clipped argument and run the program.
+                let xc = x.clamp(domain[0], domain[1]);
+                let n = range.len() / 2;
+                let mut stack: Vec<PsValue> = vec![PsValue::Num(xc)];
+                if exec_ps(program, &mut stack).is_err() {
+                    // §7.10.5.2 execution error (stack under/overflow,
+                    // type error, undefined result). Fall back to black.
+                    return vec![0.0; n];
+                }
+                // The items remaining after execution are the outputs.
+                // It is an error for the count to differ from Range's n
+                // (§7.10.5) or for any to be non-numeric; treat both as
+                // the conservative black fallback.
+                if stack.len() != n {
+                    return vec![0.0; n];
+                }
+                let mut out = Vec::with_capacity(n);
+                for v in &stack {
+                    match v {
+                        PsValue::Num(f) => out.push(*f),
+                        PsValue::Bool(_) => return vec![0.0; n],
+                    }
+                }
+                clip_to_range(&mut out, Some(range));
+                out
+            }
         }
+    }
+}
+
+/// Maximum operand-stack depth for a Type 4 program. §7.10.5 requires at
+/// least 100 entries and explicitly makes overflowing the stack an
+/// error; this is also the guard that keeps an adversarial `dup`-loop
+/// program bounded.
+const PS_STACK_LIMIT: usize = 100;
+
+/// Tokenise + parse a Type 4 (PostScript-calculator) program body
+/// (§7.10.5). The whole program is wrapped in an outermost `{ }`; this
+/// returns the token sequence *inside* that brace. Brace blocks nested
+/// for `if` / `ifelse` become [`PsToken::Block`]s. Returns `None` for a
+/// syntax error (§7.10.5.2): unmatched braces, a non-numeric / unknown
+/// token, or missing outer braces.
+fn parse_ps_program(src: &[u8]) -> Option<Vec<PsToken>> {
+    // The grammar is whitespace-separated; the only special characters
+    // are the curly braces. A real number is `[+-]?digits[.digits]` and
+    // the spec language has no other lexical forms.
+    let mut words: Vec<&[u8]> = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, &b) in src.iter().enumerate() {
+        if b == b'{' || b == b'}' {
+            if let Some(s) = start.take() {
+                words.push(&src[s..i]);
+            }
+            words.push(&src[i..i + 1]);
+        } else if b.is_ascii_whitespace() {
+            if let Some(s) = start.take() {
+                words.push(&src[s..i]);
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        words.push(&src[s..]);
+    }
+    // The first non-empty token must be the opening brace; the matching
+    // close brace must be the last. Parse the body between them.
+    let mut iter = words.into_iter().peekable();
+    if iter.next() != Some(b"{") {
+        return None;
+    }
+    let (body, closed) = parse_ps_block(&mut iter)?;
+    // After the top-level block closes, nothing else may follow.
+    if !closed || iter.next().is_some() {
+        return None;
+    }
+    Some(body)
+}
+
+/// Parse the contents of one brace block up to (and consuming) its
+/// closing `}`. Returns the token list plus whether a matching `}` was
+/// actually seen (`false` ⇒ unterminated block ⇒ caller reports a syntax
+/// error).
+fn parse_ps_block<'a, I>(iter: &mut std::iter::Peekable<I>) -> Option<(Vec<PsToken>, bool)>
+where
+    I: Iterator<Item = &'a [u8]>,
+{
+    let mut tokens = Vec::new();
+    while let Some(w) = iter.next() {
+        match w {
+            b"}" => return Some((tokens, true)),
+            b"{" => {
+                let (inner, closed) = parse_ps_block(iter)?;
+                if !closed {
+                    return None;
+                }
+                tokens.push(PsToken::Block(inner));
+            }
+            b"true" => tokens.push(PsToken::Bool(true)),
+            b"false" => tokens.push(PsToken::Bool(false)),
+            other => {
+                let text = str::from_utf8(other).ok()?;
+                if let Ok(num) = text.parse::<f32>() {
+                    tokens.push(PsToken::Number(num));
+                } else if let Some(op) = PsOp::from_keyword(text) {
+                    tokens.push(PsToken::Op(op));
+                } else {
+                    // Unknown token — a syntax error.
+                    return None;
+                }
+            }
+        }
+    }
+    // Ran out of tokens without a closing brace.
+    Some((tokens, false))
+}
+
+/// Execute a parsed Type 4 token sequence against the operand `stack`
+/// (§7.10.5). Returns `Err(())` on any execution error — stack
+/// under/overflow, a type error, or an undefined result (§7.10.5.2) —
+/// which the caller maps to the conservative black fallback.
+fn exec_ps(tokens: &[PsToken], stack: &mut Vec<PsValue>) -> Result<(), ()> {
+    let mut i = 0;
+    while i < tokens.len() {
+        match &tokens[i] {
+            PsToken::Number(f) => push(stack, PsValue::Num(*f))?,
+            PsToken::Bool(b) => push(stack, PsValue::Bool(*b))?,
+            // A bare block on the operand path is only meaningful as the
+            // operand of the `if` / `ifelse` that follows it; those are
+            // handled when the operator token is reached, so a block by
+            // itself (without a following conditional) is a syntax-shaped
+            // error we treat as an execution error.
+            PsToken::Block(_) => {
+                // Look ahead: `bool { proc } if` or
+                // `bool { p1 } { p2 } ifelse`.
+                let proc1 = match &tokens[i] {
+                    PsToken::Block(b) => b,
+                    _ => unreachable!(),
+                };
+                match tokens.get(i + 1) {
+                    Some(PsToken::Op(PsOp::If)) => {
+                        let cond = pop_bool(stack)?;
+                        if cond {
+                            exec_ps(proc1, stack)?;
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    Some(PsToken::Block(proc2)) => {
+                        // Expect `ifelse` after the second block.
+                        if tokens.get(i + 2) != Some(&PsToken::Op(PsOp::Ifelse)) {
+                            return Err(());
+                        }
+                        let cond = pop_bool(stack)?;
+                        if cond {
+                            exec_ps(proc1, stack)?;
+                        } else {
+                            exec_ps(proc2, stack)?;
+                        }
+                        i += 3;
+                        continue;
+                    }
+                    _ => return Err(()),
+                }
+            }
+            PsToken::Op(op) => exec_ps_op(*op, stack)?,
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// Push a value, enforcing the §7.10.5 100-entry stack ceiling
+/// (overflow is an error).
+fn push(stack: &mut Vec<PsValue>, v: PsValue) -> Result<(), ()> {
+    if stack.len() >= PS_STACK_LIMIT {
+        return Err(());
+    }
+    stack.push(v);
+    Ok(())
+}
+
+/// Pop a numeric operand; a non-number or empty stack is an error.
+fn pop_num(stack: &mut Vec<PsValue>) -> Result<f32, ()> {
+    match stack.pop() {
+        Some(PsValue::Num(f)) => Ok(f),
+        _ => Err(()),
+    }
+}
+
+/// Pop a boolean operand; a non-boolean or empty stack is an error.
+fn pop_bool(stack: &mut Vec<PsValue>) -> Result<bool, ()> {
+    match stack.pop() {
+        Some(PsValue::Bool(b)) => Ok(b),
+        _ => Err(()),
+    }
+}
+
+/// Pop a value usable as an integer (§B.3 bitwise / B.2 idiv·mod). The
+/// number must be integral within `f32` range; a non-number or a value
+/// outside the i32 range is an error.
+fn pop_int(stack: &mut Vec<PsValue>) -> Result<i32, ()> {
+    let f = pop_num(stack)?;
+    if !f.is_finite() || f.fract() != 0.0 || f < i32::MIN as f32 || f > i32::MAX as f32 {
+        return Err(());
+    }
+    Ok(f as i32)
+}
+
+/// Execute a single non-conditional operator against the stack
+/// (§7.10.5 / Annex B). `if` / `ifelse` never reach here — they are
+/// handled structurally in [`exec_ps`].
+fn exec_ps_op(op: PsOp, stack: &mut Vec<PsValue>) -> Result<(), ()> {
+    match op {
+        // ---- B.2 Arithmetic ------------------------------------------
+        PsOp::Add => {
+            let (a, b) = (pop_num(stack)?, pop_num(stack)?);
+            push(stack, PsValue::Num(b + a))
+        }
+        PsOp::Sub => {
+            let (a, b) = (pop_num(stack)?, pop_num(stack)?);
+            push(stack, PsValue::Num(b - a))
+        }
+        PsOp::Mul => {
+            let (a, b) = (pop_num(stack)?, pop_num(stack)?);
+            push(stack, PsValue::Num(b * a))
+        }
+        PsOp::Div => {
+            let a = pop_num(stack)?;
+            let b = pop_num(stack)?;
+            if a == 0.0 {
+                return Err(()); // division by zero ⇒ undefined result
+            }
+            push(stack, PsValue::Num(b / a))
+        }
+        PsOp::Idiv => {
+            let a = pop_int(stack)?;
+            let b = pop_int(stack)?;
+            if a == 0 {
+                return Err(());
+            }
+            push(stack, PsValue::Num((b / a) as f32))
+        }
+        PsOp::Mod => {
+            let a = pop_int(stack)?;
+            let b = pop_int(stack)?;
+            if a == 0 {
+                return Err(());
+            }
+            // PostScript `mod` takes the sign of the dividend (Rust `%`
+            // already does this for integers).
+            push(stack, PsValue::Num((b % a) as f32))
+        }
+        PsOp::Neg => {
+            let a = pop_num(stack)?;
+            push(stack, PsValue::Num(-a))
+        }
+        PsOp::Abs => {
+            let a = pop_num(stack)?;
+            push(stack, PsValue::Num(a.abs()))
+        }
+        PsOp::Ceiling => {
+            let a = pop_num(stack)?;
+            push(stack, PsValue::Num(a.ceil()))
+        }
+        PsOp::Floor => {
+            let a = pop_num(stack)?;
+            push(stack, PsValue::Num(a.floor()))
+        }
+        PsOp::Round => {
+            let a = pop_num(stack)?;
+            // PostScript rounds half away from zero, matching `f32::round`.
+            push(stack, PsValue::Num(a.round()))
+        }
+        PsOp::Truncate => {
+            let a = pop_num(stack)?;
+            push(stack, PsValue::Num(a.trunc()))
+        }
+        PsOp::Sqrt => {
+            let a = pop_num(stack)?;
+            if a < 0.0 {
+                return Err(()); // range error
+            }
+            push(stack, PsValue::Num(a.sqrt()))
+        }
+        PsOp::Sin => {
+            let a = pop_num(stack)?;
+            push(stack, PsValue::Num(a.to_radians().sin()))
+        }
+        PsOp::Cos => {
+            let a = pop_num(stack)?;
+            push(stack, PsValue::Num(a.to_radians().cos()))
+        }
+        PsOp::Atan => {
+            // num den atan angle — result in degrees, normalised to
+            // [0, 360) (PostScript semantics).
+            let den = pop_num(stack)?;
+            let num = pop_num(stack)?;
+            if num == 0.0 && den == 0.0 {
+                return Err(()); // undefined
+            }
+            let mut deg = num.atan2(den).to_degrees();
+            if deg < 0.0 {
+                deg += 360.0;
+            }
+            push(stack, PsValue::Num(deg))
+        }
+        PsOp::Exp => {
+            // base exponent exp real.
+            let exponent = pop_num(stack)?;
+            let base = pop_num(stack)?;
+            let r = base.powf(exponent);
+            if !r.is_finite() {
+                return Err(());
+            }
+            push(stack, PsValue::Num(r))
+        }
+        PsOp::Ln => {
+            let a = pop_num(stack)?;
+            if a <= 0.0 {
+                return Err(());
+            }
+            push(stack, PsValue::Num(a.ln()))
+        }
+        PsOp::Log => {
+            let a = pop_num(stack)?;
+            if a <= 0.0 {
+                return Err(());
+            }
+            push(stack, PsValue::Num(a.log10()))
+        }
+        PsOp::Cvi => {
+            // Convert to integer by truncation toward zero.
+            let a = pop_num(stack)?;
+            push(stack, PsValue::Num(a.trunc()))
+        }
+        PsOp::Cvr => {
+            // Convert to real — already an f32, a no-op type assertion.
+            let a = pop_num(stack)?;
+            push(stack, PsValue::Num(a))
+        }
+        // ---- B.3 Relational / boolean / bitwise ----------------------
+        PsOp::Eq => {
+            let (a, b) = (stack.pop().ok_or(())?, stack.pop().ok_or(())?);
+            push(stack, PsValue::Bool(b == a))
+        }
+        PsOp::Ne => {
+            let (a, b) = (stack.pop().ok_or(())?, stack.pop().ok_or(())?);
+            push(stack, PsValue::Bool(b != a))
+        }
+        PsOp::Gt => {
+            let (a, b) = (pop_num(stack)?, pop_num(stack)?);
+            push(stack, PsValue::Bool(b > a))
+        }
+        PsOp::Ge => {
+            let (a, b) = (pop_num(stack)?, pop_num(stack)?);
+            push(stack, PsValue::Bool(b >= a))
+        }
+        PsOp::Lt => {
+            let (a, b) = (pop_num(stack)?, pop_num(stack)?);
+            push(stack, PsValue::Bool(b < a))
+        }
+        PsOp::Le => {
+            let (a, b) = (pop_num(stack)?, pop_num(stack)?);
+            push(stack, PsValue::Bool(b <= a))
+        }
+        PsOp::And => bool_or_bitwise(stack, |x, y| x & y, |x, y| x && y),
+        PsOp::Or => bool_or_bitwise(stack, |x, y| x | y, |x, y| x || y),
+        PsOp::Xor => bool_or_bitwise(stack, |x, y| x ^ y, |x, y| x != y),
+        PsOp::Not => {
+            // Logical not on a bool, bitwise not on an int (§B.3).
+            match stack.pop() {
+                Some(PsValue::Bool(b)) => push(stack, PsValue::Bool(!b)),
+                Some(PsValue::Num(f)) => push(stack, PsValue::Num(!integer_value(f)? as f32)),
+                _ => Err(()),
+            }
+        }
+        PsOp::Bitshift => {
+            // int1 shift bitshift int2 (positive shift is left, §B.3).
+            let shift = pop_int(stack)?;
+            let v = pop_int(stack)?;
+            let r = if shift >= 0 {
+                if shift >= 32 {
+                    0
+                } else {
+                    v.wrapping_shl(shift as u32)
+                }
+            } else {
+                let s = (-shift) as u32;
+                if s >= 32 {
+                    0
+                } else {
+                    v >> s
+                }
+            };
+            push(stack, PsValue::Num(r as f32))
+        }
+        // ---- B.5 Stack -----------------------------------------------
+        PsOp::Pop => {
+            stack.pop().ok_or(())?;
+            Ok(())
+        }
+        PsOp::Exch => {
+            let len = stack.len();
+            if len < 2 {
+                return Err(());
+            }
+            stack.swap(len - 1, len - 2);
+            Ok(())
+        }
+        PsOp::Dup => {
+            let top = *stack.last().ok_or(())?;
+            push(stack, top)
+        }
+        PsOp::Copy => {
+            // any1 … anyn n copy any1 … anyn any1 … anyn (§B.5).
+            let n = pop_int(stack)?;
+            if n < 0 {
+                return Err(());
+            }
+            let n = n as usize;
+            let len = stack.len();
+            if n > len {
+                return Err(());
+            }
+            if stack.len() + n > PS_STACK_LIMIT {
+                return Err(());
+            }
+            for k in 0..n {
+                stack.push(stack[len - n + k]);
+            }
+            Ok(())
+        }
+        PsOp::Index => {
+            // anyn … any0 n index anyn … any0 anyn (§B.5): duplicate the
+            // element n positions down from the top (0 = top).
+            let n = pop_int(stack)?;
+            if n < 0 {
+                return Err(());
+            }
+            let n = n as usize;
+            let len = stack.len();
+            if n >= len {
+                return Err(());
+            }
+            push(stack, stack[len - 1 - n])
+        }
+        PsOp::Roll => {
+            // anyn-1 … any0 n j roll — circularly roll the top n elements
+            // up by j (§B.5).
+            let j = pop_int(stack)?;
+            let n = pop_int(stack)?;
+            if n < 0 {
+                return Err(());
+            }
+            let n = n as usize;
+            let len = stack.len();
+            if n > len {
+                return Err(());
+            }
+            if n > 0 {
+                let base = len - n;
+                let slice = &mut stack[base..];
+                // Positive j rotates "up" (toward the top): the top
+                // element moves down. `rotate_right(k)` moves the last k
+                // elements to the front, matching a roll-up by k.
+                let k = j.rem_euclid(n as i32) as usize;
+                slice.rotate_right(k);
+            }
+            Ok(())
+        }
+        // if / ifelse are handled structurally in exec_ps.
+        PsOp::If | PsOp::Ifelse => Err(()),
+    }
+}
+
+/// Coerce an `f32` operand to an `i32` for a bitwise operator, erroring
+/// on a non-integral or out-of-range value (§B.3 bitwise ops are
+/// integer-only).
+fn integer_value(f: f32) -> Result<i32, ()> {
+    if !f.is_finite() || f.fract() != 0.0 || f < i32::MIN as f32 || f > i32::MAX as f32 {
+        return Err(());
+    }
+    Ok(f as i32)
+}
+
+/// Implement `and` / `or` / `xor`, which are logical on two booleans and
+/// bitwise on two integers (§B.3). A mixed pair is a type error.
+fn bool_or_bitwise(
+    stack: &mut Vec<PsValue>,
+    bitwise: fn(i32, i32) -> i32,
+    logical: fn(bool, bool) -> bool,
+) -> Result<(), ()> {
+    let a = stack.pop().ok_or(())?;
+    let b = stack.pop().ok_or(())?;
+    match (b, a) {
+        (PsValue::Bool(x), PsValue::Bool(y)) => push(stack, PsValue::Bool(logical(x, y))),
+        (PsValue::Num(x), PsValue::Num(y)) => {
+            let xi = integer_value(x)?;
+            let yi = integer_value(y)?;
+            push(stack, PsValue::Num(bitwise(xi, yi) as f32))
+        }
+        _ => Err(()),
     }
 }
 
@@ -3792,10 +4463,10 @@ mod tests {
     }
 
     /// A Type 0 dictionary stripped of its sample body (`__Samples`)
-    /// and a Type 4 (calculator) dictionary are not evaluable here —
-    /// `parse` returns `None`.
+    /// and a Type 4 dictionary stripped of its program body
+    /// (`__Program`) are not evaluable here — `parse` returns `None`.
     #[test]
-    fn type0_without_samples_and_type4_are_not_evaluable() {
+    fn type0_without_samples_and_type4_without_program_are_not_evaluable() {
         let t0 = Object::Dict(
             Dict::new()
                 .with("FunctionType", Object::Integer(0))
@@ -3806,10 +4477,13 @@ mod tests {
         );
         // No __Samples entry → parse cannot reach the sample table.
         assert!(PdfFunction::parse(&t0).is_none());
+        // A Type 4 with Domain + Range but no folded program body cannot
+        // be tokenised, so it is not evaluable.
         let t4 = Object::Dict(
             Dict::new()
                 .with("FunctionType", Object::Integer(4))
-                .with("Domain", num_arr(&[0.0, 1.0])),
+                .with("Domain", num_arr(&[0.0, 1.0]))
+                .with("Range", num_arr(&[0.0, 1.0])),
         );
         assert!(PdfFunction::parse(&t4).is_none());
     }
@@ -3926,6 +4600,201 @@ mod tests {
         assert!(PdfFunction::parse(&t0).is_none());
     }
 
+    // ── Type 4 PostScript-calculator functions §7.10.5 ──────────────
+
+    /// Build a self-contained Type 4 function dictionary: the program
+    /// `src` (including its outer braces) is folded into `__Program` the
+    /// same way `prepare_function_object` does for a real stream.
+    fn type4(domain: &[f32], range: &[f32], src: &str) -> Object {
+        Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(4))
+                .with("Domain", num_arr(domain))
+                .with("Range", num_arr(range))
+                .with("__Program", Object::HexString(src.as_bytes().to_vec())),
+        )
+    }
+
+    /// An empty program `{ }` leaves the single seeded input untouched —
+    /// the simplest exercise of the whole pipeline (fold → parse →
+    /// tokenise → exec → clip) for a 1-input call site (§7.10.5).
+    #[test]
+    fn type4_identity_program() {
+        let f = PdfFunction::parse(&type4(&[0.0, 1.0], &[0.0, 1.0], "{ }"))
+            .expect("type4 identity parses");
+        // Empty program leaves the seeded input on the stack.
+        assert!((f.eval(0.25)[0] - 0.25).abs() < 1e-6);
+        assert!((f.eval(0.9)[0] - 0.9).abs() < 1e-6);
+    }
+
+    /// Arithmetic operators (§B.2): `{ 2 mul }` doubles the input,
+    /// clipped to Range.
+    #[test]
+    fn type4_arithmetic_mul_and_range_clip() {
+        let f = PdfFunction::parse(&type4(&[0.0, 1.0], &[0.0, 1.0], "{ 2 mul }")).expect("parses");
+        assert!((f.eval(0.25)[0] - 0.5).abs() < 1e-6);
+        // 2·0.8 = 1.6 clips to the Range ceiling 1.0.
+        assert!((f.eval(0.8)[0] - 1.0).abs() < 1e-6);
+    }
+
+    /// `{ 1 exch sub }` computes 1 − x (the canonical invert tint
+    /// transform), exercising `exch` (§B.5) + `sub` (§B.2).
+    #[test]
+    fn type4_invert_with_exch_sub() {
+        let f =
+            PdfFunction::parse(&type4(&[0.0, 1.0], &[0.0, 1.0], "{ 1 exch sub }")).expect("parses");
+        assert!((f.eval(0.0)[0] - 1.0).abs() < 1e-6);
+        assert!((f.eval(1.0)[0] - 0.0).abs() < 1e-6);
+        assert!((f.eval(0.3)[0] - 0.7).abs() < 1e-6);
+    }
+
+    /// `dup` (§B.5) duplicates the input so a 1-in program can emit two
+    /// outputs (here `{ dup }` → a 2-component DeviceGray-pair Range).
+    #[test]
+    fn type4_dup_emits_two_outputs() {
+        let f = PdfFunction::parse(&type4(&[0.0, 1.0], &[0.0, 1.0, 0.0, 1.0], "{ dup }"))
+            .expect("parses");
+        let out = f.eval(0.4);
+        assert_eq!(out.len(), 2);
+        assert!((out[0] - 0.4).abs() < 1e-6);
+        assert!((out[1] - 0.4).abs() < 1e-6);
+    }
+
+    /// Conditional `ifelse` (§B.4): a threshold function emitting 0 below
+    /// 0.5 and 1 at/above it.
+    #[test]
+    fn type4_ifelse_threshold() {
+        let f = PdfFunction::parse(&type4(
+            &[0.0, 1.0],
+            &[0.0, 1.0],
+            "{ 0.5 ge { 1 } { 0 } ifelse }",
+        ))
+        .expect("parses");
+        assert!((f.eval(0.2)[0] - 0.0).abs() < 1e-6);
+        assert!((f.eval(0.5)[0] - 1.0).abs() < 1e-6);
+        assert!((f.eval(0.9)[0] - 1.0).abs() < 1e-6);
+    }
+
+    /// Single-branch `if` (§B.4): clamp negatives — `{ dup 0 lt { pop 0 }
+    /// if }` leaves the input unless it is below 0, where it is replaced
+    /// by 0. (Domain already clips to ≥0 here, so the branch is the
+    /// false path and the value passes through.)
+    #[test]
+    fn type4_single_branch_if() {
+        let f = PdfFunction::parse(&type4(
+            &[0.0, 1.0],
+            &[0.0, 1.0],
+            "{ dup 0 lt { pop 0 } if }",
+        ))
+        .expect("parses");
+        assert!((f.eval(0.6)[0] - 0.6).abs() < 1e-6);
+    }
+
+    /// `roll` (§B.5): `{ 3 1 roll }` rotates the top three elements up by
+    /// one. Seed three inputs via `dup`s, then verify the rotation order.
+    #[test]
+    fn type4_roll_rotates_stack() {
+        // Program: push 10, push 20 (now stack: x 10 20), then 3 1 roll.
+        // Per §B.5 with n=3,j=1 the input [x,10,20] becomes [20,x,10].
+        let f = PdfFunction::parse(&type4(
+            &[0.0, 100.0],
+            &[0.0, 100.0, 0.0, 100.0, 0.0, 100.0],
+            "{ 10 20 3 1 roll }",
+        ))
+        .expect("parses");
+        let out = f.eval(5.0);
+        assert_eq!(out.len(), 3);
+        assert_eq!((out[0], out[1], out[2]), (20.0, 5.0, 10.0));
+    }
+
+    /// `index` (§B.5): `{ 0 index }` duplicates the top element (n=0).
+    #[test]
+    fn type4_index_copies_nth() {
+        let f = PdfFunction::parse(&type4(&[0.0, 1.0], &[0.0, 1.0, 0.0, 1.0], "{ 0 index }"))
+            .expect("parses");
+        let out = f.eval(0.7);
+        assert_eq!(out.len(), 2);
+        assert!((out[0] - 0.7).abs() < 1e-6 && (out[1] - 0.7).abs() < 1e-6);
+    }
+
+    /// Boolean / relational chain: `{ 0.5 gt { 1 } { 0 } ifelse }` plus
+    /// a `not` round-trip through the boolean path.
+    #[test]
+    fn type4_boolean_not_and_relational() {
+        let f = PdfFunction::parse(&type4(
+            &[0.0, 1.0],
+            &[0.0, 1.0],
+            "{ 0.5 gt not { 0 } { 1 } ifelse }",
+        ))
+        .expect("parses");
+        // x=0.9 > 0.5 ⇒ true, not ⇒ false ⇒ second branch ⇒ 1.
+        assert!((f.eval(0.9)[0] - 1.0).abs() < 1e-6);
+        // x=0.2 > 0.5 ⇒ false, not ⇒ true ⇒ first branch ⇒ 0.
+        assert!((f.eval(0.2)[0] - 0.0).abs() < 1e-6);
+    }
+
+    /// An execution error (here division by zero, §7.10.5.2) yields the
+    /// conservative black fallback (all-zero output of Range's arity).
+    #[test]
+    fn type4_division_by_zero_falls_back_to_black() {
+        let f = PdfFunction::parse(&type4(&[0.0, 1.0], &[0.0, 1.0], "{ 0 div }")).expect("parses");
+        assert_eq!(f.eval(0.5), vec![0.0]);
+    }
+
+    /// A program whose leftover-operand count differs from Range's arity
+    /// is an error (§7.10.5): black fallback rather than a wrong colour.
+    #[test]
+    fn type4_output_arity_mismatch_falls_back() {
+        // `{ pop }` leaves zero operands but Range wants one.
+        let f = PdfFunction::parse(&type4(&[0.0, 1.0], &[0.0, 1.0], "{ pop }")).expect("parses");
+        assert_eq!(f.eval(0.5), vec![0.0]);
+    }
+
+    /// Syntax errors (§7.10.5.2) make `parse` reject the function:
+    /// unbalanced braces, missing outer braces, and unknown tokens.
+    #[test]
+    fn type4_syntax_errors_reject() {
+        // Missing outer braces.
+        assert!(PdfFunction::parse(&type4(&[0.0, 1.0], &[0.0, 1.0], "2 mul")).is_none());
+        // Unbalanced (unterminated) brace.
+        assert!(PdfFunction::parse(&type4(&[0.0, 1.0], &[0.0, 1.0], "{ 2 mul")).is_none());
+        // Trailing tokens after the outer block close.
+        assert!(PdfFunction::parse(&type4(&[0.0, 1.0], &[0.0, 1.0], "{ } 3")).is_none());
+        // Unknown operator token.
+        assert!(PdfFunction::parse(&type4(&[0.0, 1.0], &[0.0, 1.0], "{ frobnicate }")).is_none());
+    }
+
+    /// A Type 4 tint transform drives a real Separation `scn` end to end:
+    /// `{ 1 exch sub }` over a DeviceGray alternate inverts the tint, so
+    /// `1 scn` (full ink) → gray 0.0 → black.
+    #[test]
+    fn type4_separation_scn_end_to_end() {
+        let arr = separation(
+            "Spot",
+            Object::Name("DeviceGray".into()),
+            type4(&[0.0, 1.0], &[0.0, 1.0], "{ 1 exch sub }"),
+        );
+        let cs = Dict::new().with("CS0", arr);
+        // tint 1.0 → 1−1 = 0.0 gray → black.
+        let bytes = b"q /CS0 cs 1 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (0, 0, 0));
+        // tint 0.0 → 1−0 = 1.0 gray → white.
+        let bytes = b"q /CS0 cs 0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (255, 255, 255));
+    }
+
+    /// `parse_ps_program` tokenises numbers, booleans, nested blocks, and
+    /// operators into the expected tree (the DoubleDot §7.10.5 example).
+    #[test]
+    fn type4_parses_doubledot_example() {
+        // { 360 mul sin 2 div exch 360 mul sin 2 div add }
+        let prog =
+            parse_ps_program(b"{ 360 mul sin 2 div exch 360 mul sin 2 div add }").expect("parses");
+        assert_eq!(prog.first(), Some(&PsToken::Number(360.0)));
+        assert_eq!(prog.get(1), Some(&PsToken::Op(PsOp::Mul)));
+        assert_eq!(prog.last(), Some(&PsToken::Op(PsOp::Add)));
+    }
+
     /// Build a `[ /Separation name alt tint ]` array (§8.6.6.4).
     fn separation(name: &str, alt: Object, tint: Object) -> Object {
         Object::Array(vec![
@@ -4039,14 +4908,15 @@ mod tests {
         assert_eq!(color_space_from_object(&arr), ColorSpaceKind::Unknown);
     }
 
-    /// A Separation whose tint transform is a Type 4 (unevaluable here)
-    /// stays `Unknown`.
+    /// A Separation whose tint transform is a Type 4 with no folded
+    /// program body (unevaluable) stays `Unknown`.
     #[test]
     fn separation_unevaluable_tint_is_unknown() {
         let t4 = Object::Dict(
             Dict::new()
                 .with("FunctionType", Object::Integer(4))
-                .with("Domain", num_arr(&[0.0, 1.0])),
+                .with("Domain", num_arr(&[0.0, 1.0]))
+                .with("Range", num_arr(&[0.0, 1.0])),
         );
         let arr = separation("Spot", Object::Name("DeviceGray".into()), t4);
         assert_eq!(color_space_from_object(&arr), ColorSpaceKind::Unknown);

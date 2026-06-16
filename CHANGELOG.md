@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- evaluate Type 4 (PostScript calculator) tint transforms in /Separation colour spaces (§7.10.5): a small stack machine over the §7.10.5 / Annex B operator subset (arithmetic, relational/boolean/bitwise, conditional if/ifelse, and stack operators), with the decoded program body folded into the function dictionary under `__Program`; execution and syntax errors (§7.10.5.2) fall back to conservative black
 - evaluate Type 0 (sampled) tint transforms in /Separation colour spaces (§7.10.2): single-input sample tables with Encode/Decode linear mappings and Order-1 interpolation, decoded sample body folded into the function dictionary
 
 ## [0.1.4](https://github.com/OxideAV/oxideav-pdf/compare/v0.1.3...v0.1.4) - 2026-06-15
