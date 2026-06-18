@@ -1611,6 +1611,55 @@ fn prepare_color_space_object(
                         tint,
                     ]))
                 }
+                Some("DeviceN") => {
+                    // [ /DeviceN names alternateSpace tintTransform
+                    //   (attributes) ] — §8.6.6.5. Resolve the names
+                    // array (each entry may be an indirect ref),
+                    // prepare the alternate space recursively, and
+                    // prepare the n-in/m-out tint-transform function so
+                    // the content parser sees a self-contained array.
+                    // The optional attributes dictionary is dropped (its
+                    // NChannel custom-blending hints are not consulted —
+                    // §8.6.6.5 lets a conforming reader render through
+                    // the alternate + tint transform instead).
+                    let mut it = items.into_iter();
+                    let _family = it.next();
+                    let names = match it.next() {
+                        Some(Object::Reference(id)) => reader.resolve(id)?,
+                        Some(other) => other,
+                        None => return Ok(Object::Array(vec![Object::Name("DeviceN".into())])),
+                    };
+                    // The names entry must be an array; resolve any
+                    // indirect colorant-name references one hop.
+                    let names = match names {
+                        Object::Array(elems) => {
+                            let mut resolved = Vec::with_capacity(elems.len());
+                            for e in elems {
+                                let r = match e {
+                                    Object::Reference(id) => reader.resolve(id)?,
+                                    other => other,
+                                };
+                                resolved.push(r);
+                            }
+                            Object::Array(resolved)
+                        }
+                        other => other,
+                    };
+                    let alt = match it.next() {
+                        Some(a) => prepare_color_space_object(reader, a)?,
+                        None => Object::Null,
+                    };
+                    let tint = match it.next() {
+                        Some(f) => prepare_function_object(reader, f)?,
+                        None => Object::Null,
+                    };
+                    Ok(Object::Array(vec![
+                        Object::Name("DeviceN".into()),
+                        names,
+                        alt,
+                        tint,
+                    ]))
+                }
                 _ => Ok(Object::Array(items)),
             }
         }

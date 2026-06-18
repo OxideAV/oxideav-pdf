@@ -711,33 +711,40 @@ enum PdfFunction {
         bounds: Vec<f32>,
         encode: Vec<f32>,
     },
-    /// §7.10.2 Type 0: a sampled function. Restricted here to a single
-    /// input dimension (`m = 1`), the only shape reachable from a
-    /// 1-input call site (Separation tint transforms). `domain` is the
-    /// `[d0, d1]` input clip; `range` is the required `2·n` output clip;
-    /// `size` is the number of samples along the single input axis;
-    /// `n` is the output dimensionality; `encode` is the `[e0, e1]`
-    /// input→table mapping (default `[0, size−1]`); `decode` is the
-    /// `2·n` sample→output mapping (default `= range`); `samples` holds
-    /// each sample value already widened to `f32` in storage order
-    /// (output `j` of input index `i` at `i·n + j`), normalised out of
-    /// the `[0, 2^BitsPerSample − 1]` integer interval before Decode.
+    /// §7.10.2 Type 0: a sampled function with `m` input dimensions.
+    /// `domain` is the `2·m` input clip (`[d0_0, d1_0, d0_1, d1_1, …]`);
+    /// `range` is the required `2·n` output clip; `size` is the per-axis
+    /// sample count (length `m`); `n` is the output dimensionality;
+    /// `encode` is the `2·m` input→table mapping (default
+    /// `[0, size_0−1, 0, size_1−1, …]`); `decode` is the `2·n`
+    /// sample→output mapping (default `= range`); `samples` holds each
+    /// sample value already widened to `f32` in storage order — the
+    /// first input dimension varies fastest, output `j` of flat sample
+    /// index `s` at `s·n + j` (§7.10.2 "the sample values in the first
+    /// dimension vary fastest … values shall be stored in the same order
+    /// as Range") — normalised out of the `[0, 2^BitsPerSample − 1]`
+    /// integer interval before Decode. Only Order-1 (multilinear)
+    /// interpolation is represented; an `/Order 3` function is rejected
+    /// at parse time (the owning space stays unevaluable).
     Sampled {
-        domain: [f32; 2],
+        domain: Vec<f32>,
         range: Vec<f32>,
-        size: usize,
+        size: Vec<usize>,
         n: usize,
-        encode: [f32; 2],
+        encode: Vec<f32>,
         decode: Vec<f32>,
         samples: Vec<f32>,
     },
     /// §7.10.5 Type 4: a PostScript-calculator program. `domain` is the
-    /// `[d0, d1]` 1-input clip; `range` is the required `2·n` output clip
-    /// (its length also fixes the number of output components taken off
-    /// the final operand stack); `program` is the parsed top-level
-    /// expression (the body inside the outermost `{ }`).
+    /// `2·m` input clip (one `[d0 d1]` pair per input variable — a
+    /// 1-input call site supplies `m = 1`, a DeviceN tint transform
+    /// supplies one pair per colorant); `range` is the required `2·n`
+    /// output clip (its length also fixes the number of output
+    /// components taken off the final operand stack); `program` is the
+    /// parsed top-level expression (the body inside the outermost
+    /// `{ }`).
     Calculator {
-        domain: [f32; 2],
+        domain: Vec<f32>,
         range: Vec<f32>,
         program: Vec<PsToken>,
     },
@@ -891,39 +898,63 @@ impl PdfFunction {
                 .find(|(k, _)| k == key)
                 .map(|(_, v)| v)
         };
-        let domain = get("Domain").and_then(read_num_pair)?;
         let range = get("Range").and_then(read_num_array);
         match get("FunctionType").and_then(number_as_i64) {
             Some(0) => {
-                // §7.10.2 Table 39. Restrict to one input dimension —
-                // the only shape a 1-input call site (Separation tint
-                // transform) ever evaluates. /Range is required and
-                // gives the output dimensionality n.
+                // §7.10.2 Table 39. `m` input dimensions (any number);
+                // /Range is required and gives the output dimensionality
+                // n. /Domain has 2·m entries (one [d0 d1] pair per axis).
+                let domain = get("Domain").and_then(read_num_array)?;
+                if domain.is_empty() || domain.len() % 2 != 0 {
+                    return None;
+                }
                 let range = range?;
                 if range.is_empty() || range.len() % 2 != 0 {
                     return None;
                 }
                 let n = range.len() / 2;
-                // /Size is an array of m positive integers; m must be 1.
+                // /Order ∈ {1, 3}; only Order-1 (multilinear) is
+                // represented here. An /Order 3 (cubic spline) function
+                // is rejected so the owning space stays unevaluable
+                // rather than silently rendered with the wrong curve.
+                if let Some(order) = get("Order").and_then(number_as_i64) {
+                    if order != 1 {
+                        return None;
+                    }
+                }
+                // /Size is an array of m positive integers; m must match
+                // /Domain's pair count.
                 let size_arr = get("Size").and_then(read_num_array)?;
-                if size_arr.len() != 1 {
+                let m = domain.len() / 2;
+                if size_arr.len() != m {
                     return None;
                 }
-                let size = size_arr[0];
-                if !(size.is_finite()) || size < 1.0 {
-                    return None;
+                let mut size = Vec::with_capacity(m);
+                for s in &size_arr {
+                    if !s.is_finite() || *s < 1.0 {
+                        return None;
+                    }
+                    size.push(*s as usize);
                 }
-                let size = size as usize;
                 // /BitsPerSample ∈ {1,2,4,8,12,16,24,32}.
                 let bps = get("BitsPerSample").and_then(number_as_i64)?;
                 if !matches!(bps, 1 | 2 | 4 | 8 | 12 | 16 | 24 | 32) {
                     return None;
                 }
                 let bps = bps as u32;
-                // /Encode default [0 (Size−1)]; /Decode default = Range.
-                let encode = match get("Encode").and_then(read_num_pair) {
-                    Some(e) => e,
-                    None => [0.0, (size as f32) - 1.0],
+                // /Encode default [0 (Size_i−1)] per axis; /Decode
+                // default = Range.
+                let encode = match get("Encode").and_then(read_num_array) {
+                    Some(e) if e.len() == 2 * m => e,
+                    Some(_) => return None,
+                    None => {
+                        let mut e = Vec::with_capacity(2 * m);
+                        for &sz in &size {
+                            e.push(0.0);
+                            e.push((sz as f32) - 1.0);
+                        }
+                        e
+                    }
                 };
                 let decode = get("Decode")
                     .and_then(read_num_array)
@@ -931,12 +962,18 @@ impl PdfFunction {
                 if decode.len() != 2 * n {
                     return None;
                 }
+                // Total sample count = (∏ Size_i) · n. Guard the product
+                // against overflow for an adversarial /Size.
+                let mut total: usize = 1;
+                for &sz in &size {
+                    total = total.checked_mul(sz)?;
+                }
+                let count = total.checked_mul(n)?;
                 // Sample body folded in by `prepare_function_object`.
                 let raw = match get("__Samples") {
                     Some(Object::HexString(bytes)) => bytes.as_slice(),
                     _ => return None,
                 };
-                let count = size.checked_mul(n)?;
                 let samples = unpack_samples(raw, bps, count)?;
                 Some(PdfFunction::Sampled {
                     domain,
@@ -949,7 +986,10 @@ impl PdfFunction {
                 })
             }
             Some(2) => {
-                // §7.10.3 Table 40. C0 defaults to [0.0], C1 to [1.0].
+                // §7.10.3 Table 40. A Type 2 function has exactly one
+                // input (Domain is a single [d0 d1] pair). C0 defaults to
+                // [0.0], C1 to [1.0].
+                let domain = get("Domain").and_then(read_num_pair)?;
                 let c0 = get("C0")
                     .and_then(read_num_array)
                     .unwrap_or_else(|| vec![0.0]);
@@ -969,7 +1009,9 @@ impl PdfFunction {
                 })
             }
             Some(3) => {
-                // §7.10.4 Table 41.
+                // §7.10.4 Table 41. A Type 3 stitching function has
+                // exactly one input (Domain is a single [d0 d1] pair).
+                let domain = get("Domain").and_then(read_num_pair)?;
                 let Some(Object::Array(fs)) = get("Functions") else {
                     return None;
                 };
@@ -993,8 +1035,14 @@ impl PdfFunction {
                 })
             }
             Some(4) => {
-                // §7.10.5 Table 38: Domain and Range are both required;
-                // Range also fixes the output dimensionality n.
+                // §7.10.5 Table 38: Domain and Range are both required.
+                // Domain carries 2·m entries (one [d0 d1] pair per input
+                // variable — `m` inputs for a DeviceN tint transform);
+                // Range fixes the output dimensionality n.
+                let domain = get("Domain").and_then(read_num_array)?;
+                if domain.is_empty() || domain.len() % 2 != 0 {
+                    return None;
+                }
                 let range = range?;
                 if range.is_empty() || range.len() % 2 != 0 {
                     return None;
@@ -1017,9 +1065,21 @@ impl PdfFunction {
     }
 
     /// Evaluate this 1-input function at `x`, returning the output
-    /// component vector. The input is clipped to `Domain` and the
-    /// outputs are clipped to `Range` when present (§7.10.1).
+    /// component vector. A thin wrapper over [`eval_n`](Self::eval_n) for
+    /// the single-input call sites (Separation tint transforms, Type 3
+    /// child functions).
     fn eval(&self, x: f32) -> Vec<f32> {
+        self.eval_n(&[x])
+    }
+
+    /// Evaluate this function at the `m`-component input vector `inputs`,
+    /// returning the output component vector. Inputs are clipped to
+    /// `Domain` and outputs to `Range` (§7.10.1). Type 2 (exponential)
+    /// and Type 3 (stitching) are intrinsically 1-input and read
+    /// `inputs[0]` (a missing first input is treated as `0.0`); Type 0
+    /// (sampled) and Type 4 (calculator) consume all `m` inputs.
+    fn eval_n(&self, inputs: &[f32]) -> Vec<f32> {
+        let first = inputs.first().copied().unwrap_or(0.0);
         match self {
             PdfFunction::Exponential {
                 domain,
@@ -1028,7 +1088,7 @@ impl PdfFunction {
                 c1,
                 n,
             } => {
-                let xc = x.clamp(domain[0], domain[1]);
+                let xc = first.clamp(domain[0], domain[1]);
                 // y_j = C0_j + x^N · (C1_j − C0_j), §7.10.3 Table 40.
                 let xn = xc.powf(*n);
                 let mut out: Vec<f32> = c0
@@ -1046,7 +1106,7 @@ impl PdfFunction {
                 bounds,
                 encode,
             } => {
-                let xc = x.clamp(domain[0], domain[1]);
+                let xc = first.clamp(domain[0], domain[1]);
                 // Find subdomain i: the half-open interval [b_{i-1}, b_i)
                 // (the last is closed on the right), §7.10.4. b_{-1} =
                 // Domain0, b_{k-1} = Domain1.
@@ -1077,43 +1137,21 @@ impl PdfFunction {
                 encode,
                 decode,
                 samples,
-            } => {
-                // §7.10.2. Clip the input to Domain, encode into the
-                // sample-table axis, clip to [0, Size−1].
-                let xc = x.clamp(domain[0], domain[1]);
-                let e = interpolate(xc, domain[0], domain[1], encode[0], encode[1]);
-                let e = e.clamp(0.0, (*size as f32) - 1.0);
-                // Order-1 (linear) interpolation between the two nearest
-                // surrounding samples. A single-sample axis (Size == 1)
-                // maps every input to index 0.
-                let i0 = e.floor() as usize;
-                let i1 = (i0 + 1).min(size - 1);
-                let frac = e - (i0 as f32);
-                let mut out = Vec::with_capacity(*n);
-                for j in 0..*n {
-                    let s0 = samples[i0 * n + j];
-                    let s1 = samples[i1 * n + j];
-                    // Samples are pre-normalised to [0, 1] (raw code ÷
-                    // (2^BitsPerSample − 1); see `samples` doc); linearly
-                    // blend, then Decode maps [0, 1] → output range.
-                    let s = s0 + frac * (s1 - s0);
-                    let y = interpolate(s, 0.0, 1.0, decode[2 * j], decode[2 * j + 1]);
-                    out.push(y);
-                }
-                clip_to_range(&mut out, Some(range));
-                out
-            }
+            } => eval_sampled(inputs, domain, range, size, *n, encode, decode, samples),
             PdfFunction::Calculator {
                 domain,
                 range,
                 program,
             } => {
                 // §7.10.5: the input variables form the initial operand
-                // stack. This is a 1-input call site, so seed the single
-                // clipped argument and run the program.
-                let xc = x.clamp(domain[0], domain[1]);
+                // stack, in order, each clipped to its Domain pair.
+                let m = domain.len() / 2;
                 let n = range.len() / 2;
-                let mut stack: Vec<PsValue> = vec![PsValue::Num(xc)];
+                let mut stack: Vec<PsValue> = Vec::with_capacity(m);
+                for i in 0..m {
+                    let xi = inputs.get(i).copied().unwrap_or(0.0);
+                    stack.push(PsValue::Num(xi.clamp(domain[2 * i], domain[2 * i + 1])));
+                }
                 if exec_ps(program, &mut stack).is_err() {
                     // §7.10.5.2 execution error (stack under/overflow,
                     // type error, undefined result). Fall back to black.
@@ -1136,6 +1174,37 @@ impl PdfFunction {
                 clip_to_range(&mut out, Some(range));
                 out
             }
+        }
+    }
+
+    /// The number of input variables `m` this function consumes. Type 2
+    /// (exponential) and Type 3 (stitching) are 1-input by definition
+    /// (§7.10.3 / §7.10.4); Type 0 (sampled) and Type 4 (calculator)
+    /// derive `m` from their `Domain` pair count. Used to validate a
+    /// DeviceN tint transform's arity against the colorant count
+    /// (§8.6.6.5).
+    fn input_arity(&self) -> usize {
+        match self {
+            PdfFunction::Exponential { .. } | PdfFunction::Stitching { .. } => 1,
+            PdfFunction::Sampled { size, .. } => size.len(),
+            PdfFunction::Calculator { domain, .. } => domain.len() / 2,
+        }
+    }
+
+    /// The number of output components `n` this function produces, when
+    /// statically known. Type 0 carries `n` directly; Type 2's arity is
+    /// `C0`'s length; Type 4's is `Range`'s pair count. Type 3
+    /// (stitching) returns `None` — its output arity follows its child
+    /// functions, which a DeviceN tint transform never is (its tint
+    /// transform is the top-level n-in/m-out function). Used to validate
+    /// a DeviceN tint transform's output against the alternate space's
+    /// component count (§8.6.6.5).
+    fn output_arity(&self) -> Option<usize> {
+        match self {
+            PdfFunction::Sampled { n, .. } => Some(*n),
+            PdfFunction::Exponential { c0, .. } => Some(c0.len()),
+            PdfFunction::Calculator { range, .. } => Some(range.len() / 2),
+            PdfFunction::Stitching { .. } => None,
         }
     }
 }
@@ -1681,6 +1750,83 @@ fn unpack_samples(raw: &[u8], bps: u32, count: usize) -> Option<Vec<f32>> {
     Some(out)
 }
 
+/// Evaluate an `m`-input Type 0 (sampled) function (§7.10.2) at the
+/// `inputs` vector using Order-1 multilinear interpolation. Each input
+/// `x_i` is clipped to its `Domain` pair, encoded into the sample-table
+/// axis `[0, Size_i − 1]`, and split into a base index plus fraction.
+/// The output is the multilinear blend of the `2^m` surrounding grid
+/// corners, decoded into the output range and clipped to `Range`. The
+/// sample table stores the first input dimension fastest (`flat =
+/// i_0 + Size_0·(i_1 + Size_1·(i_2 + …))`) with `n` interleaved outputs
+/// per grid point.
+#[allow(clippy::too_many_arguments)]
+fn eval_sampled(
+    inputs: &[f32],
+    domain: &[f32],
+    range: &[f32],
+    size: &[usize],
+    n: usize,
+    encode: &[f32],
+    decode: &[f32],
+    samples: &[f32],
+) -> Vec<f32> {
+    let m = size.len();
+    // Per-axis base index `i0` and interpolation fraction `frac`.
+    let mut base = Vec::with_capacity(m);
+    let mut frac = Vec::with_capacity(m);
+    for i in 0..m {
+        let xi = inputs.get(i).copied().unwrap_or(0.0);
+        let xc = xi.clamp(domain[2 * i], domain[2 * i + 1]);
+        let e = interpolate(
+            xc,
+            domain[2 * i],
+            domain[2 * i + 1],
+            encode[2 * i],
+            encode[2 * i + 1],
+        );
+        let e = e.clamp(0.0, (size[i] as f32) - 1.0);
+        let i0 = e.floor() as usize;
+        base.push(i0);
+        frac.push(e - (i0 as f32));
+    }
+    // Accumulate the multilinear blend over the 2^m corners. Corner `c`
+    // is the bit pattern over the m axes: bit i set ⇒ step to i0+1 on
+    // axis i (clamped to Size_i − 1), with weight ∏ (bit set ? frac_i :
+    // 1 − frac_i). A degenerate axis (Size_i == 1) keeps index 0 and the
+    // step clamps back onto it, so frac contributes nothing.
+    let corners = 1usize << m;
+    let mut out = vec![0.0f32; n];
+    for c in 0..corners {
+        let mut weight = 1.0f32;
+        let mut flat = 0usize;
+        let mut stride = 1usize;
+        for i in 0..m {
+            let up = (c >> i) & 1 == 1;
+            let idx = if up {
+                (base[i] + 1).min(size[i] - 1)
+            } else {
+                base[i]
+            };
+            weight *= if up { frac[i] } else { 1.0 - frac[i] };
+            flat += idx * stride;
+            stride *= size[i];
+        }
+        if weight == 0.0 {
+            continue;
+        }
+        let off = flat * n;
+        for (j, acc) in out.iter_mut().enumerate() {
+            *acc += weight * samples[off + j];
+        }
+    }
+    // Decode each blended sample [0,1] → output range, clip to Range.
+    for (j, v) in out.iter_mut().enumerate() {
+        *v = interpolate(*v, 0.0, 1.0, decode[2 * j], decode[2 * j + 1]);
+    }
+    clip_to_range(&mut out, Some(range));
+    out
+}
+
 /// Read an all-numeric array into a `Vec<f32>` (function `/C0`, `/C1`,
 /// `/Range`, `/Bounds`, `/Encode`). Returns `None` if the object isn't
 /// an array or any element isn't a number.
@@ -1738,13 +1884,30 @@ enum ColorSpaceKind {
         /// no visible output (§8.6.6.4), so `sc`/`scn` yields no paint.
         none_colorant: bool,
     },
+    /// A `/DeviceN` space (§8.6.6.5): `n_in` tint components (one per
+    /// entry in the colour space's `names` array, in stream order) are
+    /// mapped through `tint` (an `n_in`-in / m-out tint-transform
+    /// function, §7.10) into `alt`-space component values, which `alt`
+    /// then renders to RGB. `alt` is the alternate device family (the
+    /// only families this round renders); `tint` is an evaluable Type 0
+    /// (sampled) / Type 4 (PostScript-calculator) function — the
+    /// multi-input families a DeviceN tint transform uses. `all_none` is
+    /// set when every colorant name is `/None`: such a space always
+    /// discards its output and never reverts to the alternate
+    /// (§8.6.6.5).
+    DeviceN {
+        n_in: usize,
+        alt: Box<ColorSpaceKind>,
+        tint: PdfFunction,
+        all_none: bool,
+    },
     /// Any space the parser doesn't resolve to a device family, a
-    /// device-based Indexed space, or a device-alternate Separation —
-    /// `/Pattern`, a CIE-based CalRGB / CalGray / Lab space, a DeviceN
-    /// space, a Separation whose tint transform isn't an evaluable
-    /// Type 0/2/3 function or whose alternate isn't a device family, or a
-    /// `/Resources /ColorSpace` key whose definition the parser can't
-    /// reduce to a device fallback.
+    /// device-based Indexed space, a device-alternate Separation, or a
+    /// device-alternate DeviceN — `/Pattern`, a CIE-based CalRGB /
+    /// CalGray / Lab space, a Separation/DeviceN whose tint transform
+    /// isn't an evaluable function or whose alternate isn't a device
+    /// family, or a `/Resources /ColorSpace` key whose definition the
+    /// parser can't reduce to a device fallback.
     Unknown,
 }
 
@@ -1777,6 +1940,9 @@ impl ColorSpaceKind {
             // §8.6.6.4: a Separation colour value is a single tint
             // component, regardless of the alternate space's arity.
             ColorSpaceKind::Separation { .. } => Some(1),
+            // §8.6.6.5: a DeviceN colour value carries one tint per
+            // colorant name, in the names-array order.
+            ColorSpaceKind::DeviceN { n_in, .. } => Some(*n_in),
             ColorSpaceKind::Unknown => None,
         }
     }
@@ -1834,6 +2000,7 @@ fn color_space_from_object(obj: &Object) -> ColorSpaceKind {
             Some(Object::Name(family)) if family == "ICCBased" => icc_based_from_array(items),
             Some(Object::Name(family)) if family == "Indexed" => indexed_from_array(items),
             Some(Object::Name(family)) if family == "Separation" => separation_from_array(items),
+            Some(Object::Name(family)) if family == "DeviceN" => device_n_from_array(items),
             _ => ColorSpaceKind::Unknown,
         },
         _ => ColorSpaceKind::Unknown,
@@ -1926,12 +2093,14 @@ fn separation_from_array(items: &[Object]) -> ColorSpaceKind {
     let alt = color_space_from_object(&items[2]);
     // §8.6.6.4: the alternate "may not be another special colour space
     // (Pattern, Indexed, Separation, or DeviceN)" — `components()` is
-    // `None` for `Unknown`, and an Indexed/Separation alternate is
-    // rejected by matching their variants.
+    // `None` for `Unknown`, and an Indexed/Separation/DeviceN alternate
+    // is rejected by matching their variants.
     if alt.components().is_none()
         || matches!(
             alt,
-            ColorSpaceKind::Indexed { .. } | ColorSpaceKind::Separation { .. }
+            ColorSpaceKind::Indexed { .. }
+                | ColorSpaceKind::Separation { .. }
+                | ColorSpaceKind::DeviceN { .. }
         )
     {
         // A `/None` colorant ignores the alternate entirely (no visible
@@ -1959,6 +2128,93 @@ fn separation_from_array(items: &[Object]) -> ColorSpaceKind {
         alt: Box::new(alt),
         tint,
         none_colorant,
+    }
+}
+
+/// Reduce `[ /DeviceN names alternateSpace tintTransform (attributes) ]`
+/// to a tracked `DeviceN` space per ISO 32000-1 §8.6.6.5.
+///
+/// `names` is the array of `n_in` colorant names; its length fixes the
+/// number of tint components an `sc`/`scn` carries. The space resolves
+/// only when the alternate reduces to a device family (DeviceGray /
+/// DeviceRGB / DeviceCMYK — the families this round renders) and the
+/// `n_in`-input tint transform parses as an evaluable function. A
+/// non-device or special-space alternate (forbidden by §8.6.6.5 anyway),
+/// or a tint transform whose input arity doesn't match `n_in` or whose
+/// output arity doesn't match the alternate's component count, collapses
+/// to `Unknown`, preserving the conservative black fallback. The
+/// optional `attributes` dictionary (NChannel `/Subtype`, `/Colorants`,
+/// `/Process`, `/MixingHints`) is not consulted — a conforming reader
+/// that does not use those custom-blending hints renders through the
+/// supplied alternate + tint transform (§8.6.6.5), which is what this
+/// does.
+///
+/// §8.6.6.5: when every colorant name is `/None` the space always
+/// discards its output (`all_none`); the parser still resolves it so the
+/// `sc`/`scn` operand count is known and no paint is produced.
+fn device_n_from_array(items: &[Object]) -> ColorSpaceKind {
+    if items.len() < 4 {
+        return ColorSpaceKind::Unknown;
+    }
+    let Object::Array(name_objs) = &items[1] else {
+        return ColorSpaceKind::Unknown;
+    };
+    if name_objs.is_empty() {
+        return ColorSpaceKind::Unknown;
+    }
+    let mut all_none = true;
+    for nm in name_objs {
+        match nm {
+            Object::Name(n) => {
+                if n != "None" {
+                    all_none = false;
+                }
+            }
+            // A non-name entry in the names array is malformed.
+            _ => return ColorSpaceKind::Unknown,
+        }
+    }
+    let n_in = name_objs.len();
+    let alt = color_space_from_object(&items[2]);
+    // §8.6.6.5: the alternate "shall not be another special colour space
+    // (Pattern, Indexed, Separation, or DeviceN)" and must reduce to a
+    // device family this round can render.
+    let alt_comps = match &alt {
+        ColorSpaceKind::DeviceGray => 1,
+        ColorSpaceKind::DeviceRgb => 3,
+        ColorSpaceKind::DeviceCmyk => 4,
+        _ => return ColorSpaceKind::Unknown,
+    };
+    // An all-None space never reverts to the alternate, so the tint
+    // transform is irrelevant; track it with a no-op tint so the operand
+    // count is known and `scn` yields no paint.
+    if all_none {
+        return ColorSpaceKind::DeviceN {
+            n_in,
+            alt: Box::new(alt),
+            tint: PdfFunction::Exponential {
+                domain: [0.0, 1.0],
+                range: None,
+                c0: vec![0.0],
+                c1: vec![0.0],
+                n: 1.0,
+            },
+            all_none: true,
+        };
+    }
+    let Some(tint) = PdfFunction::parse(&items[3]) else {
+        return ColorSpaceKind::Unknown;
+    };
+    // The tint transform must be n_in-in / alt_comps-out (§8.6.6.5). A
+    // mismatch is a malformed space — fall back to the black behaviour.
+    if tint.input_arity() != n_in || tint.output_arity() != Some(alt_comps) {
+        return ColorSpaceKind::Unknown;
+    }
+    ColorSpaceKind::DeviceN {
+        n_in,
+        alt: Box::new(alt),
+        tint,
+        all_none: false,
     }
 }
 
@@ -2970,6 +3226,12 @@ impl<'a> State<'a> {
                 tint,
                 none_colorant,
             } => return separation_color(alt, tint, *none_colorant, comps[0]),
+            ColorSpaceKind::DeviceN {
+                alt,
+                tint,
+                all_none,
+                ..
+            } => return device_n_color(alt, tint, *all_none, &comps),
             ColorSpaceKind::Unknown => unreachable!("components() returned Some"),
         })
     }
@@ -3169,6 +3431,15 @@ fn initial_color_for(cs: &ColorSpaceKind) -> Option<Paint> {
             tint,
             none_colorant,
         } => separation_color(alt, tint, *none_colorant, 1.0),
+        // §8.6.6.5: "each component shall be given an initial value of
+        // 1.0" — the maximum tint on every colorant, run through the
+        // tint transform.
+        ColorSpaceKind::DeviceN {
+            n_in,
+            alt,
+            tint,
+            all_none,
+        } => device_n_color(alt, tint, *all_none, &vec![1.0; *n_in]),
         ColorSpaceKind::Unknown => None,
     }
 }
@@ -3202,11 +3473,12 @@ fn indexed_color(base: &ColorSpaceKind, hival: u32, table: &[u8], index: f32) ->
             Paint::Solid(rgb_from_cmyk(unit(0), unit(1), unit(2), unit(3)))
         }
         // `indexed_from_array` rejects a non-device base, and a nested
-        // An `Indexed` or `Separation` base is forbidden by §8.6.6.3
-        // (and rejected by `indexed_from_array`), so these are
+        // An `Indexed`, `Separation`, or `DeviceN` base is forbidden by
+        // §8.6.6.3 (and rejected by `indexed_from_array`), so these are
         // unreachable in practice; fall back to black for total safety.
         ColorSpaceKind::Indexed { .. }
         | ColorSpaceKind::Separation { .. }
+        | ColorSpaceKind::DeviceN { .. }
         | ColorSpaceKind::Unknown => Paint::Solid(Rgba::opaque(0, 0, 0)),
     })
 }
@@ -3232,6 +3504,32 @@ fn separation_color(
     }
     let t = tint_value.clamp(0.0, 1.0);
     let comps = tint.eval(t);
+    paint_from_device_components(alt, &comps)
+}
+
+/// Resolve an `sc`/`scn` tint-component vector against a `/DeviceN`
+/// colour space per ISO 32000-1 §8.6.6.5. Each of the `n_in` tints is
+/// clamped into `0.0..=1.0`, the whole vector is run through the n-in /
+/// m-out tint-transform function to produce the alternate space's `m`
+/// component values, and those are rendered to RGB through the alternate
+/// device family.
+///
+/// An all-`/None` space (`all_none`) discards its output (no paint, like
+/// a Separation `/None` colorant). A component-count mismatch between the
+/// tint transform's output and the alternate family yields `None`
+/// (conservative black fallback) — though `device_n_from_array` already
+/// validates the arity at resolve time, so this is defence in depth.
+fn device_n_color(
+    alt: &ColorSpaceKind,
+    tint: &PdfFunction,
+    all_none: bool,
+    tints: &[f32],
+) -> Option<Paint> {
+    if all_none {
+        return None;
+    }
+    let clamped: Vec<f32> = tints.iter().map(|t| t.clamp(0.0, 1.0)).collect();
+    let comps = tint.eval_n(&clamped);
     paint_from_device_components(alt, &comps)
 }
 
@@ -4583,10 +4881,13 @@ mod tests {
         assert!((f.eval(2.0 / 3.0)[0] - 1.0).abs() < 1e-5);
     }
 
-    /// §7.10.2 with more than one input dimension is not reachable from
-    /// a 1-input call site — `parse` returns `None`.
+    /// §7.10.2 with two input dimensions: bilinear interpolation over a
+    /// 2×2 sample grid. Samples are stored first-dimension-fastest:
+    /// f(0,0)=0, f(1,0)=255, f(0,1)=128, f(1,1)=64 (raw 8-bit codes,
+    /// normalised by 255 before Decode = Range = [0,1]). The corners must
+    /// reproduce exactly; the centre is the average of all four.
     #[test]
-    fn type0_multidim_input_is_not_evaluable() {
+    fn type0_bilinear_2x2_grid() {
         let t0 = Object::Dict(
             Dict::new()
                 .with("FunctionType", Object::Integer(0))
@@ -4596,7 +4897,34 @@ mod tests {
                 .with("BitsPerSample", Object::Integer(8))
                 .with("__Samples", Object::HexString(vec![0, 255, 128, 64])),
         );
-        // Domain has 2 input dims → read_num_pair rejects it.
+        let f = PdfFunction::parse(&t0).expect("2-input type0 parses");
+        // Corners are exact.
+        assert!((f.eval_n(&[0.0, 0.0])[0] - 0.0).abs() < 1e-6);
+        assert!((f.eval_n(&[1.0, 0.0])[0] - 1.0).abs() < 1e-6);
+        assert!((f.eval_n(&[0.0, 1.0])[0] - 128.0 / 255.0).abs() < 1e-6);
+        assert!((f.eval_n(&[1.0, 1.0])[0] - 64.0 / 255.0).abs() < 1e-6);
+        // Centre = mean of the four corners.
+        let mean = (0.0 + 255.0 + 128.0 + 64.0) / 4.0 / 255.0;
+        assert!((f.eval_n(&[0.5, 0.5])[0] - mean).abs() < 1e-6);
+        // Midpoint of the bottom edge = mean of f(0,0) and f(1,0).
+        assert!((f.eval_n(&[0.5, 0.0])[0] - 0.5).abs() < 1e-6);
+    }
+
+    /// §7.10.2 Order-3 (cubic spline) is not represented — `parse`
+    /// rejects it so the owning space stays unevaluable rather than being
+    /// silently rendered with linear interpolation.
+    #[test]
+    fn type0_order_3_is_rejected() {
+        let t0 = Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(0))
+                .with("Domain", num_arr(&[0.0, 1.0]))
+                .with("Range", num_arr(&[0.0, 1.0]))
+                .with("Size", num_arr(&[4.0]))
+                .with("BitsPerSample", Object::Integer(8))
+                .with("Order", Object::Integer(3))
+                .with("__Samples", Object::HexString(vec![0, 85, 170, 255])),
+        );
         assert!(PdfFunction::parse(&t0).is_none());
     }
 
@@ -4781,6 +5109,130 @@ mod tests {
         // tint 0.0 → 1−0 = 1.0 gray → white.
         let bytes = b"q /CS0 cs 0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
         assert_eq!(first_fill_with_cs(bytes, &cs), (255, 255, 255));
+    }
+
+    // ── DeviceN colour spaces §8.6.6.5 ──────────────────────────────
+
+    /// Build a `[ /DeviceN [names…] alt tint ]` array (§8.6.6.5).
+    fn device_n(names: &[&str], alt: Object, tint: Object) -> Object {
+        Object::Array(vec![
+            Object::Name("DeviceN".into()),
+            Object::Array(names.iter().map(|n| Object::Name((*n).into())).collect()),
+            alt,
+            tint,
+        ])
+    }
+
+    /// A two-colorant DeviceN over DeviceRGB whose tint transform is a
+    /// Type 4 program: `{ exch }` swaps the two tints so the (red, blue)
+    /// inputs map to (blue, 0-stub, red)? No — keep it concrete: a 2-in
+    /// 3-out program `{ 0 exch }` would mis-count. Use an explicit
+    /// duotone: inputs (a, b) → RGB (a, 0, b).
+    #[test]
+    fn device_n_duotone_type4_maps_to_rgb() {
+        // 2 inputs, 3 outputs. Program: stack starts [a b]; emit a, 0, b.
+        // `{ 0 exch }` → [a 0 b]? Starting [a b]: push 0 → [a b 0];
+        // exch → [a 0 b]. Exactly (a, 0, b).
+        let tint = type4(
+            &[0.0, 1.0, 0.0, 1.0],
+            &[0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+            "{ 0 exch }",
+        );
+        let arr = device_n(&["Red", "Blue"], Object::Name("DeviceRGB".into()), tint);
+        // arity check: 2-in / 3-out over DeviceRGB.
+        assert!(matches!(
+            color_space_from_object(&arr),
+            ColorSpaceKind::DeviceN { n_in: 2, .. }
+        ));
+        let cs = Dict::new().with("CS0", arr);
+        // scn supplies the two tints in names order: Red=1.0, Blue=0.5.
+        // → RGB (1.0, 0.0, 0.5) → (255, 0, 128).
+        let bytes = b"q /CS0 cs 1 0.5 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (255, 0, 128));
+    }
+
+    /// A DeviceN tint transform that is a 2-input Type 0 (sampled)
+    /// function exercises the multilinear sampled path end-to-end. The
+    /// 2×2×(n=1) grid maps (a,b) bilinearly; the single output drives a
+    /// DeviceGray alternate.
+    #[test]
+    fn device_n_type0_sampled_bilinear_to_gray() {
+        let tint = Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(0))
+                .with("Domain", num_arr(&[0.0, 1.0, 0.0, 1.0]))
+                .with("Range", num_arr(&[0.0, 1.0]))
+                .with("Size", num_arr(&[2.0, 2.0]))
+                .with("BitsPerSample", Object::Integer(8))
+                // f(0,0)=0, f(1,0)=255, f(0,1)=255, f(1,1)=255.
+                .with("__Samples", Object::HexString(vec![0, 255, 255, 255])),
+        );
+        let arr = device_n(&["A", "B"], Object::Name("DeviceGray".into()), tint);
+        let cs = Dict::new().with("CS0", arr);
+        // (a,b) = (1,0) → f=255/255=1.0 gray → white.
+        let bytes = b"q /CS0 cs 1 0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (255, 255, 255));
+        // (a,b) = (0,0) → f=0 gray → black.
+        let bytes = b"q /CS0 cs 0 0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (0, 0, 0));
+    }
+
+    /// §8.6.6.5: the initial DeviceN colour is every component at 1.0 — a
+    /// bare `cs` with no `scn` paints the full-tint colour.
+    #[test]
+    fn device_n_bare_cs_uses_full_tint() {
+        // 2-in/3-out: (a,b) → RGB (a, 0, b). At the 1.0/1.0 default →
+        // RGB (1,0,1) magenta.
+        let tint = type4(
+            &[0.0, 1.0, 0.0, 1.0],
+            &[0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+            "{ 0 exch }",
+        );
+        let arr = device_n(&["Red", "Blue"], Object::Name("DeviceRGB".into()), tint);
+        let cs = Dict::new().with("CS0", arr);
+        let bytes = b"q /CS0 cs 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (255, 0, 255));
+    }
+
+    /// §8.6.6.5: an all-`/None` DeviceN space always discards its output
+    /// — `scn` produces no paint, so the path keeps the conservative
+    /// black fallback rather than reverting to the alternate.
+    #[test]
+    fn device_n_all_none_discards_output() {
+        let tint = type4(
+            &[0.0, 1.0, 0.0, 1.0],
+            &[0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+            "{ 0 exch }",
+        );
+        let arr = device_n(&["None", "None"], Object::Name("DeviceRGB".into()), tint);
+        assert!(matches!(
+            color_space_from_object(&arr),
+            ColorSpaceKind::DeviceN { all_none: true, .. }
+        ));
+        let cs = Dict::new().with("CS0", arr);
+        // scn yields no paint → caller's conservative black fallback.
+        let bytes = b"q /CS0 cs 1 1 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (0, 0, 0));
+    }
+
+    /// §8.6.6.5: a tint transform whose input arity doesn't match the
+    /// colorant count collapses the space to `Unknown` (black fallback).
+    #[test]
+    fn device_n_arity_mismatch_falls_back() {
+        // 3 colorant names but a 2-input tint transform → mismatch.
+        let tint = type4(&[0.0, 1.0, 0.0, 1.0], &[0.0, 1.0], "{ add }");
+        let arr = device_n(&["A", "B", "C"], Object::Name("DeviceGray".into()), tint);
+        assert_eq!(color_space_from_object(&arr), ColorSpaceKind::Unknown);
+    }
+
+    /// §8.6.6.5: a non-device (e.g. another special) alternate collapses
+    /// the DeviceN space to `Unknown`.
+    #[test]
+    fn device_n_nondevice_alternate_falls_back() {
+        let tint = type4(&[0.0, 1.0, 0.0, 1.0], &[0.0, 1.0], "{ add }");
+        // Alternate is a Pattern name → not a device family.
+        let arr = device_n(&["A", "B"], Object::Name("Pattern".into()), tint);
+        assert_eq!(color_space_from_object(&arr), ColorSpaceKind::Unknown);
     }
 
     /// `parse_ps_program` tokenises numbers, booleans, nested blocks, and

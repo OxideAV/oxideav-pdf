@@ -208,9 +208,12 @@ for an end-to-end verify.
 
 The content parser honours DeviceGray / DeviceRGB / DeviceCMYK (`g` /
 `rg` / `k` and the `cs`/`CS` + `sc`/`scn` forms, §8.6), resource colour
-spaces (`ICCBased` via `/Alternate` or `/N`; `Indexed`; `Separation`
-with Type 0 sampled / Type 2 / Type 3 / Type 4 PostScript-calculator
-tint transforms, §7.10), the `gs` ExtGState operator (line state
+spaces (`ICCBased` via `/Alternate` or `/N`; `Indexed`; `Separation` and
+`DeviceN` (§8.6.6.5) with Type 0 sampled / Type 2 / Type 3 / Type 4
+PostScript-calculator tint transforms, §7.10 — Type 0 sampled functions
+interpolate multilinearly over any number of input dimensions, so a
+multi-colorant DeviceN tint transform maps through its device
+alternate), the `gs` ExtGState operator (line state
 + alpha, cumulative), `Tj`/`TJ` text shows resolved against
 `/Resources /Font`, and the marked-content operators
 (`BMC`/`BDC`/`EMC`/`MP`/`DP`, §14.6) with named-property resolution.
@@ -256,9 +259,11 @@ cargo bench -p oxideav-pdf --bench reader_open
   raw codec bytes; the reader-side surface is complete).
 - Ed25519 / Ed448 signature dispatch in `pubsec::verify`.
 - Transparency groups beyond per-`Group` `/ca` + `/CA` opacity.
-- DeviceN (multi-input) tint transforms and multi-input Type 0
-  functions. (Single-input Type 4 PostScript-calculator functions are
-  evaluated, §7.10.5.)
+- DeviceN `/Attributes` NChannel custom-blending hints (`/Colorants`,
+  `/Process`, `/MixingHints`); the space still renders through its
+  `alternateSpace` + `tintTransform`, which §8.6.6.5 permits. Order-3
+  (cubic-spline) Type 0 interpolation (Order-1 multilinear is
+  evaluated).
 
 ## Usage
 

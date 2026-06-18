@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- evaluate /DeviceN colour spaces (§8.6.6.5): an `n`-colorant `sc`/`scn` tint vector (one value per `names` entry, in stream order) is mapped through the `n`-in/`m`-out tint-transform function into the device alternate, then rendered to RGB. The all-`/None` space discards its output; arity- and alternate-validated at resolve time. Backed by multi-input function evaluation — Type 0 (sampled) functions now interpolate multilinearly over any number of input dimensions (the first dimension varies fastest, §7.10.2), and Type 4 (PostScript-calculator) functions seed all `m` inputs onto the operand stack. Order-3 (cubic-spline) Type 0 functions are rejected (Order-1 multilinear only). The DeviceN `/Attributes` NChannel dictionary is dropped — the space renders through `alternateSpace` + `tintTransform`, which §8.6.6.5 permits
 - evaluate Type 4 (PostScript calculator) tint transforms in /Separation colour spaces (§7.10.5): a small stack machine over the §7.10.5 / Annex B operator subset (arithmetic, relational/boolean/bitwise, conditional if/ifelse, and stack operators), with the decoded program body folded into the function dictionary under `__Program`; execution and syntax errors (§7.10.5.2) fall back to conservative black
 - evaluate Type 0 (sampled) tint transforms in /Separation colour spaces (§7.10.2): single-input sample tables with Encode/Decode linear mappings and Order-1 interpolation, decoded sample body folded into the function dictionary
 
