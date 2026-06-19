@@ -218,6 +218,23 @@ alternate), the `gs` ExtGState operator (line state
 `/Resources /Font`, and the marked-content operators
 (`BMC`/`BDC`/`EMC`/`MP`/`DP`, §14.6) with named-property resolution.
 
+The `sh` shading-paint operator (§8.7.4.5) surfaces a `ContentShading`
+event per paint with the resolved shading dictionary, the effective CTM,
+and the active clip. **Type 4–7 (mesh) shadings** (§8.7.4.5.5–8) are
+evaluated to device-space geometry on `ContentShading::mesh`: free-form
+(Type 4) and lattice-form (Type 5) Gouraud triangle meshes become a list
+of triangles with per-vertex RGB; Coons (Type 6) and tensor-product
+(Type 7) patch meshes become a list of bicubic patches with four corner
+colours (Coons patches expanded to the 16-control-point tensor form via
+the §8.7.4.5.8 internal-control-point equations). The bit-packed stream
+body is unpacked at the dictionary's `BitsPerCoordinate` /
+`BitsPerComponent` / `BitsPerFlag` widths, decoded through the `Decode`
+array (§8.9.5.2), and each vertex / corner colour reduced through the
+shading's `ColorSpace` and optional parametric `/Function`. Edge-flag
+triangle/patch continuation (Tables 85/86) is honoured. Axial / radial /
+function-based shadings (Types 1–3) leave `mesh` `None` (their colour
+lives in the `Function` entry).
+
 ## Interactive-form & annotation writers
 
 - [`write_pdf_with_form`] emits an `/AcroForm` with Text, Checkbox,

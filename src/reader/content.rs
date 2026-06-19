@@ -427,6 +427,78 @@ pub struct ContentShading {
     /// Active clip path from the current `q` frame's most recent
     /// `W`/`W*`. `None` when no clip is in force.
     pub clip: Option<Path>,
+    /// Evaluated mesh geometry for a Type 4–7 shading (free-form /
+    /// lattice-form Gouraud triangle mesh, Coons patch mesh, or
+    /// tensor-product patch mesh, §8.7.4.5.5–8.7.4.5.8). `None` for an
+    /// axial / radial / function-based shading (Types 1–3, which carry
+    /// their colour in the `Function` entry rather than a mesh stream),
+    /// for a shading the caller didn't plumb resources for, or for a
+    /// mesh whose stream / colour space / function couldn't be reduced
+    /// to evaluated RGB vertices. Coordinates are in the shading's
+    /// target coordinate space (pre-`ctm`); apply `ctm` to map them to
+    /// device space.
+    pub mesh: Option<MeshShading>,
+}
+
+/// Evaluated geometry + colour for a Type 4–7 shading (§8.7.4.5.5–8).
+/// All four mesh types reduce to either a list of Gouraud-shaded
+/// triangles (Types 4 and 5) or a list of colour patches each bounded
+/// by four cubic Bézier curves (Types 6 and 7), so this enum carries
+/// the two shapes. Every coordinate is in the shading's target
+/// coordinate space (the pre-`ctm` space the stream's `Decode` array
+/// maps into); every colour is already reduced to device RGB through
+/// the shading's colour space (and its optional parametric `Function`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum MeshShading {
+    /// Types 4 (free-form) and 5 (lattice-form) Gouraud-shaded triangle
+    /// meshes. Each triangle carries three [`MeshVertex`]es; the
+    /// interior colour is the Gouraud (barycentric-linear) interpolation
+    /// of the three vertex colours.
+    Triangles(Vec<MeshTriangle>),
+    /// Types 6 (Coons) and 7 (tensor-product) patch meshes. Each patch
+    /// is a bicubic surface bounded by four cubic Bézier curves with a
+    /// colour at each of its four corners (bilinearly interpolated over
+    /// the patch interior).
+    Patches(Vec<MeshPatch>),
+}
+
+/// One Gouraud-shaded triangle of a Type 4 / Type 5 mesh (§8.7.4.5.5).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeshTriangle {
+    /// The three vertices, in stream order. The shaded colour at an
+    /// interior point is the barycentric-linear blend of the three
+    /// vertex colours (Gouraud interpolation).
+    pub vertices: [MeshVertex; 3],
+}
+
+/// One vertex of a Gouraud triangle mesh: a target-space coordinate
+/// plus its evaluated device-RGB colour (§8.7.4.5.5).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeshVertex {
+    /// Vertex coordinate in the shading's target coordinate space
+    /// (pre-`ctm`).
+    pub point: Point,
+    /// Evaluated device-RGB colour at the vertex.
+    pub color: Rgba,
+}
+
+/// One colour patch of a Type 6 (Coons) / Type 7 (tensor-product) patch
+/// mesh (§8.7.4.5.7–8). The patch geometry is a bicubic surface; Type 6
+/// patches are stored as the equivalent tensor-product patch (the four
+/// internal control points derived from the boundary curves per the
+/// §8.7.4.5.8 conversion equations), so both types share this 4×4
+/// control-point representation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeshPatch {
+    /// The 16 tensor-product control points `p[col][row]` (§8.7.4.5.8
+    /// Figure 32) in the shading's target coordinate space. For a Type 6
+    /// Coons patch the four internal points (`p[1][1]`, `p[1][2]`,
+    /// `p[2][1]`, `p[2][2]`) are computed from the boundary curves.
+    pub control_points: [[Point; 4]; 4],
+    /// The four corner colours, in the §8.7.4.5.7 corner order
+    /// (`c1`=`p00`, `c2`=`p03`, `c3`=`p33`, `c4`=`p30`). The patch
+    /// interior colour is the bilinear interpolation of these four.
+    pub corner_colors: [Rgba; 4],
 }
 
 /// One marked-content operator surfaced by
@@ -2829,6 +2901,10 @@ impl<'a> State<'a> {
                     (Some(res), n) if !n.is_empty() => lookup_dict(res, n).cloned(),
                     _ => None,
                 };
+                // A Type 4–7 (mesh) shading is evaluated here into its
+                // device-space triangle / patch geometry; Types 1–3
+                // (function-based / axial / radial) leave `mesh` `None`.
+                let mesh = shading_dict.as_ref().and_then(evaluate_mesh_shading);
                 let ctm = self.effective_ctm();
                 let clip = self.current_clip();
                 self.shadings.push(ContentShading {
@@ -2836,6 +2912,7 @@ impl<'a> State<'a> {
                     shading_dict,
                     ctm,
                     clip,
+                    mesh,
                 });
                 self.operands.clear();
             }
@@ -3550,6 +3627,605 @@ fn paint_from_device_components(cs: &ColorSpaceKind, comps: &[f32]) -> Option<Pa
         ))),
         _ => None,
     }
+}
+
+// ───────────────── mesh shadings (§8.7.4.5.5–8) ──────────────────
+
+/// Convert a `count`-component colour value in colour space `cs` to a
+/// device-RGB [`Rgba`]. Reuses the same colour-space machinery the
+/// `sc`/`scn` path uses (device families, `Indexed` table lookup,
+/// `Separation` / `DeviceN` tint transforms), so a mesh vertex / patch
+/// corner colour is reduced exactly as a fill colour would be. Returns
+/// `None` for an `Unknown` space or a component-count mismatch.
+fn rgba_from_components(cs: &ColorSpaceKind, comps: &[f32]) -> Option<Rgba> {
+    let paint = match cs {
+        ColorSpaceKind::DeviceGray | ColorSpaceKind::DeviceRgb | ColorSpaceKind::DeviceCmyk => {
+            paint_from_device_components(cs, comps)?
+        }
+        ColorSpaceKind::Indexed { base, hival, table } => {
+            indexed_color(base, *hival, table, *comps.first()?)?
+        }
+        ColorSpaceKind::Separation {
+            alt,
+            tint,
+            none_colorant,
+        } => separation_color(alt, tint, *none_colorant, *comps.first()?)?,
+        ColorSpaceKind::DeviceN {
+            alt,
+            tint,
+            all_none,
+            ..
+        } => device_n_color(alt, tint, *all_none, comps)?,
+        ColorSpaceKind::Unknown => return None,
+    };
+    match paint {
+        Paint::Solid(rgba) => Some(rgba),
+        _ => None,
+    }
+}
+
+/// A little-endian-free MSB-first bit reader over a mesh stream body.
+/// `read(bits)` pulls the next `bits` bits, most-significant first
+/// (§8.7.4.5.5: "reading in sequence from higher-order to lower-order
+/// bit positions"); `align_byte` discards the remaining bits of the
+/// current byte (each vertex / patch element occupies a whole number of
+/// bytes — the trailing pad bits "shall be ignored").
+struct BitReader<'a> {
+    data: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit_pos: 0 }
+    }
+
+    /// Read `bits` (1..=32) bits MSB-first as an unsigned integer.
+    /// Returns `None` when the stream is exhausted.
+    fn read(&mut self, bits: u32) -> Option<u64> {
+        let mut code: u64 = 0;
+        for _ in 0..bits {
+            let byte = *self.data.get(self.bit_pos / 8)?;
+            let bit = (byte >> (7 - (self.bit_pos % 8) as u32)) & 1;
+            code = (code << 1) | (bit as u64);
+            self.bit_pos += 1;
+        }
+        Some(code)
+    }
+
+    /// Advance to the next byte boundary (each mesh element — vertex or
+    /// patch — is byte-aligned, §8.7.4.5.5).
+    fn align_byte(&mut self) {
+        if self.bit_pos % 8 != 0 {
+            self.bit_pos = self.bit_pos.div_ceil(8) * 8;
+        }
+    }
+
+    /// `true` once the reader has consumed at least one whole byte and
+    /// no further byte-aligned element can be read (used to terminate a
+    /// patch / triangle stream that provides a whole number of elements).
+    fn at_end(&self) -> bool {
+        self.bit_pos / 8 >= self.data.len()
+    }
+}
+
+/// Decode an integer coordinate / colour code in `[0, 2^bits − 1]` to
+/// its target value via the §8.9.5.2 `Decode` linear map (the same
+/// `Interpolate` the image Decode array uses).
+fn decode_value(code: u64, bits: u32, dmin: f32, dmax: f32) -> f32 {
+    let max_code = if bits >= 32 {
+        u32::MAX as f32
+    } else {
+        ((1u64 << bits) - 1) as f32
+    };
+    if max_code == 0.0 {
+        return dmin;
+    }
+    dmin + (code as f32) * (dmax - dmin) / max_code
+}
+
+/// Parse + evaluate a Type 4–7 (mesh) shading dictionary (§8.7.4.5.5–8)
+/// into its device-space [`MeshShading`] geometry. Returns `None` for a
+/// Type 1–3 shading, a missing / malformed stream body (the
+/// `resolve_shading_resources` `__MeshData` fold), an unresolved colour
+/// space, or any structural error in the bit-packed stream. The colour
+/// at each vertex / corner is reduced to device RGB through the
+/// shading's `ColorSpace` and (when present) its parametric `Function`.
+/// Crate-internal test accessor for [`evaluate_mesh_shading`] so the
+/// `document` module's integration test can drive the evaluator over a
+/// dict its `resolve_shading_resources` produced.
+#[cfg(test)]
+pub(crate) fn evaluate_mesh_shading_for_test(dict: &Dict) -> Option<MeshShading> {
+    evaluate_mesh_shading(dict)
+}
+
+fn evaluate_mesh_shading(dict: &Dict) -> Option<MeshShading> {
+    let get = |key: &str| {
+        dict.entries()
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    };
+    let shading_type = get("ShadingType").and_then(number_as_i64)?;
+    if !(4..=7).contains(&shading_type) {
+        return None;
+    }
+    let cs = color_space_from_object(get("ColorSpace")?);
+    if cs == ColorSpaceKind::Unknown {
+        return None;
+    }
+    // §8.7.4.5.5: the colour-component count comes from the colour
+    // space — unless a `/Function` entry is present, in which case the
+    // stream carries a single parametric value `t` per vertex / corner
+    // and the function maps it to the space's components.
+    let func = parse_shading_function(get("Function"));
+    let n_color = if func.is_some() { 1 } else { cs.components()? };
+    let bits_coord = get("BitsPerCoordinate").and_then(number_as_i64)? as u32;
+    if !matches!(bits_coord, 1 | 2 | 4 | 8 | 12 | 16 | 24 | 32) {
+        return None;
+    }
+    let bits_comp = get("BitsPerComponent").and_then(number_as_i64)? as u32;
+    if !matches!(bits_comp, 1 | 2 | 4 | 8 | 12 | 16) {
+        return None;
+    }
+    let decode = get("Decode").and_then(read_num_array)?;
+    // Decode: [ xmin xmax ymin ymax c1min c1max … ]. Two coordinate
+    // pairs + one pair per colour component.
+    if decode.len() != 4 + 2 * n_color {
+        return None;
+    }
+    let raw = match get("__MeshData") {
+        Some(Object::HexString(bytes)) => bytes.as_slice(),
+        _ => return None,
+    };
+    // §8.7.4.5.5 / §8.7.4.5.7: `BitsPerFlag` is required for Type 4
+    // (free-form triangle mesh) and Type 6/7 (patch meshes); Type 5
+    // (lattice) carries no edge flags, so its flag width is irrelevant.
+    let bits_flag = if shading_type == 5 {
+        0
+    } else {
+        let bf = get("BitsPerFlag").and_then(number_as_i64)? as u32;
+        if !matches!(bf, 2 | 4 | 8) {
+            return None;
+        }
+        bf
+    };
+    let evaluator = MeshEvaluator {
+        cs: &cs,
+        func: func.as_ref(),
+        n_color,
+        bits_coord,
+        bits_comp,
+        bits_flag,
+        decode: &decode,
+    };
+    match shading_type {
+        4 => evaluator.eval_type4(raw),
+        5 => {
+            let vpr = get("VerticesPerRow").and_then(number_as_i64)?;
+            if vpr < 2 {
+                return None;
+            }
+            evaluator.eval_type5(raw, vpr as usize)
+        }
+        6 => evaluator.eval_patch(raw, bits_flag, false),
+        7 => evaluator.eval_patch(raw, bits_flag, true),
+        _ => None,
+    }
+}
+
+/// Parse a shading's optional `/Function` entry (§8.7.4.5.5) — either a
+/// single 1-in / n-out function or an array of n 1-in / 1-out functions
+/// (`resolve_shading_resources` has already made each self-contained).
+/// `None` for an absent / unparseable entry, in which case the stream
+/// carries explicit colour components rather than a parametric value.
+fn parse_shading_function(obj: Option<&Object>) -> Option<ShadingFunction> {
+    match obj? {
+        Object::Array(items) => {
+            let parts: Vec<PdfFunction> = items
+                .iter()
+                .map(PdfFunction::parse)
+                .collect::<Option<_>>()?;
+            if parts.is_empty() {
+                return None;
+            }
+            Some(ShadingFunction::Array(parts))
+        }
+        single => Some(ShadingFunction::Single(PdfFunction::parse(single)?)),
+    }
+}
+
+/// A shading's parametric colour function (§8.7.4.5.5): the stream gives
+/// one value `t` per vertex / corner, mapped to the colour space's
+/// components by either one `n`-out function or `n` 1-out functions.
+enum ShadingFunction {
+    Single(PdfFunction),
+    Array(Vec<PdfFunction>),
+}
+
+impl ShadingFunction {
+    /// Evaluate at parametric value `t`, returning the colour-space
+    /// component vector.
+    fn eval(&self, t: f32) -> Vec<f32> {
+        match self {
+            ShadingFunction::Single(f) => f.eval(t),
+            ShadingFunction::Array(fs) => fs
+                .iter()
+                .filter_map(|f| f.eval(t).first().copied())
+                .collect(),
+        }
+    }
+}
+
+/// Bundled mesh-stream parameters threaded through the per-type
+/// evaluators (Type 4 free-form, Type 5 lattice, Type 6/7 patch).
+struct MeshEvaluator<'a> {
+    cs: &'a ColorSpaceKind,
+    func: Option<&'a ShadingFunction>,
+    n_color: usize,
+    bits_coord: u32,
+    bits_comp: u32,
+    /// `BitsPerFlag` (§8.7.4.5.5) — the edge-flag width for Type 4
+    /// (free-form) triangle meshes and Type 6/7 patch meshes. `0` for
+    /// Type 5 (lattice-form), which carries no edge flags.
+    bits_flag: u32,
+    decode: &'a [f32],
+}
+
+impl MeshEvaluator<'_> {
+    /// Read + decode one vertex coordinate pair from `r` using the
+    /// `Decode` array's first two pairs.
+    fn read_point(&self, r: &mut BitReader) -> Option<Point> {
+        let xc = r.read(self.bits_coord)?;
+        let yc = r.read(self.bits_coord)?;
+        let x = decode_value(xc, self.bits_coord, self.decode[0], self.decode[1]);
+        let y = decode_value(yc, self.bits_coord, self.decode[2], self.decode[3]);
+        Some(Point::new(x, y))
+    }
+
+    /// Read + decode one vertex / corner colour from `r`. When the
+    /// shading has a `/Function`, the stream carries a single parametric
+    /// value `t` (decoded against the first colour-Decode pair) that the
+    /// function maps to the colour-space components; otherwise it carries
+    /// `n_color` raw components.
+    fn read_color(&self, r: &mut BitReader) -> Option<Rgba> {
+        if let Some(func) = self.func {
+            let code = r.read(self.bits_comp)?;
+            let t = decode_value(code, self.bits_comp, self.decode[4], self.decode[5]);
+            let comps = func.eval(t);
+            rgba_from_components(self.cs, &comps)
+        } else {
+            let mut comps = Vec::with_capacity(self.n_color);
+            for i in 0..self.n_color {
+                let code = r.read(self.bits_comp)?;
+                let dmin = self.decode[4 + 2 * i];
+                let dmax = self.decode[5 + 2 * i];
+                comps.push(decode_value(code, self.bits_comp, dmin, dmax));
+            }
+            rgba_from_components(self.cs, &comps)
+        }
+    }
+
+    /// Read one full vertex (point + colour), byte-aligned afterwards.
+    fn read_vertex(&self, r: &mut BitReader) -> Option<MeshVertex> {
+        let point = self.read_point(r)?;
+        let color = self.read_color(r)?;
+        r.align_byte();
+        Some(MeshVertex { point, color })
+    }
+
+    /// §8.7.4.5.5 Type 4: free-form Gouraud triangle mesh. Each vertex
+    /// carries an edge flag (`f = 0` starts a new triangle; `f = 1`/`2`
+    /// continues from the previous one).
+    fn eval_type4(&self, raw: &[u8]) -> Option<MeshShading> {
+        let bits_flag = self.bits_flag;
+        let mut r = BitReader::new(raw);
+        let mut triangles: Vec<MeshTriangle> = Vec::new();
+        // The three vertices of the most recent triangle, in stream
+        // order (va, vb, vc) per Figure 25.
+        let mut prev: Option<[MeshVertex; 3]> = None;
+        loop {
+            if r.at_end() {
+                break;
+            }
+            let f = match r.read(bits_flag) {
+                Some(v) => v & 0b11,
+                None => break,
+            };
+            let v = self.read_vertex(&mut r)?;
+            match f {
+                0 => {
+                    // Start a new triangle: this vertex plus the next
+                    // two (whose own flags are ignored, §8.7.4.5.5).
+                    r.read(bits_flag)?;
+                    let vb = self.read_vertex(&mut r)?;
+                    r.read(bits_flag)?;
+                    let vc = self.read_vertex(&mut r)?;
+                    let tri = [v, vb, vc];
+                    triangles.push(MeshTriangle { vertices: tri });
+                    prev = Some(tri);
+                }
+                1 => {
+                    // Continue on side vbc: new triangle (vb, vc, vd).
+                    let [_va, vb, vc] = prev?;
+                    let tri = [vb, vc, v];
+                    triangles.push(MeshTriangle { vertices: tri });
+                    prev = Some(tri);
+                }
+                2 => {
+                    // Continue on side vac: new triangle (va, vc, vd).
+                    let [va, _vb, vc] = prev?;
+                    let tri = [va, vc, v];
+                    triangles.push(MeshTriangle { vertices: tri });
+                    prev = Some(tri);
+                }
+                _ => return None,
+            }
+        }
+        if triangles.is_empty() {
+            return None;
+        }
+        Some(MeshShading::Triangles(triangles))
+    }
+
+    /// §8.7.4.5.6 Type 5: lattice-form Gouraud triangle mesh. Vertices
+    /// are laid out row-major (`VerticesPerRow` per row, no edge flags);
+    /// adjacent rows form two triangles per cell (§8.7.4.5.6).
+    fn eval_type5(&self, raw: &[u8], vpr: usize) -> Option<MeshShading> {
+        let mut r = BitReader::new(raw);
+        let mut rows: Vec<Vec<MeshVertex>> = Vec::new();
+        loop {
+            if r.at_end() {
+                break;
+            }
+            let mut row = Vec::with_capacity(vpr);
+            for _ in 0..vpr {
+                match self.read_vertex(&mut r) {
+                    Some(v) => row.push(v),
+                    None => break,
+                }
+            }
+            if row.len() != vpr {
+                break;
+            }
+            rows.push(row);
+        }
+        if rows.len() < 2 {
+            return None;
+        }
+        let mut triangles = Vec::new();
+        for i in 0..rows.len() - 1 {
+            for j in 0..vpr - 1 {
+                // (V_i,j, V_i,j+1, V_i+1,j) and
+                // (V_i,j+1, V_i+1,j, V_i+1,j+1), §8.7.4.5.6.
+                let a = rows[i][j];
+                let b = rows[i][j + 1];
+                let c = rows[i + 1][j];
+                let d = rows[i + 1][j + 1];
+                triangles.push(MeshTriangle {
+                    vertices: [a, b, c],
+                });
+                triangles.push(MeshTriangle {
+                    vertices: [b, c, d],
+                });
+            }
+        }
+        Some(MeshShading::Triangles(triangles))
+    }
+
+    /// §8.7.4.5.7–8 Type 6 / 7: Coons / tensor-product patch mesh.
+    /// `tensor` selects the 16-control-point tensor layout (Type 7) vs
+    /// the 12-control-point Coons layout (Type 6); a Coons patch is
+    /// expanded to the equivalent tensor patch via the §8.7.4.5.8
+    /// internal-control-point equations.
+    fn eval_patch(&self, raw: &[u8], bits_flag: u32, tensor: bool) -> Option<MeshShading> {
+        let mut r = BitReader::new(raw);
+        let mut patches: Vec<MeshPatch> = Vec::new();
+        // Coordinate count per patch element: 12 boundary control points
+        // (Coons) or 16 (tensor); a continuation patch (`f != 0`)
+        // supplies only the 8 / 12 *new* points.
+        loop {
+            if r.at_end() {
+                break;
+            }
+            let f = match r.read(bits_flag) {
+                Some(v) => v & 0b11,
+                None => break,
+            };
+            let new_pts = if f == 0 {
+                if tensor {
+                    16
+                } else {
+                    12
+                }
+            } else if tensor {
+                12
+            } else {
+                8
+            };
+            let mut pts = Vec::with_capacity(new_pts);
+            for _ in 0..new_pts {
+                pts.push(self.read_point(&mut r)?);
+            }
+            let new_cols = if f == 0 { 4 } else { 2 };
+            let mut cols = Vec::with_capacity(new_cols);
+            for _ in 0..new_cols {
+                cols.push(self.read_color(&mut r)?);
+            }
+            r.align_byte();
+            let patch = build_patch(f, tensor, &pts, &cols, patches.last())?;
+            patches.push(patch);
+        }
+        if patches.is_empty() {
+            return None;
+        }
+        Some(MeshShading::Patches(patches))
+    }
+}
+
+/// Assemble one Coons / tensor patch from its freshly-read control
+/// points + corner colours and the previous patch's edge data
+/// (§8.7.4.5.7 Table 85 / §8.7.4.5.8 Table 86).
+///
+/// The 16 tensor control points are addressed as `p[col][row]`
+/// (`p[i][j]` = `pij` in Figure 32). For a tensor patch (`tensor =
+/// true`) the 16 explicit points arrive in the Table 86 stream order;
+/// for a Coons patch (`tensor = false`) the 12 boundary points arrive in
+/// the Table 85 order (= the 12 boundary entries of the tensor order)
+/// and the four internal points are derived from the boundary curves via
+/// the §8.7.4.5.8 conversion equations. A continuation patch (`f != 0`)
+/// inherits four boundary points + two corner colours from the previous
+/// patch's shared edge.
+fn build_patch(
+    f: u64,
+    tensor: bool,
+    new_pts: &[Point],
+    new_cols: &[Rgba],
+    prev: Option<&MeshPatch>,
+) -> Option<MeshPatch> {
+    // The tensor stream order of the 16 points (Table 86, f=0), as
+    // (col, row) indices into p[col][row]:
+    //   p00 p01 p02 p03 p13 p23 p33 p32 p31 p30 p20 p10 p11 p12 p22 p21
+    const TENSOR_ORDER: [(usize, usize); 16] = [
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (0, 3),
+        (1, 3),
+        (2, 3),
+        (3, 3),
+        (3, 2),
+        (3, 1),
+        (3, 0),
+        (2, 0),
+        (1, 0),
+        (1, 1),
+        (1, 2),
+        (2, 2),
+        (2, 1),
+    ];
+    // For a continuation patch the stream supplies the *new* points,
+    // which fill the tensor-order slots starting at index 4 (Coons) /
+    // index 4 (tensor) — the first four entries are the shared edge,
+    // inherited below. Table 85/86 list the new points starting with
+    // p13/x5; the first four tensor-order slots (the shared edge) are
+    // not in the stream.
+    let mut p = [[Point::new(0.0, 0.0); 4]; 4];
+    // For tensor patches we always work in the 16-slot order. For Coons
+    // patches only the 12 boundary slots (the first 12 entries of
+    // TENSOR_ORDER) are populated from the stream; the four internal
+    // slots are the last four entries.
+    let boundary_slots = 12usize;
+    if f == 0 {
+        let count = if tensor { 16 } else { boundary_slots };
+        if new_pts.len() != count {
+            return None;
+        }
+        for (k, &pt) in new_pts.iter().enumerate() {
+            let (c, rr) = TENSOR_ORDER[k];
+            p[c][rr] = pt;
+        }
+    } else {
+        let prev = prev?;
+        // Inherit the four shared-edge boundary points from the previous
+        // patch per the edge flag (§8.7.4.5.8 Table 86 — the same four
+        // tensor-order slots 0..3 are filled from the previous patch's
+        // selected edge). The mapping is expressed via the previous
+        // patch's `p[col][row]`.
+        let shared: [(usize, usize); 4] = match f {
+            1 => [(0, 3), (1, 3), (2, 3), (3, 3)], // prev top edge (p03 p13 p23 p33)
+            2 => [(3, 3), (3, 2), (3, 1), (3, 0)], // prev right edge (p33 p32 p31 p30)
+            3 => [(3, 0), (2, 0), (1, 0), (0, 0)], // prev bottom edge (p30 p20 p10 p00)
+            _ => return None,
+        };
+        // Tensor-order slots 0..3 (p00 p01 p02 p03) take the previous
+        // patch's shared-edge points.
+        for (k, &(c, rr)) in shared.iter().enumerate() {
+            let (tc, trr) = TENSOR_ORDER[k];
+            p[tc][trr] = prev.control_points[c][rr];
+        }
+        // The remaining new points fill tensor-order slots 4..count.
+        let count = if tensor { 16 } else { boundary_slots };
+        if new_pts.len() != count - 4 {
+            return None;
+        }
+        for (k, &pt) in new_pts.iter().enumerate() {
+            let (c, rr) = TENSOR_ORDER[k + 4];
+            p[c][rr] = pt;
+        }
+    }
+    // For a Coons patch, derive the four internal control points from
+    // the boundary curves (§8.7.4.5.8 conversion equations).
+    if !tensor {
+        p[1][1] = coons_internal(
+            p[0][0], p[0][1], p[1][0], p[0][3], p[3][0], p[3][1], p[1][3], p[3][3],
+        );
+        p[1][2] = coons_internal(
+            p[0][3], p[0][2], p[1][3], p[0][0], p[3][3], p[3][2], p[1][0], p[3][0],
+        );
+        p[2][1] = coons_internal(
+            p[3][0], p[3][1], p[2][0], p[3][3], p[0][0], p[0][1], p[2][3], p[0][3],
+        );
+        p[2][2] = coons_internal(
+            p[3][3], p[3][2], p[2][3], p[3][0], p[0][3], p[0][2], p[2][0], p[0][0],
+        );
+    }
+    // Corner colours: c1=p00, c2=p03, c3=p33, c4=p30 (§8.7.4.5.7).
+    let corner_colors: [Rgba; 4] = if f == 0 {
+        if new_cols.len() != 4 {
+            return None;
+        }
+        [new_cols[0], new_cols[1], new_cols[2], new_cols[3]]
+    } else {
+        let prev = prev?;
+        if new_cols.len() != 2 {
+            return None;
+        }
+        // Two corner colours inherited from the previous patch's shared
+        // edge, two read from the stream (§8.7.4.5.7 Table 85 /
+        // §8.7.4.5.8 Table 86: c1 c2 inherited, c3 c4 = the new pair).
+        let (c1, c2) = match f {
+            1 => (prev.corner_colors[1], prev.corner_colors[2]), // c1=c2prev c2=c3prev
+            2 => (prev.corner_colors[2], prev.corner_colors[3]), // c1=c3prev c2=c4prev
+            3 => (prev.corner_colors[3], prev.corner_colors[0]), // c1=c4prev c2=c1prev
+            _ => return None,
+        };
+        [c1, c2, new_cols[0], new_cols[1]]
+    };
+    Some(MeshPatch {
+        control_points: p,
+        corner_colors,
+    })
+}
+
+/// One internal-control-point of a Coons patch, derived from the
+/// boundary control points per the §8.7.4.5.8 conversion equation
+///
+/// ```text
+/// p = 1/9 × [ −4·a + 6·(b + c) − 2·(d + e) + 3·(f + g) − 1·h ]
+/// ```
+///
+/// The four `p11`/`p12`/`p21`/`p22` equations share this shape with
+/// different point assignments; the caller supplies them in
+/// `(a, b, c, d, e, f, g, h)` order.
+#[allow(clippy::too_many_arguments)]
+fn coons_internal(
+    a: Point,
+    b: Point,
+    c: Point,
+    d: Point,
+    e: Point,
+    f: Point,
+    g: Point,
+    h: Point,
+) -> Point {
+    let comp = |a: f32, b: f32, c: f32, d: f32, e: f32, f: f32, g: f32, h: f32| -> f32 {
+        (-4.0 * a + 6.0 * (b + c) - 2.0 * (d + e) + 3.0 * (f + g) - h) / 9.0
+    };
+    Point::new(
+        comp(a.x, b.x, c.x, d.x, e.x, f.x, g.x, h.x),
+        comp(a.y, b.y, c.y, d.y, e.y, f.y, g.y, h.y),
+    )
 }
 
 /// Convert a DeviceCMYK colour value to DeviceRGB per ISO 32000-1
@@ -6048,5 +6724,535 @@ mod tests {
         let bytes = b"q 100 100 m 200 200 l S Q\n";
         let p = parse_with_shading(bytes, None, None, Some(&shadings));
         assert!(p.shadings.is_empty());
+    }
+
+    // ───────────── mesh shadings (§8.7.4.5.5–8) ──────────────
+
+    /// A tiny MSB-first bit writer mirroring [`BitReader`], used to
+    /// hand-assemble mesh stream bodies in the tests.
+    struct BitWriter {
+        bytes: Vec<u8>,
+        bit: u32,
+    }
+    impl BitWriter {
+        fn new() -> Self {
+            Self {
+                bytes: Vec::new(),
+                bit: 0,
+            }
+        }
+        fn write(&mut self, value: u64, bits: u32) {
+            for i in (0..bits).rev() {
+                if self.bit == 0 {
+                    self.bytes.push(0);
+                }
+                let b = ((value >> i) & 1) as u8;
+                let last = self.bytes.len() - 1;
+                self.bytes[last] |= b << (7 - self.bit);
+                self.bit = (self.bit + 1) % 8;
+            }
+        }
+        fn align(&mut self) {
+            self.bit = 0;
+        }
+        fn finish(mut self) -> Vec<u8> {
+            self.align();
+            self.bytes
+        }
+    }
+
+    fn decode_rgb8() -> Object {
+        // [ xmin xmax ymin ymax rmin rmax gmin gmax bmin bmax ] for an
+        // 8-bit coordinate / colour DeviceRGB mesh over a 0..1 unit box.
+        Object::Array(
+            [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+                .into_iter()
+                .map(Object::Real)
+                .collect(),
+        )
+    }
+
+    /// Type 4 free-form Gouraud mesh: one all-red / green / blue
+    /// triangle decodes to three coloured vertices.
+    #[test]
+    fn mesh_type4_single_triangle_decodes_vertices() {
+        let mut w = BitWriter::new();
+        // f=0, (0,0) red ; ignored-flag, (1,0) green ; ignored, (0,1) blue.
+        // 8-bit coords, 8-bit components, 8-bit flag.
+        let vert = |w: &mut BitWriter, flag: u64, x: u64, y: u64, r: u64, g: u64, b: u64| {
+            w.write(flag, 8);
+            w.write(x, 8);
+            w.write(y, 8);
+            w.write(r, 8);
+            w.write(g, 8);
+            w.write(b, 8);
+            w.align();
+        };
+        vert(&mut w, 0, 0, 0, 255, 0, 0);
+        vert(&mut w, 0, 255, 0, 0, 255, 0);
+        vert(&mut w, 0, 0, 255, 0, 0, 255);
+        let data = w.finish();
+        let dict = Dict::new()
+            .with("ShadingType", Object::Integer(4))
+            .with("ColorSpace", Object::Name("DeviceRGB".into()))
+            .with("BitsPerCoordinate", Object::Integer(8))
+            .with("BitsPerComponent", Object::Integer(8))
+            .with("BitsPerFlag", Object::Integer(8))
+            .with("Decode", decode_rgb8())
+            .with("__MeshData", Object::HexString(data));
+        let mesh = evaluate_mesh_shading(&dict).expect("mesh evaluated");
+        let MeshShading::Triangles(tris) = mesh else {
+            panic!("expected triangles")
+        };
+        assert_eq!(tris.len(), 1);
+        let v = tris[0].vertices;
+        assert!((v[0].point.x - 0.0).abs() < 1e-4 && (v[0].point.y - 0.0).abs() < 1e-4);
+        assert_eq!((v[0].color.r, v[0].color.g, v[0].color.b), (255, 0, 0));
+        assert!((v[1].point.x - 1.0).abs() < 1e-4);
+        assert_eq!((v[1].color.r, v[1].color.g, v[1].color.b), (0, 255, 0));
+        assert!((v[2].point.y - 1.0).abs() < 1e-4);
+        assert_eq!((v[2].color.r, v[2].color.g, v[2].color.b), (0, 0, 255));
+    }
+
+    /// Type 4 edge-flag continuation: a second vertex with `f=1` reuses
+    /// (vb, vc) of the first triangle (§8.7.4.5.5 Figure 25).
+    #[test]
+    fn mesh_type4_edge_flag_continuation() {
+        let mut w = BitWriter::new();
+        let vert = |w: &mut BitWriter, flag: u64, x: u64, y: u64, r: u64, g: u64, b: u64| {
+            w.write(flag, 8);
+            w.write(x, 8);
+            w.write(y, 8);
+            w.write(r, 8);
+            w.write(g, 8);
+            w.write(b, 8);
+            w.align();
+        };
+        vert(&mut w, 0, 0, 0, 255, 0, 0); // va
+        vert(&mut w, 0, 255, 0, 0, 255, 0); // vb
+        vert(&mut w, 0, 0, 255, 0, 0, 255); // vc
+        vert(&mut w, 1, 255, 255, 255, 255, 0); // vd on side vbc
+        let data = w.finish();
+        let dict = Dict::new()
+            .with("ShadingType", Object::Integer(4))
+            .with("ColorSpace", Object::Name("DeviceRGB".into()))
+            .with("BitsPerCoordinate", Object::Integer(8))
+            .with("BitsPerComponent", Object::Integer(8))
+            .with("BitsPerFlag", Object::Integer(8))
+            .with("Decode", decode_rgb8())
+            .with("__MeshData", Object::HexString(data));
+        let MeshShading::Triangles(tris) = evaluate_mesh_shading(&dict).unwrap() else {
+            panic!()
+        };
+        assert_eq!(tris.len(), 2);
+        // Second triangle = (vb, vc, vd).
+        let t2 = tris[1].vertices;
+        assert!((t2[0].point.x - 1.0).abs() < 1e-4 && t2[0].point.y.abs() < 1e-4); // vb
+        assert!(t2[1].point.x.abs() < 1e-4 && (t2[1].point.y - 1.0).abs() < 1e-4); // vc
+        assert!((t2[2].point.x - 1.0).abs() < 1e-4 && (t2[2].point.y - 1.0).abs() < 1e-4); // vd
+        assert_eq!((t2[2].color.r, t2[2].color.g, t2[2].color.b), (255, 255, 0));
+    }
+
+    /// Type 5 lattice mesh: a 2×2 lattice (2 rows, 2 vertices/row)
+    /// builds two triangles per the §8.7.4.5.6 triplet rule.
+    #[test]
+    fn mesh_type5_lattice_two_by_two() {
+        let mut w = BitWriter::new();
+        let vert = |w: &mut BitWriter, x: u64, y: u64, r: u64, g: u64, b: u64| {
+            w.write(x, 8);
+            w.write(y, 8);
+            w.write(r, 8);
+            w.write(g, 8);
+            w.write(b, 8);
+            w.align();
+        };
+        // Row 0: (0,0) red, (1,0) green. Row 1: (0,1) blue, (1,1) white.
+        vert(&mut w, 0, 0, 255, 0, 0);
+        vert(&mut w, 255, 0, 0, 255, 0);
+        vert(&mut w, 0, 255, 0, 0, 255);
+        vert(&mut w, 255, 255, 255, 255, 255);
+        let data = w.finish();
+        let dict = Dict::new()
+            .with("ShadingType", Object::Integer(5))
+            .with("ColorSpace", Object::Name("DeviceRGB".into()))
+            .with("BitsPerCoordinate", Object::Integer(8))
+            .with("BitsPerComponent", Object::Integer(8))
+            .with("VerticesPerRow", Object::Integer(2))
+            .with("Decode", decode_rgb8())
+            .with("__MeshData", Object::HexString(data));
+        let MeshShading::Triangles(tris) = evaluate_mesh_shading(&dict).unwrap() else {
+            panic!()
+        };
+        // One cell → two triangles.
+        assert_eq!(tris.len(), 2);
+        // First triangle = (V00, V01, V10) = red, green, blue.
+        let t = tris[0].vertices;
+        assert_eq!((t[0].color.r, t[0].color.g, t[0].color.b), (255, 0, 0));
+        assert_eq!((t[1].color.r, t[1].color.g, t[1].color.b), (0, 255, 0));
+        assert_eq!((t[2].color.r, t[2].color.g, t[2].color.b), (0, 0, 255));
+    }
+
+    /// Type 6 Coons patch (single patch, `f=0`): 12 boundary points +
+    /// 4 corner colours decode; the four internal control points are
+    /// derived, and corner colours land at p00/p03/p33/p30.
+    #[test]
+    fn mesh_type6_coons_single_patch() {
+        let mut w = BitWriter::new();
+        w.write(0, 8); // edge flag f=0
+                       // 12 boundary points. Lay out a unit square traced in the
+                       // Coons order (p00 p01 p02 p03 p13 p23 p33 p32 p31 p30 p20 p10).
+        let pts: [(u64, u64); 12] = [
+            (0, 0),     // p00
+            (0, 85),    // p01
+            (0, 170),   // p02
+            (0, 255),   // p03
+            (85, 255),  // p13
+            (170, 255), // p23
+            (255, 255), // p33
+            (255, 170), // p32
+            (255, 85),  // p31
+            (255, 0),   // p30
+            (170, 0),   // p20
+            (85, 0),    // p10
+        ];
+        for (x, y) in pts {
+            w.write(x, 8);
+            w.write(y, 8);
+        }
+        // Four corner colours c1..c4 (p00 red, p03 green, p33 blue, p30 white).
+        let cols: [(u64, u64, u64); 4] = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255)];
+        for (r, g, b) in cols {
+            w.write(r, 8);
+            w.write(g, 8);
+            w.write(b, 8);
+        }
+        w.align();
+        let data = w.finish();
+        let dict = Dict::new()
+            .with("ShadingType", Object::Integer(6))
+            .with("ColorSpace", Object::Name("DeviceRGB".into()))
+            .with("BitsPerCoordinate", Object::Integer(8))
+            .with("BitsPerComponent", Object::Integer(8))
+            .with("BitsPerFlag", Object::Integer(8))
+            .with("Decode", decode_rgb8())
+            .with("__MeshData", Object::HexString(data));
+        let MeshShading::Patches(patches) = evaluate_mesh_shading(&dict).unwrap() else {
+            panic!("expected patches")
+        };
+        assert_eq!(patches.len(), 1);
+        let p = &patches[0];
+        // Corners decode.
+        assert!((p.control_points[0][0].x).abs() < 1e-4); // p00 at (0,0)
+        assert!((p.control_points[3][3].x - 1.0).abs() < 1e-4); // p33 at (1,1)
+        assert_eq!(
+            (
+                p.corner_colors[0].r,
+                p.corner_colors[0].g,
+                p.corner_colors[0].b
+            ),
+            (255, 0, 0)
+        );
+        assert_eq!(
+            (
+                p.corner_colors[2].r,
+                p.corner_colors[2].g,
+                p.corner_colors[2].b
+            ),
+            (0, 0, 255)
+        );
+        // For a flat unit-square patch, the derived internal points lie
+        // inside the unit square (sanity bound).
+        for c in 1..=2 {
+            for rr in 1..=2 {
+                let ip = p.control_points[c][rr];
+                assert!(ip.x > -0.5 && ip.x < 1.5, "internal x in range");
+                assert!(ip.y > -0.5 && ip.y < 1.5, "internal y in range");
+            }
+        }
+    }
+
+    /// Type 7 tensor patch (single patch, `f=0`): 16 control points +
+    /// 4 corner colours decode in the Table 86 stream order.
+    #[test]
+    fn mesh_type7_tensor_single_patch() {
+        let mut w = BitWriter::new();
+        w.write(0, 8); // f=0
+                       // 16 points in tensor stream order; we only check the four
+                       // corners land at the right (col,row) slots.
+                       // Order: p00 p01 p02 p03 p13 p23 p33 p32 p31 p30 p20 p10 p11 p12 p22 p21
+        let pts: [(u64, u64); 16] = [
+            (0, 0),     // p00
+            (0, 85),    // p01
+            (0, 170),   // p02
+            (0, 255),   // p03
+            (85, 255),  // p13
+            (170, 255), // p23
+            (255, 255), // p33
+            (255, 170), // p32
+            (255, 85),  // p31
+            (255, 0),   // p30
+            (170, 0),   // p20
+            (85, 0),    // p10
+            (85, 85),   // p11
+            (85, 170),  // p12
+            (170, 170), // p22
+            (170, 85),  // p21
+        ];
+        for (x, y) in pts {
+            w.write(x, 8);
+            w.write(y, 8);
+        }
+        for (r, g, b) in [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)] {
+            w.write(r, 8);
+            w.write(g, 8);
+            w.write(b, 8);
+        }
+        w.align();
+        let data = w.finish();
+        let dict = Dict::new()
+            .with("ShadingType", Object::Integer(7))
+            .with("ColorSpace", Object::Name("DeviceRGB".into()))
+            .with("BitsPerCoordinate", Object::Integer(8))
+            .with("BitsPerComponent", Object::Integer(8))
+            .with("BitsPerFlag", Object::Integer(8))
+            .with("Decode", decode_rgb8())
+            .with("__MeshData", Object::HexString(data));
+        let MeshShading::Patches(patches) = evaluate_mesh_shading(&dict).unwrap() else {
+            panic!()
+        };
+        assert_eq!(patches.len(), 1);
+        let p = &patches[0];
+        // Tensor internal point p11 decodes to (85,85)→(~0.333,~0.333).
+        assert!((p.control_points[1][1].x - 85.0 / 255.0).abs() < 1e-3);
+        assert!((p.control_points[2][2].y - 170.0 / 255.0).abs() < 1e-3);
+        assert_eq!(
+            (
+                p.corner_colors[3].r,
+                p.corner_colors[3].g,
+                p.corner_colors[3].b
+            ),
+            (255, 255, 0)
+        );
+    }
+
+    /// Type 6 Coons patch continuation (`f=1`): the second patch supplies
+    /// only 8 new boundary points + 2 corner colours; the four shared
+    /// boundary points and two corner colours are inherited from the
+    /// previous patch's top edge (§8.7.4.5.7 Table 85, f=1).
+    #[test]
+    fn mesh_type6_coons_edge_flag_continuation() {
+        let mut w = BitWriter::new();
+        // Patch A (f=0): unit-square boundary, corners red/green/blue/white.
+        w.write(0, 8);
+        let pts_a: [(u64, u64); 12] = [
+            (0, 0),
+            (0, 85),
+            (0, 170),
+            (0, 255),
+            (85, 255),
+            (170, 255),
+            (255, 255),
+            (255, 170),
+            (255, 85),
+            (255, 0),
+            (170, 0),
+            (85, 0),
+        ];
+        for (x, y) in pts_a {
+            w.write(x, 8);
+            w.write(y, 8);
+        }
+        for (r, g, b) in [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255)] {
+            w.write(r, 8);
+            w.write(g, 8);
+            w.write(b, 8);
+        }
+        w.align();
+        // Patch B (f=1): 8 new boundary points (the points after the
+        // shared edge in Coons order) + 2 new corner colours.
+        w.write(1, 8);
+        for k in 0..8u64 {
+            // Arbitrary distinct coordinates above the unit square.
+            w.write(255, 8);
+            w.write((k * 30).min(255), 8);
+        }
+        // c3, c4 of the new patch (yellow, magenta).
+        for (r, g, b) in [(255, 255, 0), (255, 0, 255)] {
+            w.write(r, 8);
+            w.write(g, 8);
+            w.write(b, 8);
+        }
+        w.align();
+        let data = w.finish();
+        let dict = Dict::new()
+            .with("ShadingType", Object::Integer(6))
+            .with("ColorSpace", Object::Name("DeviceRGB".into()))
+            .with("BitsPerCoordinate", Object::Integer(8))
+            .with("BitsPerComponent", Object::Integer(8))
+            .with("BitsPerFlag", Object::Integer(8))
+            .with("Decode", decode_rgb8())
+            .with("__MeshData", Object::HexString(data));
+        let MeshShading::Patches(patches) = evaluate_mesh_shading(&dict).unwrap() else {
+            panic!()
+        };
+        assert_eq!(patches.len(), 2);
+        let b = &patches[1];
+        let a = &patches[0];
+        // Patch B inherits patch A's top edge (p03 p13 p23 p33) as its
+        // own p00 p01 p02 p03 (§8.7.4.5.8 Table 86 f=1 geometry).
+        assert_eq!(b.control_points[0][0], a.control_points[0][3]); // B.p00 = A.p03
+        assert_eq!(b.control_points[0][3], a.control_points[3][3]); // B.p03 = A.p33
+                                                                    // Patch B inherits c1=c2prev (green), c2=c3prev (blue).
+        assert_eq!(
+            (
+                b.corner_colors[0].r,
+                b.corner_colors[0].g,
+                b.corner_colors[0].b
+            ),
+            (0, 255, 0)
+        );
+        assert_eq!(
+            (
+                b.corner_colors[1].r,
+                b.corner_colors[1].g,
+                b.corner_colors[1].b
+            ),
+            (0, 0, 255)
+        );
+        // c3, c4 of patch B are the new pair (yellow, magenta).
+        assert_eq!(
+            (
+                b.corner_colors[2].r,
+                b.corner_colors[2].g,
+                b.corner_colors[2].b
+            ),
+            (255, 255, 0)
+        );
+        assert_eq!(
+            (
+                b.corner_colors[3].r,
+                b.corner_colors[3].g,
+                b.corner_colors[3].b
+            ),
+            (255, 0, 255)
+        );
+    }
+
+    /// A shading with a `/Function` entry carries a single parametric
+    /// value `t` per vertex; the function maps it to colour components
+    /// (§8.7.4.5.5). A Type 2 exponential from black→white renders the
+    /// midpoint vertex as mid-grey.
+    #[test]
+    fn mesh_type4_with_parametric_function() {
+        let mut w = BitWriter::new();
+        // 8-bit coords, 8-bit single parametric component, 8-bit flag.
+        let vert = |w: &mut BitWriter, x: u64, y: u64, t: u64| {
+            w.write(0, 8); // f=0
+            w.write(x, 8);
+            w.write(y, 8);
+            w.write(t, 8);
+            w.align();
+        };
+        vert(&mut w, 0, 0, 0); // t=0 → black
+        vert(&mut w, 255, 0, 255); // t=1 → white
+        vert(&mut w, 0, 255, 128); // t≈0.5 → mid grey
+        let data = w.finish();
+        // Type 2 exponential: 1-in / 3-out, C0=[0 0 0], C1=[1 1 1], N=1.
+        let func = Dict::new()
+            .with("FunctionType", Object::Integer(2))
+            .with(
+                "Domain",
+                Object::Array(vec![Object::Real(0.0), Object::Real(1.0)]),
+            )
+            .with(
+                "C0",
+                Object::Array(vec![
+                    Object::Real(0.0),
+                    Object::Real(0.0),
+                    Object::Real(0.0),
+                ]),
+            )
+            .with(
+                "C1",
+                Object::Array(vec![
+                    Object::Real(1.0),
+                    Object::Real(1.0),
+                    Object::Real(1.0),
+                ]),
+            )
+            .with("N", Object::Real(1.0));
+        // With a Function the Decode array has only one colour pair.
+        let decode = Object::Array(
+            [0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+                .into_iter()
+                .map(Object::Real)
+                .collect(),
+        );
+        let dict = Dict::new()
+            .with("ShadingType", Object::Integer(4))
+            .with("ColorSpace", Object::Name("DeviceRGB".into()))
+            .with("BitsPerCoordinate", Object::Integer(8))
+            .with("BitsPerComponent", Object::Integer(8))
+            .with("BitsPerFlag", Object::Integer(8))
+            .with("Decode", decode)
+            .with("Function", Object::Dict(func))
+            .with("__MeshData", Object::HexString(data));
+        let MeshShading::Triangles(tris) = evaluate_mesh_shading(&dict).unwrap() else {
+            panic!()
+        };
+        let v = tris[0].vertices;
+        assert_eq!((v[0].color.r, v[0].color.g, v[0].color.b), (0, 0, 0));
+        assert_eq!((v[1].color.r, v[1].color.g, v[1].color.b), (255, 255, 255));
+        // t=128/255 ≈ 0.502 → ~128 grey.
+        assert!((v[2].color.r as i32 - 128).abs() <= 1);
+        assert_eq!(v[2].color.r, v[2].color.g);
+        assert_eq!(v[2].color.g, v[2].color.b);
+    }
+
+    /// A Type 1–3 shading (axial) leaves `mesh` `None` — only Types 4–7
+    /// carry mesh geometry.
+    #[test]
+    fn mesh_none_for_axial_shading() {
+        let dict = Dict::new()
+            .with("ShadingType", Object::Integer(2))
+            .with("ColorSpace", Object::Name("DeviceRGB".into()));
+        assert!(evaluate_mesh_shading(&dict).is_none());
+    }
+
+    /// An `sh` paint of a Type 4 mesh surfaces the evaluated geometry on
+    /// the `ContentShading` event (end-to-end through the `sh` operator).
+    #[test]
+    fn sh_surfaces_evaluated_mesh() {
+        let mut w = BitWriter::new();
+        let vert = |w: &mut BitWriter, x: u64, y: u64, r: u64, g: u64, b: u64| {
+            w.write(0, 8);
+            w.write(x, 8);
+            w.write(y, 8);
+            w.write(r, 8);
+            w.write(g, 8);
+            w.write(b, 8);
+            w.align();
+        };
+        vert(&mut w, 0, 0, 255, 0, 0);
+        vert(&mut w, 255, 0, 0, 255, 0);
+        vert(&mut w, 0, 255, 0, 0, 255);
+        let data = w.finish();
+        let sh1 = Dict::new()
+            .with("ShadingType", Object::Integer(4))
+            .with("ColorSpace", Object::Name("DeviceRGB".into()))
+            .with("BitsPerCoordinate", Object::Integer(8))
+            .with("BitsPerComponent", Object::Integer(8))
+            .with("BitsPerFlag", Object::Integer(8))
+            .with("Decode", decode_rgb8())
+            .with("__MeshData", Object::HexString(data));
+        let shadings = shading_res_with("Sh1", sh1);
+        let bytes = b"q /Sh1 sh Q\n";
+        let p = parse_with_shading(bytes, None, None, Some(&shadings));
+        assert_eq!(p.shadings.len(), 1);
+        let mesh = p.shadings[0].mesh.as_ref().expect("mesh surfaced");
+        let MeshShading::Triangles(tris) = mesh else {
+            panic!()
+        };
+        assert_eq!(tris.len(), 1);
     }
 }

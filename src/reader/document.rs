@@ -1371,16 +1371,55 @@ fn resolve_shading_resources(
         };
         // Type 1..3 shadings are bare dictionaries (§8.7.4.5.2..4);
         // Type 4..7 shadings are streams whose dictionary holds the
-        // same Table 78 + per-type entries plus the geometry payload
-        // in the stream body. Surface either shape as the per-name
-        // entry's resolved `Dict` — the consumer can re-fetch the
-        // stream body via the original object reference if needed.
+        // same Table 78 + per-type entries plus the bit-packed mesh
+        // geometry payload in the stream body. For a stream-shaped
+        // shading the decoded body is folded into the surfaced
+        // dictionary under the synthetic `__MeshData` key (a
+        // `HexString`), mirroring the Type 0 function `__Samples`
+        // handling, so the content parser can interpret the mesh
+        // without re-fetching the stream. Either shape's optional
+        // `/Function` entry (§8.7.4.5.5..8 — a parametric colour
+        // transform shared by mesh types) is prepared in place so the
+        // parser sees a self-contained, evaluable function.
         let d = match resolved {
             Object::Dict(d) => Some(d),
-            Object::Stream(s) => Some(s.dict),
+            Object::Stream(s) => {
+                let mesh = decode_stream(&s)?;
+                let mut d = s.dict;
+                d.set("__MeshData", Object::HexString(mesh));
+                Some(d)
+            }
             _ => None,
         };
-        if let Some(d) = d {
+        if let Some(mut d) = d {
+            if let Some((_, fobj)) = d
+                .entries()
+                .iter()
+                .find(|(k, _)| k == "Function")
+                .map(|(k, v)| (k.clone(), v.clone()))
+            {
+                // §8.7.4.5.5: `/Function` is either a single 1-in /
+                // n-out function or an array of n 1-in / 1-out
+                // functions. A reference may stand in for either; one
+                // hop is dereferenced before deciding which shape it
+                // is, then each element of an array is prepared
+                // individually.
+                let fobj = match fobj {
+                    Object::Reference(id) => reader.resolve(id)?,
+                    other => other,
+                };
+                let prepared = match fobj {
+                    Object::Array(items) => {
+                        let mut prepared = Vec::with_capacity(items.len());
+                        for f in items {
+                            prepared.push(prepare_function_object(reader, f)?);
+                        }
+                        Object::Array(prepared)
+                    }
+                    other => prepare_function_object(reader, other)?,
+                };
+                d.set("Function", prepared);
+            }
             out.set(name, Object::Dict(d));
         }
     }
@@ -2291,5 +2330,83 @@ mod tests {
         let dict = Dict::new().with("Filter", Object::Name("FlateDecode".into()));
         let stream = Stream::new(dict, compressed);
         assert_eq!(decode_stream(&stream).unwrap(), raw);
+    }
+
+    /// End-to-end document path for a Type 4 (free-form Gouraud) mesh
+    /// shading carried as a `/FlateDecode` stream resource: opening the
+    /// hand-rolled PDF, resolving its `/Resources /Shading`, and feeding
+    /// the surfaced dict to `evaluate_mesh_shading` produces the
+    /// triangle. Verifies `resolve_shading_resources` folds the
+    /// decompressed `__MeshData` body (§8.7.4.5.5).
+    #[test]
+    fn resolve_shading_folds_mesh_stream_body() {
+        use crate::reader::content::evaluate_mesh_shading_for_test;
+        // One all-coloured triangle: f=0 (0,0)R, f=0 (255,0)G, f=0 (0,255)B,
+        // 8-bit flag / coord / component, byte-aligned per vertex.
+        let mut body: Vec<u8> = Vec::new();
+        for (x, y, r, g, b) in [
+            (0u8, 0u8, 255u8, 0u8, 0u8),
+            (255, 0, 0, 255, 0),
+            (0, 255, 0, 0, 255),
+        ] {
+            body.extend_from_slice(&[0, x, y, r, g, b]); // flag, x, y, r, g, b
+        }
+        let compressed = crate::zlib::flate_compress(&body);
+
+        // Hand-roll a minimal PDF whose page `/Resources /Shading /Sh1`
+        // points at the mesh stream (object 5).
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n");
+        let mut offs: Vec<usize> = vec![0];
+        offs.push(out.len());
+        out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offs.push(out.len());
+        out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n");
+        offs.push(out.len());
+        out.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+              /Resources << /Shading << /Sh1 5 0 R >> >> >>\nendobj\n",
+        );
+        offs.push(out.len());
+        out.extend_from_slice(b"4 0 obj\n<< >>\nendobj\n");
+        offs.push(out.len());
+        let header = format!(
+            "5 0 obj\n<< /ShadingType 4 /ColorSpace /DeviceRGB \
+             /BitsPerCoordinate 8 /BitsPerComponent 8 /BitsPerFlag 8 \
+             /Decode [0 1 0 1 0 1 0 1 0 1] /Filter /FlateDecode /Length {} >>\nstream\n",
+            compressed.len()
+        );
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(&compressed);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_off = out.len();
+        out.extend_from_slice(b"xref\n0 6\n");
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for &o in &offs[1..] {
+            out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let mut reader = DocumentReader::open(&out).expect("open");
+        let resources = Dict::new().with(
+            "Shading",
+            Object::Dict(Dict::new().with("Sh1", Object::Reference(ObjectId::new(5)))),
+        );
+        let resolved = resolve_shading_resources(&mut reader, &resources)
+            .expect("resolve")
+            .expect("some shading dict");
+        let sh1 = match resolved.entries().iter().find(|(k, _)| k == "Sh1") {
+            Some((_, Object::Dict(d))) => d.clone(),
+            _ => panic!("Sh1 not a dict"),
+        };
+        // The decompressed mesh body was folded into __MeshData.
+        assert!(sh1.entries().iter().any(|(k, _)| k == "__MeshData"));
+        let mesh = evaluate_mesh_shading_for_test(&sh1).expect("mesh");
+        // One triangle with three coloured vertices.
+        assert!(format!("{mesh:?}").contains("Triangles"));
     }
 }
