@@ -438,6 +438,63 @@ pub struct ContentShading {
     /// target coordinate space (pre-`ctm`); apply `ctm` to map them to
     /// device space.
     pub mesh: Option<MeshShading>,
+    /// Evaluated gradient geometry + sampled colour stops for a Type 1–3
+    /// shading (function-based / axial / radial, §8.7.4.5.2–4). `None`
+    /// for a Type 4–7 mesh shading (use [`mesh`](Self::mesh) instead),
+    /// for a shading the caller didn't plumb resources for, or for a
+    /// shading whose colour space / function couldn't be evaluated.
+    /// Coordinates are in the shading's target coordinate space
+    /// (pre-`ctm`).
+    pub gradient: Option<ShadingGradient>,
+}
+
+/// Evaluated geometry + sampled colour for a Type 1–3 shading
+/// (§8.7.4.5.2–4). The colour function is sampled at a fixed resolution
+/// so a downstream rasteriser sees concrete RGB stops rather than an
+/// abstract function object; the geometry (axis / circles / domain
+/// rectangle) and `Extend` flags are carried so the consumer can map a
+/// device-space point to its parametric value.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ShadingGradient {
+    /// Type 2 (axial) shading (§8.7.4.5.3): a colour blend along the
+    /// linear axis from `(x0, y0)` to `(x1, y1)`.
+    Axial {
+        /// Axis endpoints `[x0, y0, x1, y1]` (`Coords`) in target space.
+        coords: [f32; 4],
+        /// `Extend` flags `[before, after]` (§8.7.4.5.3).
+        extend: [bool; 2],
+        /// Colour stops sampled uniformly across the `Domain` `[t0, t1]`,
+        /// from `t0` (first) to `t1` (last).
+        stops: Vec<Rgba>,
+    },
+    /// Type 3 (radial) shading (§8.7.4.5.4): a colour blend between the
+    /// circle `(x0, y0, r0)` and `(x1, y1, r1)`.
+    Radial {
+        /// Circle parameters `[x0, y0, r0, x1, y1, r1]` (`Coords`).
+        coords: [f32; 6],
+        /// `Extend` flags `[before, after]` (§8.7.4.5.4).
+        extend: [bool; 2],
+        /// Colour stops sampled uniformly across the `Domain` `[t0, t1]`,
+        /// from the starting circle (`s = 0`) to the ending circle
+        /// (`s = 1`).
+        stops: Vec<Rgba>,
+    },
+    /// Type 1 (function-based) shading (§8.7.4.5.2): the colour at every
+    /// point of the `Domain` rectangle is the value of a 2-in / n-out
+    /// function. Sampled onto a uniform grid over the domain.
+    FunctionBased {
+        /// Domain rectangle `[xmin, xmax, ymin, ymax]` (`Domain`).
+        domain: [f32; 4],
+        /// `Matrix` mapping the domain rectangle into target space.
+        matrix: Transform2D,
+        /// Grid width / height (samples per axis).
+        grid: (usize, usize),
+        /// `grid.0 × grid.1` sampled colours, row-major with the first
+        /// (x) axis varying fastest; sample `(i, j)` at index
+        /// `j * grid.0 + i` corresponds to domain point
+        /// `(xmin + i·dx, ymin + j·dy)`.
+        samples: Vec<Rgba>,
+    },
 }
 
 /// Evaluated geometry + colour for a Type 4–7 shading (§8.7.4.5.5–8).
@@ -2901,10 +2958,14 @@ impl<'a> State<'a> {
                     (Some(res), n) if !n.is_empty() => lookup_dict(res, n).cloned(),
                     _ => None,
                 };
-                // A Type 4–7 (mesh) shading is evaluated here into its
-                // device-space triangle / patch geometry; Types 1–3
-                // (function-based / axial / radial) leave `mesh` `None`.
+                // A Type 4–7 (mesh) shading is evaluated into its
+                // device-space triangle / patch geometry; a Type 1–3
+                // (function-based / axial / radial) shading is evaluated
+                // into sampled-colour gradient stops. Exactly one of
+                // `mesh` / `gradient` is populated (or neither, when the
+                // shading can't be reduced).
                 let mesh = shading_dict.as_ref().and_then(evaluate_mesh_shading);
+                let gradient = shading_dict.as_ref().and_then(evaluate_gradient_shading);
                 let ctm = self.effective_ctm();
                 let clip = self.current_clip();
                 self.shadings.push(ContentShading {
@@ -2913,6 +2974,7 @@ impl<'a> State<'a> {
                     ctm,
                     clip,
                     mesh,
+                    gradient,
                 });
                 self.operands.clear();
             }
@@ -3814,6 +3876,166 @@ fn evaluate_mesh_shading(dict: &Dict) -> Option<MeshShading> {
     }
 }
 
+/// Number of colour stops sampled across an axial / radial shading's
+/// parametric domain (§8.7.4.5.3–4). 64 evenly-spaced samples capture a
+/// smooth gradient at typical output resolutions; a downstream consumer
+/// interpolates between adjacent stops.
+const GRADIENT_STOPS: usize = 64;
+/// Per-axis sample count for a Type 1 (function-based) shading's domain
+/// grid (§8.7.4.5.2). 16×16 = 256 samples balances fidelity vs. size for
+/// the general 2-in / n-out colour function.
+const FUNCTION_GRID: usize = 16;
+
+/// Parse + evaluate a Type 1–3 (function-based / axial / radial) shading
+/// dictionary (§8.7.4.5.2–4) into its geometry + sampled colour stops.
+/// Returns `None` for a Type 4–7 mesh shading (use
+/// [`evaluate_mesh_shading`]), an unresolved colour space, a missing /
+/// malformed `Function`, or malformed geometry. The colour function is
+/// evaluated across the parametric `Domain` and each result reduced to
+/// device RGB through the shading's `ColorSpace`.
+fn evaluate_gradient_shading(dict: &Dict) -> Option<ShadingGradient> {
+    let get = |key: &str| {
+        dict.entries()
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    };
+    let shading_type = get("ShadingType").and_then(number_as_i64)?;
+    if !(1..=3).contains(&shading_type) {
+        return None;
+    }
+    let cs = color_space_from_object(get("ColorSpace")?);
+    if cs == ColorSpaceKind::Unknown {
+        return None;
+    }
+    let func = parse_shading_function(get("Function"))?;
+    let extend = match get("Extend") {
+        Some(Object::Array(items)) if items.len() == 2 => [
+            matches!(items[0], Object::Bool(true)),
+            matches!(items[1], Object::Bool(true)),
+        ],
+        _ => [false, false],
+    };
+    match shading_type {
+        2 => {
+            // §8.7.4.5.3: Coords = [x0 y0 x1 y1]; Domain = [t0 t1]
+            // (default [0 1]). Sample the function across [t0, t1].
+            let coords_v = get("Coords").and_then(read_num_array)?;
+            if coords_v.len() != 4 {
+                return None;
+            }
+            let coords = [coords_v[0], coords_v[1], coords_v[2], coords_v[3]];
+            let (t0, t1) = shading_domain(get("Domain"));
+            let stops = sample_stops(&cs, &func, t0, t1)?;
+            Some(ShadingGradient::Axial {
+                coords,
+                extend,
+                stops,
+            })
+        }
+        3 => {
+            // §8.7.4.5.4: Coords = [x0 y0 r0 x1 y1 r1].
+            let coords_v = get("Coords").and_then(read_num_array)?;
+            if coords_v.len() != 6 {
+                return None;
+            }
+            let coords = [
+                coords_v[0],
+                coords_v[1],
+                coords_v[2],
+                coords_v[3],
+                coords_v[4],
+                coords_v[5],
+            ];
+            let (t0, t1) = shading_domain(get("Domain"));
+            let stops = sample_stops(&cs, &func, t0, t1)?;
+            Some(ShadingGradient::Radial {
+                coords,
+                extend,
+                stops,
+            })
+        }
+        1 => {
+            // §8.7.4.5.2: Domain = [xmin xmax ymin ymax] (default
+            // [0 1 0 1]); Matrix maps the domain into target space; the
+            // 2-in / n-out Function gives the colour at each domain
+            // point. Sample onto a FUNCTION_GRID × FUNCTION_GRID grid.
+            let domain = match get("Domain").and_then(read_num_array) {
+                Some(d) if d.len() == 4 => [d[0], d[1], d[2], d[3]],
+                Some(_) => return None,
+                None => [0.0, 1.0, 0.0, 1.0],
+            };
+            let matrix = match get("Matrix").and_then(read_num_array) {
+                Some(m) if m.len() == 6 => Transform2D {
+                    a: m[0],
+                    b: m[1],
+                    c: m[2],
+                    d: m[3],
+                    e: m[4],
+                    f: m[5],
+                },
+                Some(_) => return None,
+                None => Transform2D::identity(),
+            };
+            let nx = FUNCTION_GRID;
+            let ny = FUNCTION_GRID;
+            let mut samples = Vec::with_capacity(nx * ny);
+            for j in 0..ny {
+                let y = lerp_domain(domain[2], domain[3], j, ny);
+                for i in 0..nx {
+                    let x = lerp_domain(domain[0], domain[1], i, nx);
+                    let comps = func.eval_n(&[x, y]);
+                    samples.push(rgba_from_components(&cs, &comps)?);
+                }
+            }
+            Some(ShadingGradient::FunctionBased {
+                domain,
+                matrix,
+                grid: (nx, ny),
+                samples,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Read a shading's optional `/Domain` `[t0 t1]` entry (§8.7.4.5.3–4),
+/// defaulting to `[0.0, 1.0]`.
+fn shading_domain(obj: Option<&Object>) -> (f32, f32) {
+    match obj.and_then(read_num_array) {
+        Some(d) if d.len() == 2 => (d[0], d[1]),
+        _ => (0.0, 1.0),
+    }
+}
+
+/// The `k`-th of `n` uniform samples across `[lo, hi]` (inclusive of both
+/// endpoints when `n > 1`).
+fn lerp_domain(lo: f32, hi: f32, k: usize, n: usize) -> f32 {
+    if n <= 1 {
+        return lo;
+    }
+    lo + (hi - lo) * (k as f32) / ((n - 1) as f32)
+}
+
+/// Sample an axial / radial shading's colour function at
+/// [`GRADIENT_STOPS`] uniform parametric values across `[t0, t1]`,
+/// reducing each to device RGB. Returns `None` if any sample's colour
+/// can't be reduced (unresolved alternate, arity mismatch).
+fn sample_stops(
+    cs: &ColorSpaceKind,
+    func: &ShadingFunction,
+    t0: f32,
+    t1: f32,
+) -> Option<Vec<Rgba>> {
+    let mut stops = Vec::with_capacity(GRADIENT_STOPS);
+    for k in 0..GRADIENT_STOPS {
+        let t = lerp_domain(t0, t1, k, GRADIENT_STOPS);
+        let comps = func.eval(t);
+        stops.push(rgba_from_components(cs, &comps)?);
+    }
+    Some(stops)
+}
+
 /// Parse a shading's optional `/Function` entry (§8.7.4.5.5) — either a
 /// single 1-in / n-out function or an array of n 1-in / 1-out functions
 /// (`resolve_shading_resources` has already made each self-contained).
@@ -3847,11 +4069,21 @@ impl ShadingFunction {
     /// Evaluate at parametric value `t`, returning the colour-space
     /// component vector.
     fn eval(&self, t: f32) -> Vec<f32> {
+        self.eval_n(&[t])
+    }
+
+    /// Evaluate at the `m`-input vector `inputs` (one input for axial /
+    /// radial / mesh §8.7.4.5.5 functions, two for a Type 1
+    /// function-based shading, §8.7.4.5.2), returning the colour-space
+    /// component vector. A `Single` n-out function consumes all inputs;
+    /// an `Array` of 1-out functions feeds the same inputs to each and
+    /// concatenates their first outputs.
+    fn eval_n(&self, inputs: &[f32]) -> Vec<f32> {
         match self {
-            ShadingFunction::Single(f) => f.eval(t),
+            ShadingFunction::Single(f) => f.eval_n(inputs),
             ShadingFunction::Array(fs) => fs
                 .iter()
-                .filter_map(|f| f.eval(t).first().copied())
+                .filter_map(|f| f.eval_n(inputs).first().copied())
                 .collect(),
         }
     }
@@ -7254,5 +7486,210 @@ mod tests {
             panic!()
         };
         assert_eq!(tris.len(), 1);
+    }
+
+    // ─────────── gradient shadings (Types 1–3, §8.7.4.5.2–4) ───────────
+
+    /// Build a Type 2 (exponential) function dict from black→white.
+    fn exp_black_to_white() -> Object {
+        Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(2))
+                .with(
+                    "Domain",
+                    Object::Array(vec![Object::Real(0.0), Object::Real(1.0)]),
+                )
+                .with(
+                    "C0",
+                    Object::Array(vec![
+                        Object::Real(0.0),
+                        Object::Real(0.0),
+                        Object::Real(0.0),
+                    ]),
+                )
+                .with(
+                    "C1",
+                    Object::Array(vec![
+                        Object::Real(1.0),
+                        Object::Real(1.0),
+                        Object::Real(1.0),
+                    ]),
+                )
+                .with("N", Object::Real(1.0)),
+        )
+    }
+
+    /// Type 2 axial shading: geometry + 64 colour stops from black to
+    /// white across the default domain `[0, 1]` (§8.7.4.5.3).
+    #[test]
+    fn gradient_type2_axial_samples_stops() {
+        let dict = Dict::new()
+            .with("ShadingType", Object::Integer(2))
+            .with("ColorSpace", Object::Name("DeviceRGB".into()))
+            .with(
+                "Coords",
+                Object::Array(vec![
+                    Object::Real(0.0),
+                    Object::Real(0.0),
+                    Object::Real(100.0),
+                    Object::Real(0.0),
+                ]),
+            )
+            .with("Function", exp_black_to_white())
+            .with(
+                "Extend",
+                Object::Array(vec![Object::Bool(true), Object::Bool(false)]),
+            );
+        let g = evaluate_gradient_shading(&dict).expect("gradient");
+        let ShadingGradient::Axial {
+            coords,
+            extend,
+            stops,
+        } = g
+        else {
+            panic!("expected axial")
+        };
+        assert_eq!(coords, [0.0, 0.0, 100.0, 0.0]);
+        assert_eq!(extend, [true, false]);
+        assert_eq!(stops.len(), 64);
+        // First stop t=0 → black, last t=1 → white.
+        assert_eq!((stops[0].r, stops[0].g, stops[0].b), (0, 0, 0));
+        assert_eq!((stops[63].r, stops[63].g, stops[63].b), (255, 255, 255));
+        // Monotonic increase (linear N=1 exponential).
+        assert!(stops[32].r > stops[0].r && stops[32].r < stops[63].r);
+    }
+
+    /// Type 3 radial shading: six-number `Coords` + stops (§8.7.4.5.4).
+    #[test]
+    fn gradient_type3_radial_samples_stops() {
+        let dict = Dict::new()
+            .with("ShadingType", Object::Integer(3))
+            .with("ColorSpace", Object::Name("DeviceRGB".into()))
+            .with(
+                "Coords",
+                Object::Array(
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 50.0]
+                        .into_iter()
+                        .map(Object::Real)
+                        .collect(),
+                ),
+            )
+            .with("Function", exp_black_to_white());
+        let g = evaluate_gradient_shading(&dict).expect("gradient");
+        let ShadingGradient::Radial {
+            coords,
+            extend,
+            stops,
+        } = g
+        else {
+            panic!("expected radial")
+        };
+        assert_eq!(coords, [0.0, 0.0, 0.0, 0.0, 0.0, 50.0]);
+        assert_eq!(extend, [false, false]); // default
+        assert_eq!(stops.len(), 64);
+        assert_eq!((stops[0].r, stops[0].g, stops[0].b), (0, 0, 0));
+    }
+
+    /// Type 1 function-based shading: a 2-in / 3-out Type 4 calculator
+    /// returning `(x, y, 0)` samples onto the domain grid (§8.7.4.5.2).
+    #[test]
+    fn gradient_type1_function_based_grid() {
+        // A Type 4 (PostScript-calculator) program that discards its two
+        // inputs and returns constant mid-grey `0.5 0.5 0.5`, so every
+        // grid sample is independent of (x, y) and easy to verify.
+        let program = b"{ pop pop 0.5 0.5 0.5 }".to_vec();
+        let func = Dict::new()
+            .with("FunctionType", Object::Integer(4))
+            .with(
+                "Domain",
+                Object::Array(vec![
+                    Object::Real(0.0),
+                    Object::Real(1.0),
+                    Object::Real(0.0),
+                    Object::Real(1.0),
+                ]),
+            )
+            .with(
+                "Range",
+                Object::Array(vec![
+                    Object::Real(0.0),
+                    Object::Real(1.0),
+                    Object::Real(0.0),
+                    Object::Real(1.0),
+                    Object::Real(0.0),
+                    Object::Real(1.0),
+                ]),
+            )
+            .with("__Program", Object::HexString(program));
+        let dict = Dict::new()
+            .with("ShadingType", Object::Integer(1))
+            .with("ColorSpace", Object::Name("DeviceRGB".into()))
+            .with("Function", Object::Dict(func));
+        let g = evaluate_gradient_shading(&dict).expect("gradient");
+        let ShadingGradient::FunctionBased {
+            domain,
+            grid,
+            samples,
+            ..
+        } = g
+        else {
+            panic!("expected function-based")
+        };
+        assert_eq!(domain, [0.0, 1.0, 0.0, 1.0]); // default
+        assert_eq!(grid, (16, 16));
+        assert_eq!(samples.len(), 256);
+        // Constant mid-grey program → every sample ~128.
+        for s in &samples {
+            assert!((s.r as i32 - 128).abs() <= 1);
+            assert_eq!(s.r, s.g);
+            assert_eq!(s.g, s.b);
+        }
+    }
+
+    /// A Type 4–7 mesh shading leaves `gradient` `None`; a Type 1–3
+    /// shading leaves `mesh` `None` — the two surfaces are exclusive.
+    #[test]
+    fn gradient_and_mesh_are_exclusive() {
+        let axial = Dict::new()
+            .with("ShadingType", Object::Integer(2))
+            .with("ColorSpace", Object::Name("DeviceRGB".into()))
+            .with(
+                "Coords",
+                Object::Array(vec![
+                    Object::Real(0.0),
+                    Object::Real(0.0),
+                    Object::Real(1.0),
+                    Object::Real(0.0),
+                ]),
+            )
+            .with("Function", exp_black_to_white());
+        assert!(evaluate_mesh_shading(&axial).is_none());
+        assert!(evaluate_gradient_shading(&axial).is_some());
+    }
+
+    /// `sh` of a Type 2 axial shading surfaces the gradient on the
+    /// `ContentShading` event (end-to-end through the operator).
+    #[test]
+    fn sh_surfaces_evaluated_gradient() {
+        let sh1 = Dict::new()
+            .with("ShadingType", Object::Integer(2))
+            .with("ColorSpace", Object::Name("DeviceRGB".into()))
+            .with(
+                "Coords",
+                Object::Array(vec![
+                    Object::Real(0.0),
+                    Object::Real(0.0),
+                    Object::Real(72.0),
+                    Object::Real(0.0),
+                ]),
+            )
+            .with("Function", exp_black_to_white());
+        let shadings = shading_res_with("Sh1", sh1);
+        let bytes = b"q /Sh1 sh Q\n";
+        let p = parse_with_shading(bytes, None, None, Some(&shadings));
+        assert_eq!(p.shadings.len(), 1);
+        assert!(p.shadings[0].mesh.is_none());
+        let g = p.shadings[0].gradient.as_ref().expect("gradient surfaced");
+        assert!(matches!(g, ShadingGradient::Axial { .. }));
     }
 }

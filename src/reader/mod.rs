@@ -52,7 +52,8 @@ pub use content::{
     parse_content_stream, parse_content_stream_full, parse_content_stream_full_with_color_space,
     parse_content_stream_full_with_properties, parse_content_stream_full_with_shading,
     parse_content_stream_with_resources, ContentMarkedContent, ContentShading, ContentTextShow,
-    MarkedContentOp, MeshPatch, MeshShading, MeshTriangle, MeshVertex, ParsedContent, TextShowOp,
+    MarkedContentOp, MeshPatch, MeshShading, MeshTriangle, MeshVertex, ParsedContent,
+    ShadingGradient, TextShowOp,
 };
 pub use document::{
     read_pdf_to_scene, read_pdf_to_scene_with_certificate,
