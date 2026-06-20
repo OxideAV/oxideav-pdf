@@ -1322,11 +1322,101 @@ fn resolve_font_resources(
             Object::Reference(id) => reader.resolve(*id)?,
             other => other.clone(),
         };
-        if let Object::Dict(d) = resolved {
+        if let Object::Dict(mut d) = resolved {
+            // Deep-resolve the entries the content walker's §9.4.4 text
+            // advance needs (`/Widths`, `/FontDescriptor /MissingWidth`,
+            // and for Type0 the descendant CIDFont's `/W` / `/DW`) so
+            // they are direct numerics / arrays rather than indirect
+            // references when `build_font_metrics` reads them.
+            resolve_font_widths(reader, &mut d)?;
             out.set(name, Object::Dict(d));
         }
     }
     Ok(Some(out))
+}
+
+/// Dereference the width-related entries of a single resolved font
+/// dictionary so the content walker's §9.4.4 advance sees direct
+/// values. Mutates `font` in place:
+///
+/// * `/Widths` — an indirect array reference is replaced by the
+///   resolved `Object::Array`.
+/// * `/FontDescriptor` — resolved to a direct dict (its
+///   `/MissingWidth` is read by the walker).
+/// * `/DescendantFonts` — for Type0 fonts the (usually one-element)
+///   array is resolved, its CIDFont dict dereferenced, and that
+///   CIDFont's `/W` array dereferenced. The descendant is stored back
+///   as a direct `Object::Dict` so `build_cid_metrics` finds it.
+fn resolve_font_widths(
+    reader: &mut DocumentReader<'_>,
+    font: &mut Dict,
+) -> Result<(), PdfError> {
+    // /Widths (simple fonts) — resolve an indirect array.
+    if let Some(Object::Reference(id)) = font.entries().iter().find_map(|(k, v)| {
+        if k == "Widths" {
+            Some(v.clone())
+        } else {
+            None
+        }
+    }) {
+        let resolved = reader.resolve(id)?;
+        font.set("Widths", resolved);
+    }
+    // /FontDescriptor — resolve to a direct dict for /MissingWidth.
+    if let Some(Object::Reference(id)) = font.entries().iter().find_map(|(k, v)| {
+        if k == "FontDescriptor" {
+            Some(v.clone())
+        } else {
+            None
+        }
+    }) {
+        if let Ok(Object::Dict(d)) = reader.resolve(id) {
+            font.set("FontDescriptor", Object::Dict(d));
+        }
+    }
+    // /DescendantFonts (Type0) — resolve the array + CIDFont + its /W.
+    let descendant_ref = font.entries().iter().find_map(|(k, v)| {
+        if k == "DescendantFonts" {
+            Some(v.clone())
+        } else {
+            None
+        }
+    });
+    if let Some(obj) = descendant_ref {
+        let array_obj = match obj {
+            Object::Reference(id) => reader.resolve(id)?,
+            other => other,
+        };
+        // Pull the first dict (the sole CIDFont) out of the array.
+        let cid_ref = match array_obj {
+            Object::Array(items) => items.into_iter().next(),
+            Object::Dict(d) => Some(Object::Dict(d)),
+            _ => None,
+        };
+        if let Some(cid_obj) = cid_ref {
+            let cid_obj = match cid_obj {
+                Object::Reference(id) => reader.resolve(id)?,
+                other => other,
+            };
+            if let Object::Dict(mut cid_font) = cid_obj {
+                // Resolve the CIDFont's /W array (often indirect).
+                if let Some(Object::Reference(id)) =
+                    cid_font.entries().iter().find_map(|(k, v)| {
+                        if k == "W" {
+                            Some(v.clone())
+                        } else {
+                            None
+                        }
+                    })
+                {
+                    let resolved = reader.resolve(id)?;
+                    cid_font.set("W", resolved);
+                }
+                font.set("DescendantFonts", Object::Dict(cid_font));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a page's `/Resources /Shading` subdictionary into a

@@ -736,6 +736,20 @@ struct State<'a> {
     /// to 0.0 per Table 105. Set by `TL` and by the implicit `TL` a
     /// `"` operator emits.
     text_leading: f32,
+    /// Character spacing `Tc` (§9.3.2) in unscaled text-space units.
+    /// Added to the horizontal component of every glyph's
+    /// displacement (§9.4.4). Default 0.0 (Table 105). Set by `Tc`,
+    /// and by the implicit `Tc` a `"` operator emits.
+    char_spacing: f32,
+    /// Word spacing `Tw` (§9.3.3) in unscaled text-space units.
+    /// Added to the displacement of every single-byte code 32
+    /// (ASCII space) glyph (§9.4.4). Default 0.0 (Table 105). Set by
+    /// `Tw`, and by the implicit `Tw` a `"` operator emits.
+    word_spacing: f32,
+    /// Horizontal scaling `Th` (§9.3.4), stored as a fraction
+    /// (`scale ÷ 100`). Scales the horizontal text-space displacement
+    /// (§9.4.4). Default 1.0 (Table 105 default `100`). Set by `Tz`.
+    horiz_scale: f32,
     /// Whether the parser is currently inside a `BT … ET` text
     /// object (§9.4 — operators outside a `BT` are silently ignored
     /// per Table 105). Toggled by `BT` (`true`) and `ET` (`false`).
@@ -793,6 +807,14 @@ enum Operand {
 enum ArrayElem {
     Number(f32),
     String(Vec<u8>),
+}
+
+/// One element of a `TJ` array, used while advancing the text matrix
+/// (§9.4.3 / §9.4.4): a shown string or a numeric kern adjustment
+/// (thousandths of a text-space unit).
+enum TjElem {
+    Str(Vec<u8>),
+    Kern(f32),
 }
 
 /// A PDF function (ISO 32000-1 §7.10) reduced to the two
@@ -2382,6 +2404,9 @@ impl<'a> State<'a> {
             text_matrix: Transform2D::identity(),
             text_line_matrix: Transform2D::identity(),
             text_leading: 0.0,
+            char_spacing: 0.0,
+            word_spacing: 0.0,
+            horiz_scale: 1.0,
             in_text_object: false,
             text_shows: Vec::new(),
             shadings: Vec::new(),
@@ -2775,11 +2800,37 @@ impl<'a> State<'a> {
                 }
                 self.operands.clear();
             }
-            b"Tc" | b"Tw" | b"Tz" | b"Tr" | b"Ts" => {
-                // Char-spacing / word-spacing / horizontal scale /
-                // rendering mode / rise — round-128 doesn't track
-                // these (they only affect glyph positioning, not the
-                // decoded text or the run origin). Drop operands.
+            b"Tc" => {
+                // charSpace Tc — set character spacing (§9.3.2). Feeds
+                // the §9.4.4 displacement so consecutive shows on a
+                // line advance correctly.
+                if let Some(Operand::Number(n)) = self.operands.last() {
+                    self.char_spacing = *n;
+                }
+                self.operands.clear();
+            }
+            b"Tw" => {
+                // wordSpace Tw — set word spacing (§9.3.3). Applied to
+                // single-byte code-32 glyphs in the §9.4.4
+                // displacement.
+                if let Some(Operand::Number(n)) = self.operands.last() {
+                    self.word_spacing = *n;
+                }
+                self.operands.clear();
+            }
+            b"Tz" => {
+                // scale Tz — set horizontal scaling (§9.3.4). The
+                // operand is a percentage; Th is `scale ÷ 100`.
+                if let Some(Operand::Number(n)) = self.operands.last() {
+                    self.horiz_scale = *n / 100.0;
+                }
+                self.operands.clear();
+            }
+            b"Tr" | b"Ts" => {
+                // Rendering mode / rise — these affect glyph
+                // appearance and the rendering-matrix vertical offset,
+                // not the horizontal run advance the walker tracks.
+                // Drop operands.
                 self.operands.clear();
             }
 
@@ -2863,23 +2914,51 @@ impl<'a> State<'a> {
                     Some(Operand::String(s)) => s.clone(),
                     _ => Vec::new(),
                 };
-                self.emit_text_show(bytes, TextShowOp::Tj);
+                let metrics = self.current_font_metrics();
+                self.emit_text_show(bytes.clone(), TextShowOp::Tj);
+                // §9.4.4 — advance Tm by the shown glyphs so a
+                // following show on the same line starts at the right
+                // origin.
+                self.advance_text(&bytes, &metrics);
                 self.operands.clear();
             }
             b"TJ" => {
-                // [(s1) num1 (s2) num2 …] TJ — concatenate the
-                // strings in array order. Per-element numeric
-                // displacements affect glyph kerning but not the
-                // decoded payload.
+                // [(s1) num1 (s2) num2 …] TJ — show the strings in
+                // array order, advancing the text matrix between each
+                // glyph (§9.4.4) and applying the per-element numeric
+                // kern adjustments (§9.4.3: a number `Tj` translates
+                // Tm by `−Tj/1000 × Tfs × Th`). The decoded payload
+                // surfaced on the event is the concatenation of every
+                // string element.
+                let metrics = self.current_font_metrics();
                 let mut bytes = Vec::new();
+                let mut elements: Vec<TjElem> = Vec::new();
                 if let Some(Operand::Array(items)) = self.operands.last() {
                     for el in items {
-                        if let ArrayElem::String(s) = el {
-                            bytes.extend_from_slice(s);
+                        match el {
+                            ArrayElem::String(s) => {
+                                bytes.extend_from_slice(s);
+                                elements.push(TjElem::Str(s.clone()));
+                            }
+                            ArrayElem::Number(n) => elements.push(TjElem::Kern(*n)),
                         }
                     }
                 }
+                // Record the show at the array's start origin first.
                 self.emit_text_show(bytes, TextShowOp::TJ);
+                let tfs = self.current_font.as_ref().map(|(_, s)| *s).unwrap_or(0.0);
+                let th = self.horiz_scale;
+                for el in elements {
+                    match el {
+                        TjElem::Str(s) => self.advance_text(&s, &metrics),
+                        TjElem::Kern(adj) => {
+                            // A positive kern moves the next glyph
+                            // *left* (§9.4.3): tx = −adj/1000 × Tfs × Th.
+                            let tx = -adj / 1000.0 * tfs * th;
+                            self.translate_text(tx);
+                        }
+                    }
+                }
                 self.operands.clear();
             }
             b"'" => {
@@ -2900,12 +2979,25 @@ impl<'a> State<'a> {
                     Some(Operand::String(s)) => s.clone(),
                     _ => Vec::new(),
                 };
-                self.emit_text_show(bytes, TextShowOp::SingleQuote);
+                let metrics = self.current_font_metrics();
+                self.emit_text_show(bytes.clone(), TextShowOp::SingleQuote);
+                self.advance_text(&bytes, &metrics);
                 self.operands.clear();
             }
             b"\"" => {
-                // aw ac string " — set word + char spacing (which we
-                // don't track), implicit T*, then Tj.
+                // aw ac string " — set word spacing (aw) + char spacing
+                // (ac), do an implicit T*, then show like Tj
+                // (§9.4.3 / Table 109). The two leading numeric
+                // operands set Tw and Tc for this and subsequent shows.
+                let (aw, ac) = match (
+                    self.operands.iter().rev().nth(2),
+                    self.operands.iter().rev().nth(1),
+                ) {
+                    (Some(Operand::Number(aw)), Some(Operand::Number(ac))) => (*aw, *ac),
+                    _ => (self.word_spacing, self.char_spacing),
+                };
+                self.word_spacing = aw;
+                self.char_spacing = ac;
                 let leading = self.text_leading;
                 let m = Transform2D {
                     a: 1.0,
@@ -2921,7 +3013,9 @@ impl<'a> State<'a> {
                     Some(Operand::String(s)) => s.clone(),
                     _ => Vec::new(),
                 };
-                self.emit_text_show(bytes, TextShowOp::DoubleQuote);
+                let metrics = self.current_font_metrics();
+                self.emit_text_show(bytes.clone(), TextShowOp::DoubleQuote);
+                self.advance_text(&bytes, &metrics);
                 self.operands.clear();
             }
 
@@ -3214,6 +3308,75 @@ impl<'a> State<'a> {
             position: (self.text_matrix.e, self.text_matrix.f),
             operator,
         });
+    }
+
+    /// Resolve the currently-selected font (`Tf` name) into
+    /// [`FontMetrics`]. Returns [`FontMetrics::None`] when no font is
+    /// set, the name isn't in `/Resources /Font`, or the dict carries
+    /// no resolvable width data.
+    fn current_font_metrics(&self) -> FontMetrics {
+        let name = match &self.current_font {
+            Some((n, _)) if !n.is_empty() => n.as_str(),
+            _ => return FontMetrics::None,
+        };
+        match self.font_resources.and_then(|fr| lookup_dict(fr, name)) {
+            Some(d) => build_font_metrics(d),
+            None => FontMetrics::None,
+        }
+    }
+
+    /// Advance the text matrix `Tm` by the displacement of every glyph
+    /// in `bytes`, per §9.4.4. `metrics` supplies the per-glyph widths;
+    /// the current `char_spacing` / `word_spacing` / `horiz_scale` /
+    /// font size feed the displacement equation
+    ///
+    /// ```text
+    /// tx = ((w0 − Tj/1000)·Tfs + Tc + Tw)·Th
+    /// ```
+    ///
+    /// with `Tj = 0` (the per-element `TJ` kern is applied separately).
+    /// `Tw` is added only for the single-byte code 32 (ASCII space) per
+    /// §9.3.3. Word/char spacing and `Th` scaling are applied even when
+    /// `metrics` is [`FontMetrics::None`] (`w0 = 0`), so spacing-only
+    /// adjustments still move the origin.
+    fn advance_text(&mut self, bytes: &[u8], metrics: &FontMetrics) {
+        let tfs = self.current_font.as_ref().map(|(_, s)| *s).unwrap_or(0.0);
+        let th = self.horiz_scale;
+        let tc = self.char_spacing;
+        if metrics.two_byte() {
+            // Composite Identity font: each code is two bytes, CID =
+            // code; Tw never applies to multi-byte codes (§9.3.3).
+            let mut i = 0;
+            while i + 1 < bytes.len() {
+                let cid = ((bytes[i] as i64) << 8) | bytes[i + 1] as i64;
+                let w0 = metrics.width(cid) / 1000.0;
+                let tx = (w0 * tfs + tc) * th;
+                self.translate_text(tx);
+                i += 2;
+            }
+        } else {
+            for &b in bytes {
+                let w0 = metrics.width(b as i64) / 1000.0;
+                let tw = if b == 32 { self.word_spacing } else { 0.0 };
+                let tx = (w0 * tfs + tc + tw) * th;
+                self.translate_text(tx);
+            }
+        }
+    }
+
+    /// Translate the text matrix by `(tx, 0)` in text space — the
+    /// horizontal-writing displacement of §9.4.4
+    /// (`Tm_new = [1 0 0 1 tx 0] × Tm`).
+    fn translate_text(&mut self, tx: f32) {
+        let m = Transform2D {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: tx,
+            f: 0.0,
+        };
+        self.text_matrix = compose(self.text_matrix, m);
     }
 
     /// Apply the entries of a `/Type /ExtGState` parameter dictionary
@@ -4742,6 +4905,240 @@ fn lookup_dict<'a>(dict: &'a Dict, key: &str) -> Option<&'a Dict> {
             Object::Dict(d) => Some(d),
             _ => None,
         })
+}
+
+/// Per-glyph horizontal advance metrics resolved from a font
+/// dictionary, in glyph-space units (thousandths of a text-space
+/// unit; §9.2.4). Used by the text-showing operators to apply the
+/// §9.4.4 displacement and so advance the text matrix between
+/// consecutive glyphs / shows.
+///
+/// Built by [`build_font_metrics`] from the already-resolved
+/// `/Resources /Font /Fx` dictionary. The walker requires the
+/// document-level resolver to have deep-resolved the width data
+/// (`/Widths` array entries, and for composite fonts the descendant
+/// CIDFont's `/W` / `/DW`) so the values are direct numerics here —
+/// matching the one-hop-resolved resource contract the rest of the
+/// walker relies on.
+#[derive(Clone, Debug)]
+enum FontMetrics {
+    /// Simple font (Type1 / TrueType / Type3, §9.6): one byte per
+    /// code. `widths[code − first_char]` gives the advance; codes
+    /// outside `[first_char, first_char + widths.len())` use
+    /// `missing_width`.
+    Simple {
+        first_char: i64,
+        widths: Vec<f32>,
+        missing_width: f32,
+    },
+    /// Composite (Type0) font (§9.7): two bytes per code under the
+    /// Identity-H/V CMaps the writer emits, where the CID equals the
+    /// code. `default_width` is the CIDFont `/DW` (default 1000);
+    /// `ranges` are the parsed `/W` entries (start CID, run of
+    /// per-CID widths).
+    Cid {
+        default_width: f32,
+        ranges: Vec<(i64, Vec<f32>)>,
+        two_byte: bool,
+    },
+    /// No width data could be resolved — every glyph advances by 0,
+    /// so consecutive shows keep the prior behaviour of reporting the
+    /// run origin without a per-glyph step.
+    None,
+}
+
+impl FontMetrics {
+    /// Horizontal advance (glyph-space, thousandths) for one code.
+    /// `is_cid` callers pass the CID; simple-font callers pass the
+    /// byte. Returns 0.0 for [`FontMetrics::None`].
+    fn width(&self, code: i64) -> f32 {
+        match self {
+            FontMetrics::Simple {
+                first_char,
+                widths,
+                missing_width,
+            } => {
+                let idx = code - first_char;
+                if idx >= 0 && (idx as usize) < widths.len() {
+                    widths[idx as usize]
+                } else {
+                    *missing_width
+                }
+            }
+            FontMetrics::Cid {
+                default_width,
+                ranges,
+                ..
+            } => {
+                for (start, run) in ranges {
+                    let off = code - start;
+                    if off >= 0 && (off as usize) < run.len() {
+                        return run[off as usize];
+                    }
+                }
+                *default_width
+            }
+            FontMetrics::None => 0.0,
+        }
+    }
+
+    /// Whether codes are two bytes wide (composite Identity fonts).
+    fn two_byte(&self) -> bool {
+        matches!(self, FontMetrics::Cid { two_byte: true, .. })
+    }
+}
+
+/// Resolve a font dictionary into [`FontMetrics`].
+///
+/// * **Simple fonts** (§9.6.2.1, Table 111): `/FirstChar`, `/Widths`
+///   (array of numbers), and `/MissingWidth` (from `/FontDescriptor`,
+///   default 0). When `/Widths` is absent the metrics are
+///   [`FontMetrics::None`] — the standard-14 base fonts omit `/Widths`
+///   and their built-in AFM metrics aren't available clean-room here.
+/// * **Composite (Type0) fonts** (§9.7.4.3): the descendant CIDFont's
+///   `/W` array (two-or-three-element groups, §9.7.4.3) and `/DW`
+///   default (default 1000). The walker only resolves the Identity
+///   CMaps, where CID = 2-byte code.
+fn build_font_metrics(font: &Dict) -> FontMetrics {
+    let subtype = font
+        .entries()
+        .iter()
+        .find_map(|(k, v)| match (k.as_str(), v) {
+            ("Subtype", Object::Name(s)) => Some(s.as_str()),
+            _ => None,
+        });
+    if subtype == Some("Type0") {
+        return build_cid_metrics(font);
+    }
+
+    // Simple font: /FirstChar + /Widths (+ /MissingWidth in the
+    // /FontDescriptor). When the document-level resolver has
+    // dereferenced /Widths it is a direct Array of numbers here.
+    let first_char = font
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "FirstChar")
+        .and_then(|(_, v)| number_as_i64(v))
+        .unwrap_or(0);
+    let widths = match font.entries().iter().find(|(k, _)| k == "Widths") {
+        Some((_, Object::Array(items))) => items
+            .iter()
+            .map(|o| number_as_f32(o).unwrap_or(0.0))
+            .collect(),
+        _ => Vec::new(),
+    };
+    if widths.is_empty() {
+        return FontMetrics::None;
+    }
+    let missing_width = font
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "FontDescriptor")
+        .and_then(|(_, v)| match v {
+            Object::Dict(d) => d
+                .entries()
+                .iter()
+                .find(|(k, _)| k == "MissingWidth")
+                .and_then(|(_, v)| number_as_f32(v)),
+            _ => None,
+        })
+        .unwrap_or(0.0);
+    FontMetrics::Simple {
+        first_char,
+        widths,
+        missing_width,
+    }
+}
+
+/// Resolve a Type0 font's descendant CIDFont metrics (§9.7.4.3).
+///
+/// The descendant CIDFont sits in `/DescendantFonts` (a one-element
+/// array). Its `/DW` is the default width (default 1000) and `/W` is
+/// the per-CID width array. `/W` groups are either `c [w1 w2 … wn]`
+/// (consecutive widths starting at CID `c`) or `cfirst clast w` (the
+/// single width `w` for every CID in `[cfirst, clast]`).
+fn build_cid_metrics(font: &Dict) -> FontMetrics {
+    // /Encoding decides the code width. Identity-H/V (the only CMaps
+    // the writer emits, and the only ones the walker resolves) are
+    // two-byte, CID = code. A non-Identity named CMap or an embedded
+    // CMap stream can't be resolved clean-room here, so the safest
+    // default is the two-byte Identity assumption.
+    let two_byte = true;
+    let descendant = font
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "DescendantFonts")
+        .and_then(|(_, v)| match v {
+            // The document-level resolver flattens the one-element
+            // array to the CIDFont dict directly, or leaves it as an
+            // array whose first element is the dict.
+            Object::Dict(d) => Some(d.clone()),
+            Object::Array(items) => items.iter().find_map(|o| match o {
+                Object::Dict(d) => Some(d.clone()),
+                _ => None,
+            }),
+            _ => None,
+        });
+    let Some(cid_font) = descendant else {
+        return FontMetrics::Cid {
+            default_width: 1000.0,
+            ranges: Vec::new(),
+            two_byte,
+        };
+    };
+    let default_width = cid_font
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "DW")
+        .and_then(|(_, v)| number_as_f32(v))
+        .unwrap_or(1000.0);
+    let ranges = match cid_font.entries().iter().find(|(k, _)| k == "W") {
+        Some((_, Object::Array(items))) => parse_cid_widths(items),
+        _ => Vec::new(),
+    };
+    FontMetrics::Cid {
+        default_width,
+        ranges,
+        two_byte,
+    }
+}
+
+/// Parse a CIDFont `/W` array (§9.7.4.3) into `(start_cid, widths)`
+/// runs. Tolerates malformed groups by skipping forward.
+fn parse_cid_widths(items: &[Object]) -> Vec<(i64, Vec<f32>)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        let Some(c) = number_as_i64(&items[i]) else {
+            i += 1;
+            continue;
+        };
+        match items.get(i + 1) {
+            // `c [w1 w2 … wn]` — explicit per-CID widths.
+            Some(Object::Array(ws)) => {
+                let run: Vec<f32> = ws.iter().map(|o| number_as_f32(o).unwrap_or(0.0)).collect();
+                out.push((c, run));
+                i += 2;
+            }
+            // `cfirst clast w` — one width over a CID range.
+            Some(obj) => {
+                let clast = number_as_i64(obj);
+                let w = items.get(i + 2).and_then(number_as_f32);
+                match (clast, w) {
+                    (Some(clast), Some(w)) if clast >= c => {
+                        let count = (clast - c + 1).min(1 << 20) as usize;
+                        out.push((c, vec![w; count]));
+                        i += 3;
+                    }
+                    _ => {
+                        i += 1;
+                    }
+                }
+            }
+            None => break,
+        }
+    }
+    out
 }
 
 /// Multiply a [`Paint`]'s carried alpha by a Table 58 alpha constant
@@ -7691,5 +8088,140 @@ mod tests {
         assert!(p.shadings[0].mesh.is_none());
         let g = p.shadings[0].gradient.as_ref().expect("gradient surfaced");
         assert!(matches!(g, ShadingGradient::Axial { .. }));
+    }
+
+    /// Build a simple font with explicit per-code `/Widths` so the
+    /// §9.4.4 advance can be exercised. Each ASCII code from
+    /// `first_char` onward gets the given width (glyph-space units).
+    fn simple_font_with_widths(first_char: i64, widths: &[i64]) -> Dict {
+        let arr: Vec<Object> = widths.iter().map(|w| Object::Integer(*w)).collect();
+        Dict::new()
+            .with("Type", Object::Name("Font".into()))
+            .with("Subtype", Object::Name("Type1".into()))
+            .with("FirstChar", Object::Integer(first_char))
+            .with("Widths", Object::Array(arr))
+    }
+
+    /// Two consecutive `Tj` operators on the same line: the second
+    /// show's origin equals the first plus the sum of the first
+    /// string's glyph advances (§9.4.4). Without the advance both
+    /// would report the same x.
+    #[test]
+    fn consecutive_tj_advances_text_matrix_by_widths() {
+        // 'A' = 65, 'B' = 66 — first_char 65, widths 500 / 250
+        // (glyph-space thousandths).
+        let f1 = simple_font_with_widths(65, &[500, 250]);
+        let fonts = font_res_with("F1", f1);
+        // Font size 10 ⇒ each unit-thousandth contributes size/1000.
+        let bytes = b"BT /F1 10 Tf 0 700 Td (A) Tj (B) Tj ET\n";
+        let p = parse_full(bytes, None, Some(&fonts));
+        assert_eq!(p.text_shows.len(), 2);
+        // First show at the run origin.
+        assert!((p.text_shows[0].position.0 - 0.0).abs() < 1e-3);
+        // Second show advanced by 'A' width = 500/1000 * 10 = 5.0.
+        assert!(
+            (p.text_shows[1].position.0 - 5.0).abs() < 1e-3,
+            "got {}",
+            p.text_shows[1].position.0
+        );
+        assert!((p.text_shows[1].position.1 - 700.0).abs() < 1e-3);
+    }
+
+    /// Character spacing `Tc` adds to every glyph's advance (§9.3.2 /
+    /// §9.4.4); word spacing `Tw` adds only to ASCII-space glyphs.
+    #[test]
+    fn tc_tw_feed_the_advance() {
+        // Codes: space(32)=250, 'A'(65)=500. first_char 32, the
+        // widths array spans 32..=65.
+        let mut widths = vec![0i64; 66 - 32];
+        widths[0] = 250; // space
+        widths[65 - 32] = 500; // 'A'
+        let f1 = simple_font_with_widths(32, &widths);
+        let fonts = font_res_with("F1", f1);
+        // Tc=2, Tw=3, size 10. Show "A A" (three glyphs); the second
+        // Tj origin is the sum of all three advances:
+        //   'A'  : (500/1000*10 + 2)        = 7
+        //   ' '  : (250/1000*10 + 2 + 3)    = 7.5
+        //   'A'  : (500/1000*10 + 2)        = 7
+        // Second Tj origin = 7 + 7.5 + 7 = 21.5.
+        let bytes = b"BT /F1 10 Tf 2 Tc 3 Tw 0 0 Td (A A) Tj (X) Tj ET\n";
+        let p = parse_full(bytes, None, Some(&fonts));
+        assert_eq!(p.text_shows.len(), 2);
+        assert!(
+            (p.text_shows[1].position.0 - 21.5).abs() < 1e-3,
+            "got {}",
+            p.text_shows[1].position.0
+        );
+    }
+
+    /// Horizontal scaling `Tz` scales the whole horizontal advance
+    /// (§9.3.4 / §9.4.4).
+    #[test]
+    fn tz_scales_the_advance() {
+        let f1 = simple_font_with_widths(65, &[1000]);
+        let fonts = font_res_with("F1", f1);
+        // Tz 50 ⇒ Th = 0.5. 'A' advance = 1000/1000*10*0.5 = 5.0.
+        let bytes = b"BT /F1 10 Tf 50 Tz 0 0 Td (A) Tj (A) Tj ET\n";
+        let p = parse_full(bytes, None, Some(&fonts));
+        assert_eq!(p.text_shows.len(), 2);
+        assert!(
+            (p.text_shows[1].position.0 - 5.0).abs() < 1e-3,
+            "got {}",
+            p.text_shows[1].position.0
+        );
+    }
+
+    /// A `TJ` array applies the per-element kern adjustments (§9.4.3:
+    /// `tx = −adj/1000 × Tfs × Th`) in addition to the glyph widths.
+    #[test]
+    fn tj_array_kern_adjusts_origin() {
+        let f1 = simple_font_with_widths(65, &[1000, 1000]); // 'A','B'
+        let fonts = font_res_with("F1", f1);
+        // [ (A) -100 (B) ] : 'A' advance = 10, kern -(-100)/1000*10 =
+        // +1, so total advance through the array before the next show
+        // = 10 + 1 + (B advance 10) = 21.
+        let bytes = b"BT /F1 10 Tf 0 0 Td [(A) -100 (B)] TJ (C) Tj ET\n";
+        let p = parse_full(bytes, None, Some(&fonts));
+        assert_eq!(p.text_shows.len(), 2);
+        assert!(
+            (p.text_shows[1].position.0 - 21.0).abs() < 1e-3,
+            "got {}",
+            p.text_shows[1].position.0
+        );
+    }
+
+    /// A composite (Type0 / Identity-H) font advances by two-byte
+    /// CIDs read from the `/W` array, defaulting to `/DW` (§9.7.4.3).
+    #[test]
+    fn type0_cid_font_advances_by_w_array() {
+        // Descendant CIDFont: DW 1000, W = [ 1 [500] ] ⇒ CID 1 = 500.
+        let cidfont = Dict::new()
+            .with("Type", Object::Name("Font".into()))
+            .with("Subtype", Object::Name("CIDFontType2".into()))
+            .with("DW", Object::Integer(1000))
+            .with(
+                "W",
+                Object::Array(vec![
+                    Object::Integer(1),
+                    Object::Array(vec![Object::Integer(500)]),
+                ]),
+            );
+        let f0 = Dict::new()
+            .with("Type", Object::Name("Font".into()))
+            .with("Subtype", Object::Name("Type0".into()))
+            .with("Encoding", Object::Name("Identity-H".into()))
+            .with("DescendantFonts", Object::Dict(cidfont));
+        let fonts = font_res_with("F0", f0);
+        // Two 2-byte codes: <0001> (CID 1, width 500) then <0002>
+        // (CID 2, default 1000). Show <00010002>, then a second show.
+        // Advance = (500/1000 + 1000/1000) * 10 = 15.
+        let bytes = b"BT /F0 10 Tf 0 0 Td <00010002> Tj (X) Tj ET\n";
+        let p = parse_full(bytes, None, Some(&fonts));
+        assert_eq!(p.text_shows.len(), 2);
+        assert!(
+            (p.text_shows[1].position.0 - 15.0).abs() < 1e-3,
+            "got {}",
+            p.text_shows[1].position.0
+        );
     }
 }
