@@ -179,6 +179,10 @@ for an end-to-end verify.
   the Adobe Glyph List, including `uniXXXX` / `uXXXXXXXX` escapes). `TJ`
   word-break gaps are recovered, and each run carries its text render
   mode (`Tr` — including the invisible OCR layer) and text rise (`Ts`).
+  Consecutive shows on one line advance the text origin per §9.4.4
+  (`tx = ((w0 − Tj/1000)·Tfs + Tc + Tw)·Th`) using per-glyph `/Widths`
+  (simple) or `/W` / `/DW` (Type0 Identity) metrics, so runs without an
+  explicit `Td` / `Tm` still get distinct positions.
 - **Logical reading order** — `read_in_logical_order()` walks the
   `/StructTreeRoot` tree (Tagged PDF, §14.6–14.8) and emits runs in
   author order, falling back to raster order when no struct tree exists.

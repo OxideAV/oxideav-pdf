@@ -393,14 +393,240 @@ fn walk_pages(
 /// Per-font byte→Unicode decoders keyed by `/Resources /Font` slot.
 type PageFonts = HashMap<String, FontDecoder>;
 
+/// Per-font horizontal advance metrics (glyph-space thousandths),
+/// used by the extraction walker to apply the §9.4.4 text-space
+/// displacement and so report a distinct origin for each text run on a
+/// line that lacks explicit `Td` / `Tm` repositioning.
+///
+/// Resolved by [`build_font_advance`] from the font dictionary at
+/// page-load time (where the [`DocumentReader`] is available to
+/// dereference indirect `/Widths` / `/W` arrays).
+#[derive(Clone, Debug)]
+enum FontAdvance {
+    /// Simple font (one byte per code, §9.6): `widths[code − first]`,
+    /// falling back to `missing` outside the array's range.
+    Simple {
+        first: i64,
+        widths: Vec<f32>,
+        missing: f32,
+    },
+    /// Composite Identity font (two bytes per code, CID = code,
+    /// §9.7.4.3): `/W` runs over `default` (the `/DW`).
+    Cid {
+        default: f32,
+        ranges: Vec<(i64, Vec<f32>)>,
+    },
+    /// No resolvable widths — every glyph advances 0 (prior behaviour).
+    None,
+}
+
+impl FontAdvance {
+    fn width(&self, code: i64) -> f32 {
+        match self {
+            FontAdvance::Simple {
+                first,
+                widths,
+                missing,
+            } => {
+                let idx = code - first;
+                if idx >= 0 && (idx as usize) < widths.len() {
+                    widths[idx as usize]
+                } else {
+                    *missing
+                }
+            }
+            FontAdvance::Cid { default, ranges } => {
+                for (start, run) in ranges {
+                    let off = code - start;
+                    if off >= 0 && (off as usize) < run.len() {
+                        return run[off as usize];
+                    }
+                }
+                *default
+            }
+            FontAdvance::None => 0.0,
+        }
+    }
+
+    fn is_cid(&self) -> bool {
+        matches!(self, FontAdvance::Cid { .. })
+    }
+}
+
+/// Read a font dictionary's horizontal advance metrics into a
+/// [`FontAdvance`] (§9.6.2.1 simple `/Widths`; §9.7.4.3 composite
+/// `/W` + `/DW`). Indirect `/Widths`, `/FontDescriptor`,
+/// `/DescendantFonts` and `/W` references are dereferenced through
+/// `reader`.
+fn build_font_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvance {
+    let subtype = font
+        .entries()
+        .iter()
+        .find_map(|(k, v)| match (k.as_str(), v) {
+            ("Subtype", Object::Name(s)) => Some(s.as_str()),
+            _ => None,
+        });
+    if subtype == Some("Type0") {
+        return build_cid_advance(reader, font);
+    }
+    let first = font
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "FirstChar")
+        .and_then(|(_, v)| obj_as_i64(v))
+        .unwrap_or(0);
+    let widths_obj = font
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Widths")
+        .map(|(_, v)| v.clone());
+    let widths_obj = match widths_obj {
+        Some(Object::Reference(id)) => reader.resolve(id).ok(),
+        other => other,
+    };
+    let widths: Vec<f32> = match widths_obj {
+        Some(Object::Array(items)) => items.iter().map(|o| obj_as_f32(o).unwrap_or(0.0)).collect(),
+        _ => Vec::new(),
+    };
+    if widths.is_empty() {
+        return FontAdvance::None;
+    }
+    // /MissingWidth lives in the /FontDescriptor (§9.8.1 Table 122).
+    let descr = font
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "FontDescriptor")
+        .map(|(_, v)| v.clone());
+    let descr = match descr {
+        Some(Object::Reference(id)) => reader.resolve(id).ok(),
+        other => other,
+    };
+    let missing = match descr {
+        Some(Object::Dict(d)) => d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "MissingWidth")
+            .and_then(|(_, v)| obj_as_f32(v))
+            .unwrap_or(0.0),
+        _ => 0.0,
+    };
+    FontAdvance::Simple {
+        first,
+        widths,
+        missing,
+    }
+}
+
+/// Resolve a Type0 font's descendant CIDFont advance metrics
+/// (§9.7.4.3): `/DW` default + `/W` per-CID runs.
+fn build_cid_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvance {
+    let desc_obj = font
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "DescendantFonts")
+        .map(|(_, v)| v.clone());
+    let desc_obj = match desc_obj {
+        Some(Object::Reference(id)) => reader.resolve(id).ok(),
+        other => other,
+    };
+    // Pull the sole CIDFont dict out of the (usually one-element) array.
+    let cid_obj = match desc_obj {
+        Some(Object::Array(items)) => items.into_iter().next(),
+        Some(Object::Dict(d)) => Some(Object::Dict(d)),
+        _ => None,
+    };
+    let cid_obj = match cid_obj {
+        Some(Object::Reference(id)) => reader.resolve(id).ok(),
+        other => other,
+    };
+    let Some(Object::Dict(cid_font)) = cid_obj else {
+        return FontAdvance::Cid {
+            default: 1000.0,
+            ranges: Vec::new(),
+        };
+    };
+    let default = cid_font
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "DW")
+        .and_then(|(_, v)| obj_as_f32(v))
+        .unwrap_or(1000.0);
+    let w_obj = cid_font
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "W")
+        .map(|(_, v)| v.clone());
+    let w_obj = match w_obj {
+        Some(Object::Reference(id)) => reader.resolve(id).ok(),
+        other => other,
+    };
+    let ranges = match w_obj {
+        Some(Object::Array(items)) => parse_w_array(&items),
+        _ => Vec::new(),
+    };
+    FontAdvance::Cid { default, ranges }
+}
+
+/// Parse a CIDFont `/W` array (§9.7.4.3) into `(start_cid, widths)`
+/// runs. Groups are `c [w1 … wn]` or `cfirst clast w`.
+fn parse_w_array(items: &[Object]) -> Vec<(i64, Vec<f32>)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        let Some(c) = obj_as_i64(&items[i]) else {
+            i += 1;
+            continue;
+        };
+        match items.get(i + 1) {
+            Some(Object::Array(ws)) => {
+                let run: Vec<f32> = ws.iter().map(|o| obj_as_f32(o).unwrap_or(0.0)).collect();
+                out.push((c, run));
+                i += 2;
+            }
+            Some(obj) => {
+                let clast = obj_as_i64(obj);
+                let w = items.get(i + 2).and_then(obj_as_f32);
+                match (clast, w) {
+                    (Some(clast), Some(w)) if clast >= c => {
+                        let count = (clast - c + 1).min(1 << 20) as usize;
+                        out.push((c, vec![w; count]));
+                        i += 3;
+                    }
+                    _ => i += 1,
+                }
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+fn obj_as_f32(o: &Object) -> Option<f32> {
+    match o {
+        Object::Integer(i) => Some(*i as f32),
+        Object::Real(r) => Some(*r as f32),
+        _ => None,
+    }
+}
+
+fn obj_as_i64(o: &Object) -> Option<i64> {
+    match o {
+        Object::Integer(i) => Some(*i),
+        Object::Real(r) => Some(*r as i64),
+        _ => None,
+    }
+}
+
 /// Resolve a page leaf into the pieces the text walker needs:
 /// per-font byte→Unicode decoders + the concatenated content stream.
 /// Returns `None` when the page has no `/Contents` (a perfectly valid
 /// blank page — emit nothing).
+type PageAdvances = HashMap<String, FontAdvance>;
+
 fn load_page_for_text(
     reader: &mut DocumentReader<'_>,
     page_id: ObjectId,
-) -> Result<Option<(PageFonts, Vec<u8>)>, PdfError> {
+) -> Result<Option<(PageFonts, PageAdvances, Vec<u8>)>, PdfError> {
     let page_obj = reader.resolve(page_id)?;
     let Object::Dict(page_dict) = page_obj else {
         return Ok(None);
@@ -421,6 +647,7 @@ fn load_page_for_text(
         None => return Ok(None),
     };
     let mut fonts: HashMap<String, FontDecoder> = HashMap::new();
+    let mut advances: HashMap<String, FontAdvance> = HashMap::new();
     if let Object::Dict(rdict) = resources {
         let font_dict = rdict
             .entries()
@@ -441,6 +668,8 @@ fn load_page_for_text(
                     if let Object::Dict(font_d) = resolved {
                         let decoder = FontDecoder::from_dict(reader, &font_d)?;
                         fonts.insert(name.clone(), decoder);
+                        let advance = build_font_advance(reader, &font_d);
+                        advances.insert(name.clone(), advance);
                     }
                 }
             }
@@ -468,7 +697,7 @@ fn load_page_for_text(
         _ => return Ok(None),
     };
 
-    Ok(Some((fonts, content_bytes)))
+    Ok(Some((fonts, advances, content_bytes)))
 }
 
 fn extract_page(
@@ -476,10 +705,10 @@ fn extract_page(
     page_id: ObjectId,
     out: &mut PdfTextExtraction,
 ) -> Result<(), PdfError> {
-    let Some((fonts, content_bytes)) = load_page_for_text(reader, page_id)? else {
+    let Some((fonts, advances, content_bytes)) = load_page_for_text(reader, page_id)? else {
         return Ok(());
     };
-    let mut walker = TextWalker::new(fonts);
+    let mut walker = TextWalker::new(fonts, advances);
     walker.parse(&content_bytes)?;
     out.runs.extend(walker.into_runs());
     Ok(())
@@ -491,10 +720,10 @@ fn extract_page_marked(
     page_index: u32,
     out: &mut PdfMarkedTextExtraction,
 ) -> Result<(), PdfError> {
-    let Some((fonts, content_bytes)) = load_page_for_text(reader, page_id)? else {
+    let Some((fonts, advances, content_bytes)) = load_page_for_text(reader, page_id)? else {
         return Ok(());
     };
-    let mut walker = TextWalker::new(fonts);
+    let mut walker = TextWalker::new(fonts, advances);
     walker.track_mcid = true;
     walker.parse(&content_bytes)?;
     let runs = walker.into_runs_with_mcid();
@@ -1249,6 +1478,9 @@ fn skip_token(bytes: &[u8], i: usize) -> usize {
 /// font + size and emit one [`TextRun`] per show.
 struct TextWalker {
     fonts: HashMap<String, FontDecoder>,
+    /// Per-font horizontal advance metrics (§9.4.4), keyed like
+    /// `fonts`. Drives the post-show text-matrix advance.
+    advances: HashMap<String, FontAdvance>,
     runs: Vec<TextRun>,
     /// Parallel to `runs`: the MCID in scope at the moment of each
     /// emit. Populated even when `track_mcid` is false (it's free —
@@ -1288,6 +1520,15 @@ struct TextWalker {
     /// `BT` (Table 105: `Ts` is a graphics-state text parameter, not a
     /// text-object parameter). Saved / restored by `q` / `Q`.
     text_rise: f32,
+    /// Character spacing `Tc` (§9.3.2), unscaled text-space units.
+    /// Added to every glyph's §9.4.4 advance. Default 0.0.
+    char_spacing: f32,
+    /// Word spacing `Tw` (§9.3.3), unscaled text-space units. Added to
+    /// single-byte code-32 glyphs in the §9.4.4 advance. Default 0.0.
+    word_spacing: f32,
+    /// Horizontal scaling `Th` (§9.3.4) as a fraction (`scale ÷ 100`).
+    /// Scales the §9.4.4 horizontal advance. Default 1.0.
+    horiz_scale: f32,
     /// Saved text states — one entry per `q`. We don't push the whole
     /// graphics state (paint, transform, etc.) since the path walker
     /// already covers those; just the text-relevant slots.
@@ -1341,12 +1582,16 @@ struct SavedTextState {
     leading: f32,
     render_mode: TextRenderMode,
     text_rise: f32,
+    char_spacing: f32,
+    word_spacing: f32,
+    horiz_scale: f32,
 }
 
 impl TextWalker {
-    fn new(fonts: HashMap<String, FontDecoder>) -> Self {
+    fn new(fonts: HashMap<String, FontDecoder>, advances: HashMap<String, FontAdvance>) -> Self {
         Self {
             fonts,
+            advances,
             runs: Vec::new(),
             run_mcids: Vec::new(),
             operands: Vec::new(),
@@ -1358,6 +1603,9 @@ impl TextWalker {
             leading: 0.0,
             render_mode: TextRenderMode::Fill,
             text_rise: 0.0,
+            char_spacing: 0.0,
+            word_spacing: 0.0,
+            horiz_scale: 1.0,
             saved: Vec::new(),
             track_mcid: false,
             mcid_stack: Vec::new(),
@@ -1496,6 +1744,9 @@ impl TextWalker {
                     leading: self.leading,
                     render_mode: self.render_mode,
                     text_rise: self.text_rise,
+                    char_spacing: self.char_spacing,
+                    word_spacing: self.word_spacing,
+                    horiz_scale: self.horiz_scale,
                 });
                 self.operands.clear();
             }
@@ -1508,6 +1759,9 @@ impl TextWalker {
                     self.leading = s.leading;
                     self.render_mode = s.render_mode;
                     self.text_rise = s.text_rise;
+                    self.char_spacing = s.char_spacing;
+                    self.word_spacing = s.word_spacing;
+                    self.horiz_scale = s.horiz_scale;
                 }
                 self.operands.clear();
             }
@@ -1589,10 +1843,13 @@ impl TextWalker {
                 self.emit_show(&s);
             }
             b"\"" => {
-                // aw ac string " — set Tw, Tc, T*, Tj.
+                // aw ac string " — set Tw, Tc, T*, Tj (§9.4.3 /
+                // Table 109).
                 let s = self.pop_string().unwrap_or_default();
-                let _ac = self.pop_num().unwrap_or(0.0);
-                let _aw = self.pop_num().unwrap_or(0.0);
+                let ac = self.pop_num().unwrap_or(0.0);
+                let aw = self.pop_num().unwrap_or(0.0);
+                self.word_spacing = aw;
+                self.char_spacing = ac;
                 let translate = [1.0, 0.0, 0.0, 1.0, 0.0, -self.leading];
                 self.tlm = mul(translate, self.tlm);
                 self.tm = self.tlm;
@@ -1622,11 +1879,24 @@ impl TextWalker {
                 }
                 self.operands.clear();
             }
-            // Other text-state operators we record-but-don't-act-on.
-            // Char / word spacing and horizontal scale only shift glyph
-            // geometry, not the decoded text, the run's mode, or its
-            // origin.
-            b"Tc" | b"Tw" | b"Tz" => {
+            // Char / word spacing and horizontal scale feed the §9.4.4
+            // advance so a following run's origin reflects them.
+            b"Tc" => {
+                if let Some(n) = self.pop_num() {
+                    self.char_spacing = n;
+                }
+                self.operands.clear();
+            }
+            b"Tw" => {
+                if let Some(n) = self.pop_num() {
+                    self.word_spacing = n;
+                }
+                self.operands.clear();
+            }
+            b"Tz" => {
+                if let Some(n) = self.pop_num() {
+                    self.horiz_scale = n / 100.0;
+                }
                 self.operands.clear();
             }
             // Marked-content operators (ISO 32000-1 §14.6).
@@ -1761,6 +2031,9 @@ impl TextWalker {
         }
         let text = self.decode_bytes(bytes);
         self.push_run(text);
+        // §9.4.4 — advance Tm past the shown glyphs so a following show
+        // on the same line starts at the correct origin.
+        self.advance_bytes(bytes);
         self.operands.clear();
     }
 
@@ -1811,7 +2084,16 @@ impl TextWalker {
                 TJItem::Kern(adj) => pending_gap += -adj,
             }
         }
+        // Record the run at the array's start origin, then advance Tm
+        // through every element (glyph widths + per-element kerns,
+        // §9.4.3 / §9.4.4) so a following show is correctly positioned.
         self.push_run(text);
+        for item in arr {
+            match item {
+                TJItem::Str(b) => self.advance_bytes(b),
+                TJItem::Kern(adj) => self.advance_kern(*adj),
+            }
+        }
         self.operands.clear();
     }
 
@@ -1838,6 +2120,57 @@ impl TextWalker {
         // Stamp the current MCID (top of stack) onto the run.
         let cur_mcid = self.mcid_stack.last().copied().unwrap_or(None);
         self.run_mcids.push(cur_mcid);
+    }
+
+    /// Advance the text matrix `Tm` by the §9.4.4 displacement of every
+    /// glyph in `bytes`:
+    ///
+    /// ```text
+    /// tx = ((w0 − Tj/1000)·Tfs + Tc + Tw)·Th
+    /// ```
+    ///
+    /// (with `Tj = 0`; `TJ` kerns go through [`Self::advance_kern`]).
+    /// `w0` is the current font's per-glyph advance (glyph-space
+    /// thousandths); `Tw` applies only to single-byte code 32. Composite
+    /// Identity fonts step two bytes per CID. A zero-advance font
+    /// (`FontAdvance::None`) still moves by the `Tc`/`Tw`/`Th` spacing.
+    fn advance_bytes(&mut self, bytes: &[u8]) {
+        let tfs = self.cur_size;
+        let th = self.horiz_scale;
+        let tc = self.char_spacing;
+        let adv = self.advances.get(&self.cur_font).cloned();
+        let adv = adv.unwrap_or(FontAdvance::None);
+        if adv.is_cid() {
+            let mut i = 0;
+            while i + 1 < bytes.len() {
+                let cid = ((bytes[i] as i64) << 8) | bytes[i + 1] as i64;
+                let w0 = adv.width(cid) / 1000.0;
+                let tx = (w0 * tfs + tc) * th;
+                self.translate_tm(tx);
+                i += 2;
+            }
+        } else {
+            for &b in bytes {
+                let w0 = adv.width(b as i64) / 1000.0;
+                let tw = if b == 32 { self.word_spacing } else { 0.0 };
+                let tx = (w0 * tfs + tc + tw) * th;
+                self.translate_tm(tx);
+            }
+        }
+    }
+
+    /// Apply a `TJ` numeric kern (§9.4.3): translate `Tm` by
+    /// `−adj/1000 × Tfs × Th`.
+    fn advance_kern(&mut self, adj: f32) {
+        let tx = -adj / 1000.0 * self.cur_size * self.horiz_scale;
+        self.translate_tm(tx);
+    }
+
+    /// Translate `Tm` by `(tx, 0)` in text space
+    /// (`Tm = [1 0 0 1 tx 0] × Tm`).
+    fn translate_tm(&mut self, tx: f32) {
+        let translate = [1.0, 0.0, 0.0, 1.0, tx, 0.0];
+        self.tm = mul(translate, self.tm);
     }
 
     /// Minimum rightward `TJ` gap, in thousandths of an em, that the

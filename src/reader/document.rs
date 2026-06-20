@@ -1347,18 +1347,13 @@ fn resolve_font_resources(
 ///   array is resolved, its CIDFont dict dereferenced, and that
 ///   CIDFont's `/W` array dereferenced. The descendant is stored back
 ///   as a direct `Object::Dict` so `build_cid_metrics` finds it.
-fn resolve_font_widths(
-    reader: &mut DocumentReader<'_>,
-    font: &mut Dict,
-) -> Result<(), PdfError> {
+fn resolve_font_widths(reader: &mut DocumentReader<'_>, font: &mut Dict) -> Result<(), PdfError> {
     // /Widths (simple fonts) — resolve an indirect array.
-    if let Some(Object::Reference(id)) = font.entries().iter().find_map(|(k, v)| {
-        if k == "Widths" {
-            Some(v.clone())
-        } else {
-            None
-        }
-    }) {
+    if let Some(Object::Reference(id)) =
+        font.entries()
+            .iter()
+            .find_map(|(k, v)| if k == "Widths" { Some(v.clone()) } else { None })
+    {
         let resolved = reader.resolve(id)?;
         font.set("Widths", resolved);
     }
@@ -1400,15 +1395,13 @@ fn resolve_font_widths(
             };
             if let Object::Dict(mut cid_font) = cid_obj {
                 // Resolve the CIDFont's /W array (often indirect).
-                if let Some(Object::Reference(id)) =
-                    cid_font.entries().iter().find_map(|(k, v)| {
-                        if k == "W" {
-                            Some(v.clone())
-                        } else {
-                            None
-                        }
-                    })
-                {
+                if let Some(Object::Reference(id)) = cid_font.entries().iter().find_map(|(k, v)| {
+                    if k == "W" {
+                        Some(v.clone())
+                    } else {
+                        None
+                    }
+                }) {
                     let resolved = reader.resolve(id)?;
                     cid_font.set("W", resolved);
                 }
