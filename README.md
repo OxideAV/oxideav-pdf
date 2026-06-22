@@ -215,7 +215,9 @@ The content parser honours DeviceGray / DeviceRGB / DeviceCMYK (`g` /
 spaces (`ICCBased` via `/Alternate` or `/N`; `Indexed`; `Separation` and
 `DeviceN` (§8.6.6.5) with Type 0 sampled / Type 2 / Type 3 / Type 4
 PostScript-calculator tint transforms, §7.10 — Type 0 sampled functions
-interpolate multilinearly over any number of input dimensions, so a
+interpolate over any number of input dimensions, `/Order 1` multilinear
+or `/Order 3` cubic-spline (a per-axis Catmull-Rom blend through the four
+nearest knots, with the §7.10.2 `/Size < 4` linear fallback), so a
 multi-colorant DeviceN tint transform maps through its device
 alternate), the `gs` ExtGState operator (line state
 + alpha, cumulative), `Tj`/`TJ` text shows resolved against
@@ -289,9 +291,7 @@ cargo bench -p oxideav-pdf --bench reader_open
 - Transparency groups beyond per-`Group` `/ca` + `/CA` opacity.
 - DeviceN `/Attributes` NChannel custom-blending hints (`/Colorants`,
   `/Process`, `/MixingHints`); the space still renders through its
-  `alternateSpace` + `tintTransform`, which §8.6.6.5 permits. Order-3
-  (cubic-spline) Type 0 interpolation (Order-1 multilinear is
-  evaluated).
+  `alternateSpace` + `tintTransform`, which §8.6.6.5 permits.
 
 ## Usage
 

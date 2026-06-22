@@ -874,9 +874,11 @@ enum PdfFunction {
     /// index `s` at `s·n + j` (§7.10.2 "the sample values in the first
     /// dimension vary fastest … values shall be stored in the same order
     /// as Range") — normalised out of the `[0, 2^BitsPerSample − 1]`
-    /// integer interval before Decode. Only Order-1 (multilinear)
-    /// interpolation is represented; an `/Order 3` function is rejected
-    /// at parse time (the owning space stays unevaluable).
+    /// integer interval before Decode. `order` is the §7.10.2 `/Order`
+    /// interpolation degree: `1` for multilinear, `3` for the cubic-spline
+    /// tensor blend (a per-axis cubic that passes through the four nearest
+    /// samples). Per §7.10.2, a `/Size` below 4 on an axis falls back to
+    /// linear interpolation on that axis even when `order == 3`.
     Sampled {
         domain: Vec<f32>,
         range: Vec<f32>,
@@ -885,6 +887,7 @@ enum PdfFunction {
         encode: Vec<f32>,
         decode: Vec<f32>,
         samples: Vec<f32>,
+        order: u8,
     },
     /// §7.10.5 Type 4: a PostScript-calculator program. `domain` is the
     /// `2·m` input clip (one `[d0 d1]` pair per input variable — a
@@ -1064,15 +1067,14 @@ impl PdfFunction {
                     return None;
                 }
                 let n = range.len() / 2;
-                // /Order ∈ {1, 3}; only Order-1 (multilinear) is
-                // represented here. An /Order 3 (cubic spline) function
-                // is rejected so the owning space stays unevaluable
-                // rather than silently rendered with the wrong curve.
-                if let Some(order) = get("Order").and_then(number_as_i64) {
-                    if order != 1 {
-                        return None;
-                    }
-                }
+                // /Order ∈ {1, 3} (§7.10.2): 1 = linear (multilinear over
+                // m axes), 3 = cubic spline. Any other value is malformed
+                // and leaves the owning space unevaluable. Default is 1.
+                let order = match get("Order").and_then(number_as_i64) {
+                    Some(1) | None => 1u8,
+                    Some(3) => 3u8,
+                    Some(_) => return None,
+                };
                 // /Size is an array of m positive integers; m must match
                 // /Domain's pair count.
                 let size_arr = get("Size").and_then(read_num_array)?;
@@ -1134,6 +1136,7 @@ impl PdfFunction {
                     encode,
                     decode,
                     samples,
+                    order,
                 })
             }
             Some(2) => {
@@ -1288,7 +1291,10 @@ impl PdfFunction {
                 encode,
                 decode,
                 samples,
-            } => eval_sampled(inputs, domain, range, size, *n, encode, decode, samples),
+                order,
+            } => eval_sampled(
+                inputs, domain, range, size, *n, encode, decode, samples, *order,
+            ),
             PdfFunction::Calculator {
                 domain,
                 range,
@@ -1901,13 +1907,75 @@ fn unpack_samples(raw: &[u8], bps: u32, count: usize) -> Option<Vec<f32>> {
     Some(out)
 }
 
+/// The §7.10.2 cubic-spline basis weights for a fractional position `t`
+/// in `[0, 1]` between the two central samples of a four-sample window
+/// `[p_{-1}, p_0, p_1, p_2]`. These are the Catmull-Rom weights — the
+/// cubic that passes through all four samples and reproduces `p_0` at
+/// `t = 0` and `p_1` at `t = 1` (so the curve interpolates, not merely
+/// approximates, the sample points the spec requires it to pass
+/// through). Returned in window order `[w_{-1}, w_0, w_1, w_2]`; the
+/// weights sum to 1 for every `t`, so a constant sample table is
+/// reproduced exactly. At `t = 0` this collapses to `[0, 1, 0, 0]` and
+/// at `t = 1` to `[0, 0, 1, 0]`, matching the linear blend at the knots.
+fn cubic_weights(t: f32) -> [f32; 4] {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    // Catmull-Rom (tension 0.5) cardinal basis.
+    [
+        -0.5 * t3 + t2 - 0.5 * t,
+        1.5 * t3 - 2.5 * t2 + 1.0,
+        -1.5 * t3 + 2.0 * t2 + 0.5 * t,
+        0.5 * t3 - 0.5 * t2,
+    ]
+}
+
+/// One axis's interpolation contributions: a short list of
+/// `(sample index on this axis, weight)` pairs whose weights sum to 1.
+/// Order-1 yields up to two entries (the two bracketing samples);
+/// Order-3 yields up to four (the cubic window). The full sample blend
+/// is the tensor product of these per-axis contribution lists.
+type AxisTaps = smallvec_like::Taps;
+
+/// A tiny fixed-capacity tap list (max 4 entries — the widest axis
+/// window is the Order-3 cubic). Avoids a heap allocation per axis per
+/// evaluation, which matters because tint transforms are called once
+/// per painted sample.
+mod smallvec_like {
+    /// Up to four `(index, weight)` taps for one input axis.
+    #[derive(Clone, Copy)]
+    pub(super) struct Taps {
+        pub(super) items: [(usize, f32); 4],
+        pub(super) len: usize,
+    }
+
+    impl Taps {
+        pub(super) fn new() -> Self {
+            Taps {
+                items: [(0, 0.0); 4],
+                len: 0,
+            }
+        }
+        pub(super) fn push(&mut self, idx: usize, w: f32) {
+            self.items[self.len] = (idx, w);
+            self.len += 1;
+        }
+        pub(super) fn as_slice(&self) -> &[(usize, f32)] {
+            &self.items[..self.len]
+        }
+    }
+}
+
 /// Evaluate an `m`-input Type 0 (sampled) function (§7.10.2) at the
-/// `inputs` vector using Order-1 multilinear interpolation. Each input
-/// `x_i` is clipped to its `Domain` pair, encoded into the sample-table
-/// axis `[0, Size_i − 1]`, and split into a base index plus fraction.
-/// The output is the multilinear blend of the `2^m` surrounding grid
-/// corners, decoded into the output range and clipped to `Range`. The
-/// sample table stores the first input dimension fastest (`flat =
+/// `inputs` vector. Each input `x_i` is clipped to its `Domain` pair,
+/// encoded into the sample-table axis `[0, Size_i − 1]`, and split into
+/// a base index plus fraction. With `order == 1` the output is the
+/// multilinear blend of the `2^m` surrounding grid corners; with
+/// `order == 3` it is the tensor-product cubic-spline blend over the
+/// four nearest samples per axis (§7.10.2 "cubic spline
+/// interpolation"). Per §7.10.2, an axis whose `Size < 4` cannot carry a
+/// cubic window and falls back to linear on that axis. The blend is then
+/// decoded into the output range and clipped to `Range`. The sample
+/// table stores the first input dimension fastest (`flat =
 /// i_0 + Size_0·(i_1 + Size_1·(i_2 + …))`) with `n` interleaved outputs
 /// per grid point.
 #[allow(clippy::too_many_arguments)]
@@ -1920,11 +1988,11 @@ fn eval_sampled(
     encode: &[f32],
     decode: &[f32],
     samples: &[f32],
+    order: u8,
 ) -> Vec<f32> {
     let m = size.len();
-    // Per-axis base index `i0` and interpolation fraction `frac`.
-    let mut base = Vec::with_capacity(m);
-    let mut frac = Vec::with_capacity(m);
+    // Per-axis tap lists (index + weight contributions) and strides.
+    let mut taps: Vec<AxisTaps> = Vec::with_capacity(m);
     for i in 0..m {
         let xi = inputs.get(i).copied().unwrap_or(0.0);
         let xc = xi.clamp(domain[2 * i], domain[2 * i + 1]);
@@ -1935,39 +2003,76 @@ fn eval_sampled(
             encode[2 * i],
             encode[2 * i + 1],
         );
-        let e = e.clamp(0.0, (size[i] as f32) - 1.0);
+        let last = size[i] - 1;
+        let e = e.clamp(0.0, last as f32);
         let i0 = e.floor() as usize;
-        base.push(i0);
-        frac.push(e - (i0 as f32));
+        let frac = e - (i0 as f32);
+        let mut t = AxisTaps::new();
+        // Order-3 requires Size ≥ 4 to form the four-sample cubic window
+        // (§7.10.2: "If Size is less than 4, … Order 3 shall be
+        // ignored"). Otherwise interpolate linearly between the two
+        // bracketing samples.
+        if order == 3 && size[i] >= 4 {
+            // Window indices i0−1, i0, i0+1, i0+2, each clamped to the
+            // axis so an edge window reuses the boundary sample (the
+            // weights still sum to 1, giving an extrapolation-free clamp
+            // at the table edges).
+            let w = cubic_weights(frac);
+            let lo = i0 as isize - 1;
+            for (k, &wk) in w.iter().enumerate() {
+                let idx = (lo + k as isize).clamp(0, last as isize) as usize;
+                if wk != 0.0 {
+                    t.push(idx, wk);
+                }
+            }
+        } else {
+            let up = (i0 + 1).min(last);
+            t.push(i0, 1.0 - frac);
+            if frac != 0.0 && up != i0 {
+                t.push(up, frac);
+            }
+        }
+        taps.push(t);
     }
-    // Accumulate the multilinear blend over the 2^m corners. Corner `c`
-    // is the bit pattern over the m axes: bit i set ⇒ step to i0+1 on
-    // axis i (clamped to Size_i − 1), with weight ∏ (bit set ? frac_i :
-    // 1 − frac_i). A degenerate axis (Size_i == 1) keeps index 0 and the
-    // step clamps back onto it, so frac contributes nothing.
-    let corners = 1usize << m;
+    // Tensor-product accumulation over the cartesian product of the
+    // per-axis taps. `combo` indexes one tap per axis; the contribution
+    // weight is the product of the chosen per-axis weights and the flat
+    // sample offset is Σ idx_i · stride_i (axis 0 varies fastest).
     let mut out = vec![0.0f32; n];
-    for c in 0..corners {
+    let mut idx_in_axis = vec![0usize; m];
+    loop {
         let mut weight = 1.0f32;
         let mut flat = 0usize;
         let mut stride = 1usize;
         for i in 0..m {
-            let up = (c >> i) & 1 == 1;
-            let idx = if up {
-                (base[i] + 1).min(size[i] - 1)
-            } else {
-                base[i]
-            };
-            weight *= if up { frac[i] } else { 1.0 - frac[i] };
+            let (idx, w) = taps[i].as_slice()[idx_in_axis[i]];
+            weight *= w;
             flat += idx * stride;
             stride *= size[i];
         }
-        if weight == 0.0 {
-            continue;
+        if weight != 0.0 {
+            let off = flat * n;
+            for (j, acc) in out.iter_mut().enumerate() {
+                *acc += weight * samples[off + j];
+            }
         }
-        let off = flat * n;
-        for (j, acc) in out.iter_mut().enumerate() {
-            *acc += weight * samples[off + j];
+        // Odometer increment across the per-axis tap lists.
+        let mut axis = 0;
+        loop {
+            if axis == m {
+                // All combinations exhausted.
+                idx_in_axis.clear();
+                break;
+            }
+            idx_in_axis[axis] += 1;
+            if idx_in_axis[axis] < taps[axis].as_slice().len() {
+                break;
+            }
+            idx_in_axis[axis] = 0;
+            axis += 1;
+        }
+        if idx_in_axis.is_empty() {
+            break;
         }
     }
     // Decode each blended sample [0,1] → output range, clip to Range.
@@ -6215,11 +6320,79 @@ mod tests {
         assert!((f.eval_n(&[0.5, 0.0])[0] - 0.5).abs() < 1e-6);
     }
 
-    /// §7.10.2 Order-3 (cubic spline) is not represented — `parse`
-    /// rejects it so the owning space stays unevaluable rather than being
-    /// silently rendered with linear interpolation.
+    /// §7.10.2 Order-3 (cubic spline) is accepted and carried through to
+    /// evaluation. The interpolant must pass through the sample knots
+    /// (it interpolates, not approximates) — at integer encoded
+    /// positions the result equals the corresponding sample exactly.
     #[test]
-    fn type0_order_3_is_rejected() {
+    fn type0_order_3_passes_through_knots() {
+        // 4 samples on [0,3]; Encode maps Domain [0,3] → table [0,3].
+        let t0 = Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(0))
+                .with("Domain", num_arr(&[0.0, 3.0]))
+                .with("Range", num_arr(&[0.0, 1.0]))
+                .with("Size", num_arr(&[4.0]))
+                .with("BitsPerSample", Object::Integer(8))
+                .with("Order", Object::Integer(3))
+                .with("__Samples", Object::HexString(vec![0, 85, 170, 255])),
+        );
+        let f = PdfFunction::parse(&t0).expect("order-3 sampled function parses");
+        let expect = [0.0, 85.0 / 255.0, 170.0 / 255.0, 1.0];
+        for (k, &e) in expect.iter().enumerate() {
+            let got = f.eval_n(&[k as f32])[0];
+            assert!((got - e).abs() < 1e-6, "knot {k}: got {got}, want {e}");
+        }
+    }
+
+    /// §7.10.2 cubic-spline weights sum to 1 for every fractional
+    /// position, so a constant sample table reproduces that constant
+    /// everywhere (no overshoot for a flat curve).
+    #[test]
+    fn type0_order_3_constant_table_is_flat() {
+        let t0 = Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(0))
+                .with("Domain", num_arr(&[0.0, 3.0]))
+                .with("Range", num_arr(&[0.0, 1.0]))
+                .with("Size", num_arr(&[4.0]))
+                .with("BitsPerSample", Object::Integer(8))
+                .with("Order", Object::Integer(3))
+                .with("__Samples", Object::HexString(vec![128, 128, 128, 128])),
+        );
+        let f = PdfFunction::parse(&t0).expect("parses");
+        for &x in &[0.0f32, 0.3, 1.0, 1.7, 2.5, 3.0] {
+            let got = f.eval_n(&[x])[0];
+            assert!((got - 128.0 / 255.0).abs() < 1e-6, "x={x}: got {got}");
+        }
+    }
+
+    /// §7.10.2: a `/Size` below 4 cannot carry a cubic window, so
+    /// `/Order 3` is ignored on that axis and the function interpolates
+    /// linearly. With 2 samples 0 and 255, the midpoint is exactly 0.5.
+    #[test]
+    fn type0_order_3_falls_back_to_linear_below_size_4() {
+        let t0 = Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(0))
+                .with("Domain", num_arr(&[0.0, 1.0]))
+                .with("Range", num_arr(&[0.0, 1.0]))
+                .with("Size", num_arr(&[2.0]))
+                .with("BitsPerSample", Object::Integer(8))
+                .with("Order", Object::Integer(3))
+                .with("__Samples", Object::HexString(vec![0, 255])),
+        );
+        let f = PdfFunction::parse(&t0).expect("parses");
+        assert!((f.eval_n(&[0.5])[0] - 0.5).abs() < 1e-6);
+        assert!((f.eval_n(&[0.0])[0] - 0.0).abs() < 1e-6);
+        assert!((f.eval_n(&[1.0])[0] - 1.0).abs() < 1e-6);
+    }
+
+    /// A malformed `/Order` (neither 1 nor 3) leaves the function
+    /// unevaluable, per §7.10.2 Table 39 ("Valid values shall be 1 and
+    /// 3").
+    #[test]
+    fn type0_invalid_order_is_rejected() {
         let t0 = Object::Dict(
             Dict::new()
                 .with("FunctionType", Object::Integer(0))
@@ -6227,10 +6400,30 @@ mod tests {
                 .with("Range", num_arr(&[0.0, 1.0]))
                 .with("Size", num_arr(&[4.0]))
                 .with("BitsPerSample", Object::Integer(8))
-                .with("Order", Object::Integer(3))
+                .with("Order", Object::Integer(2))
                 .with("__Samples", Object::HexString(vec![0, 85, 170, 255])),
         );
         assert!(PdfFunction::parse(&t0).is_none());
+    }
+
+    /// Order-1 (linear) remains the default and is unaffected by the
+    /// cubic path: a 4-sample ramp interpolates linearly at the
+    /// midpoints when no `/Order` is given.
+    #[test]
+    fn type0_default_order_is_linear() {
+        let t0 = Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(0))
+                .with("Domain", num_arr(&[0.0, 3.0]))
+                .with("Range", num_arr(&[0.0, 1.0]))
+                .with("Size", num_arr(&[4.0]))
+                .with("BitsPerSample", Object::Integer(8))
+                .with("__Samples", Object::HexString(vec![0, 85, 170, 255])),
+        );
+        let f = PdfFunction::parse(&t0).expect("parses");
+        // Linear midpoint between samples 1 and 2 (85 and 170).
+        let mid = (85.0 + 170.0) / 2.0 / 255.0;
+        assert!((f.eval_n(&[1.5])[0] - mid).abs() < 1e-6);
     }
 
     // ── Type 4 PostScript-calculator functions §7.10.5 ──────────────
