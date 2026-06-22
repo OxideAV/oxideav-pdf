@@ -182,7 +182,9 @@ for an end-to-end verify.
   Consecutive shows on one line advance the text origin per §9.4.4
   (`tx = ((w0 − Tj/1000)·Tfs + Tc + Tw)·Th`) using per-glyph `/Widths`
   (simple) or `/W` / `/DW` (Type0 Identity) metrics, so runs without an
-  explicit `Td` / `Tm` still get distinct positions.
+  explicit `Td` / `Tm` still get distinct positions. Type 3 font widths
+  are scaled into text space by the font's `/FontMatrix` (§9.6.5), not
+  the 1/1000 Type1 convention.
 - **Logical reading order** — `read_in_logical_order()` walks the
   `/StructTreeRoot` tree (Tagged PDF, §14.6–14.8) and emits runs in
   author order, falling back to raster order when no struct tree exists.

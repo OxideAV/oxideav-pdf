@@ -3448,20 +3448,24 @@ impl<'a> State<'a> {
         let tfs = self.current_font.as_ref().map(|(_, s)| *s).unwrap_or(0.0);
         let th = self.horiz_scale;
         let tc = self.char_spacing;
+        // Convert a stored width to text-space units: 1/1000 for
+        // Type1 / TrueType / composite, the Type 3 /FontMatrix scale for
+        // a Type 3 font (§9.2.4 / §9.6.5).
+        let scale = metrics.text_scale();
         if metrics.two_byte() {
             // Composite Identity font: each code is two bytes, CID =
             // code; Tw never applies to multi-byte codes (§9.3.3).
             let mut i = 0;
             while i + 1 < bytes.len() {
                 let cid = ((bytes[i] as i64) << 8) | bytes[i + 1] as i64;
-                let w0 = metrics.width(cid) / 1000.0;
+                let w0 = metrics.width(cid) * scale;
                 let tx = (w0 * tfs + tc) * th;
                 self.translate_text(tx);
                 i += 2;
             }
         } else {
             for &b in bytes {
-                let w0 = metrics.width(b as i64) / 1000.0;
+                let w0 = metrics.width(b as i64) * scale;
                 let tw = if b == 32 { self.word_spacing } else { 0.0 };
                 let tx = (w0 * tfs + tc + tw) * th;
                 self.translate_text(tx);
@@ -5030,11 +5034,16 @@ enum FontMetrics {
     /// Simple font (Type1 / TrueType / Type3, §9.6): one byte per
     /// code. `widths[code − first_char]` gives the advance; codes
     /// outside `[first_char, first_char + widths.len())` use
-    /// `missing_width`.
+    /// `missing_width`. `text_scale` converts a stored width into
+    /// text-space units (§9.2.4): `0.001` for Type1 / TrueType (their
+    /// widths are in thousandths of text space), or the horizontal
+    /// component of the Type 3 `/FontMatrix` (§9.6.5 — Type 3 widths are
+    /// in glyph space, interpreted through `/FontMatrix`).
     Simple {
         first_char: i64,
         widths: Vec<f32>,
         missing_width: f32,
+        text_scale: f32,
     },
     /// Composite (Type0) font (§9.7): two bytes per code under the
     /// Identity-H/V CMaps the writer emits, where the CID equals the
@@ -5062,6 +5071,7 @@ impl FontMetrics {
                 first_char,
                 widths,
                 missing_width,
+                ..
             } => {
                 let idx = code - first_char;
                 if idx >= 0 && (idx as usize) < widths.len() {
@@ -5090,6 +5100,19 @@ impl FontMetrics {
     /// Whether codes are two bytes wide (composite Identity fonts).
     fn two_byte(&self) -> bool {
         matches!(self, FontMetrics::Cid { two_byte: true, .. })
+    }
+
+    /// Factor converting a [`Self::width`] result into text-space units
+    /// for the §9.4.4 displacement (§9.2.4). Type1 / TrueType widths are
+    /// thousandths of text space (`0.001`); a Type 3 font carries the
+    /// horizontal `/FontMatrix` scale instead, since its widths live in
+    /// glyph space. Composite fonts are thousandths (`/W` / `/DW` are in
+    /// glyph space with the standard 1000-unit em).
+    fn text_scale(&self) -> f32 {
+        match self {
+            FontMetrics::Simple { text_scale, .. } => *text_scale,
+            _ => 0.001,
+        }
     }
 }
 
@@ -5148,10 +5171,28 @@ fn build_font_metrics(font: &Dict) -> FontMetrics {
             _ => None,
         })
         .unwrap_or(0.0);
+    // §9.6.5: a Type 3 font's /Widths are in glyph space, scaled into
+    // text space by its /FontMatrix horizontal component (matrix `a`).
+    // Type1 / TrueType widths are already in thousandths of text space.
+    // Other simple fonts default to the 1000-unit em.
+    let text_scale = if subtype == Some("Type3") {
+        font.entries()
+            .iter()
+            .find(|(k, _)| k == "FontMatrix")
+            .and_then(|(_, v)| match v {
+                Object::Array(items) if items.len() == 6 => number_as_f32(&items[0]),
+                _ => None,
+            })
+            .filter(|s| s.is_finite())
+            .unwrap_or(0.001)
+    } else {
+        0.001
+    };
     FontMetrics::Simple {
         first_char,
         widths,
         missing_width,
+        text_scale,
     }
 }
 
@@ -8318,6 +8359,69 @@ mod tests {
             p.text_shows[1].position.0
         );
         assert!((p.text_shows[1].position.1 - 700.0).abs() < 1e-3);
+    }
+
+    /// §9.6.5: a Type 3 font's `/Widths` are in glyph space and scaled
+    /// into text space by the `/FontMatrix` horizontal component, not by
+    /// the 1/1000 Type1 convention. A FontMatrix of `[0.01 …]` (ten
+    /// times the default `0.001`) makes a stored width of 50 advance by
+    /// `50 · 0.01 · size`, i.e. ten times what the /1000 rule would give.
+    #[test]
+    fn type3_font_advances_via_font_matrix() {
+        let f1 = Dict::new()
+            .with("Type", Object::Name("Font".into()))
+            .with("Subtype", Object::Name("Type3".into()))
+            .with("FirstChar", Object::Integer(65))
+            .with("Widths", Object::Array(vec![Object::Integer(50)]))
+            .with(
+                "FontMatrix",
+                Object::Array(vec![
+                    Object::Real(0.01),
+                    Object::Real(0.0),
+                    Object::Real(0.0),
+                    Object::Real(0.01),
+                    Object::Real(0.0),
+                    Object::Real(0.0),
+                ]),
+            );
+        let fonts = font_res_with("F1", f1);
+        // 'A' advance = width(50) · FontMatrix.a(0.01) · size(10) = 5.0.
+        let bytes = b"BT /F1 10 Tf 0 700 Td (A) Tj (A) Tj ET\n";
+        let p = parse_full(bytes, None, Some(&fonts));
+        assert_eq!(p.text_shows.len(), 2);
+        assert!(
+            (p.text_shows[1].position.0 - 5.0).abs() < 1e-3,
+            "got {}",
+            p.text_shows[1].position.0
+        );
+    }
+
+    /// A Type 3 font with the default `/FontMatrix [0.001 …]` advances
+    /// exactly like a Type1 font of the same `/Widths` — the 1/1000
+    /// equivalence the default matrix encodes.
+    #[test]
+    fn type3_default_font_matrix_matches_type1() {
+        let f1 = Dict::new()
+            .with("Type", Object::Name("Font".into()))
+            .with("Subtype", Object::Name("Type3".into()))
+            .with("FirstChar", Object::Integer(65))
+            .with("Widths", Object::Array(vec![Object::Integer(500)]))
+            .with(
+                "FontMatrix",
+                Object::Array(vec![
+                    Object::Real(0.001),
+                    Object::Real(0.0),
+                    Object::Real(0.0),
+                    Object::Real(0.001),
+                    Object::Real(0.0),
+                    Object::Real(0.0),
+                ]),
+            );
+        let fonts = font_res_with("F1", f1);
+        // 500 · 0.001 · 10 = 5.0, same as the Type1 width-500 case.
+        let bytes = b"BT /F1 10 Tf 0 700 Td (A) Tj (A) Tj ET\n";
+        let p = parse_full(bytes, None, Some(&fonts));
+        assert!((p.text_shows[1].position.0 - 5.0).abs() < 1e-3);
     }
 
     /// Character spacing `Tc` adds to every glyph's advance (§9.3.2 /

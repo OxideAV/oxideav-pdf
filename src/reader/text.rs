@@ -404,11 +404,15 @@ type PageFonts = HashMap<String, FontDecoder>;
 #[derive(Clone, Debug)]
 enum FontAdvance {
     /// Simple font (one byte per code, §9.6): `widths[code − first]`,
-    /// falling back to `missing` outside the array's range.
+    /// falling back to `missing` outside the array's range. `text_scale`
+    /// converts a stored width into text-space units (§9.2.4): `0.001`
+    /// for Type1 / TrueType, or the horizontal `/FontMatrix` component
+    /// for a Type 3 font, whose `/Widths` are in glyph space (§9.6.5).
     Simple {
         first: i64,
         widths: Vec<f32>,
         missing: f32,
+        text_scale: f32,
     },
     /// Composite Identity font (two bytes per code, CID = code,
     /// §9.7.4.3): `/W` runs over `default` (the `/DW`).
@@ -427,6 +431,7 @@ impl FontAdvance {
                 first,
                 widths,
                 missing,
+                ..
             } => {
                 let idx = code - first;
                 if idx >= 0 && (idx as usize) < widths.len() {
@@ -450,6 +455,17 @@ impl FontAdvance {
 
     fn is_cid(&self) -> bool {
         matches!(self, FontAdvance::Cid { .. })
+    }
+
+    /// Factor converting a [`Self::width`] result into text-space units
+    /// (§9.2.4). Type1 / TrueType and composite fonts use `0.001`; a
+    /// Type 3 font carries its `/FontMatrix` horizontal scale, since its
+    /// widths are in glyph space (§9.6.5).
+    fn text_scale(&self) -> f32 {
+        match self {
+            FontAdvance::Simple { text_scale, .. } => *text_scale,
+            _ => 0.001,
+        }
     }
 }
 
@@ -510,10 +526,27 @@ fn build_font_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvan
             .unwrap_or(0.0),
         _ => 0.0,
     };
+    // §9.6.5: a Type 3 font's /Widths are in glyph space and scaled to
+    // text space by the /FontMatrix horizontal component. Type1 /
+    // TrueType widths are already in thousandths of text space.
+    let text_scale = if subtype == Some("Type3") {
+        font.entries()
+            .iter()
+            .find(|(k, _)| k == "FontMatrix")
+            .and_then(|(_, v)| match v {
+                Object::Array(items) if items.len() == 6 => obj_as_f32(&items[0]),
+                _ => None,
+            })
+            .filter(|s| s.is_finite())
+            .unwrap_or(0.001)
+    } else {
+        0.001
+    };
     FontAdvance::Simple {
         first,
         widths,
         missing,
+        text_scale,
     }
 }
 
@@ -2140,18 +2173,19 @@ impl TextWalker {
         let tc = self.char_spacing;
         let adv = self.advances.get(&self.cur_font).cloned();
         let adv = adv.unwrap_or(FontAdvance::None);
+        let scale = adv.text_scale();
         if adv.is_cid() {
             let mut i = 0;
             while i + 1 < bytes.len() {
                 let cid = ((bytes[i] as i64) << 8) | bytes[i + 1] as i64;
-                let w0 = adv.width(cid) / 1000.0;
+                let w0 = adv.width(cid) * scale;
                 let tx = (w0 * tfs + tc) * th;
                 self.translate_tm(tx);
                 i += 2;
             }
         } else {
             for &b in bytes {
-                let w0 = adv.width(b as i64) / 1000.0;
+                let w0 = adv.width(b as i64) * scale;
                 let tw = if b == 32 { self.word_spacing } else { 0.0 };
                 let tx = (w0 * tfs + tc + tw) * th;
                 self.translate_tm(tx);
