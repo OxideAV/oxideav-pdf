@@ -2209,6 +2209,20 @@ enum ColorSpaceKind {
         tint: PdfFunction,
         all_none: bool,
     },
+    /// A `/CalGray` space (§8.6.5.2): one component decoded by `gamma`
+    /// and scaled by the `white` point `[XW YW ZW]` to a CIE XYZ value,
+    /// then mapped to device RGB.
+    CalGray { white: [f32; 3], gamma: f32 },
+    /// A `/CalRGB` space (§8.6.5.3): three components decoded by the
+    /// per-channel `gamma` `[GR GG GB]`, multiplied by the 3×3 `matrix`
+    /// `[XA YA ZA XB YB ZB XC YC ZC]` to a CIE XYZ value, then mapped to
+    /// device RGB.
+    CalRgb { gamma: [f32; 3], matrix: [f32; 9] },
+    /// A `/Lab` space (§8.6.5.4): the L*a*b* triple (L* in 0..=100,
+    /// a*/b* clamped into `range` `[amin amax bmin bmax]`) mapped to a
+    /// CIE XYZ value through the implicit two-stage transform scaled by
+    /// the `white` point, then to device RGB.
+    Lab { white: [f32; 3], range: [f32; 4] },
     /// Any space the parser doesn't resolve to a device family, a
     /// device-based Indexed space, a device-alternate Separation, or a
     /// device-alternate DeviceN — `/Pattern`, a CIE-based CalRGB /
@@ -2251,6 +2265,10 @@ impl ColorSpaceKind {
             // §8.6.6.5: a DeviceN colour value carries one tint per
             // colorant name, in the names-array order.
             ColorSpaceKind::DeviceN { n_in, .. } => Some(*n_in),
+            // §8.6.5.2: a CIE-based A space carries one component.
+            ColorSpaceKind::CalGray { .. } => Some(1),
+            // §8.6.5.3 / §8.6.5.4: a CIE-based ABC space carries three.
+            ColorSpaceKind::CalRgb { .. } | ColorSpaceKind::Lab { .. } => Some(3),
             ColorSpaceKind::Unknown => None,
         }
     }
@@ -2309,6 +2327,9 @@ fn color_space_from_object(obj: &Object) -> ColorSpaceKind {
             Some(Object::Name(family)) if family == "Indexed" => indexed_from_array(items),
             Some(Object::Name(family)) if family == "Separation" => separation_from_array(items),
             Some(Object::Name(family)) if family == "DeviceN" => device_n_from_array(items),
+            Some(Object::Name(family)) if family == "CalGray" => cal_gray_from_array(items),
+            Some(Object::Name(family)) if family == "CalRGB" => cal_rgb_from_array(items),
+            Some(Object::Name(family)) if family == "Lab" => lab_from_array(items),
             _ => ColorSpaceKind::Unknown,
         },
         _ => ColorSpaceKind::Unknown,
@@ -2351,13 +2372,22 @@ fn indexed_from_array(items: &[Object]) -> ColorSpaceKind {
         return ColorSpaceKind::Unknown;
     }
     let base = color_space_from_object(&items[1]);
-    // The base must reduce to a device family — `components()` is `None`
-    // for `Unknown`, and §8.6.6.3 forbids an Indexed (or Pattern) base,
-    // so a nested `Indexed` is rejected too. The table's per-entry byte
-    // count `m` follows from the base at lookup time (`indexed_color`);
-    // a short table is tolerated by returning no colour for an
-    // out-of-range slot rather than rejecting the whole space here.
-    if base.components().is_none() || matches!(base, ColorSpaceKind::Indexed { .. }) {
+    // §8.6.6.3 forbids a Pattern, Indexed, Separation, or DeviceN base.
+    // Device families and the CIE-based families (CalGray / CalRGB /
+    // Lab) are permitted; their table entries are decoded per
+    // `indexed_color`. `components()` is `None` only for `Unknown`,
+    // which is also rejected. The table's per-entry byte count `m`
+    // follows from the base at lookup time; a short table is tolerated
+    // by returning no colour for an out-of-range slot rather than
+    // rejecting the whole space here.
+    if base.components().is_none()
+        || matches!(
+            base,
+            ColorSpaceKind::Indexed { .. }
+                | ColorSpaceKind::Separation { .. }
+                | ColorSpaceKind::DeviceN { .. }
+        )
+    {
         return ColorSpaceKind::Unknown;
     }
     let hival = match &items[2] {
@@ -2524,6 +2554,112 @@ fn device_n_from_array(items: &[Object]) -> ColorSpaceKind {
         tint,
         all_none: false,
     }
+}
+
+/// Read a fixed-length array of numbers from a colour-space dictionary
+/// entry — used for `WhitePoint`/`BlackPoint` (3), `Gamma` (3),
+/// `Matrix` (9), and `Range` (4). Returns `None` when the key is
+/// absent, not an array, the wrong length, or carries a non-number.
+fn read_fixed_num_array<const N: usize>(dict: &Dict, key: &str) -> Option<[f32; N]> {
+    let (_, obj) = dict.entries().iter().find(|(k, _)| k == key)?;
+    let nums = read_num_array(obj)?;
+    if nums.len() != N {
+        return None;
+    }
+    let mut out = [0.0f32; N];
+    out.copy_from_slice(&nums);
+    Some(out)
+}
+
+/// Validate a `WhitePoint` per §8.6.5.2–4: `XW` and `ZW` shall be
+/// positive and `YW` shall be 1.0. A non-conforming white point makes
+/// the whole CIE space unrenderable, so the caller falls back to
+/// `Unknown` (conservative black).
+fn valid_white_point(w: [f32; 3]) -> bool {
+    w[0] > 0.0 && w[2] > 0.0 && (w[1] - 1.0).abs() < 1e-4 && w.iter().all(|c| c.is_finite())
+}
+
+/// Reduce `[ /CalGray << /WhitePoint … /Gamma g >> ]` to a tracked
+/// `CalGray` space per §8.6.5.2. `WhitePoint` is required and validated;
+/// `Gamma` is an optional positive number (default 1.0).
+fn cal_gray_from_array(items: &[Object]) -> ColorSpaceKind {
+    let Some(Object::Dict(dict)) = items.get(1) else {
+        return ColorSpaceKind::Unknown;
+    };
+    let Some(white) = read_fixed_num_array::<3>(dict, "WhitePoint") else {
+        return ColorSpaceKind::Unknown;
+    };
+    if !valid_white_point(white) {
+        return ColorSpaceKind::Unknown;
+    }
+    let gamma = match dict.entries().iter().find(|(k, _)| k == "Gamma") {
+        Some((_, obj)) => match number_as_f32(obj) {
+            Some(g) if g > 0.0 && g.is_finite() => g,
+            // A present-but-malformed Gamma collapses the space.
+            _ => return ColorSpaceKind::Unknown,
+        },
+        None => 1.0,
+    };
+    ColorSpaceKind::CalGray { white, gamma }
+}
+
+/// Reduce `[ /CalRGB << /WhitePoint … /Gamma [..] /Matrix [..] >> ]` to
+/// a tracked `CalRgb` space per §8.6.5.3. `WhitePoint` is required and
+/// validated; `Gamma` (default `[1 1 1]`) and `Matrix` (default
+/// identity) are optional. The white point is not separately stored —
+/// it is already folded into the `Matrix` columns by the producer, and
+/// §8.6.5.3's transform reads only Gamma + Matrix.
+fn cal_rgb_from_array(items: &[Object]) -> ColorSpaceKind {
+    let Some(Object::Dict(dict)) = items.get(1) else {
+        return ColorSpaceKind::Unknown;
+    };
+    let Some(white) = read_fixed_num_array::<3>(dict, "WhitePoint") else {
+        return ColorSpaceKind::Unknown;
+    };
+    if !valid_white_point(white) {
+        return ColorSpaceKind::Unknown;
+    }
+    let gamma = match dict.entries().iter().find(|(k, _)| k == "Gamma") {
+        Some(_) => match read_fixed_num_array::<3>(dict, "Gamma") {
+            Some(g) if g.iter().all(|x| *x > 0.0 && x.is_finite()) => g,
+            _ => return ColorSpaceKind::Unknown,
+        },
+        None => [1.0, 1.0, 1.0],
+    };
+    let matrix = match dict.entries().iter().find(|(k, _)| k == "Matrix") {
+        Some(_) => match read_fixed_num_array::<9>(dict, "Matrix") {
+            Some(m) if m.iter().all(|x| x.is_finite()) => m,
+            _ => return ColorSpaceKind::Unknown,
+        },
+        // Identity matrix default per Table 64.
+        None => [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    };
+    ColorSpaceKind::CalRgb { gamma, matrix }
+}
+
+/// Reduce `[ /Lab << /WhitePoint … /Range [..] >> ]` to a tracked `Lab`
+/// space per §8.6.5.4. `WhitePoint` is required and validated; `Range`
+/// (default `[-100 100 -100 100]`) bounds the a*/b* components. A
+/// malformed `Range` (wrong length, non-number, or min > max) collapses
+/// the space.
+fn lab_from_array(items: &[Object]) -> ColorSpaceKind {
+    let Some(Object::Dict(dict)) = items.get(1) else {
+        return ColorSpaceKind::Unknown;
+    };
+    let Some(white) = read_fixed_num_array::<3>(dict, "WhitePoint") else {
+        return ColorSpaceKind::Unknown;
+    };
+    if !valid_white_point(white) {
+        return ColorSpaceKind::Unknown;
+    }
+    let range = match dict.entries().iter().find(|(k, _)| k == "Range") {
+        Some(_) => match read_fixed_num_array::<4>(dict, "Range") {
+            Some(r) if r.iter().all(|x| x.is_finite()) && r[0] <= r[1] && r[2] <= r[3] => r,
+            _ => return ColorSpaceKind::Unknown,
+        },
+        None => [-100.0, 100.0, -100.0, 100.0],
+    };
+    ColorSpaceKind::Lab { white, range }
 }
 
 impl<'a> State<'a> {
@@ -3732,6 +3868,9 @@ impl<'a> State<'a> {
                 all_none,
                 ..
             } => return device_n_color(alt, tint, *all_none, &comps),
+            ColorSpaceKind::CalGray { .. }
+            | ColorSpaceKind::CalRgb { .. }
+            | ColorSpaceKind::Lab { .. } => return cie_color(cs, &comps),
             ColorSpaceKind::Unknown => unreachable!("components() returned Some"),
         })
     }
@@ -3940,6 +4079,14 @@ fn initial_color_for(cs: &ColorSpaceKind) -> Option<Paint> {
             tint,
             all_none,
         } => device_n_color(alt, tint, *all_none, &vec![1.0; *n_in]),
+        // §8.6.5: "Setting the current stroking or nonstroking colour
+        // space to any CIE-based colour space shall initialize all
+        // components of the corresponding current colour to 0.0." For
+        // Lab the a*/b* zero is clamped into Range by `cie_color`.
+        ColorSpaceKind::CalGray { .. } => cie_color(cs, &[0.0]),
+        ColorSpaceKind::CalRgb { .. } | ColorSpaceKind::Lab { .. } => {
+            cie_color(cs, &[0.0, 0.0, 0.0])
+        }
         ColorSpaceKind::Unknown => None,
     }
 }
@@ -3972,7 +4119,20 @@ fn indexed_color(base: &ColorSpaceKind, hival: u32, table: &[u8], index: f32) ->
         ColorSpaceKind::DeviceCmyk => {
             Paint::Solid(rgb_from_cmyk(unit(0), unit(1), unit(2), unit(3)))
         }
-        // `indexed_from_array` rejects a non-device base, and a nested
+        // §8.6.6.3: a CIE-based base is permitted. Each table byte is
+        // decoded `0..255 → 0.0..1.0` then mapped into the base
+        // component's own range before the CIE → RGB transform. CalGray
+        // / CalRGB components already lie in 0.0..1.0; for Lab the L*
+        // component spans 0..100 and a*/b* span the space's `range`.
+        ColorSpaceKind::CalGray { .. } | ColorSpaceKind::CalRgb { .. } => {
+            cie_color(base, &(0..m).map(unit).collect::<Vec<_>>())?
+        }
+        ColorSpaceKind::Lab { range, .. } => {
+            let l = unit(0) * 100.0;
+            let a = range[0] + unit(1) * (range[1] - range[0]);
+            let b = range[2] + unit(2) * (range[3] - range[2]);
+            cie_color(base, &[l, a, b])?
+        }
         // An `Indexed`, `Separation`, or `DeviceN` base is forbidden by
         // §8.6.6.3 (and rejected by `indexed_from_array`), so these are
         // unreachable in practice; fall back to black for total safety.
@@ -4033,6 +4193,29 @@ fn device_n_color(
     paint_from_device_components(alt, &comps)
 }
 
+/// Resolve an `sc`/`scn` component vector against a CIE-based colour
+/// space (CalGray §8.6.5.2, CalRGB §8.6.5.3, Lab §8.6.5.4) to a
+/// [`Paint`]. `comps` carries one component for CalGray, three for
+/// CalRGB / Lab. Lab's a*/b* operands are clamped into the space's
+/// `range` "without error indication" (§8.6.5.4 Range). Returns `None`
+/// for a component-count mismatch or a non-CIE space.
+fn cie_color(cs: &ColorSpaceKind, comps: &[f32]) -> Option<Paint> {
+    match cs {
+        ColorSpaceKind::CalGray { white, gamma } if comps.len() == 1 => {
+            Some(Paint::Solid(cal_gray_color(*white, *gamma, comps[0])))
+        }
+        ColorSpaceKind::CalRgb { gamma, matrix } if comps.len() == 3 => Some(Paint::Solid(
+            cal_rgb_color(*gamma, *matrix, [comps[0], comps[1], comps[2]]),
+        )),
+        ColorSpaceKind::Lab { white, range } if comps.len() == 3 => {
+            let a = comps[1].clamp(range[0], range[1]);
+            let b = comps[2].clamp(range[2], range[3]);
+            Some(Paint::Solid(lab_color(*white, [comps[0], a, b])))
+        }
+        _ => None,
+    }
+}
+
 /// Render a device colour space's component values to a [`Paint`].
 /// Returns `None` when the count doesn't match the family's arity (a
 /// non-device family is also rejected — only the three device families
@@ -4079,6 +4262,9 @@ fn rgba_from_components(cs: &ColorSpaceKind, comps: &[f32]) -> Option<Rgba> {
             all_none,
             ..
         } => device_n_color(alt, tint, *all_none, comps)?,
+        ColorSpaceKind::CalGray { .. }
+        | ColorSpaceKind::CalRgb { .. }
+        | ColorSpaceKind::Lab { .. } => cie_color(cs, comps)?,
         ColorSpaceKind::Unknown => return None,
     };
     match paint {
@@ -4849,6 +5035,99 @@ fn rgb_from_cmyk(cyan: f32, magenta: f32, yellow: f32, black: f32) -> Rgba {
 
 fn unit_to_byte(f: f32) -> u8 {
     (f.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+// ───────────── CIE-based colour science (§8.6.5.2–4) ──────────────
+//
+// The CalGray (§8.6.5.2), CalRGB (§8.6.5.3) and Lab (§8.6.5.4) spaces
+// produce a CIE 1931 XYZ tristimulus value through the per-space
+// transformations defined in their respective sub-clauses (gamma decode
+// + WhitePoint scale for CalGray, gamma decode + 3×3 Matrix for CalRGB,
+// the implicit L*a*b* → XYZ stages for Lab). §10.2 ("CIE-Based Colour
+// to Device Colour") then gamut-maps XYZ onto the output device. With
+// no physical device model in a software renderer the conventional
+// reduction is to the sRGB display space: a fixed XYZ → linear-RGB
+// matrix followed by the sRGB opto-electronic transfer encoding. This
+// is the standard sRGB colorimetry (IEC 61966-2-1), reproduced here
+// from first principles — not derived from any third-party renderer.
+
+/// Encode one linear-light RGB component (0.0..=1.0) with the sRGB
+/// transfer function. Values are clamped into range first; the
+/// piecewise curve has a small linear segment near black and a
+/// 1/2.4-power segment above the `0.0031308` breakpoint.
+fn srgb_encode(c: f32) -> f32 {
+    let c = c.clamp(0.0, 1.0);
+    if c <= 0.003_130_8 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Map a CIE 1931 XYZ tristimulus value to a device-RGB [`Rgba`] via
+/// the sRGB display space. The XYZ → linear-sRGB matrix is the standard
+/// D65 sRGB primaries inverse; each linear component is then sRGB-
+/// encoded and quantised. Out-of-gamut components are clamped to
+/// `0.0..=1.0` "without error indication" in the spirit of §8.6.5's
+/// component-clamping rule.
+fn rgb_from_xyz(x: f32, y: f32, z: f32) -> Rgba {
+    let r = 3.240_625_5 * x - 1.537_208 * y - 0.498_628_6 * z;
+    let g = -0.968_930_7 * x + 1.875_756_1 * y + 0.041_517_5 * z;
+    let b = 0.055_710_1 * x - 0.204_021_1 * y + 1.056_995_9 * z;
+    rgb_from_unit(srgb_encode(r), srgb_encode(g), srgb_encode(b))
+}
+
+/// CalGray (§8.6.5.2): decode the single gray component `a` by the
+/// `gamma` exponent and scale by the white point `[xw, yw, zw]` to get
+/// XYZ, then map to RGB. `a` is clamped into `0.0..=1.0` per the
+/// CIE-based-A component range.
+fn cal_gray_color(white: [f32; 3], gamma: f32, a: f32) -> Rgba {
+    let a = a.clamp(0.0, 1.0);
+    let decoded = a.powf(gamma);
+    rgb_from_xyz(white[0] * decoded, white[1] * decoded, white[2] * decoded)
+}
+
+/// CalRGB (§8.6.5.3): decode the A/B/C components by their per-channel
+/// `gamma` exponents, multiply the decoded vector by the 3×3 `matrix`
+/// (`[xa ya za xb yb zb xc yc zc]`, column-major per component) to get
+/// XYZ, then map to RGB. Components are clamped into `0.0..=1.0`.
+fn cal_rgb_color(gamma: [f32; 3], matrix: [f32; 9], abc: [f32; 3]) -> Rgba {
+    let da = abc[0].clamp(0.0, 1.0).powf(gamma[0]);
+    let db = abc[1].clamp(0.0, 1.0).powf(gamma[1]);
+    let dc = abc[2].clamp(0.0, 1.0).powf(gamma[2]);
+    // X = XA·A^GR + XB·B^GG + XC·C^GB, and likewise for Y, Z.
+    let x = matrix[0] * da + matrix[3] * db + matrix[6] * dc;
+    let y = matrix[1] * da + matrix[4] * db + matrix[7] * dc;
+    let z = matrix[2] * da + matrix[5] * db + matrix[8] * dc;
+    rgb_from_xyz(x, y, z)
+}
+
+/// The §8.6.5.4 `g(x)` reverse-companding function used by both the Lab
+/// → XYZ stage.
+fn lab_g(x: f32) -> f32 {
+    // 6/29 = 0.206896…; below the breakpoint the linear segment with
+    // slope 108/841 and offset 4/29 applies.
+    if x >= 6.0 / 29.0 {
+        x * x * x
+    } else {
+        (108.0 / 841.0) * (x - 4.0 / 29.0)
+    }
+}
+
+/// Lab (§8.6.5.4): map the `[l, a, b]` triple (L* in 0..=100, a*/b*
+/// already clamped into the space's `Range`) to XYZ through the implicit
+/// two-stage transform, scaling by the white point `[xw, yw, zw]`, then
+/// to RGB.
+fn lab_color(white: [f32; 3], lab: [f32; 3]) -> Rgba {
+    let l = lab[0].clamp(0.0, 100.0);
+    let m_base = (l + 16.0) / 116.0;
+    let l_in = m_base + lab[1] / 500.0;
+    let n_in = m_base - lab[2] / 200.0;
+    rgb_from_xyz(
+        white[0] * lab_g(l_in),
+        white[1] * lab_g(m_base),
+        white[2] * lab_g(n_in),
+    )
 }
 
 fn compose(a: Transform2D, b: Transform2D) -> Transform2D {
@@ -8609,5 +8888,231 @@ mod tests {
             "got {}",
             p.text_shows[1].position.0
         );
+    }
+
+    // ── CIE-based colour spaces (§8.6.5.2–4) ──────────────────────
+
+    /// The D65 white point used throughout the §8.6.5 examples.
+    const D65: [f32; 3] = [0.9505, 1.0000, 1.0890];
+
+    /// `srgb_encode` matches the IEC 61966-2-1 piecewise curve at its
+    /// reference points: 0 → 0, 1 → 1, and the `0.0031308` linear-segment
+    /// breakpoint maps continuously.
+    #[test]
+    fn srgb_encode_reference_points() {
+        assert!((srgb_encode(0.0) - 0.0).abs() < 1e-6);
+        assert!((srgb_encode(1.0) - 1.0).abs() < 1e-6);
+        // At the breakpoint both branches agree to within rounding.
+        let bp = 0.003_130_8;
+        let lin = 12.92 * bp;
+        assert!((srgb_encode(bp) - lin).abs() < 1e-4);
+        // A mid value lands on the power segment (≈ 0.7354 for 0.5).
+        assert!((srgb_encode(0.5) - 0.735_36).abs() < 1e-3);
+    }
+
+    /// A CalGray colour space's full-on gray (A = 1.0) under the D65
+    /// white point maps to (very near) white; A = 0.0 maps to black.
+    #[test]
+    fn cal_gray_endpoints() {
+        let white = cal_gray_color(D65, 1.0, 1.0);
+        assert_eq!((white.r, white.g, white.b), (255, 255, 255));
+        let black = cal_gray_color(D65, 1.0, 0.0);
+        assert_eq!((black.r, black.g, black.b), (0, 0, 0));
+    }
+
+    /// A CalGray gamma > 1 darkens a mid gray relative to gamma 1 (the
+    /// decode raises A to the gamma power before the white-point scale).
+    #[test]
+    fn cal_gray_gamma_darkens_midtones() {
+        let g1 = cal_gray_color(D65, 1.0, 0.5).r;
+        let g22 = cal_gray_color(D65, 2.2, 0.5).r;
+        assert!(g22 < g1, "gamma 2.2 ({g22}) should darken vs 1.0 ({g1})");
+    }
+
+    /// The §8.6.5.3 CalRGB example (D65, 1.8 gammas, Trinitron matrix):
+    /// the all-zero colour is black; full-on (1,1,1) is light.
+    #[test]
+    fn cal_rgb_example_endpoints() {
+        let matrix = [
+            0.4497, 0.2446, 0.0252, 0.3163, 0.6720, 0.1412, 0.1845, 0.0833, 0.9227,
+        ];
+        let gamma = [1.8, 1.8, 1.8];
+        let black = cal_rgb_color(gamma, matrix, [0.0, 0.0, 0.0]);
+        assert_eq!((black.r, black.g, black.b), (0, 0, 0));
+        let white = cal_rgb_color(gamma, matrix, [1.0, 1.0, 1.0]);
+        // The matrix columns sum to ≈ D65, so (1,1,1) is near-white.
+        assert!(white.r > 230 && white.g > 230 && white.b > 230);
+        // A pure-red input (A only) yields a red-dominant device colour.
+        let red = cal_rgb_color(gamma, matrix, [1.0, 0.0, 0.0]);
+        assert!(red.r > red.g && red.r > red.b);
+    }
+
+    /// Lab `g(x)` is continuous at the `6/29` breakpoint and cubes above
+    /// it.
+    #[test]
+    fn lab_g_breakpoint_continuous() {
+        let bp = 6.0 / 29.0;
+        let cube = bp * bp * bp;
+        assert!((lab_g(bp) - cube).abs() < 1e-6);
+        // Above: g(0.5) = 0.125.
+        assert!((lab_g(0.5) - 0.125).abs() < 1e-6);
+    }
+
+    /// L* = 100 with a* = b* = 0 under D65 is the reference white;
+    /// L* = 0 is black. Both achromatic.
+    #[test]
+    fn lab_neutral_axis() {
+        let white = lab_color(D65, [100.0, 0.0, 0.0]);
+        assert_eq!((white.r, white.g, white.b), (255, 255, 255));
+        let black = lab_color(D65, [0.0, 0.0, 0.0]);
+        assert_eq!((black.r, black.g, black.b), (0, 0, 0));
+        // A neutral mid grey (L*=50, a=b=0) is achromatic: r≈g≈b.
+        let grey = lab_color(D65, [50.0, 0.0, 0.0]);
+        assert!(grey.r.abs_diff(grey.g) <= 2 && grey.g.abs_diff(grey.b) <= 2);
+    }
+
+    /// Positive a* pushes the colour toward red/magenta (more red than
+    /// green); positive b* toward yellow (more red+green than blue).
+    #[test]
+    fn lab_chroma_axes_direction() {
+        let reddish = lab_color(D65, [60.0, 60.0, 0.0]);
+        assert!(reddish.r > reddish.g, "+a* should be red-dominant");
+        let yellowish = lab_color(D65, [80.0, 0.0, 70.0]);
+        assert!(
+            yellowish.r > yellowish.b && yellowish.g > yellowish.b,
+            "+b* should be yellow (low blue)"
+        );
+    }
+
+    // ── CIE space resolution from the colour-space dictionary ─────
+
+    /// `[ /CalGray << /WhitePoint [..] /Gamma g >> ]` resolves to a
+    /// `CalGray` carrying the white point + gamma; a missing Gamma
+    /// defaults to 1.0; a missing/invalid WhitePoint collapses.
+    #[test]
+    fn cal_gray_resolves_from_array() {
+        let arr = Object::Array(vec![
+            Object::Name("CalGray".into()),
+            Object::Dict(
+                Dict::new()
+                    .with(
+                        "WhitePoint",
+                        Object::Array(vec![
+                            Object::Real(0.9505),
+                            Object::Real(1.0),
+                            Object::Real(1.089),
+                        ]),
+                    )
+                    .with("Gamma", Object::Real(2.222)),
+            ),
+        ]);
+        match color_space_from_object(&arr) {
+            ColorSpaceKind::CalGray { white, gamma } => {
+                assert!((white[1] - 1.0).abs() < 1e-6);
+                assert!((gamma - 2.222).abs() < 1e-6);
+            }
+            other => panic!("expected CalGray, got {other:?}"),
+        }
+        // YW != 1.0 is non-conforming → Unknown.
+        let bad = Object::Array(vec![
+            Object::Name("CalGray".into()),
+            Object::Dict(Dict::new().with(
+                "WhitePoint",
+                Object::Array(vec![
+                    Object::Real(0.95),
+                    Object::Real(0.5),
+                    Object::Real(1.0),
+                ]),
+            )),
+        ]);
+        assert_eq!(color_space_from_object(&bad), ColorSpaceKind::Unknown);
+    }
+
+    /// End-to-end: a `/Resources /ColorSpace /CS0 = [/CalGray …]`,
+    /// `/CS0 cs 1 sc` paints white (A = 1.0 full gray).
+    #[test]
+    fn cal_gray_end_to_end_white() {
+        let arr = Object::Array(vec![
+            Object::Name("CalGray".into()),
+            Object::Dict(Dict::new().with(
+                "WhitePoint",
+                Object::Array(vec![
+                    Object::Real(0.9505),
+                    Object::Real(1.0),
+                    Object::Real(1.089),
+                ]),
+            )),
+        ]);
+        let cs = Dict::new().with("CS0", arr);
+        let bytes = b"q /CS0 cs 1 sc 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (255, 255, 255));
+    }
+
+    /// End-to-end: a `/Lab` space with the default Range, `1 sc`-style
+    /// three-component `scn` of `100 0 0` paints white.
+    #[test]
+    fn lab_end_to_end_white() {
+        let arr = Object::Array(vec![
+            Object::Name("Lab".into()),
+            Object::Dict(
+                Dict::new()
+                    .with(
+                        "WhitePoint",
+                        Object::Array(vec![
+                            Object::Real(0.9505),
+                            Object::Real(1.0),
+                            Object::Real(1.089),
+                        ]),
+                    )
+                    .with(
+                        "Range",
+                        Object::Array(vec![
+                            Object::Integer(-128),
+                            Object::Integer(127),
+                            Object::Integer(-128),
+                            Object::Integer(127),
+                        ]),
+                    ),
+            ),
+        ]);
+        match color_space_from_object(&arr) {
+            ColorSpaceKind::Lab { range, .. } => {
+                assert_eq!(range, [-128.0, 127.0, -128.0, 127.0]);
+            }
+            other => panic!("expected Lab, got {other:?}"),
+        }
+        let cs = Dict::new().with("CS0", arr);
+        let bytes = b"q /CS0 cs 100 0 0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (255, 255, 255));
+    }
+
+    /// A CalRGB resource resolves and its `scn` reads three components;
+    /// a missing Matrix defaults to identity, a missing Gamma to [1 1 1].
+    #[test]
+    fn cal_rgb_resolves_default_matrix() {
+        let arr = Object::Array(vec![
+            Object::Name("CalRGB".into()),
+            Object::Dict(Dict::new().with(
+                "WhitePoint",
+                Object::Array(vec![
+                    Object::Real(0.9505),
+                    Object::Real(1.0),
+                    Object::Real(1.089),
+                ]),
+            )),
+        ]);
+        match color_space_from_object(&arr) {
+            ColorSpaceKind::CalRgb { gamma, matrix } => {
+                assert_eq!(gamma, [1.0, 1.0, 1.0]);
+                assert_eq!(matrix, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+            }
+            other => panic!("expected CalRgb, got {other:?}"),
+        }
+        // Identity matrix: (1,1,1) → XYZ (1,1,1), well above D65 white,
+        // clamps to device white.
+        let cs = Dict::new().with("CS0", arr);
+        let bytes = b"q /CS0 cs 1 1 1 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        let (r, g, b) = first_fill_with_cs(bytes, &cs);
+        assert!(r > 230 && g > 230 && b > 230);
     }
 }

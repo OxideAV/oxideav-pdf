@@ -222,7 +222,11 @@ for an end-to-end verify.
 
 The content parser honours DeviceGray / DeviceRGB / DeviceCMYK (`g` /
 `rg` / `k` and the `cs`/`CS` + `sc`/`scn` forms, §8.6), resource colour
-spaces (`ICCBased` via `/Alternate` or `/N`; `Indexed`; `Separation` and
+spaces (`ICCBased` via `/Alternate` or `/N`; `Indexed`; the CIE-based
+families `CalGray` (§8.6.5.2), `CalRGB` (§8.6.5.3) and `Lab` (§8.6.5.4),
+each decoded to CIE 1931 XYZ via its `/WhitePoint` / `/Gamma` / `/Matrix`
+/ `/Range` and reduced to device RGB through the standard sRGB display
+colorimetry; `Separation` and
 `DeviceN` (§8.6.6.5) with Type 0 sampled / Type 2 / Type 3 / Type 4
 PostScript-calculator tint transforms, §7.10 — Type 0 sampled functions
 interpolate over any number of input dimensions, `/Order 1` multilinear
