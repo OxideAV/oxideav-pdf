@@ -3391,8 +3391,12 @@ impl<'a> State<'a> {
                 // into sampled-colour gradient stops. Exactly one of
                 // `mesh` / `gradient` is populated (or neither, when the
                 // shading can't be reduced).
-                let mesh = shading_dict.as_ref().and_then(evaluate_mesh_shading);
-                let gradient = shading_dict.as_ref().and_then(evaluate_gradient_shading);
+                let mesh = shading_dict
+                    .as_ref()
+                    .and_then(|d| evaluate_mesh_shading(d, self.color_space_resources));
+                let gradient = shading_dict
+                    .as_ref()
+                    .and_then(|d| evaluate_gradient_shading(d, self.color_space_resources));
                 let ctm = self.effective_ctm();
                 let clip = self.current_clip();
                 self.shadings.push(ContentShading {
@@ -4368,10 +4372,25 @@ fn decode_value(code: u64, bits: u32, dmin: f32, dmax: f32) -> f32 {
 /// dict its `resolve_shading_resources` produced.
 #[cfg(test)]
 pub(crate) fn evaluate_mesh_shading_for_test(dict: &Dict) -> Option<MeshShading> {
-    evaluate_mesh_shading(dict)
+    evaluate_mesh_shading(dict, None)
 }
 
-fn evaluate_mesh_shading(dict: &Dict) -> Option<MeshShading> {
+/// Resolve a shading dictionary's `/ColorSpace` entry to a tracked
+/// [`ColorSpaceKind`] (§8.7.4.5.2). The entry is usually an inline array
+/// (`[/CalRGB …]`, `[/ICCBased …]`, a device name, …) which
+/// [`color_space_from_object`] interprets directly. PDF also permits a
+/// shading's `/ColorSpace` to be a *name* referring to the page's
+/// `/Resources /ColorSpace` subdictionary; when the object is a bare
+/// non-device name and `color_space_resources` is plumbed in, the name
+/// is resolved through it (the same path `cs`/`CS` uses).
+fn shading_color_space(obj: &Object, color_space_resources: Option<&Dict>) -> ColorSpaceKind {
+    if let Object::Name(n) = obj {
+        return ColorSpaceKind::resolve_with_resources(n, color_space_resources);
+    }
+    color_space_from_object(obj)
+}
+
+fn evaluate_mesh_shading(dict: &Dict, color_space_resources: Option<&Dict>) -> Option<MeshShading> {
     let get = |key: &str| {
         dict.entries()
             .iter()
@@ -4382,7 +4401,7 @@ fn evaluate_mesh_shading(dict: &Dict) -> Option<MeshShading> {
     if !(4..=7).contains(&shading_type) {
         return None;
     }
-    let cs = color_space_from_object(get("ColorSpace")?);
+    let cs = shading_color_space(get("ColorSpace")?, color_space_resources);
     if cs == ColorSpaceKind::Unknown {
         return None;
     }
@@ -4463,7 +4482,10 @@ const FUNCTION_GRID: usize = 16;
 /// malformed `Function`, or malformed geometry. The colour function is
 /// evaluated across the parametric `Domain` and each result reduced to
 /// device RGB through the shading's `ColorSpace`.
-fn evaluate_gradient_shading(dict: &Dict) -> Option<ShadingGradient> {
+fn evaluate_gradient_shading(
+    dict: &Dict,
+    color_space_resources: Option<&Dict>,
+) -> Option<ShadingGradient> {
     let get = |key: &str| {
         dict.entries()
             .iter()
@@ -4474,7 +4496,7 @@ fn evaluate_gradient_shading(dict: &Dict) -> Option<ShadingGradient> {
     if !(1..=3).contains(&shading_type) {
         return None;
     }
-    let cs = color_space_from_object(get("ColorSpace")?);
+    let cs = shading_color_space(get("ColorSpace")?, color_space_resources);
     if cs == ColorSpaceKind::Unknown {
         return None;
     }
@@ -8054,7 +8076,7 @@ mod tests {
             .with("BitsPerFlag", Object::Integer(8))
             .with("Decode", decode_rgb8())
             .with("__MeshData", Object::HexString(data));
-        let mesh = evaluate_mesh_shading(&dict).expect("mesh evaluated");
+        let mesh = evaluate_mesh_shading(&dict, None).expect("mesh evaluated");
         let MeshShading::Triangles(tris) = mesh else {
             panic!("expected triangles")
         };
@@ -8095,7 +8117,7 @@ mod tests {
             .with("BitsPerFlag", Object::Integer(8))
             .with("Decode", decode_rgb8())
             .with("__MeshData", Object::HexString(data));
-        let MeshShading::Triangles(tris) = evaluate_mesh_shading(&dict).unwrap() else {
+        let MeshShading::Triangles(tris) = evaluate_mesh_shading(&dict, None).unwrap() else {
             panic!()
         };
         assert_eq!(tris.len(), 2);
@@ -8134,7 +8156,7 @@ mod tests {
             .with("VerticesPerRow", Object::Integer(2))
             .with("Decode", decode_rgb8())
             .with("__MeshData", Object::HexString(data));
-        let MeshShading::Triangles(tris) = evaluate_mesh_shading(&dict).unwrap() else {
+        let MeshShading::Triangles(tris) = evaluate_mesh_shading(&dict, None).unwrap() else {
             panic!()
         };
         // One cell → two triangles.
@@ -8190,7 +8212,7 @@ mod tests {
             .with("BitsPerFlag", Object::Integer(8))
             .with("Decode", decode_rgb8())
             .with("__MeshData", Object::HexString(data));
-        let MeshShading::Patches(patches) = evaluate_mesh_shading(&dict).unwrap() else {
+        let MeshShading::Patches(patches) = evaluate_mesh_shading(&dict, None).unwrap() else {
             panic!("expected patches")
         };
         assert_eq!(patches.len(), 1);
@@ -8271,7 +8293,7 @@ mod tests {
             .with("BitsPerFlag", Object::Integer(8))
             .with("Decode", decode_rgb8())
             .with("__MeshData", Object::HexString(data));
-        let MeshShading::Patches(patches) = evaluate_mesh_shading(&dict).unwrap() else {
+        let MeshShading::Patches(patches) = evaluate_mesh_shading(&dict, None).unwrap() else {
             panic!()
         };
         assert_eq!(patches.len(), 1);
@@ -8346,7 +8368,7 @@ mod tests {
             .with("BitsPerFlag", Object::Integer(8))
             .with("Decode", decode_rgb8())
             .with("__MeshData", Object::HexString(data));
-        let MeshShading::Patches(patches) = evaluate_mesh_shading(&dict).unwrap() else {
+        let MeshShading::Patches(patches) = evaluate_mesh_shading(&dict, None).unwrap() else {
             panic!()
         };
         assert_eq!(patches.len(), 2);
@@ -8451,7 +8473,7 @@ mod tests {
             .with("Decode", decode)
             .with("Function", Object::Dict(func))
             .with("__MeshData", Object::HexString(data));
-        let MeshShading::Triangles(tris) = evaluate_mesh_shading(&dict).unwrap() else {
+        let MeshShading::Triangles(tris) = evaluate_mesh_shading(&dict, None).unwrap() else {
             panic!()
         };
         let v = tris[0].vertices;
@@ -8470,7 +8492,7 @@ mod tests {
         let dict = Dict::new()
             .with("ShadingType", Object::Integer(2))
             .with("ColorSpace", Object::Name("DeviceRGB".into()));
-        assert!(evaluate_mesh_shading(&dict).is_none());
+        assert!(evaluate_mesh_shading(&dict, None).is_none());
     }
 
     /// An `sh` paint of a Type 4 mesh surfaces the evaluated geometry on
@@ -8562,7 +8584,7 @@ mod tests {
                 "Extend",
                 Object::Array(vec![Object::Bool(true), Object::Bool(false)]),
             );
-        let g = evaluate_gradient_shading(&dict).expect("gradient");
+        let g = evaluate_gradient_shading(&dict, None).expect("gradient");
         let ShadingGradient::Axial {
             coords,
             extend,
@@ -8597,7 +8619,7 @@ mod tests {
                 ),
             )
             .with("Function", exp_black_to_white());
-        let g = evaluate_gradient_shading(&dict).expect("gradient");
+        let g = evaluate_gradient_shading(&dict, None).expect("gradient");
         let ShadingGradient::Radial {
             coords,
             extend,
@@ -8610,6 +8632,98 @@ mod tests {
         assert_eq!(extend, [false, false]); // default
         assert_eq!(stops.len(), 64);
         assert_eq!((stops[0].r, stops[0].g, stops[0].b), (0, 0, 0));
+    }
+
+    /// `shading_color_space` resolves a bare-name `/ColorSpace` against
+    /// the page's `/Resources /ColorSpace` subdictionary (§8.7.4.5.2). A
+    /// device name still short-circuits; an inline array is interpreted
+    /// directly; a resource key resolves through the dict.
+    #[test]
+    fn shading_color_space_resolves_resource_key() {
+        // Bare device name: no resource lookup needed.
+        assert_eq!(
+            shading_color_space(&Object::Name("DeviceRGB".into()), None),
+            ColorSpaceKind::DeviceRgb
+        );
+        // A resource key `/CS0` → CalRGB.
+        let cal_rgb = Object::Array(vec![
+            Object::Name("CalRGB".into()),
+            Object::Dict(Dict::new().with(
+                "WhitePoint",
+                Object::Array(vec![
+                    Object::Real(0.9505),
+                    Object::Real(1.0),
+                    Object::Real(1.089),
+                ]),
+            )),
+        ]);
+        let res = Dict::new().with("CS0", cal_rgb);
+        assert!(matches!(
+            shading_color_space(&Object::Name("CS0".into()), Some(&res)),
+            ColorSpaceKind::CalRgb { .. }
+        ));
+        // Unknown key with no resources stays Unknown.
+        assert_eq!(
+            shading_color_space(&Object::Name("CS9".into()), None),
+            ColorSpaceKind::Unknown
+        );
+    }
+
+    /// An axial (Type 2) shading whose `/ColorSpace` is a *named*
+    /// resource key resolving to a CIE-based CalGray space evaluates its
+    /// gradient stops through that space instead of failing. Previously
+    /// a name `/ColorSpace` collapsed to `Unknown` and dropped the
+    /// gradient.
+    #[test]
+    fn gradient_named_resource_colour_space_resolves() {
+        // CalGray colour function: single-component black→white ramp.
+        let func = Object::Dict(
+            Dict::new()
+                .with("FunctionType", Object::Integer(2))
+                .with(
+                    "Domain",
+                    Object::Array(vec![Object::Real(0.0), Object::Real(1.0)]),
+                )
+                .with("C0", Object::Array(vec![Object::Real(0.0)]))
+                .with("C1", Object::Array(vec![Object::Real(1.0)]))
+                .with("N", Object::Real(1.0)),
+        );
+        let dict = Dict::new()
+            .with("ShadingType", Object::Integer(2))
+            .with("ColorSpace", Object::Name("CSGray".into()))
+            .with(
+                "Coords",
+                Object::Array(
+                    [0.0, 0.0, 100.0, 0.0]
+                        .into_iter()
+                        .map(Object::Real)
+                        .collect(),
+                ),
+            )
+            .with("Function", func);
+        let cal_gray = Object::Array(vec![
+            Object::Name("CalGray".into()),
+            Object::Dict(Dict::new().with(
+                "WhitePoint",
+                Object::Array(vec![
+                    Object::Real(0.9505),
+                    Object::Real(1.0),
+                    Object::Real(1.089),
+                ]),
+            )),
+        ]);
+        let res = Dict::new().with("CSGray", cal_gray);
+        // Without resources the name can't resolve → no gradient.
+        assert!(evaluate_gradient_shading(&dict, None).is_none());
+        // With resources the CalGray space resolves and stops sample.
+        let g = evaluate_gradient_shading(&dict, Some(&res)).expect("gradient");
+        let ShadingGradient::Axial { stops, .. } = g else {
+            panic!("expected axial");
+        };
+        assert_eq!(stops.len(), 64);
+        // t=0 → gray A=0 → black; t=1 → gray A=1 → white.
+        assert_eq!((stops[0].r, stops[0].g, stops[0].b), (0, 0, 0));
+        assert_eq!((stops[63].r, stops[63].g, stops[63].b), (255, 255, 255));
     }
 
     /// Type 1 function-based shading: a 2-in / 3-out Type 4 calculator
@@ -8647,7 +8761,7 @@ mod tests {
             .with("ShadingType", Object::Integer(1))
             .with("ColorSpace", Object::Name("DeviceRGB".into()))
             .with("Function", Object::Dict(func));
-        let g = evaluate_gradient_shading(&dict).expect("gradient");
+        let g = evaluate_gradient_shading(&dict, None).expect("gradient");
         let ShadingGradient::FunctionBased {
             domain,
             grid,
@@ -8685,8 +8799,8 @@ mod tests {
                 ]),
             )
             .with("Function", exp_black_to_white());
-        assert!(evaluate_mesh_shading(&axial).is_none());
-        assert!(evaluate_gradient_shading(&axial).is_some());
+        assert!(evaluate_mesh_shading(&axial, None).is_none());
+        assert!(evaluate_gradient_shading(&axial, None).is_some());
     }
 
     /// `sh` of a Type 2 axial shading surfaces the gradient on the
