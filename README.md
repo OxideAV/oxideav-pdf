@@ -65,11 +65,13 @@ Both reader and writer support every PDF file-structure form:
 Indirect stream `/Length` references (§7.3.10) are resolved against the
 xref table — the shape every one-pass writer produces.
 
-The reader resolves the inheritable page attributes `MediaBox` and
-`Resources` (§7.7.3.4) by walking the leaf page's `/Parent` chain, so a
-document that defines them once on an intermediate `/Pages` node renders
-at the right size with its fonts / XObjects / shadings in scope (the walk
-is depth-bounded and cycle-guarded).
+The reader resolves the inheritable page attributes `MediaBox`,
+`Resources`, and `Rotate` (§7.7.3.4) by walking the leaf page's
+`/Parent` chain, so a document that defines them once on an intermediate
+`/Pages` node renders at the right size, with its fonts / XObjects /
+shadings in scope, and with the correct clockwise rotation on
+`Page::orientation` (normalised to `0` / `90` / `180` / `270`). The walk
+is depth-bounded and cycle-guarded.
 
 ## Stream filters
 

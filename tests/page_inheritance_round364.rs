@@ -121,3 +121,94 @@ fn inherited_resources_resolve_form_xobject() {
         "the form named only in the inherited /Resources paints, got {fills:?}"
     );
 }
+
+/// Build a single-page PDF whose `/Pages` parent carries
+/// `/Rotate <parent_rotate>`; the leaf page carries the literal
+/// `leaf_page_extra` entries (e.g. its own `/Rotate` override or none).
+fn build_rotate_pdf(parent_rotate: &str, leaf_page_extra: &str) -> Vec<u8> {
+    let mut bytes: Vec<u8> = Vec::with_capacity(512);
+    bytes.extend_from_slice(b"%PDF-1.5\n%\xE2\xE3\xCF\xD3\n");
+
+    let mut offsets: [u64; 5] = [0; 5];
+
+    offsets[1] = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    offsets[2] = bytes.len() as u64;
+    bytes.extend_from_slice(
+        format!(
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 \
+             /MediaBox [0 0 200 200] {parent_rotate} >>\nendobj\n"
+        )
+        .as_bytes(),
+    );
+
+    let content: &[u8] = b"q Q\n";
+
+    offsets[3] = bytes.len() as u64;
+    bytes.extend_from_slice(
+        format!(
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R {leaf_page_extra} >>\nendobj\n"
+        )
+        .as_bytes(),
+    );
+
+    offsets[4] = bytes.len() as u64;
+    bytes.extend_from_slice(
+        format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+    );
+    bytes.extend_from_slice(content);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let n = offsets.len();
+    let xref_off = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n");
+    bytes.extend_from_slice(format!("0 {n}\n").as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for off in offsets.iter().skip(1) {
+        bytes.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(b"trailer\n");
+    bytes.extend_from_slice(format!("<< /Size {n} /Root 1 0 R >>\n").as_bytes());
+    bytes.extend_from_slice(format!("startxref\n{xref_off}\n%%EOF\n").as_bytes());
+    bytes
+}
+
+fn page_orientation(pdf: &[u8]) -> u16 {
+    let scene = read_pdf_to_scene(pdf).expect("read PDF to scene");
+    scene.pages.as_ref().unwrap()[0].orientation
+}
+
+#[test]
+fn rotate_inherited_from_parent() {
+    // /Rotate 90 on the /Pages parent, leaf overrides nothing.
+    let pdf = build_rotate_pdf("/Rotate 90", "");
+    assert_eq!(page_orientation(&pdf), 90);
+}
+
+#[test]
+fn rotate_leaf_overrides_parent() {
+    // Parent says 90, leaf says 270 — the leaf's own value wins.
+    let pdf = build_rotate_pdf("/Rotate 90", "/Rotate 270");
+    assert_eq!(page_orientation(&pdf), 270);
+}
+
+#[test]
+fn rotate_negative_normalises_into_canonical_range() {
+    // -90 (a multiple of 90) normalises to 270 clockwise.
+    let pdf = build_rotate_pdf("/Rotate -90", "");
+    assert_eq!(page_orientation(&pdf), 270);
+}
+
+#[test]
+fn rotate_non_multiple_of_90_falls_back_to_zero() {
+    // 45 is not a multiple of 90 (malformed) → default 0.
+    let pdf = build_rotate_pdf("/Rotate 45", "");
+    assert_eq!(page_orientation(&pdf), 0);
+}
+
+#[test]
+fn rotate_absent_defaults_to_zero() {
+    let pdf = build_rotate_pdf("", "");
+    assert_eq!(page_orientation(&pdf), 0);
+}

@@ -1287,6 +1287,16 @@ fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Pag
     )?;
     let root = parsed.root;
     let mut page = Page::new(width, height);
+    // /Rotate (§7.7.3.3 Table 30) — degrees clockwise, a multiple of
+    // 90, inheritable. Normalise any multiple of 90 (incl. negative /
+    // > 360 values some producers emit) into the canonical 0 / 90 /
+    // 180 / 270 the scene `Page::orientation` carries; a non-multiple
+    // of 90 is malformed and left at the default 0.
+    if let Some(Object::Integer(deg)) = resolve_inheritable_attr(reader, &page_dict, "Rotate")? {
+        if deg % 90 == 0 {
+            page.orientation = (deg.rem_euclid(360)) as u16;
+        }
+    }
     page.content = VectorFrame {
         width,
         height,
