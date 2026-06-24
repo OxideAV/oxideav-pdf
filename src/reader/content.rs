@@ -2409,12 +2409,13 @@ fn indexed_from_array(items: &[Object]) -> ColorSpaceKind {
 /// tracked `Separation` space per ISO 32000-1 §8.6.6.4.
 ///
 /// The space resolves only when the alternate reduces to a device
-/// family (DeviceGray / DeviceRGB / DeviceCMYK — the families this
-/// round renders) and the tint transform parses as an evaluable Type 0
-/// (sampled) / Type 2 / Type 3 function ([`PdfFunction::parse`]). A
-/// non-device alternate (CIE-based / Indexed / another special space —
-/// the latter forbidden by §8.6.6.4 anyway) or a Type 4 tint transform
-/// collapses to `Unknown`, preserving the conservative black fallback.
+/// family (DeviceGray / DeviceRGB / DeviceCMYK) or a CIE-based family
+/// (CalGray / CalRGB / Lab) — the families this round renders — and the
+/// tint transform parses as an evaluable Type 0 (sampled) / Type 2 /
+/// Type 3 function ([`PdfFunction::parse`]). An `Indexed`/`Separation`/
+/// `DeviceN` alternate (forbidden by §8.6.6.4 anyway), an unresolvable
+/// alternate, or a Type 4 tint transform collapses to `Unknown`,
+/// preserving the conservative black fallback.
 ///
 /// The special colorant names `All` and `None` (§8.6.6.4): for these a
 /// conforming reader ignores the alternate and tint transform. `None`
@@ -2475,9 +2476,10 @@ fn separation_from_array(items: &[Object]) -> ColorSpaceKind {
 /// `names` is the array of `n_in` colorant names; its length fixes the
 /// number of tint components an `sc`/`scn` carries. The space resolves
 /// only when the alternate reduces to a device family (DeviceGray /
-/// DeviceRGB / DeviceCMYK — the families this round renders) and the
+/// DeviceRGB / DeviceCMYK) or a CIE-based family (CalGray / CalRGB /
+/// Lab) — the families this round renders — and the
 /// `n_in`-input tint transform parses as an evaluable function. A
-/// non-device or special-space alternate (forbidden by §8.6.6.5 anyway),
+/// special-space alternate (forbidden by §8.6.6.5 anyway),
 /// or a tint transform whose input arity doesn't match `n_in` or whose
 /// output arity doesn't match the alternate's component count, collapses
 /// to `Unknown`, preserving the conservative black fallback. The
@@ -2515,11 +2517,12 @@ fn device_n_from_array(items: &[Object]) -> ColorSpaceKind {
     let n_in = name_objs.len();
     let alt = color_space_from_object(&items[2]);
     // §8.6.6.5: the alternate "shall not be another special colour space
-    // (Pattern, Indexed, Separation, or DeviceN)" and must reduce to a
-    // device family this round can render.
+    // (Pattern, Indexed, Separation, or DeviceN)". A device family or a
+    // CIE-based family (CalGray = 1, CalRGB / Lab = 3) is renderable;
+    // its component count fixes the required tint-transform output arity.
     let alt_comps = match &alt {
-        ColorSpaceKind::DeviceGray => 1,
-        ColorSpaceKind::DeviceRgb => 3,
+        ColorSpaceKind::DeviceGray | ColorSpaceKind::CalGray { .. } => 1,
+        ColorSpaceKind::DeviceRgb | ColorSpaceKind::CalRgb { .. } | ColorSpaceKind::Lab { .. } => 3,
         ColorSpaceKind::DeviceCmyk => 4,
         _ => return ColorSpaceKind::Unknown,
     };
@@ -4164,7 +4167,27 @@ fn separation_color(
     }
     let t = tint_value.clamp(0.0, 1.0);
     let comps = tint.eval(t);
-    paint_from_device_components(alt, &comps)
+    paint_from_alt_components(alt, &comps)
+}
+
+/// Render a tint-transform output vector through a Separation / DeviceN
+/// *alternate* colour space (§8.6.6.4–5). The alternate may be a device
+/// family or a CIE-based family (CalGray / CalRGB / Lab) — both are
+/// rendered to RGB; the Lab alternate interprets its three components as
+/// an L*a*b* triple (the tint transform is responsible for emitting them
+/// in the alternate's own range). Returns `None` for an arity mismatch
+/// or a non-renderable alternate, preserving the conservative black
+/// fallback.
+fn paint_from_alt_components(alt: &ColorSpaceKind, comps: &[f32]) -> Option<Paint> {
+    match alt {
+        ColorSpaceKind::DeviceGray | ColorSpaceKind::DeviceRgb | ColorSpaceKind::DeviceCmyk => {
+            paint_from_device_components(alt, comps)
+        }
+        ColorSpaceKind::CalGray { .. }
+        | ColorSpaceKind::CalRgb { .. }
+        | ColorSpaceKind::Lab { .. } => cie_color(alt, comps),
+        _ => None,
+    }
 }
 
 /// Resolve an `sc`/`scn` tint-component vector against a `/DeviceN`
@@ -4190,7 +4213,7 @@ fn device_n_color(
     }
     let clamped: Vec<f32> = tints.iter().map(|t| t.clamp(0.0, 1.0)).collect();
     let comps = tint.eval_n(&clamped);
-    paint_from_device_components(alt, &comps)
+    paint_from_alt_components(alt, &comps)
 }
 
 /// Resolve an `sc`/`scn` component vector against a CIE-based colour
@@ -9114,5 +9137,113 @@ mod tests {
         let bytes = b"q /CS0 cs 1 1 1 scn 0 0 m 10 10 l 10 0 l h f Q\n";
         let (r, g, b) = first_fill_with_cs(bytes, &cs);
         assert!(r > 230 && g > 230 && b > 230);
+    }
+
+    // ── CIE-based alternates for Separation / DeviceN (§8.6.6.4–5) ─
+
+    /// `[ /CalGray << /WhitePoint [..] >> ]` as an inline object for use
+    /// as a Separation / DeviceN alternate.
+    fn cal_gray_obj() -> Object {
+        Object::Array(vec![
+            Object::Name("CalGray".into()),
+            Object::Dict(Dict::new().with(
+                "WhitePoint",
+                Object::Array(vec![
+                    Object::Real(0.9505),
+                    Object::Real(1.0),
+                    Object::Real(1.089),
+                ]),
+            )),
+        ])
+    }
+
+    fn lab_obj() -> Object {
+        Object::Array(vec![
+            Object::Name("Lab".into()),
+            Object::Dict(Dict::new().with(
+                "WhitePoint",
+                Object::Array(vec![
+                    Object::Real(0.9505),
+                    Object::Real(1.0),
+                    Object::Real(1.089),
+                ]),
+            )),
+        ])
+    }
+
+    /// A Separation over a CalGray alternate (§8.6.6.4 permits a
+    /// CIE-based alternate). The tint transform maps `t → A` (the gray
+    /// component); at full tint A = 1.0 → device white, at zero → black.
+    #[test]
+    fn separation_calgray_alternate_renders() {
+        // 1-in / 1-out: C0 = 0.0, C1 = 1.0 (identity tint → gray A).
+        let tint = type2(&[0.0], &[1.0], 1.0);
+        let arr = separation("Spot", cal_gray_obj(), tint);
+        match color_space_from_object(&arr) {
+            ColorSpaceKind::Separation { alt, .. } => {
+                assert!(matches!(*alt, ColorSpaceKind::CalGray { .. }));
+            }
+            other => panic!("expected Separation/CalGray, got {other:?}"),
+        }
+        let cs = Dict::new().with("CS0", arr);
+        // tint 1.0 → A = 1.0 → white.
+        let bytes = b"q /CS0 cs 1 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (255, 255, 255));
+        // tint 0.0 → A = 0.0 → black.
+        let bytes = b"q /CS0 cs 0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (0, 0, 0));
+    }
+
+    /// A two-colorant DeviceN over a Lab alternate. A Type 4 program
+    /// maps the two tints to an L*a*b* triple: `(t0, t1) → (100·t0, 0,
+    /// 0)` — a neutral grey ramp. At (1,*) L* = 100 → white.
+    #[test]
+    fn device_n_lab_alternate_renders() {
+        // 2-in / 3-out. Stack starts [t0 t1]. Program:
+        //   pop          → [t0]
+        //   100 mul      → [100·t0]
+        //   0 0          → [100·t0 0 0]  (L*, a*, b*)
+        let tint = type4(
+            &[0.0, 1.0, 0.0, 1.0],
+            &[0.0, 100.0, -128.0, 127.0, -128.0, 127.0],
+            "{ pop 100 mul 0 0 }",
+        );
+        let arr = device_n(&["C0", "C1"], lab_obj(), tint);
+        match color_space_from_object(&arr) {
+            ColorSpaceKind::DeviceN { alt, n_in, .. } => {
+                assert_eq!(n_in, 2);
+                assert!(matches!(*alt, ColorSpaceKind::Lab { .. }));
+            }
+            other => panic!("expected DeviceN/Lab, got {other:?}"),
+        }
+        let cs = Dict::new().with("CS0", arr);
+        // (1, 0) → L* = 100, a*=b*=0 → white.
+        let bytes = b"q /CS0 cs 1 0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (255, 255, 255));
+        // (0, 0) → L* = 0 → black.
+        let bytes = b"q /CS0 cs 0 0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (0, 0, 0));
+    }
+
+    /// A DeviceN whose tint-transform output arity (2) doesn't match the
+    /// CalRGB alternate's component count (3) is rejected at resolve time
+    /// — the conservative black fallback applies.
+    #[test]
+    fn device_n_cie_alternate_arity_mismatch_rejected() {
+        let cal_rgb = Object::Array(vec![
+            Object::Name("CalRGB".into()),
+            Object::Dict(Dict::new().with(
+                "WhitePoint",
+                Object::Array(vec![
+                    Object::Real(0.9505),
+                    Object::Real(1.0),
+                    Object::Real(1.089),
+                ]),
+            )),
+        ]);
+        // 1-in / 2-out tint, but CalRGB needs 3 outputs.
+        let tint = type2(&[0.0, 0.0], &[1.0, 1.0], 1.0);
+        let arr = device_n(&["C0"], cal_rgb, tint);
+        assert_eq!(color_space_from_object(&arr), ColorSpaceKind::Unknown);
     }
 }
