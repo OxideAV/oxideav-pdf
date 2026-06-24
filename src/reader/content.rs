@@ -9246,4 +9246,94 @@ mod tests {
         let arr = device_n(&["C0"], cal_rgb, tint);
         assert_eq!(color_space_from_object(&arr), ColorSpaceKind::Unknown);
     }
+
+    /// An `/Indexed` space with a CIE-based (CalRGB) base (§8.6.6.3
+    /// permits a CIE base). The 2-entry colour table holds two CalRGB
+    /// triples; entry 0 = (1,1,1) → a bright colour through the identity
+    /// CalRGB (XYZ (1,1,1) is brighter than the D65 white, so the sRGB
+    /// reduction is near-white but not pure white), entry 1 = (0,0,0) →
+    /// black.
+    #[test]
+    fn indexed_calrgb_base_renders() {
+        let cal_rgb = Object::Array(vec![
+            Object::Name("CalRGB".into()),
+            Object::Dict(Dict::new().with(
+                "WhitePoint",
+                Object::Array(vec![
+                    Object::Real(0.9505),
+                    Object::Real(1.0),
+                    Object::Real(1.089),
+                ]),
+            )),
+        ]);
+        // hival = 1; table = [255 255 255  0 0 0] (entry 0 max, 1 black).
+        let table = Object::HexString(vec![255, 255, 255, 0, 0, 0]);
+        let arr = Object::Array(vec![
+            Object::Name("Indexed".into()),
+            cal_rgb,
+            Object::Integer(1),
+            table,
+        ]);
+        match color_space_from_object(&arr) {
+            ColorSpaceKind::Indexed { base, hival, .. } => {
+                assert_eq!(hival, 1);
+                assert!(matches!(*base, ColorSpaceKind::CalRgb { .. }));
+            }
+            other => panic!("expected Indexed/CalRGB, got {other:?}"),
+        }
+        let cs = Dict::new().with("CS0", arr);
+        // index 0 → entry (1,1,1) → bright near-white.
+        let bytes = b"q /CS0 cs 0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        let (r, g, b) = first_fill_with_cs(bytes, &cs);
+        assert!(r > 230 && g > 230 && b > 230, "entry 0 got ({r},{g},{b})");
+        // index 1 → entry (0,0,0) → black.
+        let bytes = b"q /CS0 cs 1 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        assert_eq!(first_fill_with_cs(bytes, &cs), (0, 0, 0));
+    }
+
+    /// An `/Indexed` space with a `/Lab` base: the table bytes decode
+    /// through the L*/Range scaling. Entry 0's L* byte 255 → L*=100 with
+    /// a*=b* mid-range (byte 128) → near-white; verifying the Lab branch
+    /// of `indexed_color` is reached (no panic, a plausible bright
+    /// colour).
+    #[test]
+    fn indexed_lab_base_decodes_table() {
+        let lab = Object::Array(vec![
+            Object::Name("Lab".into()),
+            Object::Dict(
+                Dict::new()
+                    .with(
+                        "WhitePoint",
+                        Object::Array(vec![
+                            Object::Real(0.9505),
+                            Object::Real(1.0),
+                            Object::Real(1.089),
+                        ]),
+                    )
+                    .with(
+                        "Range",
+                        Object::Array(vec![
+                            Object::Integer(-128),
+                            Object::Integer(127),
+                            Object::Integer(-128),
+                            Object::Integer(127),
+                        ]),
+                    ),
+            ),
+        ]);
+        // hival 0, one entry: L*-byte 255 (→100), a*/b* bytes 128
+        // (→ ≈ -0.5, near-neutral). A bright near-white.
+        let table = Object::HexString(vec![255, 128, 128]);
+        let arr = Object::Array(vec![
+            Object::Name("Indexed".into()),
+            lab,
+            Object::Integer(0),
+            table,
+        ]);
+        let cs = Dict::new().with("CS0", arr);
+        let bytes = b"q /CS0 cs 0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        let (r, g, b) = first_fill_with_cs(bytes, &cs);
+        // L*=100 neutral → a bright achromatic colour.
+        assert!(r > 230 && g > 230 && b > 230, "got ({r},{g},{b})");
+    }
 }
