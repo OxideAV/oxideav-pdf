@@ -1112,6 +1112,64 @@ fn walk_pages_tree_inner(
     }
 }
 
+/// Maximum `/Parent` chain length walked when resolving an inheritable
+/// page attribute (§7.7.3.4). A well-formed page tree is shallow; this
+/// ceiling bounds a malformed or cyclic chain so resolution always
+/// terminates even though the per-node visited set already breaks a
+/// direct cycle.
+const MAX_PAGE_TREE_DEPTH: usize = 64;
+
+/// Resolve an inheritable page attribute (`MediaBox`, `Resources`,
+/// `CropBox`, or `Rotate`, §7.7.3.4 Table 30) for a leaf page. The
+/// page dictionary is checked first; when it omits the key the
+/// `/Parent` chain is walked up the page tree and the first ancestor
+/// that carries the key supplies the value. Returns `Ok(None)` when
+/// neither the page nor any ancestor defines it (the caller then
+/// applies the attribute's default).
+///
+/// The walk is bounded by [`MAX_PAGE_TREE_DEPTH`] and cycle-guarded by
+/// a visited-id set so a self-referential `/Parent` (malformed input)
+/// can't loop. The returned `Object` is the value verbatim (an
+/// indirect reference is *not* dereferenced here — the caller's
+/// existing one-hop resolution handles that, matching the prior
+/// directly-attached path).
+fn resolve_inheritable_attr(
+    reader: &mut DocumentReader<'_>,
+    page_dict: &Dict,
+    key: &str,
+) -> Result<Option<Object>, PdfError> {
+    if let Some((_, v)) = page_dict.entries().iter().find(|(k, _)| k == key) {
+        return Ok(Some(v.clone()));
+    }
+    // Climb `/Parent` until the key is found, the chain ends, or the
+    // depth / cycle guard fires.
+    let mut parent = page_dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Parent")
+        .map(|(_, v)| v.clone());
+    let mut visited: HashSet<ObjectId> = HashSet::new();
+    let mut depth = 0;
+    while let Some(Object::Reference(parent_id)) = parent {
+        if depth >= MAX_PAGE_TREE_DEPTH || !visited.insert(parent_id) {
+            break;
+        }
+        depth += 1;
+        let Object::Dict(node) = reader.resolve(parent_id)? else {
+            break;
+        };
+        if let Some((_, v)) = node.entries().iter().find(|(k, _)| k == key) {
+            return Ok(Some(v.clone()));
+        }
+        parent = node
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Parent")
+            .map(|(_, v)| v.clone());
+    }
+    Ok(None)
+}
+
 fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Page, PdfError> {
     let page_obj = reader.resolve(page_id)?;
     let Object::Dict(page_dict) = page_obj else {
@@ -1120,14 +1178,11 @@ fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Pag
         )));
     };
 
-    // /MediaBox is required for the leaf page (or inherited from a
-    // parent — round-3 only handles directly-attached media boxes;
-    // inheritance lands in round 4 if the writer ever needs it).
-    let media_box = page_dict
-        .entries()
-        .iter()
-        .find(|(k, _)| k == "MediaBox")
-        .map(|(_, v)| v.clone());
+    // /MediaBox is required for the leaf page or inherited from an
+    // ancestor /Pages node (§7.7.3.4 — `MediaBox` is one of the four
+    // inheritable page attributes alongside `Resources`, `CropBox`,
+    // and `Rotate`). Walk the `/Parent` chain when the leaf omits it.
+    let media_box = resolve_inheritable_attr(reader, &page_dict, "MediaBox")?;
     let (width, height) = match media_box {
         Some(Object::Array(items)) if items.len() == 4 => {
             let llx = number_to_f32(&items[0])?;
@@ -1142,8 +1197,8 @@ fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Pag
             )));
         }
         None => {
-            // Round-3: no inheritance walk. Default to A4 portrait
-            // so the page object is still constructible.
+            // No /MediaBox on the page or any ancestor — default to A4
+            // portrait so the page object is still constructible.
             (595.0, 842.0)
         }
     };
@@ -1175,14 +1230,12 @@ fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Pag
     };
 
     // /Resources is a dictionary or an indirect reference to one
-    // (§7.8.3 Table 33). Inheritance through `/Parent` is round-4+
-    // (matching the round-3 /MediaBox stance) — directly-attached
-    // entries only.
-    let resources_obj = page_dict
-        .entries()
-        .iter()
-        .find(|(k, _)| k == "Resources")
-        .map(|(_, v)| v.clone());
+    // (§7.8.3 Table 33). It is inheritable (§7.7.3.4): a page that
+    // omits it takes the nearest ancestor /Pages node's /Resources, so
+    // documents that hang one resource dictionary on the page-tree root
+    // resolve their fonts / XObjects / shadings instead of rendering
+    // empty.
+    let resources_obj = resolve_inheritable_attr(reader, &page_dict, "Resources")?;
     let resources_dict = match resources_obj {
         Some(Object::Reference(id)) => match reader.resolve(id)? {
             Object::Dict(d) => Some(d),
