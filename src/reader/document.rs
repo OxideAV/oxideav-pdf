@@ -36,7 +36,7 @@ use crate::objects::{Dict, Object, ObjectId, Stream};
 use crate::pubsec::{
     open_with_certificate, open_with_certificate_and_trust_store, PubSecCredential, TrustStore,
 };
-use crate::reader::content::parse_content_stream_full_with_xobjects;
+use crate::reader::content::parse_content_stream_full_with_patterns;
 use crate::reader::parse::Parser;
 use crate::reader::xref::{parse_xref, XrefEntry, XrefTable};
 
@@ -1275,8 +1275,13 @@ fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Pag
     } else {
         None
     };
+    let pattern_dict = if let Some(rdict) = resources_dict.as_ref() {
+        resolve_pattern_resources(reader, rdict)?
+    } else {
+        None
+    };
 
-    let parsed = parse_content_stream_full_with_xobjects(
+    let parsed = parse_content_stream_full_with_patterns(
         &content_bytes,
         ext_gstate_dict.as_ref(),
         fonts_dict.as_ref(),
@@ -1284,6 +1289,7 @@ fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Pag
         color_space_dict.as_ref(),
         properties_dict.as_ref(),
         xobject_forms.as_ref(),
+        pattern_dict.as_ref(),
     )?;
     let root = parsed.root;
     let mut page = Page::new(width, height);
@@ -1580,6 +1586,95 @@ fn resolve_shading_resources(
     Ok(Some(out))
 }
 
+/// Resolve a page's `/Resources /Pattern` subdictionary (§8.7.3) into a
+/// fully-dereferenced [`Dict`] the content parser can interpret for
+/// `scn`/`SCN` shading-pattern fills.
+///
+/// Returns `Ok(None)` when the resources dict carries no `/Pattern`
+/// entry. Each per-name value is dereferenced to a pattern dictionary
+/// (a tiling pattern, `/PatternType 1`, is a *stream*; a shading
+/// pattern, `/PatternType 2`, is a bare dictionary). For a shading
+/// pattern the nested `/Shading` is dereferenced and, when it is an
+/// axial / radial shading carrying a `/Function`, that function is
+/// prepared in place (sample bodies / nested references resolved) so the
+/// content parser sees a self-contained, evaluable shading — mirroring
+/// [`resolve_shading_resources`]. Tiling patterns are surfaced verbatim
+/// (the parser renders no scene primitive for them this round). The pattern's `/Matrix` is left as-is.
+fn resolve_pattern_resources(
+    reader: &mut DocumentReader<'_>,
+    resources: &Dict,
+) -> Result<Option<Dict>, PdfError> {
+    let pat_obj = resources
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Pattern")
+        .map(|(_, v)| v.clone());
+    let pat_obj = match pat_obj {
+        Some(Object::Reference(id)) => reader.resolve(id)?,
+        Some(other) => other,
+        None => return Ok(None),
+    };
+    let Object::Dict(pat_dict) = pat_obj else {
+        return Ok(None);
+    };
+    let mut out = Dict::new();
+    for (name, value) in pat_dict.entries() {
+        let resolved = match value {
+            Object::Reference(id) => reader.resolve(*id)?,
+            other => other.clone(),
+        };
+        // A shading pattern is a bare dict; a tiling pattern is a stream
+        // (its dict still carries /PatternType 1). Surface the dict for
+        // either shape; only the shading-pattern path is interpreted.
+        let mut d = match resolved {
+            Object::Dict(d) => d,
+            Object::Stream(s) => s.dict,
+            _ => continue,
+        };
+        // For a shading pattern (PatternType 2), dereference + prepare
+        // the nested /Shading so the content parser sees a self-contained
+        // shading dictionary with an evaluable /Function.
+        if let Some((_, sh)) = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Shading")
+            .map(|(k, v)| (k.clone(), v.clone()))
+        {
+            let sh = match sh {
+                Object::Reference(id) => reader.resolve(id)?,
+                other => other,
+            };
+            if let Object::Dict(mut shading) = sh {
+                if let Some((_, fobj)) = shading
+                    .entries()
+                    .iter()
+                    .find(|(k, _)| k == "Function")
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                {
+                    let fobj = match fobj {
+                        Object::Reference(id) => reader.resolve(id)?,
+                        other => other,
+                    };
+                    let prepared = match fobj {
+                        Object::Array(items) => {
+                            let mut prepared = Vec::with_capacity(items.len());
+                            for f in items {
+                                prepared.push(prepare_function_object(reader, f)?);
+                            }
+                            Object::Array(prepared)
+                        }
+                        other => prepare_function_object(reader, other)?,
+                    };
+                    shading.set("Function", prepared);
+                }
+                d.set("Shading", Object::Dict(shading));
+            }
+        }
+        out.set(name, Object::Dict(d));
+    }
+    Ok(Some(out))
+}
+
 /// Resolve a page's `/Resources /ColorSpace` subdictionary into a
 /// fully-dereferenced [`Dict`] whose per-name entries are resolved
 /// colour-space `Object`s the round-275 content parser interprets
@@ -1844,8 +1939,12 @@ fn resolve_one_form_xobject(
         Some(r) => resolve_xobject_forms(reader, r, depth + 1, visited)?,
         None => None,
     };
+    let pattern_dict = match form_resources.as_ref() {
+        Some(r) => resolve_pattern_resources(reader, r)?,
+        None => None,
+    };
 
-    let parsed = parse_content_stream_full_with_xobjects(
+    let parsed = parse_content_stream_full_with_patterns(
         &content_bytes,
         ext_gstate_dict.as_ref(),
         fonts_dict.as_ref(),
@@ -1853,6 +1952,7 @@ fn resolve_one_form_xobject(
         color_space_dict.as_ref(),
         properties_dict.as_ref(),
         nested_forms.as_ref(),
+        pattern_dict.as_ref(),
     )?;
 
     // The content parser returns a root `Group` carrying any top-level

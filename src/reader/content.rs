@@ -84,8 +84,8 @@ use std::collections::BTreeMap;
 use std::str;
 
 use oxideav_core::vector::{
-    DashPattern, FillRule, Group, LineCap, LineJoin, Node, Paint, Path, PathCommand, PathNode,
-    Point, Rgba, Stroke, Transform2D,
+    DashPattern, FillRule, GradientStop, Group, LineCap, LineJoin, LinearGradient, Node, Paint,
+    Path, PathCommand, PathNode, Point, RadialGradient, Rgba, SpreadMethod, Stroke, Transform2D,
 };
 
 use crate::error::PdfError;
@@ -332,6 +332,37 @@ pub fn parse_content_stream_full_with_xobjects(
         properties_resources,
     )
     .with_xobject_forms(xobject_forms);
+    state.parse(input)?;
+    Ok(state.finish())
+}
+
+/// [`parse_content_stream_full_with_xobjects`] plus the page's
+/// `/Resources /Pattern` subdictionary, so a `scn`/`SCN` shading-pattern
+/// fill (`/PatternType 2`, §8.7.3.3 + §8.7.4.5) paints the equivalent
+/// scene gradient instead of falling back to black. Each pattern entry's
+/// `/Shading` is evaluated through the same axial / radial machinery the
+/// `sh` operator uses; the shading `Coords` are mapped to device space
+/// through the pattern `/Matrix` composed with the CTM in effect.
+#[allow(clippy::too_many_arguments)]
+pub fn parse_content_stream_full_with_patterns(
+    input: &[u8],
+    ext_gstate: Option<&Dict>,
+    font_resources: Option<&Dict>,
+    shading_resources: Option<&Dict>,
+    color_space_resources: Option<&Dict>,
+    properties_resources: Option<&Dict>,
+    xobject_forms: Option<&BTreeMap<String, Group>>,
+    pattern_resources: Option<&Dict>,
+) -> Result<ParsedContent, PdfError> {
+    let mut state = State::new(
+        ext_gstate,
+        font_resources,
+        shading_resources,
+        color_space_resources,
+        properties_resources,
+    )
+    .with_xobject_forms(xobject_forms)
+    .with_pattern_resources(pattern_resources);
     state.parse(input)?;
     Ok(state.finish())
 }
@@ -812,6 +843,15 @@ struct State<'a> {
     /// — they are surfaced through the dedicated
     /// [`crate::reader::images`] walker.
     xobject_forms: Option<&'a BTreeMap<String, Group>>,
+    /// Page's `/Resources /Pattern` subdictionary, if plumbed in. Each
+    /// per-name entry is the pattern's resolved dictionary (for a
+    /// `/PatternType 2` shading pattern, its `/Shading` subdictionary is
+    /// folded in place exactly like `/Resources /Shading` entries, so a
+    /// `scn /Pname` fill can evaluate the shading's gradient). When this
+    /// is `None` or the named pattern isn't a renderable shading
+    /// pattern, a `scn` pattern operand keeps the conservative black
+    /// fallback (the round-3 behaviour).
+    pattern_resources: Option<&'a Dict>,
 }
 
 struct Frame {
@@ -2707,6 +2747,7 @@ impl<'a> State<'a> {
             text_shows: Vec::new(),
             shadings: Vec::new(),
             xobject_forms: None,
+            pattern_resources: None,
         }
     }
 
@@ -2716,6 +2757,15 @@ impl<'a> State<'a> {
     /// entry points leave this `None` and `Do` stays a no-op.
     fn with_xobject_forms(mut self, forms: Option<&'a BTreeMap<String, Group>>) -> Self {
         self.xobject_forms = forms;
+        self
+    }
+
+    /// Attach the page's `/Resources /Pattern` subdictionary (§8.7.3) so
+    /// a `scn /Pname` shading-pattern fill (`/PatternType 2`) can paint
+    /// a gradient. The legacy entry points leave this `None` and a
+    /// pattern fill stays the conservative black fallback.
+    fn with_pattern_resources(mut self, patterns: Option<&'a Dict>) -> Self {
+        self.pattern_resources = patterns;
         self
     }
 
@@ -2978,7 +3028,9 @@ impl<'a> State<'a> {
                 // (Pattern, an unresolved resource colour space, or a
                 // trailing `/Name` pattern operand) keep the round-3
                 // conservative black fallback.
-                let paint = self.color_from_components(&self.fill_cs.clone());
+                let paint = self
+                    .color_from_components(&self.fill_cs.clone())
+                    .or_else(|| self.pattern_paint_from_operand());
                 self.fill_paint = paint.or_else(|| {
                     self.fill_paint
                         .clone()
@@ -2987,7 +3039,9 @@ impl<'a> State<'a> {
                 self.operands.clear();
             }
             b"SC" | b"SCN" => {
-                let paint = self.color_from_components(&self.stroke_cs.clone());
+                let paint = self
+                    .color_from_components(&self.stroke_cs.clone())
+                    .or_else(|| self.pattern_paint_from_operand());
                 self.stroke_paint = paint.or_else(|| {
                     self.stroke_paint
                         .clone()
@@ -3896,6 +3950,50 @@ impl<'a> State<'a> {
         }
     }
 
+    /// Resolve a `scn`/`SCN` trailing `/Name` operand as a shading
+    /// pattern (§8.7.3.3 + §8.7.4.5) and, when it is a `/PatternType 2`
+    /// pattern carrying an axial / radial `/Shading`, return the
+    /// equivalent scene gradient [`Paint`]. The shading's `Coords` are
+    /// mapped from pattern space into device space through the pattern's
+    /// `/Matrix` composed with the current CTM (§8.7.3.1: a pattern's
+    /// matrix maps pattern space to the default coordinate space of the
+    /// page, then the CTM in effect applies). Returns `None` when no
+    /// pattern resources are plumbed in, the name isn't a renderable
+    /// shading pattern, or the shading is function-based / mesh (no
+    /// linear/radial scene analogue).
+    fn pattern_paint_from_operand(&self) -> Option<Paint> {
+        let name = match self.operands.last() {
+            Some(Operand::Name(n)) => n.as_str(),
+            _ => return None,
+        };
+        let pat = lookup_dict(self.pattern_resources?, name)?;
+        let get = |k: &str| pat.entries().iter().find(|(kk, _)| kk == k).map(|(_, v)| v);
+        // Only shading patterns (PatternType 2) map to a scene gradient.
+        if get("PatternType").and_then(number_as_i64) != Some(2) {
+            return None;
+        }
+        let Some(Object::Dict(shading)) = get("Shading") else {
+            return None;
+        };
+        let gradient = evaluate_gradient_shading(shading, self.color_space_resources)?;
+        let pattern_matrix = match get("Matrix").and_then(read_num_array) {
+            Some(m) if m.len() == 6 => Transform2D {
+                a: m[0],
+                b: m[1],
+                c: m[2],
+                d: m[3],
+                e: m[4],
+                f: m[5],
+            },
+            // A malformed Matrix is rejected; an absent one defaults to
+            // identity (§8.7.3.1).
+            Some(_) => return None,
+            None => Transform2D::identity(),
+        };
+        let to_target = compose(self.effective_ctm(), pattern_matrix);
+        gradient_to_paint(&gradient, to_target)
+    }
+
     fn parse(&mut self, input: &[u8]) -> Result<(), PdfError> {
         let mut i = 0;
         while i < input.len() {
@@ -4482,6 +4580,89 @@ const FUNCTION_GRID: usize = 16;
 /// malformed `Function`, or malformed geometry. The colour function is
 /// evaluated across the parametric `Domain` and each result reduced to
 /// device RGB through the shading's `ColorSpace`.
+/// Convert evenly-spaced shading colour samples into `[GradientStop]`
+/// with offsets `i / (n − 1)` across `0.0..=1.0`. A single sample is
+/// pinned at offset 0.0.
+fn stops_to_gradient_stops(stops: &[Rgba]) -> Vec<GradientStop> {
+    let n = stops.len();
+    stops
+        .iter()
+        .enumerate()
+        .map(|(i, c)| GradientStop {
+            offset: if n <= 1 {
+                0.0
+            } else {
+                i as f32 / (n - 1) as f32
+            },
+            color: *c,
+        })
+        .collect()
+}
+
+/// Map the `Extend` flags of an axial / radial shading to a scene
+/// [`SpreadMethod`]. PDF only has "extend" (pad) or "don't extend"; the
+/// scene's `Pad` covers the extend-true case, and a non-extending
+/// shading is also approximated as `Pad` (the colour outside the axis is
+/// undefined in PDF — clamping is the conservative choice).
+fn extend_to_spread(_extend: [bool; 2]) -> SpreadMethod {
+    SpreadMethod::Pad
+}
+
+/// Convert an evaluated [`ShadingGradient`] (axial or radial) into a
+/// scene [`Paint`] gradient, mapping the shading `Coords` from shading
+/// space into target space through `to_target` (the pattern `/Matrix`
+/// composed with the current CTM). A function-based (Type 1) shading has
+/// no single scene-gradient analogue and yields `None`. The radial
+/// radii are scaled by the geometric-mean scale factor of `to_target`
+/// (PDF shading-pattern matrices are typically uniform-scale, so this is
+/// exact in the common case and a reasonable approximation otherwise).
+fn gradient_to_paint(g: &ShadingGradient, to_target: Transform2D) -> Option<Paint> {
+    let scale = {
+        // |det|^(1/2) — the uniform-equivalent linear scale of the 2×2
+        // part of the affine map.
+        let det = (to_target.a * to_target.d - to_target.b * to_target.c).abs();
+        det.sqrt()
+    };
+    match g {
+        ShadingGradient::Axial {
+            coords,
+            extend,
+            stops,
+        } => {
+            let start = to_target.apply(Point::new(coords[0], coords[1]));
+            let end = to_target.apply(Point::new(coords[2], coords[3]));
+            Some(Paint::LinearGradient(LinearGradient {
+                start,
+                end,
+                stops: stops_to_gradient_stops(stops),
+                spread: extend_to_spread(*extend),
+            }))
+        }
+        ShadingGradient::Radial {
+            coords,
+            extend,
+            stops,
+        } => {
+            // Map the ending circle (the one the stops sweep toward) to
+            // the scene's outer circle; the starting circle becomes the
+            // focal point. r1 is the outer radius.
+            let focal = to_target.apply(Point::new(coords[0], coords[1]));
+            let center = to_target.apply(Point::new(coords[3], coords[4]));
+            let radius = coords[5] * scale;
+            Some(Paint::RadialGradient(RadialGradient {
+                center,
+                radius,
+                focal: Some(focal),
+                stops: stops_to_gradient_stops(stops),
+                spread: extend_to_spread(*extend),
+            }))
+        }
+        // A function-based shading paints a 2-D colour field with no
+        // linear/radial scene analogue.
+        ShadingGradient::FunctionBased { .. } => None,
+    }
+}
+
 fn evaluate_gradient_shading(
     dict: &Dict,
     color_space_resources: Option<&Dict>,
@@ -6267,6 +6448,147 @@ mod tests {
     fn pattern_scn_keeps_black_fallback() {
         let bytes = b"q /Pattern cs /P0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
         assert_eq!(fill_rgb(&first_path(bytes)), (0, 0, 0));
+    }
+
+    /// Build a `/PatternType 2` (shading-pattern) dict wrapping an axial
+    /// shading from `coords` with a black→white function, optionally with
+    /// a `/Matrix`.
+    fn shading_pattern(coords: [f32; 4], matrix: Option<[f32; 6]>) -> Dict {
+        let shading = Dict::new()
+            .with("ShadingType", Object::Integer(2))
+            .with("ColorSpace", Object::Name("DeviceRGB".into()))
+            .with(
+                "Coords",
+                Object::Array(coords.into_iter().map(|n| Object::Real(n as f64)).collect()),
+            )
+            .with("Function", exp_black_to_white());
+        let mut d = Dict::new()
+            .with("PatternType", Object::Integer(2))
+            .with("Shading", Object::Dict(shading));
+        if let Some(m) = matrix {
+            d.set(
+                "Matrix",
+                Object::Array(m.into_iter().map(|n| Object::Real(n as f64)).collect()),
+            );
+        }
+        d
+    }
+
+    /// Parse with `/Resources /Pattern` plumbed in, return the first
+    /// painted path's fill `Paint`.
+    fn first_fill_with_pattern(bytes: &[u8], patterns: &Dict) -> Paint {
+        let parsed = parse_content_stream_full_with_patterns(
+            bytes,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(patterns),
+        )
+        .unwrap();
+        let Node::Group(g) = &parsed.root.children[0] else {
+            panic!("expected group");
+        };
+        let Node::Path(p) = &g.children[0] else {
+            panic!("expected path");
+        };
+        p.fill.clone().expect("path has a fill")
+    }
+
+    /// A `/Pattern cs /P0 scn` fill whose `/P0` is a `/PatternType 2`
+    /// axial shading pattern paints a `Paint::LinearGradient`, not the
+    /// black fallback. The gradient runs along the shading axis and its
+    /// stops sweep black → white.
+    #[test]
+    fn shading_pattern_axial_paints_linear_gradient() {
+        let pat = Dict::new().with(
+            "P0",
+            Object::Dict(shading_pattern([0.0, 0.0, 100.0, 0.0], None)),
+        );
+        let bytes = b"q /Pattern cs /P0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        let Paint::LinearGradient(lg) = first_fill_with_pattern(bytes, &pat) else {
+            panic!("expected a linear gradient");
+        };
+        // Identity CTM + no Matrix: axis endpoints pass through verbatim.
+        assert!((lg.start.x - 0.0).abs() < 1e-3 && (lg.start.y - 0.0).abs() < 1e-3);
+        assert!((lg.end.x - 100.0).abs() < 1e-3 && (lg.end.y - 0.0).abs() < 1e-3);
+        assert_eq!(lg.stops.len(), 64);
+        assert_eq!((lg.stops[0].color.r, lg.stops[0].color.g), (0, 0));
+        let last = lg.stops.last().unwrap();
+        assert_eq!((last.color.r, last.color.g, last.color.b), (255, 255, 255));
+        // Offsets span 0.0..=1.0 monotonically.
+        assert!((lg.stops[0].offset - 0.0).abs() < 1e-6);
+        assert!((last.offset - 1.0).abs() < 1e-6);
+    }
+
+    /// The pattern's `/Matrix` maps the shading axis into target space:
+    /// a translate-by-(50, 20) matrix shifts both endpoints.
+    #[test]
+    fn shading_pattern_matrix_transforms_axis() {
+        let pat = Dict::new().with(
+            "P0",
+            Object::Dict(shading_pattern(
+                [0.0, 0.0, 100.0, 0.0],
+                Some([1.0, 0.0, 0.0, 1.0, 50.0, 20.0]),
+            )),
+        );
+        let bytes = b"q /Pattern cs /P0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        let Paint::LinearGradient(lg) = first_fill_with_pattern(bytes, &pat) else {
+            panic!("expected a linear gradient");
+        };
+        assert!((lg.start.x - 50.0).abs() < 1e-3 && (lg.start.y - 20.0).abs() < 1e-3);
+        assert!((lg.end.x - 150.0).abs() < 1e-3 && (lg.end.y - 20.0).abs() < 1e-3);
+    }
+
+    /// A radial shading pattern paints a `Paint::RadialGradient` whose
+    /// outer circle is the shading's ending circle.
+    #[test]
+    fn shading_pattern_radial_paints_radial_gradient() {
+        let shading = Dict::new()
+            .with("ShadingType", Object::Integer(3))
+            .with("ColorSpace", Object::Name("DeviceRGB".into()))
+            .with(
+                "Coords",
+                Object::Array(
+                    [10.0, 20.0, 0.0, 10.0, 20.0, 40.0]
+                        .into_iter()
+                        .map(|n: f64| Object::Real(n))
+                        .collect(),
+                ),
+            )
+            .with("Function", exp_black_to_white());
+        let pat = Dict::new().with(
+            "P0",
+            Object::Dict(
+                Dict::new()
+                    .with("PatternType", Object::Integer(2))
+                    .with("Shading", Object::Dict(shading)),
+            ),
+        );
+        let bytes = b"q /Pattern cs /P0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        let Paint::RadialGradient(rg) = first_fill_with_pattern(bytes, &pat) else {
+            panic!("expected a radial gradient");
+        };
+        assert!((rg.center.x - 10.0).abs() < 1e-3 && (rg.center.y - 20.0).abs() < 1e-3);
+        assert!((rg.radius - 40.0).abs() < 1e-3);
+        assert_eq!(rg.stops.len(), 64);
+    }
+
+    /// A `/PatternType 1` (tiling) pattern has no scene-gradient analogue
+    /// this round — the fill stays the black fallback.
+    #[test]
+    fn tiling_pattern_keeps_black_fallback() {
+        let pat = Dict::new().with(
+            "P0",
+            Object::Dict(Dict::new().with("PatternType", Object::Integer(1))),
+        );
+        let bytes = b"q /Pattern cs /P0 scn 0 0 m 10 10 l 10 0 l h f Q\n";
+        match first_fill_with_pattern(bytes, &pat) {
+            Paint::Solid(c) => assert_eq!((c.r, c.g, c.b), (0, 0, 0)),
+            other => panic!("expected black solid fallback, got {other:?}"),
+        }
     }
 
     /// A `cs` naming an unresolved `/Resources /ColorSpace` key (here a

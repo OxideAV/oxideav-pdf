@@ -271,7 +271,16 @@ array (§8.9.5.2), and each vertex / corner colour reduced through the
 shading's `ColorSpace` and optional parametric `/Function`. Edge-flag
 triangle/patch continuation (Tables 85/86) is honoured. `mesh` and
 `gradient` are mutually exclusive — a Type 1–3 shading populates
-`gradient` (and leaves `mesh` `None`), a Type 4–7 shading the reverse.
+`gradient` (and leaves `mesh` `None`), a Type 4–7 shading the reverse. A
+shading's `/ColorSpace` may be an inline array or a *named*
+`/Resources /ColorSpace` key (resolved like `cs`/`CS`).
+
+**Shading-pattern fills** (`/PatternType 2`, §8.7.3.3) paint directly
+into the `Scene`: a `scn`/`SCN` whose `/Pattern` operand names a shading
+pattern becomes a `Paint::LinearGradient` (axial) or
+`Paint::RadialGradient` (radial), with the shading axis / circles mapped
+to device space through the pattern `/Matrix` composed with the CTM.
+Tiling patterns (`/PatternType 1`) keep the conservative black fallback.
 
 ## Interactive-form & annotation writers
 
