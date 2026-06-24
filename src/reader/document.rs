@@ -21,10 +21,11 @@
 //! reader symmetric with the writer's output. Object streams (PDF
 //! 1.5+) and encryption are deferred to round 4+.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use oxideav_core::vector::{
-    FillRule, Group, Node, Paint, Path, PathCommand, PathNode, Rgba, VectorFrame,
+    FillRule, Group, Node, Paint, Path, PathCommand, PathNode, Point, Rgba, Transform2D,
+    VectorFrame,
 };
 use oxideav_core::TimeBase;
 use oxideav_scene::{Metadata, Page, Scene};
@@ -35,7 +36,7 @@ use crate::objects::{Dict, Object, ObjectId, Stream};
 use crate::pubsec::{
     open_with_certificate, open_with_certificate_and_trust_store, PubSecCredential, TrustStore,
 };
-use crate::reader::content::parse_content_stream_full_with_properties;
+use crate::reader::content::parse_content_stream_full_with_xobjects;
 use crate::reader::parse::Parser;
 use crate::reader::xref::{parse_xref, XrefEntry, XrefTable};
 
@@ -1215,14 +1216,21 @@ fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Pag
     } else {
         None
     };
+    let xobject_forms = if let Some(rdict) = resources_dict.as_ref() {
+        let mut seen = HashSet::new();
+        resolve_xobject_forms(reader, rdict, 0, &mut seen)?
+    } else {
+        None
+    };
 
-    let parsed = parse_content_stream_full_with_properties(
+    let parsed = parse_content_stream_full_with_xobjects(
         &content_bytes,
         ext_gstate_dict.as_ref(),
         fonts_dict.as_ref(),
         shading_dict.as_ref(),
         color_space_dict.as_ref(),
         properties_dict.as_ref(),
+        xobject_forms.as_ref(),
     )?;
     let root = parsed.root;
     let mut page = Page::new(width, height);
@@ -1617,6 +1625,263 @@ fn resolve_properties_resources(
         }
     }
     Ok(Some(out))
+}
+
+/// Maximum nesting depth for Form XObject recursion (§8.10). A form
+/// may paint another form via its own `Do`; without a ceiling a
+/// pathologically deep (or cyclic, though the visited-set guards the
+/// direct cycle) chain could exhaust the stack. 12 mirrors the
+/// parser's own structural depth ceiling and is far beyond any
+/// legitimate document's appearance-stream nesting.
+const MAX_XOBJECT_DEPTH: usize = 12;
+
+/// Resolve a page's (or form's) `/Resources /XObject` subdictionary
+/// into a map of resource-name → pre-parsed Form XObject [`Group`]
+/// (ISO 32000-1 §8.10). Image XObjects are skipped (they are surfaced
+/// separately by [`crate::reader::images`]); only `/Subtype /Form`
+/// entries are returned.
+///
+/// Each form's content stream is decoded, its own `/Resources` are
+/// resolved, and its content is recursively parsed (so a form that
+/// itself paints nested forms via `Do` is expanded). The resulting
+/// `Group` carries:
+///
+/// * `transform` = the form's `/Matrix` (default identity), mapping
+///   form space into the user space in effect where `Do` is invoked
+///   (§8.10.1: the matrix is concatenated with the CTM);
+/// * `clip` = the `/BBox` rectangle as a closed subpath (§8.10.1: the
+///   form is clipped to its bounding box).
+///
+/// `depth` bounds the recursion at [`MAX_XOBJECT_DEPTH`]; `visited`
+/// tracks the object ids of forms currently on the resolution stack so
+/// a direct self-reference (a form whose content `Do`s itself) is
+/// broken rather than looping. A malformed or unresolvable entry is
+/// silently dropped so a `Do` against it behaves as a tolerated no-op.
+///
+/// Returns `Ok(None)` when the resources dict carries no `/XObject`
+/// entry or when no entry resolved to a non-empty Form group.
+fn resolve_xobject_forms(
+    reader: &mut DocumentReader<'_>,
+    resources: &Dict,
+    depth: usize,
+    visited: &mut HashSet<ObjectId>,
+) -> Result<Option<BTreeMap<String, Group>>, PdfError> {
+    if depth >= MAX_XOBJECT_DEPTH {
+        return Ok(None);
+    }
+    let xobj_obj = resources
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "XObject")
+        .map(|(_, v)| v.clone());
+    let xobj_obj = match xobj_obj {
+        Some(Object::Reference(id)) => reader.resolve(id)?,
+        Some(other) => other,
+        None => return Ok(None),
+    };
+    let Object::Dict(xobj_dict) = xobj_obj else {
+        return Ok(None);
+    };
+    let mut out: BTreeMap<String, Group> = BTreeMap::new();
+    for (name, value) in xobj_dict.entries() {
+        // Per §8.9 / §8.10 an XObject is an indirect object; capture
+        // its id so a form referencing itself is cycle-guarded.
+        let (form_id, resolved) = match value {
+            Object::Reference(id) => (Some(*id), reader.resolve(*id)?),
+            other => (None, other.clone()),
+        };
+        let Object::Stream(stream) = resolved else {
+            continue;
+        };
+        // Only Form XObjects splice into the scene tree here.
+        let subtype = stream
+            .dict
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Subtype")
+            .map(|(_, v)| v);
+        if !matches!(subtype, Some(Object::Name(s)) if s == "Form") {
+            continue;
+        }
+        if let Some(id) = form_id {
+            if visited.contains(&id) {
+                continue;
+            }
+            visited.insert(id);
+        }
+        let group = resolve_one_form_xobject(reader, &stream, depth, visited)?;
+        if let Some(id) = form_id {
+            visited.remove(&id);
+        }
+        if let Some(g) = group {
+            if !g.children.is_empty() {
+                out.insert(name.clone(), g);
+            }
+        }
+    }
+    if out.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(out))
+    }
+}
+
+/// Parse one Form XObject stream into a [`Group`] (§8.10.1). The
+/// form's `/Matrix` becomes the group transform, its `/BBox` the group
+/// clip, and its content stream — resolved against its own
+/// `/Resources` (fonts, ext-gstate, shadings, colour spaces,
+/// properties, and nested Form XObjects) — the group children.
+/// Returns `Ok(None)` for a form that can't be decoded or whose
+/// content parses to nothing.
+fn resolve_one_form_xobject(
+    reader: &mut DocumentReader<'_>,
+    stream: &Stream,
+    depth: usize,
+    visited: &mut HashSet<ObjectId>,
+) -> Result<Option<Group>, PdfError> {
+    let content_bytes = match decode_stream(stream) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+
+    // The form's own /Resources (Table 95). A form may omit it (PDF 1.1
+    // promoted resources to the page), in which case the form sees no
+    // resources here — its `Do` / text / shading operators degrade to
+    // the same tolerated no-ops the page path uses for a missing entry.
+    let form_resources = match stream.dict.entries().iter().find(|(k, _)| k == "Resources") {
+        Some((_, Object::Reference(id))) => match reader.resolve(*id)? {
+            Object::Dict(d) => Some(d),
+            _ => None,
+        },
+        Some((_, Object::Dict(d))) => Some(d.clone()),
+        _ => None,
+    };
+
+    let ext_gstate_dict = match form_resources.as_ref() {
+        Some(r) => resolve_ext_gstate(reader, r)?,
+        None => None,
+    };
+    let fonts_dict = match form_resources.as_ref() {
+        Some(r) => resolve_font_resources(reader, r)?,
+        None => None,
+    };
+    let shading_dict = match form_resources.as_ref() {
+        Some(r) => resolve_shading_resources(reader, r)?,
+        None => None,
+    };
+    let color_space_dict = match form_resources.as_ref() {
+        Some(r) => resolve_color_space_resources(reader, r)?,
+        None => None,
+    };
+    let properties_dict = match form_resources.as_ref() {
+        Some(r) => resolve_properties_resources(reader, r)?,
+        None => None,
+    };
+    let nested_forms = match form_resources.as_ref() {
+        Some(r) => resolve_xobject_forms(reader, r, depth + 1, visited)?,
+        None => None,
+    };
+
+    let parsed = parse_content_stream_full_with_xobjects(
+        &content_bytes,
+        ext_gstate_dict.as_ref(),
+        fonts_dict.as_ref(),
+        shading_dict.as_ref(),
+        color_space_dict.as_ref(),
+        properties_dict.as_ref(),
+        nested_forms.as_ref(),
+    )?;
+
+    // The content parser returns a root `Group` carrying any top-level
+    // `cm` transform + clip. We nest that under an outer group whose
+    // transform is the form's /Matrix and whose clip is the /BBox, so
+    // the §8.10.1 (b) concat-Matrix and (c) clip-BBox steps wrap the
+    // form's own content as a single splice-able unit.
+    let inner = parsed.root;
+    let matrix = form_matrix(&stream.dict);
+    let clip = form_bbox_clip(&stream.dict);
+    let children = if inner.transform == Transform2D::identity()
+        && inner.clip.is_none()
+        && inner.opacity == 1.0
+    {
+        // The inner root is a bare container — flatten it so we don't
+        // wrap an identity group inside the form group.
+        inner.children
+    } else {
+        vec![Node::Group(inner)]
+    };
+    if children.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Group {
+        transform: matrix,
+        opacity: 1.0,
+        clip,
+        children,
+        ..Group::default()
+    }))
+}
+
+/// The form's `/Matrix` (§8.10.2 Table 95) as a [`Transform2D`], or
+/// the identity matrix when absent / malformed.
+fn form_matrix(dict: &Dict) -> Transform2D {
+    let nums = match dict.entries().iter().find(|(k, _)| k == "Matrix") {
+        Some((_, Object::Array(items))) if items.len() == 6 => items,
+        _ => return Transform2D::identity(),
+    };
+    let mut m = [0.0f32; 6];
+    for (i, slot) in m.iter_mut().enumerate() {
+        match &nums[i] {
+            Object::Integer(v) => *slot = *v as f32,
+            Object::Real(v) => *slot = *v as f32,
+            _ => return Transform2D::identity(),
+        }
+    }
+    Transform2D {
+        a: m[0],
+        b: m[1],
+        c: m[2],
+        d: m[3],
+        e: m[4],
+        f: m[5],
+    }
+}
+
+/// The form's `/BBox` (§8.10.2 Table 95) as a closed-rectangle clip
+/// [`Path`], or `None` when absent / malformed. The four numbers are
+/// the left, bottom, right, top edges in form space (the same
+/// coordinate system the group transform — the form `/Matrix` — is
+/// applied in, so the clip is expressed pre-transform exactly like the
+/// content it bounds).
+fn form_bbox_clip(dict: &Dict) -> Option<Path> {
+    let items = match dict.entries().iter().find(|(k, _)| k == "BBox") {
+        Some((_, Object::Array(items))) if items.len() == 4 => items,
+        _ => return None,
+    };
+    let mut v = [0.0f32; 4];
+    for (i, slot) in v.iter_mut().enumerate() {
+        match &items[i] {
+            Object::Integer(n) => *slot = *n as f32,
+            Object::Real(n) => *slot = *n as f32,
+            _ => return None,
+        }
+    }
+    let (x0, y0, x1, y1) = (v[0], v[1], v[2], v[3]);
+    // Normalise so the rectangle is well-formed regardless of edge
+    // ordering (§8.10.2 names them left/bottom/right/top but a
+    // producer may emit them swapped).
+    let (lx, rx) = (x0.min(x1), x0.max(x1));
+    let (by, ty) = (y0.min(y1), y0.max(y1));
+    if rx <= lx || ty <= by {
+        return None;
+    }
+    let mut path = Path::new();
+    path.commands.push(PathCommand::MoveTo(Point::new(lx, by)));
+    path.commands.push(PathCommand::LineTo(Point::new(rx, by)));
+    path.commands.push(PathCommand::LineTo(Point::new(rx, ty)));
+    path.commands.push(PathCommand::LineTo(Point::new(lx, ty)));
+    path.commands.push(PathCommand::Close);
+    Some(path)
 }
 
 /// Recursively dereference + simplify a colour-space `Object` so the

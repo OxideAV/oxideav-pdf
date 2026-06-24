@@ -226,6 +226,17 @@ alternate), the `gs` ExtGState operator (line state
 `/Resources /Font`, and the marked-content operators
 (`BMC`/`BDC`/`EMC`/`MP`/`DP`, §14.6) with named-property resolution.
 
+**Form XObjects** (§8.10) painted via `name Do` are spliced into the
+`Scene`: the page's `/Resources /XObject` subdictionary is resolved, each
+`/Subtype /Form` entry's content stream decoded and recursively parsed
+against its own `/Resources` (including nested Form XObjects), and the
+result becomes a nested `Group` carrying the form's `/Matrix` as its
+transform and the `/BBox` rectangle as its clip — the §8.10.1
+q / concat-Matrix / clip-BBox / paint / Q algorithm. Form recursion is
+depth-bounded and cycle-guarded, so a self-referential appearance stream
+terminates. Image XObjects stay a vector-side no-op (surfaced separately
+by `image_xobjects()`).
+
 The `sh` shading-paint operator (§8.7.4.5) surfaces a `ContentShading`
 event per paint with the resolved shading dictionary, the effective CTM,
 and the active clip. **Type 1–3 shadings** (function-based / axial /

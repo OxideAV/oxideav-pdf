@@ -80,6 +80,7 @@
 //! [`parse_content_stream_with_resources`] entry points drop them
 //! silently to preserve round-3 / round-125 callers' behaviour.
 
+use std::collections::BTreeMap;
 use std::str;
 
 use oxideav_core::vector::{
@@ -293,6 +294,44 @@ pub fn parse_content_stream_full_with_properties(
         color_space_resources,
         properties_resources,
     );
+    state.parse(input)?;
+    Ok(state.finish())
+}
+
+/// Like [`parse_content_stream_full_with_properties`] but also accepts
+/// the page's pre-parsed Form XObjects (§8.10), keyed by `/Resources
+/// /XObject` resource name (leading `/` stripped). When a `name Do`
+/// operator references one of these, the form's content — already
+/// parsed into a [`Group`] whose `transform` is the form's `/Matrix`
+/// and whose `clip` is the `/BBox` rectangle — is spliced into the
+/// scene tree under the current CTM (§8.10.1's q / concat-Matrix /
+/// clip-BBox / paint / Q algorithm). A `Do` naming an unknown form
+/// (or any Image XObject, which is surfaced separately by
+/// [`crate::reader::images`]) stays a tolerated no-op.
+///
+/// The forms are pre-parsed by the caller
+/// ([`crate::reader::document::resolve_xobject_forms`]) so this parser
+/// never touches the reader: each form's own `/Resources` are resolved
+/// and its content recursively parsed before the map is built, with a
+/// depth guard against nested-form cycles.
+#[allow(clippy::too_many_arguments)]
+pub fn parse_content_stream_full_with_xobjects(
+    input: &[u8],
+    ext_gstate: Option<&Dict>,
+    font_resources: Option<&Dict>,
+    shading_resources: Option<&Dict>,
+    color_space_resources: Option<&Dict>,
+    properties_resources: Option<&Dict>,
+    xobject_forms: Option<&BTreeMap<String, Group>>,
+) -> Result<ParsedContent, PdfError> {
+    let mut state = State::new(
+        ext_gstate,
+        font_resources,
+        shading_resources,
+        color_space_resources,
+        properties_resources,
+    )
+    .with_xobject_forms(xobject_forms);
     state.parse(input)?;
     Ok(state.finish())
 }
@@ -760,6 +799,19 @@ struct State<'a> {
     /// Stream-order `sh`-paint events accumulated for the round-259
     /// [`ParsedContent::shadings`] return slot.
     shadings: Vec<ContentShading>,
+    /// Pre-parsed Form XObjects from the page's `/Resources /XObject`
+    /// subdictionary, keyed by resource name (leading `/` stripped),
+    /// supplied by [`parse_content_stream_full_with_xobjects`] — `None`
+    /// for the legacy entry points. Each value is the form's content
+    /// stream already parsed into a [`Group`] (§8.10.1) whose
+    /// `transform` is the form's `/Matrix` and whose `clip` is the
+    /// `/BBox` rectangle, so a `name Do` against it splices the group
+    /// under the current CTM with a single clone. When this is `None`
+    /// or doesn't contain the named key, `Do` stays a tolerated no-op
+    /// (matching the round-3 drop). Image XObjects are not stored here
+    /// — they are surfaced through the dedicated
+    /// [`crate::reader::images`] walker.
+    xobject_forms: Option<&'a BTreeMap<String, Group>>,
 }
 
 struct Frame {
@@ -2515,7 +2567,17 @@ impl<'a> State<'a> {
             in_text_object: false,
             text_shows: Vec::new(),
             shadings: Vec::new(),
+            xobject_forms: None,
         }
+    }
+
+    /// Attach the page's pre-parsed Form XObjects (§8.10) so the `Do`
+    /// operator can splice a named form's content into the scene tree.
+    /// Used by [`parse_content_stream_full_with_xobjects`]; the legacy
+    /// entry points leave this `None` and `Do` stays a no-op.
+    fn with_xobject_forms(mut self, forms: Option<&'a BTreeMap<String, Group>>) -> Self {
+        self.xobject_forms = forms;
+        self
     }
 
     fn finish(mut self) -> ParsedContent {
@@ -3126,8 +3188,35 @@ impl<'a> State<'a> {
 
             // XObject paint ----------------------------------------
             b"Do" => {
-                // /Imx Do — paint an image XObject. Round-3 doesn't
-                // resolve XObject images yet (round-4+), drop.
+                // `/Name Do` — paint an external object (§8.8). A Form
+                // XObject (§8.10) is spliced into the scene tree here;
+                // an Image XObject is left to the dedicated
+                // [`crate::reader::images`] walker (round-3 no-op on the
+                // scene side).
+                //
+                // §8.10.1 specifies the Do-on-form algorithm as:
+                //   a) q (save graphics state)
+                //   b) concat the form's /Matrix with the CTM
+                //   c) clip to the form's /BBox
+                //   d) paint the form's content stream
+                //   e) Q (restore)
+                //
+                // The pre-parsed form `Group` already carries /Matrix in
+                // its `transform` and the /BBox rectangle in its `clip`,
+                // so pushing it as a child of the current frame applies
+                // (b)+(c) under the frame's accumulated `cm` CTM — the
+                // q/Q bracket is implicit in the nested-group boundary.
+                let name = match self.operands.last() {
+                    Some(Operand::Name(n)) => n.clone(),
+                    _ => String::new(),
+                };
+                if !name.is_empty() {
+                    if let Some(form) = self.xobject_forms.and_then(|m| m.get(&name)) {
+                        if !form.children.is_empty() {
+                            self.current().children.push(Node::Group(form.clone()));
+                        }
+                    }
+                }
                 self.operands.clear();
             }
 
