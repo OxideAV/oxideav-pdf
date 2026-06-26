@@ -200,7 +200,11 @@ for an end-to-end verify.
   Image XObject as a self-contained JPEG stream with dimensions,
   colour space, and bits-per-component.
 - **Inline images** — `inline_images()` surfaces every `BI … ID … EI`
-  triplet (§8.9.7) with its filter tag.
+  triplet (§8.9.7) with its filter tag. The content-stream walker also
+  consumes inline images in place (so a binary payload no longer
+  corrupts the surrounding shapes or aborts the parse) and reports each
+  on `ParsedContent::inline_images` as a `ContentInlineImage` with the
+  CTM (unit-square → user-space placement) and active clip.
 - **Annotations** — `annotations()` decodes the §12.5.6 subtype taxonomy
   (Text, FreeText, the markup variants, Line, Polygon, PolyLine, Ink,
   Caret, Popup, FileAttachment, Watermark, Redact, Sound, Movie, Screen,

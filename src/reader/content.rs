@@ -90,6 +90,7 @@ use oxideav_core::vector::{
 
 use crate::error::PdfError;
 use crate::objects::{Dict, Object};
+use crate::reader::inline_images::{find_inline_image_ei, parse_one_inline_image, PdfInlineImage};
 
 /// Parse a content-stream byte sequence into a single [`Group`]
 /// containing every shape painted by the stream. Nested `q`/`Q`
@@ -405,6 +406,16 @@ pub struct ParsedContent {
     /// `parse_content_stream_with_resources`) discard the whole
     /// `ParsedContent`, so the events are unobservable there.
     pub marked_content: Vec<ContentMarkedContent>,
+    /// Every `BI … ID … EI` inline image (§8.9.7) the walker saw, in
+    /// stream order — one entry per inline image, carrying its
+    /// resolved dictionary + payload and the CTM / clip in force at
+    /// the `BI`. Surfaced from every `ParsedContent`-returning entry
+    /// point (the resolution needs no `/Resources` plumbing — an
+    /// inline image is self-contained). The `Group`-returning legacy
+    /// entries discard the whole `ParsedContent`, but they still
+    /// consume the `BI … EI` correctly so the surrounding shapes
+    /// survive.
+    pub inline_images: Vec<ContentInlineImage>,
 }
 
 /// One `Tj`/`TJ`/`'`/`"` text-show event surfaced by
@@ -455,6 +466,40 @@ pub enum TextShowOp {
     /// `"`a_w a_c string"`` — set word + char spacing, move to next
     /// line, then show.
     DoubleQuote,
+}
+
+/// One `BI … ID … EI` inline-image event surfaced by the
+/// content-stream walker (ISO 32000-1 §8.9.7). Unlike an Image
+/// XObject (which is named and resolved through `/Resources
+/// /XObject`), an inline image carries its dictionary + payload
+/// directly in the content stream, so the walker is the only place
+/// it can be observed with the correct graphics-state context.
+///
+/// The walker does NOT decode the payload into pixels — that belongs
+/// to the image pipeline. It captures the resolved
+/// [`PdfInlineImage`] (dictionary + filter-peeled payload, per
+/// [`crate::reader::inline_images`]) together with the placement
+/// context that §8.9 / §8.7.3.4 require to position it:
+///
+/// * `ctm` — the composed current transformation matrix at the `BI`.
+///   An inline image is painted into the unit square `0 ≤ x,y ≤ 1`
+///   in image space, mapped to user space by the CTM (§8.9.5.1), so
+///   `ctm` is exactly the placement matrix.
+/// * `clip` — the most recent `W`/`W*`-committed clip path in force,
+///   or `None`. The image is subject to it (§8.5.4).
+#[derive(Clone, Debug)]
+pub struct ContentInlineImage {
+    /// The resolved inline image — dictionary fields (width, height,
+    /// colour space, bits-per-component, terminal codec filter,
+    /// image-mask flag) plus the wrapping-filter-peeled payload.
+    pub image: PdfInlineImage,
+    /// Composed current transformation matrix at the moment of the
+    /// `BI` operator. Maps the unit-square image space to user space
+    /// (§8.9.5.1).
+    pub ctm: Transform2D,
+    /// Active clip path (most recent `W`/`W*` commit in the live `q`
+    /// frame), or `None` when no clip is in force (§8.5.4).
+    pub clip: Option<Path>,
 }
 
 /// One `name sh` shading-paint event surfaced by
@@ -830,6 +875,9 @@ struct State<'a> {
     /// Stream-order `sh`-paint events accumulated for the round-259
     /// [`ParsedContent::shadings`] return slot.
     shadings: Vec<ContentShading>,
+    /// Stream-order `BI … ID … EI` inline-image events accumulated for
+    /// the [`ParsedContent::inline_images`] return slot.
+    inline_images: Vec<ContentInlineImage>,
     /// Pre-parsed Form XObjects from the page's `/Resources /XObject`
     /// subdictionary, keyed by resource name (leading `/` stripped),
     /// supplied by [`parse_content_stream_full_with_xobjects`] — `None`
@@ -2746,6 +2794,7 @@ impl<'a> State<'a> {
             in_text_object: false,
             text_shows: Vec::new(),
             shadings: Vec::new(),
+            inline_images: Vec::new(),
             xobject_forms: None,
             pattern_resources: None,
         }
@@ -2788,6 +2837,7 @@ impl<'a> State<'a> {
             text_shows: self.text_shows,
             shadings: self.shadings,
             marked_content: self.marked_content,
+            inline_images: self.inline_images,
         }
     }
 
@@ -4114,10 +4164,50 @@ impl<'a> State<'a> {
                 continue;
             }
             let kw = &input[i..kw_end];
+            // `BI` opens an inline image (§8.9.7). Its raw payload
+            // between `ID` and `EI` can contain *any* bytes — including
+            // sequences that look like operators / numbers — so it must
+            // be consumed by the inline-image framer rather than tokenized
+            // by this loop. We hand the framer the bytes from just past
+            // `BI` and resume past the framer's reported `EI`.
+            if kw == b"BI" {
+                i = self.consume_inline_image(input, kw_end);
+                continue;
+            }
             self.dispatch(kw)?;
             i = kw_end;
         }
         Ok(())
+    }
+
+    /// Consume a `BI … ID … EI` inline image (§8.9.7) starting just past
+    /// the `BI` keyword (`after_bi`). Records a [`ContentInlineImage`]
+    /// event with the CTM + clip in force, and returns the byte offset
+    /// to resume parsing at (just past `EI`).
+    ///
+    /// The pre-`BI` operands are cleared (an inline image takes no
+    /// operands; any stragglers are tolerated and dropped). On a
+    /// malformed dictionary the framer returns an error — we salvage by
+    /// scanning forward to the next `EI` so the rest of the content
+    /// stream still parses, rather than aborting the whole document.
+    fn consume_inline_image(&mut self, input: &[u8], after_bi: usize) -> usize {
+        self.operands.clear();
+        match parse_one_inline_image(input, after_bi) {
+            Ok((image, resume)) => {
+                let ctm = self.effective_ctm();
+                let clip = self.current_clip();
+                self.inline_images
+                    .push(ContentInlineImage { image, ctm, clip });
+                resume
+            }
+            // Salvage: skip to the next `EI` (past it) so the trailing
+            // content stream survives a malformed inline-image dict.
+            Err(_) => match find_inline_image_ei(input, after_bi) {
+                Some(ei) => ei + 2,
+                // No `EI` at all — consume the rest of the stream.
+                None => input.len(),
+            },
+        }
     }
 }
 

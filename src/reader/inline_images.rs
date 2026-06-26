@@ -268,7 +268,10 @@ fn is_ws(b: u8) -> bool {
 /// abbreviated inline-image dict, then the `ID` keyword, then the raw
 /// payload up to `EI`. Returns the parsed image and the byte offset
 /// in the parent stream just past the `EI` keyword.
-fn parse_one_inline_image(bytes: &[u8], mut i: usize) -> Result<(PdfInlineImage, usize), PdfError> {
+pub(crate) fn parse_one_inline_image(
+    bytes: &[u8],
+    mut i: usize,
+) -> Result<(PdfInlineImage, usize), PdfError> {
     // Inline-image dict: a sequence of `/Name <value>` pairs until
     // the `ID` keyword. Values may be names, numbers, strings,
     // arrays, dicts, or booleans. We collect them as raw key/value
@@ -396,7 +399,7 @@ fn parse_one_inline_image(bytes: &[u8], mut i: usize) -> Result<(PdfInlineImage,
 /// §8.9.7 EI-locator: first occurrence of `EI` such that the
 /// preceding byte is whitespace and the following byte is
 /// whitespace or EOF.
-fn find_inline_image_ei(bytes: &[u8], from: usize) -> Option<usize> {
+pub(crate) fn find_inline_image_ei(bytes: &[u8], from: usize) -> Option<usize> {
     let mut i = from;
     while i + 2 <= bytes.len() {
         if &bytes[i..i + 2] == b"EI" {
