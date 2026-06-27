@@ -297,7 +297,11 @@ anchored to the page's default coordinate space through the pattern
 `/Matrix` independent of any `cm` in force (§8.7.2 NOTE 1); the tile
 count is hard-capped (4096) and a degenerate / singular pattern matrix
 falls back to black. A coloured cell (`/PaintType 1`) paints with its
-own colours.
+own colours; an **uncoloured** cell (`/PaintType 2`, §8.7.3.3) is a
+stencil poured with the underlying colour the `scn` supplies before the
+pattern name (`c… /Pname scn`, read by component count — gray / RGB /
+CMYK), so the same cell shape tiles different regions in different
+colours.
 
 ## Interactive-form & annotation writers
 

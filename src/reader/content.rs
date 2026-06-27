@@ -950,6 +950,13 @@ struct State<'a> {
     /// non-pattern colour operator) at `commit_path` fill time to tile
     /// the painted region. `None` when no tiling fill is in force.
     fill_tiling: Option<String>,
+    /// Underlying colour for an *uncoloured* (`/PaintType 2`) tiling
+    /// pattern fill (§8.7.3.3): the numeric components a `scn` supplies
+    /// before the pattern name, in the Pattern colour space's underlying
+    /// space (read by component count — 1 gray / 3 RGB / 4 CMYK). The
+    /// cell is a stencil poured with this colour. `None` for a coloured
+    /// (`/PaintType 1`) pattern or when no components were supplied.
+    fill_tiling_color: Option<Rgba>,
     /// Name of the active tiling pattern for the stroking colour
     /// (`SCN /Pname`). Strokes are not tiled — a tiling-stroke pattern
     /// keeps the black fallback — but the name is tracked symmetrically
@@ -2883,6 +2890,7 @@ impl<'a> State<'a> {
             pattern_resources: None,
             tiling_patterns: None,
             fill_tiling: None,
+            fill_tiling_color: None,
             stroke_tiling: None,
         }
     }
@@ -3136,6 +3144,7 @@ impl<'a> State<'a> {
                 let nums = self.take_numbers(3)?;
                 self.fill_cs = ColorSpaceKind::DeviceRgb;
                 self.fill_tiling = None;
+                self.fill_tiling_color = None;
                 self.fill_paint = Some(Paint::Solid(rgb_from_unit(nums[0], nums[1], nums[2])));
             }
             b"RG" => {
@@ -3148,6 +3157,7 @@ impl<'a> State<'a> {
                 let nums = self.take_numbers(1)?;
                 self.fill_cs = ColorSpaceKind::DeviceGray;
                 self.fill_tiling = None;
+                self.fill_tiling_color = None;
                 self.fill_paint = Some(Paint::Solid(rgb_from_unit(nums[0], nums[0], nums[0])));
             }
             b"G" => {
@@ -3173,6 +3183,7 @@ impl<'a> State<'a> {
                 } else {
                     self.fill_cs = ColorSpaceKind::DeviceCmyk;
                     self.fill_tiling = None;
+                    self.fill_tiling_color = None;
                     self.fill_paint = p;
                 }
             }
@@ -3189,6 +3200,13 @@ impl<'a> State<'a> {
                 // filled region; record it (and clear any stale shading
                 // paint). A non-tiling operand clears the tiling state.
                 self.fill_tiling = self.tiling_pattern_name_from_operand();
+                // For an uncoloured (`/PaintType 2`) pattern, capture the
+                // underlying colour the cell stencil is poured with from
+                // the numeric operands preceding the name (§8.7.3.3).
+                self.fill_tiling_color = self
+                    .fill_tiling
+                    .as_ref()
+                    .and_then(|n| self.uncoloured_tiling_color(n));
                 let paint = self
                     .color_from_components(&self.fill_cs.clone())
                     .or_else(|| self.pattern_paint_from_operand());
@@ -3220,6 +3238,7 @@ impl<'a> State<'a> {
                 // initialize the corresponding current colour to 0.0").
                 self.fill_cs = self.take_color_space_name();
                 self.fill_tiling = None;
+                self.fill_tiling_color = None;
                 self.fill_paint = initial_color_for(&self.fill_cs);
                 self.operands.clear();
             }
@@ -3932,6 +3951,14 @@ impl<'a> State<'a> {
         }
         // The /BBox clip (pattern space) applied per tile.
         let bbox_clip = rect_path(pat.bbox[0], pat.bbox[1], pat.bbox[2], pat.bbox[3]);
+        // An uncoloured (`/PaintType 2`) cell is a stencil poured with
+        // the underlying colour the `scn` supplied (§8.7.3.3); default to
+        // black when none was given. A coloured cell keeps its own paint.
+        let stencil_color = if pat.paint_type == 2 {
+            Some(self.fill_tiling_color.unwrap_or(Rgba::opaque(0, 0, 0)))
+        } else {
+            None
+        };
         let mut tiles: Vec<Node> = Vec::new();
         for j in j_lo..=j_hi {
             for i in i_lo..=i_hi {
@@ -3943,6 +3970,11 @@ impl<'a> State<'a> {
                 cell.transform = placement;
                 // Clip the cell to its /BBox (pattern space).
                 cell.clip = Some(bbox_clip.clone());
+                if let Some(color) = stencil_color {
+                    for child in &mut cell.children {
+                        recolor_node(child, color);
+                    }
+                }
                 tiles.push(Node::Group(cell));
             }
         }
@@ -4314,6 +4346,42 @@ impl<'a> State<'a> {
             Some(name.to_string())
         } else {
             None
+        }
+    }
+
+    /// For an *uncoloured* (`/PaintType 2`) tiling pattern named `name`,
+    /// read the underlying colour the cell stencil is poured with from
+    /// the numeric operands a `scn`/`SCN` supplies before the pattern
+    /// name (§8.7.3.3). The underlying space is the second element of the
+    /// `[/Pattern base]` colour space; this round reads it by component
+    /// count (1 → DeviceGray, 3 → DeviceRGB, 4 → DeviceCMYK), which
+    /// covers the device underlying spaces. Returns `None` for a coloured
+    /// (`/PaintType 1`) pattern, when no numeric operands precede the
+    /// name, or when the count isn't a device arity.
+    fn uncoloured_tiling_color(&self, name: &str) -> Option<Rgba> {
+        let pat = self.tiling_patterns?.get(name)?;
+        if pat.paint_type != 2 {
+            return None;
+        }
+        // The operands are `[c0 .. cn] /Pname`; collect the numeric
+        // components that precede the trailing name.
+        let comps: Vec<f32> = self
+            .operands
+            .iter()
+            .filter_map(|o| match o {
+                Operand::Number(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        let paint = match comps.len() {
+            1 => Paint::Solid(rgb_from_unit(comps[0], comps[0], comps[0])),
+            3 => Paint::Solid(rgb_from_unit(comps[0], comps[1], comps[2])),
+            4 => Paint::Solid(rgb_from_cmyk(comps[0], comps[1], comps[2], comps[3])),
+            _ => return None,
+        };
+        match paint {
+            Paint::Solid(c) => Some(c),
+            _ => None,
         }
     }
 
@@ -5724,6 +5792,32 @@ fn lab_color(white: [f32; 3], lab: [f32; 3]) -> Rgba {
 /// otherwise produce an unbounded node count; past this cap the fill
 /// falls back to its solid colour rather than tiling.
 const MAX_TILING_CELLS: i64 = 4096;
+
+/// Recolour every painted path in a node subtree to a single solid
+/// colour — the stencil-pour operation for an uncoloured (`/PaintType 2`)
+/// tiling pattern cell (§8.7.3.3). A `/PaintType 2` cell carries no
+/// colour of its own, so each fill / stroke that *is* present is repainted
+/// with the underlying colour the `scn` supplied. Paths with no fill /
+/// stroke (pure clip / construction paths) are left untouched; group
+/// transforms / clips are preserved.
+fn recolor_node(node: &mut Node, color: Rgba) {
+    match node {
+        Node::Path(p) => {
+            if p.fill.is_some() {
+                p.fill = Some(Paint::Solid(color));
+            }
+            if let Some(stroke) = &mut p.stroke {
+                stroke.paint = Paint::Solid(color);
+            }
+        }
+        Node::Group(g) => {
+            for child in &mut g.children {
+                recolor_node(child, color);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// A closed rectangular subpath `[llx, lly] → [urx, ury]` (the four
 /// corners + `Close`). Used as a tiling pattern cell's `/BBox` clip and
