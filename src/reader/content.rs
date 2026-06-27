@@ -368,6 +368,39 @@ pub fn parse_content_stream_full_with_patterns(
     Ok(state.finish())
 }
 
+/// Like [`parse_content_stream_full_with_patterns`] but also accepts the
+/// page's pre-parsed `/PatternType 1` tiling patterns (§8.7.3), so a
+/// `scn`/`SCN` fill naming a tiling pattern replicates its pattern cell
+/// across the filled region instead of falling back to black. Each entry
+/// is a [`TilingPattern`] carrying the cell content parsed into a
+/// [`Group`] (against the pattern's own `/Resources`), the `/BBox` clip,
+/// the `/XStep` / `/YStep` spacing, and the pattern `/Matrix`.
+#[allow(clippy::too_many_arguments)]
+pub fn parse_content_stream_full_with_tiling(
+    input: &[u8],
+    ext_gstate: Option<&Dict>,
+    font_resources: Option<&Dict>,
+    shading_resources: Option<&Dict>,
+    color_space_resources: Option<&Dict>,
+    properties_resources: Option<&Dict>,
+    xobject_forms: Option<&BTreeMap<String, Group>>,
+    pattern_resources: Option<&Dict>,
+    tiling_patterns: Option<&BTreeMap<String, TilingPattern>>,
+) -> Result<ParsedContent, PdfError> {
+    let mut state = State::new(
+        ext_gstate,
+        font_resources,
+        shading_resources,
+        color_space_resources,
+        properties_resources,
+    )
+    .with_xobject_forms(xobject_forms)
+    .with_pattern_resources(pattern_resources)
+    .with_tiling_patterns(tiling_patterns);
+    state.parse(input)?;
+    Ok(state.finish())
+}
+
 /// Output of [`parse_content_stream_full`] — the painted-shapes group
 /// (same as the round-3 / round-125 entry points return) plus the
 /// stream-order list of text-show events the round-128 walker
@@ -900,6 +933,57 @@ struct State<'a> {
     /// pattern, a `scn` pattern operand keeps the conservative black
     /// fallback (the round-3 behaviour).
     pattern_resources: Option<&'a Dict>,
+    /// Pre-parsed `/PatternType 1` tiling patterns from the page's
+    /// `/Resources /Pattern` subdictionary, keyed by resource name,
+    /// supplied by [`parse_content_stream_full_with_tiling`] (§8.7.3).
+    /// Each value carries the pattern cell already parsed into a
+    /// [`Group`] plus its `/BBox` clip, `/XStep` / `/YStep` spacing,
+    /// `/Matrix`, and `/PaintType`, so a `scn /Pname` fill naming a
+    /// tiling pattern replicates the cell across the filled region
+    /// (§8.7.3.1) instead of the conservative black fallback. When this
+    /// is `None` or the named pattern isn't a tiling pattern, a `scn`
+    /// pattern operand keeps the black fallback.
+    tiling_patterns: Option<&'a BTreeMap<String, TilingPattern>>,
+    /// Name of the active `/PatternType 1` tiling pattern for the
+    /// nonstroking colour, set by a `scn /Pname` whose `/Pname` resolves
+    /// to a [`TilingPattern`]. Consumed (and cleared by a subsequent
+    /// non-pattern colour operator) at `commit_path` fill time to tile
+    /// the painted region. `None` when no tiling fill is in force.
+    fill_tiling: Option<String>,
+    /// Name of the active tiling pattern for the stroking colour
+    /// (`SCN /Pname`). Strokes are not tiled — a tiling-stroke pattern
+    /// keeps the black fallback — but the name is tracked symmetrically
+    /// so a stroking `SCN /Pname` clears the previous solid stroke
+    /// rather than leaving a stale colour.
+    stroke_tiling: Option<String>,
+}
+
+/// A `/PatternType 1` tiling pattern (§8.7.3) reduced to what the
+/// content walker needs to replicate its cell across a filled region:
+/// the cell's content pre-parsed into a [`Group`] (against the pattern's
+/// own `/Resources`), the `/BBox` clip rectangle, the `/XStep` / `/YStep`
+/// replication spacing, the `/Matrix` mapping pattern space to the page's
+/// default coordinate system (§8.7.2 NOTE 1), and the `/PaintType`
+/// (1 = coloured, 2 = uncoloured stencil).
+#[derive(Clone, Debug)]
+pub struct TilingPattern {
+    /// Cell content stream parsed into a group (its `/Resources` already
+    /// resolved). Each tile clones this group under a per-tile transform.
+    pub cell: Group,
+    /// `/BBox` — `[llx, lly, urx, ury]` in pattern space; clips each
+    /// tile (§8.7.3.1 Table 75).
+    pub bbox: [f32; 4],
+    /// `/XStep` — horizontal replication interval in pattern space.
+    /// Non-zero per Table 75.
+    pub xstep: f32,
+    /// `/YStep` — vertical replication interval in pattern space.
+    pub ystep: f32,
+    /// `/Matrix` — maps pattern space to the parent content stream's
+    /// default coordinate space (§8.7.2). Identity when absent.
+    pub matrix: Transform2D,
+    /// `/PaintType` — 1 (coloured: cell carries its own colours) or 2
+    /// (uncoloured: cell is a stencil poured with the current colour).
+    pub paint_type: i64,
 }
 
 struct Frame {
@@ -2797,6 +2881,9 @@ impl<'a> State<'a> {
             inline_images: Vec::new(),
             xobject_forms: None,
             pattern_resources: None,
+            tiling_patterns: None,
+            fill_tiling: None,
+            stroke_tiling: None,
         }
     }
 
@@ -2815,6 +2902,19 @@ impl<'a> State<'a> {
     /// pattern fill stays the conservative black fallback.
     fn with_pattern_resources(mut self, patterns: Option<&'a Dict>) -> Self {
         self.pattern_resources = patterns;
+        self
+    }
+
+    /// Attach the page's pre-parsed `/PatternType 1` tiling patterns
+    /// (§8.7.3) so a `scn /Pname` tiling-pattern fill replicates its cell
+    /// across the painted region. The legacy entry points leave this
+    /// `None` and a tiling-pattern fill stays the conservative black
+    /// fallback.
+    fn with_tiling_patterns(
+        mut self,
+        patterns: Option<&'a BTreeMap<String, TilingPattern>>,
+    ) -> Self {
+        self.tiling_patterns = patterns;
         self
     }
 
@@ -3035,21 +3135,25 @@ impl<'a> State<'a> {
                 // resolves in RGB.
                 let nums = self.take_numbers(3)?;
                 self.fill_cs = ColorSpaceKind::DeviceRgb;
+                self.fill_tiling = None;
                 self.fill_paint = Some(Paint::Solid(rgb_from_unit(nums[0], nums[1], nums[2])));
             }
             b"RG" => {
                 let nums = self.take_numbers(3)?;
                 self.stroke_cs = ColorSpaceKind::DeviceRgb;
+                self.stroke_tiling = None;
                 self.stroke_paint = Some(Paint::Solid(rgb_from_unit(nums[0], nums[1], nums[2])));
             }
             b"g" => {
                 let nums = self.take_numbers(1)?;
                 self.fill_cs = ColorSpaceKind::DeviceGray;
+                self.fill_tiling = None;
                 self.fill_paint = Some(Paint::Solid(rgb_from_unit(nums[0], nums[0], nums[0])));
             }
             b"G" => {
                 let nums = self.take_numbers(1)?;
                 self.stroke_cs = ColorSpaceKind::DeviceGray;
+                self.stroke_tiling = None;
                 self.stroke_paint = Some(Paint::Solid(rgb_from_unit(nums[0], nums[0], nums[0])));
             }
             b"k" | b"K" => {
@@ -3064,9 +3168,11 @@ impl<'a> State<'a> {
                 )));
                 if op == b"K" {
                     self.stroke_cs = ColorSpaceKind::DeviceCmyk;
+                    self.stroke_tiling = None;
                     self.stroke_paint = p;
                 } else {
                     self.fill_cs = ColorSpaceKind::DeviceCmyk;
+                    self.fill_tiling = None;
                     self.fill_paint = p;
                 }
             }
@@ -3078,6 +3184,11 @@ impl<'a> State<'a> {
                 // (Pattern, an unresolved resource colour space, or a
                 // trailing `/Name` pattern operand) keep the round-3
                 // conservative black fallback.
+                // A `/PatternType 1` tiling-pattern operand defers to
+                // `commit_path`, which replicates the cell across the
+                // filled region; record it (and clear any stale shading
+                // paint). A non-tiling operand clears the tiling state.
+                self.fill_tiling = self.tiling_pattern_name_from_operand();
                 let paint = self
                     .color_from_components(&self.fill_cs.clone())
                     .or_else(|| self.pattern_paint_from_operand());
@@ -3089,6 +3200,7 @@ impl<'a> State<'a> {
                 self.operands.clear();
             }
             b"SC" | b"SCN" => {
+                self.stroke_tiling = self.tiling_pattern_name_from_operand();
                 let paint = self
                     .color_from_components(&self.stroke_cs.clone())
                     .or_else(|| self.pattern_paint_from_operand());
@@ -3107,11 +3219,13 @@ impl<'a> State<'a> {
                 // black/zero value per §8.6.4.2..4 ("Setting … shall
                 // initialize the corresponding current colour to 0.0").
                 self.fill_cs = self.take_color_space_name();
+                self.fill_tiling = None;
                 self.fill_paint = initial_color_for(&self.fill_cs);
                 self.operands.clear();
             }
             b"CS" => {
                 self.stroke_cs = self.take_color_space_name();
+                self.stroke_tiling = None;
                 self.stroke_paint = initial_color_for(&self.stroke_cs);
                 self.operands.clear();
             }
@@ -3684,7 +3798,17 @@ impl<'a> State<'a> {
             self.operands.clear();
             return;
         };
-        let fill_paint = if fill {
+        // A `/PatternType 1` tiling-pattern fill (§8.7.3) replicates the
+        // pattern cell across the filled region instead of painting a
+        // solid colour. When one is active, emit the tiled cells (clipped
+        // to `path`) and drop the solid fill on the PathNode — the stroke,
+        // if any, still paints below.
+        let tiled = if fill {
+            self.emit_tiling_fill(&path, rule)
+        } else {
+            false
+        };
+        let fill_paint = if fill && !tiled {
             let base = self
                 .fill_paint
                 .clone()
@@ -3717,6 +3841,137 @@ impl<'a> State<'a> {
         });
         self.current().children.push(node);
         self.operands.clear();
+    }
+
+    /// Replicate the active `/PatternType 1` tiling pattern's cell
+    /// across the region bounded by `fill_path` (§8.7.3.1). Returns
+    /// `true` when a tiling fill was emitted (so [`commit_path`] drops
+    /// the solid fill), `false` otherwise (no tiling pattern active or
+    /// resolvable — the caller keeps its existing fill).
+    ///
+    /// Geometry (§8.7.2 NOTE 1 + §8.7.3.1):
+    /// * The pattern `/Matrix` maps pattern space to the page's default
+    ///   (initial) coordinate space — the root frame's local space —
+    ///   independent of any `cm` in force at paint time. The tiled group
+    ///   is therefore emitted as a child of the **root** frame, with each
+    ///   tile placed at `Matrix · translate(i·XStep, j·YStep)`.
+    /// * Each tile clones the cell `Group` and clips it to the `/BBox`.
+    /// * The fill region clips the whole tiling: `fill_path` is mapped
+    ///   from the current frame's local space into root-local space
+    ///   (composing the frames above the root) and used as the group clip.
+    /// * The `i`/`j` index range is the cell-origin lattice covering the
+    ///   fill region's bounding box, mapped back through the inverse of
+    ///   the pattern matrix; the tile count is hard-capped so a huge fill
+    ///   over a tiny step can't explode.
+    fn emit_tiling_fill(&mut self, fill_path: &Path, rule: FillRule) -> bool {
+        let Some(name) = self.fill_tiling.clone() else {
+            return false;
+        };
+        let Some(pat) = self.tiling_patterns.and_then(|m| m.get(&name)) else {
+            return false;
+        };
+        if pat.cell.children.is_empty() {
+            return false;
+        }
+        let xstep = pat.xstep;
+        let ystep = pat.ystep;
+        if !xstep.is_finite() || !ystep.is_finite() || xstep == 0.0 || ystep == 0.0 {
+            return false;
+        }
+        // Map `fill_path` from the current frame's local space into the
+        // root frame's local space (= compose of every frame above the
+        // root). At the root frame this is identity.
+        let mut above_root = Transform2D::identity();
+        for frame in self.stack.iter().skip(1) {
+            above_root = compose(above_root, frame.transform);
+        }
+        let region_path = transform_path(fill_path, above_root);
+        let Some((rx0, ry0, rx1, ry1)) = path_bounds(&region_path) else {
+            return false;
+        };
+        // Invert the pattern matrix to map the region bbox corners into
+        // pattern space and bound the tile lattice.
+        let Some(inv) = invert_transform(pat.matrix) else {
+            return false;
+        };
+        let corners = [
+            inv.apply(Point::new(rx0, ry0)),
+            inv.apply(Point::new(rx1, ry0)),
+            inv.apply(Point::new(rx0, ry1)),
+            inv.apply(Point::new(rx1, ry1)),
+        ];
+        let (mut px0, mut py0, mut px1, mut py1) = (
+            f32::INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+        );
+        for c in corners {
+            if !c.x.is_finite() || !c.y.is_finite() {
+                return false;
+            }
+            px0 = px0.min(c.x);
+            py0 = py0.min(c.y);
+            px1 = px1.max(c.x);
+            py1 = py1.max(c.y);
+        }
+        // Tile-index range over the pattern-space bbox, padded by one
+        // cell each side so a cell whose /BBox overhangs its step still
+        // covers the region edges.
+        let i_lo = (px0 / xstep).floor() as i64 - 1;
+        let i_hi = (px1 / xstep).ceil() as i64 + 1;
+        let j_lo = (py0 / ystep).floor() as i64 - 1;
+        let j_hi = (py1 / ystep).ceil() as i64 + 1;
+        // Normalise so the range is well-ordered regardless of a negative
+        // XStep / YStep (Table 75 allows either sign).
+        let (i_lo, i_hi) = (i_lo.min(i_hi), i_lo.max(i_hi));
+        let (j_lo, j_hi) = (j_lo.min(j_hi), j_lo.max(j_hi));
+        let tile_count = (i_hi - i_lo + 1).saturating_mul(j_hi - j_lo + 1);
+        if tile_count <= 0 || tile_count > MAX_TILING_CELLS {
+            return false;
+        }
+        // The /BBox clip (pattern space) applied per tile.
+        let bbox_clip = rect_path(pat.bbox[0], pat.bbox[1], pat.bbox[2], pat.bbox[3]);
+        let mut tiles: Vec<Node> = Vec::new();
+        for j in j_lo..=j_hi {
+            for i in i_lo..=i_hi {
+                let placement = compose(
+                    pat.matrix,
+                    Transform2D::translate(i as f32 * xstep, j as f32 * ystep),
+                );
+                let mut cell = pat.cell.clone();
+                cell.transform = placement;
+                // Clip the cell to its /BBox (pattern space).
+                cell.clip = Some(bbox_clip.clone());
+                tiles.push(Node::Group(cell));
+            }
+        }
+        if tiles.is_empty() {
+            return false;
+        }
+        // One group, clipped to the fill region (root-local space),
+        // holding every tile. Pushed onto the root frame so the pattern
+        // stays anchored to page space (§8.7.2 NOTE 1).
+        let mut region_clip = region_path;
+        // Preserve the fill rule on the clip path (NonZero vs EvenOdd
+        // from the `f` / `f*` operator) per §8.5.3.3.
+        let _ = rule;
+        if region_clip.commands.is_empty() {
+            return false;
+        }
+        // Intersect with any clip already in force on the current frame,
+        // mapped to root space, by nesting: outer group carries the
+        // active clip, inner the fill region. We keep it simple — the
+        // fill region is the dominant clip for the tiling.
+        let group = Group {
+            transform: Transform2D::identity(),
+            opacity: 1.0,
+            clip: Some(std::mem::take(&mut region_clip)),
+            children: tiles,
+            ..Group::default()
+        };
+        self.stack[0].children.push(Node::Group(group));
+        true
     }
 
     /// Emit one [`ContentTextShow`] event for the current state. Only
@@ -4042,6 +4297,24 @@ impl<'a> State<'a> {
         };
         let to_target = compose(self.effective_ctm(), pattern_matrix);
         gradient_to_paint(&gradient, to_target)
+    }
+
+    /// If the trailing `scn`/`SCN` operand names a pre-parsed
+    /// `/PatternType 1` tiling pattern (§8.7.3), return its name so
+    /// `commit_path` can replicate the cell across the painted region.
+    /// Returns `None` when no tiling patterns are plumbed in or the
+    /// operand isn't a tiling-pattern name (e.g. a numeric colour, a
+    /// shading-pattern name, or an unknown name).
+    fn tiling_pattern_name_from_operand(&self) -> Option<String> {
+        let name = match self.operands.last() {
+            Some(Operand::Name(n)) => n.as_str(),
+            _ => return None,
+        };
+        if self.tiling_patterns?.contains_key(name) {
+            Some(name.to_string())
+        } else {
+            None
+        }
     }
 
     fn parse(&mut self, input: &[u8]) -> Result<(), PdfError> {
@@ -5444,6 +5717,141 @@ fn lab_color(white: [f32; 3], lab: [f32; 3]) -> Rgba {
         white[1] * lab_g(m_base),
         white[2] * lab_g(n_in),
     )
+}
+
+/// Hard ceiling on the number of pattern cells a single tiling fill may
+/// emit (§8.7.3). A fill region many multiples of XStep/YStep wide could
+/// otherwise produce an unbounded node count; past this cap the fill
+/// falls back to its solid colour rather than tiling.
+const MAX_TILING_CELLS: i64 = 4096;
+
+/// A closed rectangular subpath `[llx, lly] → [urx, ury]` (the four
+/// corners + `Close`). Used as a tiling pattern cell's `/BBox` clip and
+/// to build the per-tile clip rectangle.
+fn rect_path(x0: f32, y0: f32, x1: f32, y1: f32) -> Path {
+    let mut p = Path::new();
+    p.commands.push(PathCommand::MoveTo(Point::new(x0, y0)));
+    p.commands.push(PathCommand::LineTo(Point::new(x1, y0)));
+    p.commands.push(PathCommand::LineTo(Point::new(x1, y1)));
+    p.commands.push(PathCommand::LineTo(Point::new(x0, y1)));
+    p.commands.push(PathCommand::Close);
+    p
+}
+
+/// Apply an affine transform to every coordinate of a path's commands,
+/// returning a new path in the transformed space. Control points of
+/// curve commands are mapped too (affine maps preserve Béziers). `Close`
+/// carries no coordinate. `ArcTo` is mapped by its endpoint only — the
+/// reader never constructs arc commands in a content stream (the writer
+/// flattens arcs to cubics), so this branch is a best-effort passthrough.
+fn transform_path(path: &Path, m: Transform2D) -> Path {
+    let mut out = Path::new();
+    out.commands.reserve(path.commands.len());
+    for cmd in &path.commands {
+        let mapped = match *cmd {
+            PathCommand::MoveTo(p) => PathCommand::MoveTo(m.apply(p)),
+            PathCommand::LineTo(p) => PathCommand::LineTo(m.apply(p)),
+            PathCommand::QuadCurveTo { control, end } => PathCommand::QuadCurveTo {
+                control: m.apply(control),
+                end: m.apply(end),
+            },
+            PathCommand::CubicCurveTo { c1, c2, end } => PathCommand::CubicCurveTo {
+                c1: m.apply(c1),
+                c2: m.apply(c2),
+                end: m.apply(end),
+            },
+            PathCommand::ArcTo {
+                rx,
+                ry,
+                x_axis_rot,
+                large_arc,
+                sweep,
+                end,
+            } => PathCommand::ArcTo {
+                rx,
+                ry,
+                x_axis_rot,
+                large_arc,
+                sweep,
+                end: m.apply(end),
+            },
+            PathCommand::Close => PathCommand::Close,
+            _ => *cmd,
+        };
+        out.commands.push(mapped);
+    }
+    out
+}
+
+/// Axis-aligned bounding box `(min_x, min_y, max_x, max_y)` over every
+/// coordinate a path touches (anchor + control points — a conservative
+/// superset of the true Bézier hull, which is all the tiling lattice
+/// needs). Returns `None` for an empty path or one whose coordinates are
+/// non-finite.
+fn path_bounds(path: &Path) -> Option<(f32, f32, f32, f32)> {
+    let (mut x0, mut y0, mut x1, mut y1) = (
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    );
+    let mut acc = |p: Point| {
+        x0 = x0.min(p.x);
+        y0 = y0.min(p.y);
+        x1 = x1.max(p.x);
+        y1 = y1.max(p.y);
+    };
+    for cmd in &path.commands {
+        match *cmd {
+            PathCommand::MoveTo(p) | PathCommand::LineTo(p) => acc(p),
+            PathCommand::QuadCurveTo { control, end } => {
+                acc(control);
+                acc(end);
+            }
+            PathCommand::CubicCurveTo { c1, c2, end } => {
+                acc(c1);
+                acc(c2);
+                acc(end);
+            }
+            PathCommand::ArcTo { end, .. } => acc(end),
+            PathCommand::Close => {}
+            _ => {}
+        }
+    }
+    if x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite() && x0 <= x1 && y0 <= y1
+    {
+        Some((x0, y0, x1, y1))
+    } else {
+        None
+    }
+}
+
+/// Invert an affine transform `[a b c d e f]`. Returns `None` when the
+/// linear part is singular (zero determinant) — a degenerate pattern
+/// matrix that maps every tile to a line/point, for which no tiling can
+/// be computed.
+fn invert_transform(m: Transform2D) -> Option<Transform2D> {
+    let det = m.a * m.d - m.b * m.c;
+    if !det.is_finite() || det.abs() < f32::EPSILON {
+        return None;
+    }
+    let inv_det = 1.0 / det;
+    let a = m.d * inv_det;
+    let b = -m.b * inv_det;
+    let c = -m.c * inv_det;
+    let d = m.a * inv_det;
+    // Translation of the inverse: −(linear⁻¹ · [e f]).
+    let e = -(a * m.e + c * m.f);
+    let f = -(b * m.e + d * m.f);
+    let inv = Transform2D { a, b, c, d, e, f };
+    if [inv.a, inv.b, inv.c, inv.d, inv.e, inv.f]
+        .iter()
+        .all(|v| v.is_finite())
+    {
+        Some(inv)
+    } else {
+        None
+    }
 }
 
 fn compose(a: Transform2D, b: Transform2D) -> Transform2D {

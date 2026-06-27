@@ -36,7 +36,7 @@ use crate::objects::{Dict, Object, ObjectId, Stream};
 use crate::pubsec::{
     open_with_certificate, open_with_certificate_and_trust_store, PubSecCredential, TrustStore,
 };
-use crate::reader::content::parse_content_stream_full_with_patterns;
+use crate::reader::content::{parse_content_stream_full_with_tiling, TilingPattern};
 use crate::reader::parse::Parser;
 use crate::reader::xref::{parse_xref, XrefEntry, XrefTable};
 
@@ -1280,8 +1280,13 @@ fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Pag
     } else {
         None
     };
+    let tiling_patterns = if let Some(rdict) = resources_dict.as_ref() {
+        resolve_tiling_patterns(reader, rdict, 0)?
+    } else {
+        None
+    };
 
-    let parsed = parse_content_stream_full_with_patterns(
+    let parsed = parse_content_stream_full_with_tiling(
         &content_bytes,
         ext_gstate_dict.as_ref(),
         fonts_dict.as_ref(),
@@ -1290,6 +1295,7 @@ fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Pag
         properties_dict.as_ref(),
         xobject_forms.as_ref(),
         pattern_dict.as_ref(),
+        tiling_patterns.as_ref(),
     )?;
     let root = parsed.root;
     let mut page = Page::new(width, height);
@@ -1675,6 +1681,223 @@ fn resolve_pattern_resources(
     Ok(Some(out))
 }
 
+/// Resolve a page's `/Resources /Pattern` subdictionary into the
+/// pre-parsed `/PatternType 1` tiling patterns (§8.7.3) the content
+/// walker replicates across `scn`/`SCN` tiling-pattern fills. Each
+/// tiling pattern is a *stream*; its content stream is decoded and
+/// parsed into a [`Group`] against the pattern's own `/Resources`
+/// (mirroring [`resolve_one_form_xobject`]), and the `/BBox`, `/XStep`,
+/// `/YStep`, `/Matrix`, and `/PaintType` (Table 75) are captured.
+///
+/// Returns `Ok(None)` when the resources dict carries no `/Pattern`
+/// entry or no entry is a renderable tiling pattern (a shading pattern,
+/// `/PatternType 2`, is handled separately by
+/// [`resolve_pattern_resources`]). A tiling pattern whose cell can't be
+/// decoded, whose `/XStep` / `/YStep` is zero/absent, or whose `/BBox`
+/// is malformed is skipped (its fill keeps the conservative black
+/// fallback). `depth` bounds nested-Form recursion inside a cell.
+fn resolve_tiling_patterns(
+    reader: &mut DocumentReader<'_>,
+    resources: &Dict,
+    depth: usize,
+) -> Result<Option<BTreeMap<String, TilingPattern>>, PdfError> {
+    if depth >= MAX_XOBJECT_DEPTH {
+        return Ok(None);
+    }
+    let pat_obj = resources
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Pattern")
+        .map(|(_, v)| v.clone());
+    let pat_obj = match pat_obj {
+        Some(Object::Reference(id)) => reader.resolve(id)?,
+        Some(other) => other,
+        None => return Ok(None),
+    };
+    let Object::Dict(pat_dict) = pat_obj else {
+        return Ok(None);
+    };
+    let mut out: BTreeMap<String, TilingPattern> = BTreeMap::new();
+    for (name, value) in pat_dict.entries() {
+        let resolved = match value {
+            Object::Reference(id) => reader.resolve(*id)?,
+            other => other.clone(),
+        };
+        // Only a tiling pattern is a stream; a shading pattern is a bare
+        // dict (handled elsewhere).
+        let Object::Stream(stream) = resolved else {
+            continue;
+        };
+        if dict_int(&stream.dict, "PatternType") != Some(1) {
+            continue;
+        }
+        if let Some(tp) = resolve_one_tiling_pattern(reader, &stream, depth)? {
+            out.insert(name.clone(), tp);
+        }
+    }
+    if out.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(out))
+    }
+}
+
+/// Parse one `/PatternType 1` tiling pattern stream into a
+/// [`TilingPattern`] (§8.7.3.1 Table 75). Returns `Ok(None)` when the
+/// cell content can't be decoded / parses to nothing, the required
+/// `/XStep` / `/YStep` is missing or zero, or the `/BBox` is malformed.
+fn resolve_one_tiling_pattern(
+    reader: &mut DocumentReader<'_>,
+    stream: &Stream,
+    depth: usize,
+) -> Result<Option<TilingPattern>, PdfError> {
+    let bbox = match read_rect(&stream.dict, "BBox") {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let xstep = match dict_num(&stream.dict, "XStep") {
+        Some(v) if v.is_finite() && v != 0.0 => v,
+        _ => return Ok(None),
+    };
+    let ystep = match dict_num(&stream.dict, "YStep") {
+        Some(v) if v.is_finite() && v != 0.0 => v,
+        _ => return Ok(None),
+    };
+    let paint_type = dict_int(&stream.dict, "PaintType").unwrap_or(1);
+    let matrix = form_matrix(&stream.dict);
+
+    let content_bytes = match decode_stream(stream) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+
+    // The cell's own /Resources (Table 75 — required, but tolerate
+    // absence the same way a Form XObject does).
+    let cell_resources = match stream.dict.entries().iter().find(|(k, _)| k == "Resources") {
+        Some((_, Object::Reference(id))) => match reader.resolve(*id)? {
+            Object::Dict(d) => Some(d),
+            _ => None,
+        },
+        Some((_, Object::Dict(d))) => Some(d.clone()),
+        _ => None,
+    };
+
+    let ext_gstate_dict = match cell_resources.as_ref() {
+        Some(r) => resolve_ext_gstate(reader, r)?,
+        None => None,
+    };
+    let fonts_dict = match cell_resources.as_ref() {
+        Some(r) => resolve_font_resources(reader, r)?,
+        None => None,
+    };
+    let shading_dict = match cell_resources.as_ref() {
+        Some(r) => resolve_shading_resources(reader, r)?,
+        None => None,
+    };
+    let color_space_dict = match cell_resources.as_ref() {
+        Some(r) => resolve_color_space_resources(reader, r)?,
+        None => None,
+    };
+    let properties_dict = match cell_resources.as_ref() {
+        Some(r) => resolve_properties_resources(reader, r)?,
+        None => None,
+    };
+    let mut seen = HashSet::new();
+    let nested_forms = match cell_resources.as_ref() {
+        Some(r) => resolve_xobject_forms(reader, r, depth + 1, &mut seen)?,
+        None => None,
+    };
+    let pattern_dict = match cell_resources.as_ref() {
+        Some(r) => resolve_pattern_resources(reader, r)?,
+        None => None,
+    };
+    // A cell may itself paint with a tiling pattern (§8.7.2 NOTE 1 — an
+    // inner pattern is local to the outer cell); recurse with a deeper
+    // bound so a self-referential pattern terminates.
+    let nested_tiling = match cell_resources.as_ref() {
+        Some(r) => resolve_tiling_patterns(reader, r, depth + 1)?,
+        None => None,
+    };
+
+    let parsed = parse_content_stream_full_with_tiling(
+        &content_bytes,
+        ext_gstate_dict.as_ref(),
+        fonts_dict.as_ref(),
+        shading_dict.as_ref(),
+        color_space_dict.as_ref(),
+        properties_dict.as_ref(),
+        nested_forms.as_ref(),
+        pattern_dict.as_ref(),
+        nested_tiling.as_ref(),
+    )?;
+    if parsed.root.children.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(TilingPattern {
+        cell: parsed.root,
+        bbox,
+        xstep,
+        ystep,
+        matrix,
+        paint_type,
+    }))
+}
+
+/// Read a dict entry as an `f32` (Integer or Real). `None` for any other
+/// shape or an absent key.
+fn dict_num(dict: &Dict, key: &str) -> Option<f32> {
+    match dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v)
+    {
+        Some(Object::Integer(v)) => Some(*v as f32),
+        Some(Object::Real(v)) => Some(*v as f32),
+        _ => None,
+    }
+}
+
+/// Read a dict entry as an `i64` (Integer). `None` for any other shape.
+fn dict_int(dict: &Dict, key: &str) -> Option<i64> {
+    match dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v)
+    {
+        Some(Object::Integer(v)) => Some(*v),
+        _ => None,
+    }
+}
+
+/// Read a four-number rectangle entry `[a b c d]` as `[a, b, c, d]`.
+/// `None` when absent, not a 4-element array, or any element is not a
+/// finite number.
+fn read_rect(dict: &Dict, key: &str) -> Option<[f32; 4]> {
+    let items = match dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v)
+    {
+        Some(Object::Array(items)) if items.len() == 4 => items,
+        _ => return None,
+    };
+    let mut out = [0.0f32; 4];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = match &items[i] {
+            Object::Integer(v) => *v as f32,
+            Object::Real(v) => *v as f32,
+            _ => return None,
+        };
+        if !slot.is_finite() {
+            return None;
+        }
+    }
+    Some(out)
+}
+
 /// Resolve a page's `/Resources /ColorSpace` subdictionary into a
 /// fully-dereferenced [`Dict`] whose per-name entries are resolved
 /// colour-space `Object`s the round-275 content parser interprets
@@ -1943,8 +2166,12 @@ fn resolve_one_form_xobject(
         Some(r) => resolve_pattern_resources(reader, r)?,
         None => None,
     };
+    let tiling_patterns = match form_resources.as_ref() {
+        Some(r) => resolve_tiling_patterns(reader, r, depth + 1)?,
+        None => None,
+    };
 
-    let parsed = parse_content_stream_full_with_patterns(
+    let parsed = parse_content_stream_full_with_tiling(
         &content_bytes,
         ext_gstate_dict.as_ref(),
         fonts_dict.as_ref(),
@@ -1953,6 +2180,7 @@ fn resolve_one_form_xobject(
         properties_dict.as_ref(),
         nested_forms.as_ref(),
         pattern_dict.as_ref(),
+        tiling_patterns.as_ref(),
     )?;
 
     // The content parser returns a root `Group` carrying any top-level

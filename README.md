@@ -284,7 +284,20 @@ into the `Scene`: a `scn`/`SCN` whose `/Pattern` operand names a shading
 pattern becomes a `Paint::LinearGradient` (axial) or
 `Paint::RadialGradient` (radial), with the shading axis / circles mapped
 to device space through the pattern `/Matrix` composed with the CTM.
-Tiling patterns (`/PatternType 1`) keep the conservative black fallback.
+
+**Tiling-pattern fills** (`/PatternType 1`, §8.7.3) replicate the pattern
+cell across the filled region. Each tiling pattern's cell content stream
+is decoded and parsed against its own `/Resources` (fonts, ExtGState,
+shadings, colour spaces, nested Form XObjects, even nested tiling
+patterns) into a cell `Group`; a `scn`/`SCN` naming the pattern then
+tiles that cell at integer multiples of `/XStep` / `/YStep` (§8.7.3.1)
+over the painted region's bounding box, clipping each tile to the cell
+`/BBox` and the whole tiling to the fill path. The cell lattice is
+anchored to the page's default coordinate space through the pattern
+`/Matrix` independent of any `cm` in force (§8.7.2 NOTE 1); the tile
+count is hard-capped (4096) and a degenerate / singular pattern matrix
+falls back to black. A coloured cell (`/PaintType 1`) paints with its
+own colours.
 
 ## Interactive-form & annotation writers
 
