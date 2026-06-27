@@ -255,7 +255,13 @@ by `image_xobjects()`).
 
 The `sh` shading-paint operator (§8.7.4.5) surfaces a `ContentShading`
 event per paint with the resolved shading dictionary, the effective CTM,
-and the active clip. **Type 1–3 shadings** (function-based / axial /
+and the active clip. A **clipped** axial / radial `sh` is additionally
+painted into the `Scene`: the active clip path is filled with the
+equivalent `Paint::LinearGradient` / `Paint::RadialGradient`, so a
+gradient drawn by `… W n /Sh sh` is visible rather than event-only. (An
+unclipped `sh` would fill the whole page, so it stays event-only;
+function-based and mesh shadings have no `Paint` analogue.) **Type 1–3
+shadings** (function-based / axial /
 radial, §8.7.4.5.2–4) are evaluated to geometry + sampled colour stops
 on `ContentShading::gradient`: an axial shading carries its axis
 endpoints + `Extend` flags + 64 RGB stops across the parametric domain; a

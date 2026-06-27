@@ -3636,6 +3636,31 @@ impl<'a> State<'a> {
                     .and_then(|d| evaluate_gradient_shading(d, self.color_space_resources));
                 let ctm = self.effective_ctm();
                 let clip = self.current_clip();
+                // Paint a clipped axial / radial `sh` into the scene: the
+                // shading fills the current clipping region (§8.7.4.5). The
+                // clip path is in the current frame's local coordinate
+                // basis — the same basis the shading `Coords` are written
+                // in — so the gradient maps into it by identity (the
+                // frame's accumulated `cm` is applied once when the node is
+                // rendered). We only paint when a clip is in force; an
+                // unclipped `sh` would fill the whole page, which we leave
+                // to the `ContentShading` event rather than synthesising a
+                // page-sized fill. Type 1 (function-based) and mesh
+                // shadings have no `Paint` analogue and stay event-only.
+                if let Some(clip_path) = &clip {
+                    if let Some(paint) = gradient
+                        .as_ref()
+                        .and_then(|g| gradient_to_paint(g, Transform2D::identity()))
+                    {
+                        let node = Node::Path(PathNode {
+                            path: clip_path.clone(),
+                            fill: Some(apply_alpha(paint, self.fill_alpha)),
+                            stroke: None,
+                            fill_rule: FillRule::NonZero,
+                        });
+                        self.current().children.push(node);
+                    }
+                }
                 self.shadings.push(ContentShading {
                     name,
                     shading_dict,
