@@ -338,3 +338,105 @@ fn type3_d1_takes_current_color_d0_keeps_own() {
         "the d0 self-coloured glyph should keep its own green; got {fills:?}"
     );
 }
+
+/// §9.6.5 Table 112 resource fallback: when a Type 3 font omits its own
+/// `/Resources`, a glyph description that names a resource resolves it
+/// against the resource dictionary the font was found in (the page's
+/// here). The font's single d0 glyph paints a page-level Form XObject
+/// (`/Fm0 Do`) that fills a blue square; with the fallback that blue
+/// must surface in the scene.
+#[test]
+fn type3_glyph_resources_fall_back_to_page() {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut offs: Vec<usize> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    offs.push(buf.len());
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offs.push(buf.len());
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n");
+
+    // Page: /Font /F0 (a Type 3 font with NO /Resources) and a page-level
+    // /XObject /Fm0 the glyph description will reference.
+    offs.push(buf.len());
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Resources << /Font << /F0 4 0 R >> /XObject << /Fm0 9 0 R >> >> \
+          /Contents 5 0 R >>\nendobj\n",
+    );
+
+    // 4 = the Type 3 font dict — note: NO /Resources entry.
+    offs.push(buf.len());
+    buf.extend_from_slice(
+        b"4 0 obj\n<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+         /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R \
+         /Encoding << /Type /Encoding /Differences [97 /g0] >> \
+         /FirstChar 97 /LastChar 97 /Widths [1000] >>\nendobj\n",
+    );
+
+    // 5 = page content: show the single glyph.
+    let content: &[u8] = b"BT /F0 12 Tf 100 700 Td (a) Tj ET";
+    offs.push(buf.len());
+    buf.extend_from_slice(format!("5 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes());
+    buf.extend_from_slice(content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    // 6 = /CharProcs.
+    offs.push(buf.len());
+    buf.extend_from_slice(b"6 0 obj\n<< /g0 7 0 R >>\nendobj\n");
+
+    // 7 = the glyph description (d0 — self-coloured): it paints the
+    // page-level Form XObject /Fm0 via Do, which the font's missing
+    // /Resources must resolve from the page.
+    let glyph: &[u8] = b"1000 0 d0\n/Fm0 Do\n";
+    offs.push(buf.len());
+    buf.extend_from_slice(format!("7 0 obj\n<< /Length {} >>\nstream\n", glyph.len()).as_bytes());
+    buf.extend_from_slice(glyph);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    // 8 unused (keep numbering contiguous via a placeholder dict).
+    offs.push(buf.len());
+    buf.extend_from_slice(b"8 0 obj\n<< >>\nendobj\n");
+
+    // 9 = the Form XObject that fills a blue 500x500 square.
+    let form: &[u8] = b"0 0 1 rg 0 0 500 500 re f\n";
+    offs.push(buf.len());
+    buf.extend_from_slice(
+        format!(
+            "9 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 1000 1000] \
+             /Resources << >> /Length {} >>\nstream\n",
+            form.len()
+        )
+        .as_bytes(),
+    );
+    buf.extend_from_slice(form);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    let count = offs.len() + 1;
+    buf.extend_from_slice(format!("xref\n0 {count}\n").as_bytes());
+    buf.extend_from_slice(b"0000000000 65535 f \n");
+    for o in &offs {
+        buf.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n")
+            .as_bytes(),
+    );
+
+    let scene = read_pdf_to_scene(&buf).expect("read Type 3 PDF");
+    let pages = scene.pages.as_ref().expect("scene has pages");
+    let page = &pages[0];
+
+    let mut fills = Vec::new();
+    for n in &page.content.root.children {
+        gather_fills(n, &mut fills);
+    }
+    let blue = Rgba::opaque(0x00, 0x00, 0xFF);
+    assert!(
+        fills.contains(&blue),
+        "a Type 3 glyph referencing a page-level Form XObject (with the font \
+         carrying no /Resources) should resolve it via the page fallback and \
+         paint blue; got {fills:?}"
+    );
+}

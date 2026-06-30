@@ -1905,7 +1905,7 @@ fn resolve_type3_fonts(
         ) {
             continue;
         }
-        if let Some(font) = resolve_one_type3_font(reader, &fd, depth)? {
+        if let Some(font) = resolve_one_type3_font(reader, &fd, resources, depth)? {
             out.insert(name.clone(), font);
         }
     }
@@ -1918,9 +1918,16 @@ fn resolve_type3_fonts(
 
 /// Parse a single Type 3 font dictionary into a [`Type3Font`] (§9.6.5).
 /// Returns `Ok(None)` when the font has no paintable glyphs.
+///
+/// `enclosing_resources` is the resource dictionary the font was found
+/// in (the page's, a Form XObject's, or a pattern cell's). Per §9.6.5
+/// Table 112, when a glyph description names resources but the font
+/// carries no `/Resources` of its own, the names resolve against this
+/// enclosing dictionary.
 fn resolve_one_type3_font(
     reader: &mut DocumentReader<'_>,
     fd: &Dict,
+    enclosing_resources: &Dict,
     depth: usize,
 ) -> Result<Option<Type3Font>, PdfError> {
     // /FontMatrix (Table 112, required) — default to the conventional
@@ -1964,15 +1971,16 @@ fn resolve_one_type3_font(
     }
 
     // The font's own /Resources (Table 112). A glyph description that
-    // names a resource looks it up here, falling back to the page's
-    // resource dictionary when this is absent (§9.6.5).
+    // names a resource looks it up here; when the font omits /Resources
+    // the names fall back to the enclosing (page / form / cell) resource
+    // dictionary the font was found in (§9.6.5 Table 112).
     let glyph_resources = match fd.entries().iter().find(|(k, _)| k == "Resources") {
         Some((_, Object::Reference(id))) => match reader.resolve(*id)? {
             Object::Dict(d) => Some(d),
-            _ => None,
+            _ => Some(enclosing_resources.clone()),
         },
         Some((_, Object::Dict(d))) => Some(d.clone()),
-        _ => None,
+        _ => Some(enclosing_resources.clone()),
     };
 
     // /CharProcs — glyph name → glyph-description stream (Table 112).
