@@ -21,7 +21,7 @@
 //! reader symmetric with the writer's output. Object streams (PDF
 //! 1.5+) and encryption are deferred to round 4+.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use oxideav_core::vector::{
     FillRule, Group, Node, Paint, Path, PathCommand, PathNode, Point, Rgba, Transform2D,
@@ -36,7 +36,10 @@ use crate::objects::{Dict, Object, ObjectId, Stream};
 use crate::pubsec::{
     open_with_certificate, open_with_certificate_and_trust_store, PubSecCredential, TrustStore,
 };
-use crate::reader::content::{parse_content_stream_full_with_tiling, TilingPattern};
+use crate::reader::content::{
+    parse_content_stream_full_with_tiling, parse_content_stream_full_with_type3, TilingPattern,
+    Type3Font,
+};
 use crate::reader::parse::Parser;
 use crate::reader::xref::{parse_xref, XrefEntry, XrefTable};
 
@@ -1285,8 +1288,13 @@ fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Pag
     } else {
         None
     };
+    let type3_fonts = if let Some(rdict) = resources_dict.as_ref() {
+        resolve_type3_fonts(reader, rdict, 0)?
+    } else {
+        None
+    };
 
-    let parsed = parse_content_stream_full_with_tiling(
+    let parsed = parse_content_stream_full_with_type3(
         &content_bytes,
         ext_gstate_dict.as_ref(),
         fonts_dict.as_ref(),
@@ -1296,6 +1304,7 @@ fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Pag
         xobject_forms.as_ref(),
         pattern_dict.as_ref(),
         tiling_patterns.as_ref(),
+        type3_fonts.as_ref(),
     )?;
     let root = parsed.root;
     let mut page = Page::new(width, height);
@@ -1843,6 +1852,307 @@ fn resolve_one_tiling_pattern(
     }))
 }
 
+/// Resolve every Type 3 font (§9.6.5) in a `/Resources /Font`
+/// subdictionary into a [`Type3Font`], keyed by font resource name.
+///
+/// For each `/Subtype /Type3` font dictionary this:
+///
+/// * reads `/FontMatrix` (glyph→text space, default `[0.001 0 0 0.001
+///   0 0]`);
+/// * parses `/Encoding /Differences` into a code→glyph-name map
+///   (§9.6.6.1 — a Type 3 font's encoding is given entirely by
+///   `/Differences`, Table 112);
+/// * decodes each `/CharProcs` glyph-description stream and parses it
+///   against the font's own `/Resources` (falling back to the page's
+///   when absent, §9.6.5 Table 112) into a [`Group`].
+///
+/// Non-Type3 fonts and any glyph that fails to decode are skipped. A
+/// font with no usable glyphs is omitted from the map. `depth` bounds
+/// the Form / pattern recursion a glyph description may trigger.
+fn resolve_type3_fonts(
+    reader: &mut DocumentReader<'_>,
+    resources: &Dict,
+    depth: usize,
+) -> Result<Option<BTreeMap<String, Type3Font>>, PdfError> {
+    if depth >= MAX_XOBJECT_DEPTH {
+        return Ok(None);
+    }
+    let font_obj = resources
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Font")
+        .map(|(_, v)| v.clone());
+    let font_obj = match font_obj {
+        Some(Object::Reference(id)) => reader.resolve(id)?,
+        Some(other) => other,
+        None => return Ok(None),
+    };
+    let Object::Dict(font_dict) = font_obj else {
+        return Ok(None);
+    };
+    let mut out: BTreeMap<String, Type3Font> = BTreeMap::new();
+    for (name, value) in font_dict.entries() {
+        let resolved = match value {
+            Object::Reference(id) => reader.resolve(*id)?,
+            other => other.clone(),
+        };
+        let Object::Dict(fd) = resolved else {
+            continue;
+        };
+        if !matches!(
+            fd.entries().iter().find(|(k, _)| k == "Subtype"),
+            Some((_, Object::Name(s))) if s == "Type3"
+        ) {
+            continue;
+        }
+        if let Some(font) = resolve_one_type3_font(reader, &fd, depth)? {
+            out.insert(name.clone(), font);
+        }
+    }
+    if out.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(out))
+    }
+}
+
+/// Parse a single Type 3 font dictionary into a [`Type3Font`] (§9.6.5).
+/// Returns `Ok(None)` when the font has no paintable glyphs.
+fn resolve_one_type3_font(
+    reader: &mut DocumentReader<'_>,
+    fd: &Dict,
+    depth: usize,
+) -> Result<Option<Type3Font>, PdfError> {
+    // /FontMatrix (Table 112, required) — default to the conventional
+    // 1000-unit glyph space when absent / malformed.
+    let font_matrix = match fd.entries().iter().find(|(k, _)| k == "FontMatrix") {
+        Some((_, obj @ Object::Array(items))) if items.len() == 6 => array_matrix(obj),
+        _ => Transform2D {
+            a: 0.001,
+            b: 0.0,
+            c: 0.0,
+            d: 0.001,
+            e: 0.0,
+            f: 0.0,
+        },
+    };
+
+    // /Encoding /Differences → code → glyph name (§9.6.6.1). A Type 3
+    // font's complete encoding lives in /Differences (Table 112).
+    let mut encoding: BTreeMap<u8, String> = BTreeMap::new();
+    let enc_obj = match fd.entries().iter().find(|(k, _)| k == "Encoding") {
+        Some((_, Object::Reference(id))) => Some(reader.resolve(*id)?),
+        Some((_, other)) => Some(other.clone()),
+        None => None,
+    };
+    if let Some(Object::Dict(enc)) = enc_obj {
+        let diffs = match enc.entries().iter().find(|(k, _)| k == "Differences") {
+            Some((_, Object::Reference(id))) => Some(reader.resolve(*id)?),
+            Some((_, other)) => Some(other.clone()),
+            None => None,
+        };
+        if let Some(arr) = diffs {
+            if let Ok(parsed) = crate::reader::encoding::parse_encoding_differences(&arr) {
+                for ov in parsed.overrides {
+                    encoding.insert(ov.code, ov.glyph_name);
+                }
+            }
+        }
+    }
+    if encoding.is_empty() {
+        return Ok(None);
+    }
+
+    // The font's own /Resources (Table 112). A glyph description that
+    // names a resource looks it up here, falling back to the page's
+    // resource dictionary when this is absent (§9.6.5).
+    let glyph_resources = match fd.entries().iter().find(|(k, _)| k == "Resources") {
+        Some((_, Object::Reference(id))) => match reader.resolve(*id)? {
+            Object::Dict(d) => Some(d),
+            _ => None,
+        },
+        Some((_, Object::Dict(d))) => Some(d.clone()),
+        _ => None,
+    };
+
+    // /CharProcs — glyph name → glyph-description stream (Table 112).
+    let charprocs_obj = match fd.entries().iter().find(|(k, _)| k == "CharProcs") {
+        Some((_, Object::Reference(id))) => reader.resolve(*id)?,
+        Some((_, other)) => other.clone(),
+        None => return Ok(None),
+    };
+    let Object::Dict(charprocs) = charprocs_obj else {
+        return Ok(None);
+    };
+
+    let mut glyphs: BTreeMap<String, Group> = BTreeMap::new();
+    let mut shape_only: BTreeSet<String> = BTreeSet::new();
+    // Only resolve glyphs the encoding actually references.
+    let referenced: BTreeSet<&String> = encoding.values().collect();
+    for (glyph_name, value) in charprocs.entries() {
+        if !referenced.contains(glyph_name) {
+            continue;
+        }
+        let resolved = match value {
+            Object::Reference(id) => reader.resolve(*id)?,
+            other => other.clone(),
+        };
+        let Object::Stream(stream) = resolved else {
+            continue;
+        };
+        let content_bytes = match decode_stream(&stream) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        // Detect a leading `d1` (shape-only glyph, §9.6.5 Table 113) so
+        // the walker can later recolour it with the current fill colour.
+        if charproc_is_shape_only(&content_bytes) {
+            shape_only.insert(glyph_name.clone());
+        }
+        if let Some(group) =
+            parse_glyph_description(reader, &content_bytes, glyph_resources.as_ref(), depth)?
+        {
+            if !group.children.is_empty() {
+                glyphs.insert(glyph_name.clone(), group);
+            }
+        }
+    }
+    if glyphs.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Type3Font {
+        font_matrix,
+        encoding,
+        glyphs,
+        shape_only,
+    }))
+}
+
+/// Whether a Type 3 glyph description's first operator is `d1` (§9.6.5
+/// Table 113) — meaning the glyph specifies shape only and takes its
+/// colour from the graphics state. Scans past the leading numeric
+/// operands to the first keyword token. A `d0` first operator (or
+/// neither) means the glyph carries its own colour.
+fn charproc_is_shape_only(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        // Skip whitespace + numeric-operand characters (digits, sign,
+        // dot, exponent) — d0/d1 are preceded by 2 or 6 numbers.
+        if c.is_ascii_whitespace()
+            || c.is_ascii_digit()
+            || c == b'+'
+            || c == b'-'
+            || c == b'.'
+            || c == b'e'
+            || c == b'E'
+        {
+            i += 1;
+            continue;
+        }
+        // First non-numeric token: must be `d0` or `d1`.
+        if bytes[i..].starts_with(b"d1") {
+            return true;
+        }
+        return false;
+    }
+    false
+}
+
+/// Parse a Type 3 glyph description content stream into a [`Group`]
+/// (§9.6.5). The stream is parsed against the font's own `/Resources`
+/// (`glyph_resources`); the `d0` / `d1` leading operator is consumed as
+/// a no-op by the content walker. Returns `Ok(None)` when the content
+/// parses to nothing.
+fn parse_glyph_description(
+    reader: &mut DocumentReader<'_>,
+    content_bytes: &[u8],
+    glyph_resources: Option<&Dict>,
+    depth: usize,
+) -> Result<Option<Group>, PdfError> {
+    let ext_gstate_dict = match glyph_resources {
+        Some(r) => resolve_ext_gstate(reader, r)?,
+        None => None,
+    };
+    let fonts_dict = match glyph_resources {
+        Some(r) => resolve_font_resources(reader, r)?,
+        None => None,
+    };
+    let shading_dict = match glyph_resources {
+        Some(r) => resolve_shading_resources(reader, r)?,
+        None => None,
+    };
+    let color_space_dict = match glyph_resources {
+        Some(r) => resolve_color_space_resources(reader, r)?,
+        None => None,
+    };
+    let properties_dict = match glyph_resources {
+        Some(r) => resolve_properties_resources(reader, r)?,
+        None => None,
+    };
+    let mut seen = HashSet::new();
+    let nested_forms = match glyph_resources {
+        Some(r) => resolve_xobject_forms(reader, r, depth + 1, &mut seen)?,
+        None => None,
+    };
+    let pattern_dict = match glyph_resources {
+        Some(r) => resolve_pattern_resources(reader, r)?,
+        None => None,
+    };
+    let tiling_patterns = match glyph_resources {
+        Some(r) => resolve_tiling_patterns(reader, r, depth + 1)?,
+        None => None,
+    };
+    // A glyph description may itself show text in a (nested) Type 3
+    // font; recurse with a deeper bound so a self-referential glyph
+    // terminates.
+    let nested_type3 = match glyph_resources {
+        Some(r) => resolve_type3_fonts(reader, r, depth + 1)?,
+        None => None,
+    };
+
+    let parsed = parse_content_stream_full_with_type3(
+        content_bytes,
+        ext_gstate_dict.as_ref(),
+        fonts_dict.as_ref(),
+        shading_dict.as_ref(),
+        color_space_dict.as_ref(),
+        properties_dict.as_ref(),
+        nested_forms.as_ref(),
+        pattern_dict.as_ref(),
+        tiling_patterns.as_ref(),
+        nested_type3.as_ref(),
+    )?;
+    if parsed.root.children.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(parsed.root))
+}
+
+/// A six-number `/FontMatrix` / `/Matrix` array `Object` as a
+/// [`Transform2D`]. Caller guarantees the array has six elements.
+fn array_matrix(obj: &Object) -> Transform2D {
+    let Object::Array(items) = obj else {
+        return Transform2D::identity();
+    };
+    let mut m = [0.0f32; 6];
+    for (i, slot) in m.iter_mut().enumerate() {
+        match items.get(i) {
+            Some(Object::Integer(v)) => *slot = *v as f32,
+            Some(Object::Real(v)) => *slot = *v as f32,
+            _ => return Transform2D::identity(),
+        }
+    }
+    Transform2D {
+        a: m[0],
+        b: m[1],
+        c: m[2],
+        d: m[3],
+        e: m[4],
+        f: m[5],
+    }
+}
+
 /// Read a dict entry as an `f32` (Integer or Real). `None` for any other
 /// shape or an absent key.
 fn dict_num(dict: &Dict, key: &str) -> Option<f32> {
@@ -2170,8 +2480,12 @@ fn resolve_one_form_xobject(
         Some(r) => resolve_tiling_patterns(reader, r, depth + 1)?,
         None => None,
     };
+    let type3_fonts = match form_resources.as_ref() {
+        Some(r) => resolve_type3_fonts(reader, r, depth + 1)?,
+        None => None,
+    };
 
-    let parsed = parse_content_stream_full_with_tiling(
+    let parsed = parse_content_stream_full_with_type3(
         &content_bytes,
         ext_gstate_dict.as_ref(),
         fonts_dict.as_ref(),
@@ -2181,6 +2495,7 @@ fn resolve_one_form_xobject(
         nested_forms.as_ref(),
         pattern_dict.as_ref(),
         tiling_patterns.as_ref(),
+        type3_fonts.as_ref(),
     )?;
 
     // The content parser returns a root `Group` carrying any top-level

@@ -253,6 +253,23 @@ depth-bounded and cycle-guarded, so a self-referential appearance stream
 terminates. Image XObjects stay a vector-side no-op (surfaced separately
 by `image_xobjects()`).
 
+**Type 3 font glyphs** (§9.6.5) are painted into the `Scene` as vector
+geometry. A Type 3 font is the one simple-font family whose glyphs are
+themselves content streams (`/CharProcs`) of PDF marking operators — no
+external font program, so no glyph rasteriser is needed. On a
+`Tj` / `TJ` / `'` / `"` show under a Type 3 font, the reader resolves
+each character code through `/Encoding /Differences` to a glyph name
+(§9.6.6.1), looks the name up in `/CharProcs` to get its description
+stream (parsed against the font's own `/Resources` into a `Group`), and
+splices that group at the glyph's text-rendering matrix —
+`Tm ∘ [Tfs·Th 0 0 Tfs 0 Trise] ∘ /FontMatrix` (§9.4.4) — advancing the
+glyph origin between the bytes of a single show by each glyph's
+`/Widths` displacement. The `d0` / `d1` glyph-metric operators
+(Table 113) are consumed (the width comes from `/Widths`, the bbox is
+advisory); render mode 3 (invisible OCR layer) paints nothing, and a
+glyph absent from `/Encoding` or `/CharProcs` is skipped. Glyph
+descriptions that themselves show Type 3 text are depth-bounded.
+
 The `sh` shading-paint operator (§8.7.4.5) surfaces a `ContentShading`
 event per paint with the resolved shading dictionary, the effective CTM,
 and the active clip. A **clipped** axial / radial `sh` is additionally

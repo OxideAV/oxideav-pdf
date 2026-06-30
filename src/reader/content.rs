@@ -80,7 +80,7 @@
 //! [`parse_content_stream_with_resources`] entry points drop them
 //! silently to preserve round-3 / round-125 callers' behaviour.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str;
 
 use oxideav_core::vector::{
@@ -397,6 +397,43 @@ pub fn parse_content_stream_full_with_tiling(
     .with_xobject_forms(xobject_forms)
     .with_pattern_resources(pattern_resources)
     .with_tiling_patterns(tiling_patterns);
+    state.parse(input)?;
+    Ok(state.finish())
+}
+
+/// Like [`parse_content_stream_full_with_tiling`] but also accepts the
+/// page's pre-parsed Type 3 fonts (§9.6.5), so a `Tj`/`TJ`/`'`/`"` show
+/// selecting a Type 3 font paints each glyph's `/CharProcs` description
+/// into the scene tree as vector geometry — the one simple-font family
+/// whose glyphs are themselves content streams and therefore need no
+/// external glyph rasteriser. Each entry is a [`Type3Font`] carrying the
+/// `/FontMatrix`, the `/Encoding` code→glyph-name map, and every glyph
+/// description pre-parsed into a [`Group`] against the font's own
+/// `/Resources`.
+#[allow(clippy::too_many_arguments)]
+pub fn parse_content_stream_full_with_type3(
+    input: &[u8],
+    ext_gstate: Option<&Dict>,
+    font_resources: Option<&Dict>,
+    shading_resources: Option<&Dict>,
+    color_space_resources: Option<&Dict>,
+    properties_resources: Option<&Dict>,
+    xobject_forms: Option<&BTreeMap<String, Group>>,
+    pattern_resources: Option<&Dict>,
+    tiling_patterns: Option<&BTreeMap<String, TilingPattern>>,
+    type3_fonts: Option<&BTreeMap<String, Type3Font>>,
+) -> Result<ParsedContent, PdfError> {
+    let mut state = State::new(
+        ext_gstate,
+        font_resources,
+        shading_resources,
+        color_space_resources,
+        properties_resources,
+    )
+    .with_xobject_forms(xobject_forms)
+    .with_pattern_resources(pattern_resources)
+    .with_tiling_patterns(tiling_patterns)
+    .with_type3_fonts(type3_fonts);
     state.parse(input)?;
     Ok(state.finish())
 }
@@ -963,6 +1000,34 @@ struct State<'a> {
     /// so a stroking `SCN /Pname` clears the previous solid stroke
     /// rather than leaving a stale colour.
     stroke_tiling: Option<String>,
+    /// Pre-parsed Type 3 fonts (§9.6.5) from the page's
+    /// `/Resources /Font` subdictionary, keyed by font resource name
+    /// (leading `/` stripped), supplied by
+    /// [`parse_content_stream_full_with_type3`]. When a `Tj`/`TJ`/`'`/`"`
+    /// show runs under a font name present here, each character code's
+    /// glyph description [`Group`] is spliced into the scene tree at the
+    /// glyph's text-rendering matrix (§9.4.4) composed with the font's
+    /// `/FontMatrix`. When this is `None` or the active font isn't a
+    /// Type 3 font, text-show operators stay event-only on the vector
+    /// side (Type 1 / TrueType / Type 0 outlines need a glyph
+    /// rasteriser this walker doesn't carry).
+    type3_fonts: Option<&'a BTreeMap<String, Type3Font>>,
+    /// Text rendering mode `Tr` (§9.3.6 Table 106). Only mode `3`
+    /// (invisible — the OCR layer) suppresses Type 3 glyph painting;
+    /// every other mode paints. Default `0` (fill). Tracked here only
+    /// for the Type 3 paint path; the dedicated text-extraction walker
+    /// surfaces the mode independently.
+    text_render_mode: i64,
+    /// Text rise `Ts` (§9.4.4) in unscaled text-space units — the
+    /// vertical offset baked into the text-rendering matrix's `f`
+    /// component. Raises (positive) / lowers (negative) the glyph
+    /// baseline. Default `0.0`.
+    text_rise: f32,
+    /// Re-entrancy guard for the Type 3 glyph paint path. A glyph
+    /// description is itself a content stream that may show text in
+    /// another (or the same) Type 3 font; this caps the nesting so a
+    /// self-referential `/CharProcs` entry can't recurse without bound.
+    type3_depth: u32,
 }
 
 /// A `/PatternType 1` tiling pattern (§8.7.3) reduced to what the
@@ -991,6 +1056,45 @@ pub struct TilingPattern {
     /// `/PaintType` — 1 (coloured: cell carries its own colours) or 2
     /// (uncoloured: cell is a stencil poured with the current colour).
     pub paint_type: i64,
+}
+
+/// A Type 3 font (§9.6.5) reduced to what the content walker needs to
+/// paint its glyphs as vector geometry. Unlike Type 1 / TrueType fonts
+/// — whose glyph outlines live in an external font program that a
+/// software renderer would have to rasterise — a Type 3 font defines
+/// each glyph as a *content stream* of PDF graphics operators
+/// (`/CharProcs`). Those operators are exactly the marking operators
+/// this walker already understands, so each glyph description can be
+/// pre-parsed into a [`Group`] and spliced into the scene tree at the
+/// glyph's text-rendering matrix.
+///
+/// Per §9.6.5 the conforming reader, for each shown character code:
+///   a) looks the code up in `/Encoding` (`/Differences`) to get a
+///      glyph name;
+///   b) looks the glyph name up in `/CharProcs` to get a glyph
+///      description stream (no key → no glyph painted);
+///   c) invokes the description with the CTM set to the concatenation
+///      of `/FontMatrix` and the text space in effect at show time.
+#[derive(Clone, Debug)]
+pub struct Type3Font {
+    /// `/FontMatrix` — maps glyph space to text space (§9.2.4). Each
+    /// glyph `Group` is painted under `text_render_matrix ∘ FontMatrix`.
+    pub font_matrix: Transform2D,
+    /// Code → glyph name, built from `/Encoding /Differences` (§9.6.6.1).
+    /// A code absent here paints nothing.
+    pub encoding: BTreeMap<u8, String>,
+    /// Glyph name → pre-parsed glyph description. Each value is the
+    /// `/CharProcs` content stream (with its leading `d0` / `d1`
+    /// stripped, §9.6.5 Table 113) parsed against the font's own
+    /// `/Resources` into a [`Group`]. A glyph name in `encoding` but
+    /// not here paints nothing.
+    pub glyphs: BTreeMap<String, Group>,
+    /// Glyph names whose description began with `d1` (§9.6.5 Table 113):
+    /// the glyph specifies *shape only*, and its colour comes from the
+    /// graphics state in force when the text-showing operator runs. A
+    /// `d0` glyph (or one with neither) specifies its own colour and is
+    /// painted with the colours baked into its `Group`.
+    pub shape_only: BTreeSet<String>,
 }
 
 struct Frame {
@@ -2892,6 +2996,10 @@ impl<'a> State<'a> {
             fill_tiling: None,
             fill_tiling_color: None,
             stroke_tiling: None,
+            type3_fonts: None,
+            text_render_mode: 0,
+            text_rise: 0.0,
+            type3_depth: 0,
         }
     }
 
@@ -2923,6 +3031,16 @@ impl<'a> State<'a> {
         patterns: Option<&'a BTreeMap<String, TilingPattern>>,
     ) -> Self {
         self.tiling_patterns = patterns;
+        self
+    }
+
+    /// Attach the page's pre-parsed Type 3 fonts (§9.6.5) so a
+    /// `Tj`/`TJ`/`'`/`"` show under a Type 3 font paints each glyph's
+    /// `/CharProcs` description into the scene tree. The legacy entry
+    /// points leave this `None` and text shows stay event-only on the
+    /// vector side.
+    fn with_type3_fonts(mut self, fonts: Option<&'a BTreeMap<String, Type3Font>>) -> Self {
+        self.type3_fonts = fonts;
         self
     }
 
@@ -3369,11 +3487,24 @@ impl<'a> State<'a> {
                 }
                 self.operands.clear();
             }
-            b"Tr" | b"Ts" => {
-                // Rendering mode / rise — these affect glyph
-                // appearance and the rendering-matrix vertical offset,
-                // not the horizontal run advance the walker tracks.
-                // Drop operands.
+            b"Tr" => {
+                // `render Tr` — text rendering mode (§9.3.6 Table 106).
+                // Mode 3 (invisible) suppresses Type 3 glyph painting;
+                // every other mode paints. The mode also affects the
+                // fill/stroke split for outline fonts, which is moot on
+                // the vector side here.
+                if let Some(Operand::Number(n)) = self.operands.last() {
+                    self.text_render_mode = *n as i64;
+                }
+                self.operands.clear();
+            }
+            b"Ts" => {
+                // `rise Ts` — text rise (§9.4.4), the vertical offset
+                // baked into the text-rendering matrix. Tracked for the
+                // Type 3 glyph paint path.
+                if let Some(Operand::Number(n)) = self.operands.last() {
+                    self.text_rise = *n;
+                }
                 self.operands.clear();
             }
 
@@ -3459,6 +3590,10 @@ impl<'a> State<'a> {
                 };
                 let metrics = self.current_font_metrics();
                 self.emit_text_show(bytes.clone(), TextShowOp::Tj);
+                // §9.6.5 — a Type 3 font paints each glyph's /CharProcs
+                // description into the scene at the current text origin,
+                // before Tm advances.
+                self.paint_type3_show(&bytes);
                 // §9.4.4 — advance Tm by the shown glyphs so a
                 // following show on the same line starts at the right
                 // origin.
@@ -3493,7 +3628,14 @@ impl<'a> State<'a> {
                 let th = self.horiz_scale;
                 for el in elements {
                     match el {
-                        TjElem::Str(s) => self.advance_text(&s, &metrics),
+                        TjElem::Str(s) => {
+                            // §9.6.5 — paint Type 3 glyphs at this
+                            // element's origin, then advance Tm past
+                            // them (so the next element / kern starts
+                            // at the right place).
+                            self.paint_type3_show(&s);
+                            self.advance_text(&s, &metrics);
+                        }
                         TjElem::Kern(adj) => {
                             // A positive kern moves the next glyph
                             // *left* (§9.4.3): tx = −adj/1000 × Tfs × Th.
@@ -3524,6 +3666,7 @@ impl<'a> State<'a> {
                 };
                 let metrics = self.current_font_metrics();
                 self.emit_text_show(bytes.clone(), TextShowOp::SingleQuote);
+                self.paint_type3_show(&bytes);
                 self.advance_text(&bytes, &metrics);
                 self.operands.clear();
             }
@@ -3558,7 +3701,21 @@ impl<'a> State<'a> {
                 };
                 let metrics = self.current_font_metrics();
                 self.emit_text_show(bytes.clone(), TextShowOp::DoubleQuote);
+                self.paint_type3_show(&bytes);
                 self.advance_text(&bytes, &metrics);
+                self.operands.clear();
+            }
+
+            // Type 3 glyph metrics (§9.6.5 Table 113) ---------------
+            b"d0" | b"d1" => {
+                // `wx wy d0` / `wx wy llx lly urx ury d1` — declare the
+                // glyph's width (and, for d1, bounding box). These only
+                // appear as the first operator of a /CharProcs glyph
+                // description; the width is already taken from the
+                // font's /Widths array (§9.6.5) and the bbox is purely
+                // advisory, so the marks are produced by the path /
+                // image operators that follow. Drop the operands so the
+                // numbers don't leak into the next operator.
                 self.operands.clear();
             }
 
@@ -4119,6 +4276,118 @@ impl<'a> State<'a> {
                 self.translate_text(tx);
             }
         }
+    }
+
+    /// Paint a Type 3 font's glyphs for one shown byte string into the
+    /// scene tree (§9.6.5). For each byte the walker resolves the glyph
+    /// name via the font's `/Encoding`, looks the description `Group` up
+    /// in `/CharProcs`, and splices it under the glyph's text-rendering
+    /// matrix (§9.4.4):
+    ///
+    /// ```text
+    /// T_rm = [ Tfs·Th  0      0 ]   [ a b 0 ]
+    ///        [ 0       Tfs    0 ] × [ c d 0 ] × Tm    (then CTM on pop)
+    ///        [ 0       Trise  1 ]   [ e f 1 ]
+    /// ```
+    ///
+    /// where `[a b c d e f]` is the font's `/FontMatrix`. The frame's
+    /// accumulated `cm` CTM is applied when the frame is popped, so the
+    /// spliced group's transform is `Tm ∘ textState ∘ FontMatrix`. The
+    /// text matrix is advanced separately by [`Self::advance_text`].
+    ///
+    /// Mode `3` (invisible, §9.3.6) paints nothing. A glyph name absent
+    /// from `/Encoding` or `/CharProcs` paints nothing (§9.6.5 step b).
+    /// Re-entrancy (a glyph that itself shows Type 3 text) is depth-
+    /// bounded by `type3_depth`.
+    fn paint_type3_show(&mut self, bytes: &[u8]) {
+        // Invisible text-render mode shows no marks (§9.3.6 mode 3).
+        if self.text_render_mode == 3 {
+            return;
+        }
+        if self.type3_depth >= MAX_TYPE3_DEPTH {
+            return;
+        }
+        let font_name = match &self.current_font {
+            Some((n, _)) if !n.is_empty() => n.clone(),
+            _ => return,
+        };
+        let font = match self.type3_fonts.and_then(|m| m.get(&font_name)) {
+            Some(f) => f,
+            None => return,
+        };
+        let tfs = self.current_font.as_ref().map(|(_, s)| *s).unwrap_or(0.0);
+        let th = self.horiz_scale;
+        let tc = self.char_spacing;
+        let word_spacing = self.word_spacing;
+        let rise = self.text_rise;
+        // Per-show graphics-state scale (the text-rendering-matrix's
+        // leftmost factor, §9.4.4). FontMatrix sits inside this; the
+        // per-glyph text matrix outside; CTM (frame.transform) is applied
+        // on frame pop.
+        let text_state = Transform2D {
+            a: tfs * th,
+            b: 0.0,
+            c: 0.0,
+            d: tfs,
+            e: 0.0,
+            f: rise,
+        };
+        // Width metrics so the glyph origin advances *between* the bytes
+        // of a single show (the caller's `advance_text` only moves
+        // `self.text_matrix` once, after the whole string). We walk a
+        // local running matrix so painting and the caller's advance stay
+        // independent.
+        let metrics = self.current_font_metrics();
+        let scale = metrics.text_scale();
+        let mut tm = self.text_matrix;
+        // Build the spliceable glyph nodes while only `font` (an
+        // immutable borrow of `self.type3_fonts`) is held, then splice
+        // them in one pass — `self.current()` needs `&mut self`, which
+        // can't overlap the `font` borrow. Only matched glyph groups are
+        // cloned (not the whole font).
+        let mut nodes: Vec<Node> = Vec::new();
+        for &b in bytes {
+            if let Some(glyph) = font.encoding.get(&b).and_then(|n| font.glyphs.get(n)) {
+                if !glyph.children.is_empty() {
+                    // group transform = Tm ∘ text_state ∘ FontMatrix
+                    let outer = compose(tm, text_state);
+                    let g_xform = compose(outer, font.font_matrix);
+                    nodes.push(Node::Group(Group {
+                        transform: g_xform,
+                        children: glyph.children.clone(),
+                        ..Group::default()
+                    }));
+                }
+            }
+            // Advance the local running matrix by this glyph's
+            // displacement (§9.4.4) so the next glyph in the string paints
+            // at the right origin. `Tw` applies only to the single-byte
+            // space (code 32, §9.3.3).
+            let w0 = metrics.width(b as i64) * scale;
+            let tw = if b == 32 { word_spacing } else { 0.0 };
+            let tx = (w0 * tfs + tc + tw) * th;
+            tm = compose(
+                tm,
+                Transform2D {
+                    a: 1.0,
+                    b: 0.0,
+                    c: 0.0,
+                    d: 1.0,
+                    e: tx,
+                    f: 0.0,
+                },
+            );
+        }
+        if nodes.is_empty() {
+            return;
+        }
+        // The depth guard brackets the splice: a glyph description that
+        // itself painted Type 3 text did so while building `glyph` (at
+        // resolve time), so the runtime guard simply caps how deep a
+        // single show's nodes nest before they're attached here.
+        self.type3_depth += 1;
+        self.current().children.extend(nodes);
+        self.type3_depth -= 1;
     }
 
     /// Translate the text matrix by `(tx, 0)` in text space — the
@@ -5817,6 +6086,12 @@ fn lab_color(white: [f32; 3], lab: [f32; 3]) -> Rgba {
 /// otherwise produce an unbounded node count; past this cap the fill
 /// falls back to its solid colour rather than tiling.
 const MAX_TILING_CELLS: i64 = 4096;
+
+/// Re-entrancy ceiling for the Type 3 glyph paint path (§9.6.5). A
+/// glyph description is itself a content stream and may show text in
+/// another Type 3 font; this caps the nesting so a `/CharProcs` entry
+/// that (directly or transitively) shows itself terminates.
+const MAX_TYPE3_DEPTH: u32 = 8;
 
 /// Recolour every painted path in a node subtree to a single solid
 /// colour — the stencil-pour operation for an uncoloured (`/PaintType 2`)
