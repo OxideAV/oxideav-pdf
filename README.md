@@ -266,9 +266,12 @@ splices that group at the glyph's text-rendering matrix —
 glyph origin between the bytes of a single show by each glyph's
 `/Widths` displacement. The `d0` / `d1` glyph-metric operators
 (Table 113) are consumed (the width comes from `/Widths`, the bbox is
-advisory); render mode 3 (invisible OCR layer) paints nothing, and a
-glyph absent from `/Encoding` or `/CharProcs` is skipped. Glyph
-descriptions that themselves show Type 3 text are depth-bounded.
+advisory); a **`d1` shape-only glyph** is recoloured to the current fill
+colour at paint time (its own colour operators disregarded, Table 113
+NOTE 2), while a **`d0` self-coloured glyph** keeps its own colours.
+Render mode 3 (invisible OCR layer) paints nothing, and a glyph absent
+from `/Encoding` or `/CharProcs` is skipped. Glyph descriptions that
+themselves show Type 3 text are depth-bounded.
 
 The `sh` shading-paint operator (§8.7.4.5) surfaces a `ContentShading`
 event per paint with the resolved shading dictionary, the effective CTM,

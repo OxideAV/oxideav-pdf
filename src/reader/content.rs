@@ -4339,6 +4339,15 @@ impl<'a> State<'a> {
         // independent.
         let metrics = self.current_font_metrics();
         let scale = metrics.text_scale();
+        // The current fill colour the graphics state supplies — a
+        // shape-only (`d1`) glyph (§9.6.5 Table 113) is painted with this
+        // colour rather than any colour baked into its description
+        // (NOTE 2: the text-showing operators paint glyphs in the current
+        // colour). Self-coloured (`d0`) glyphs keep their own colours.
+        let fill_color = match &self.fill_paint {
+            Some(Paint::Solid(c)) => *c,
+            _ => Rgba::opaque(0, 0, 0),
+        };
         let mut tm = self.text_matrix;
         // Build the spliceable glyph nodes while only `font` (an
         // immutable borrow of `self.type3_fonts`) is held, then splice
@@ -4347,14 +4356,26 @@ impl<'a> State<'a> {
         // cloned (not the whole font).
         let mut nodes: Vec<Node> = Vec::new();
         for &b in bytes {
-            if let Some(glyph) = font.encoding.get(&b).and_then(|n| font.glyphs.get(n)) {
+            if let Some((glyph_name, glyph)) = font
+                .encoding
+                .get(&b)
+                .and_then(|n| font.glyphs.get(n).map(|g| (n, g)))
+            {
                 if !glyph.children.is_empty() {
                     // group transform = Tm ∘ text_state ∘ FontMatrix
                     let outer = compose(tm, text_state);
                     let g_xform = compose(outer, font.font_matrix);
+                    let mut children = glyph.children.clone();
+                    // §9.6.5 — a `d1` shape-only glyph takes the current
+                    // fill colour, not its own; recolour its paints.
+                    if font.shape_only.contains(glyph_name) {
+                        for child in &mut children {
+                            recolor_node(child, fill_color);
+                        }
+                    }
                     nodes.push(Node::Group(Group {
                         transform: g_xform,
-                        children: glyph.children.clone(),
+                        children,
                         ..Group::default()
                     }));
                 }

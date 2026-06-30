@@ -22,7 +22,7 @@
 //! Details), §9.6.6.1 (Character Encoding). PDF bytes are hand-assembled
 //! here; no third-party PDF library was consulted.
 
-use oxideav_core::vector::{Node, PathCommand, Point};
+use oxideav_core::vector::{Node, Paint, PathCommand, Point, Rgba};
 use oxideav_pdf::read_pdf_to_scene;
 
 /// Assemble a one-page PDF whose single Type 3 font is the §9.6.5 example
@@ -231,5 +231,110 @@ fn type3_invisible_mode_paints_nothing() {
     assert!(
         points.is_empty(),
         "invisible text-render mode 3 must paint no Type 3 glyph geometry; got {points:?}"
+    );
+}
+
+/// Assemble a one-page PDF with a two-glyph Type 3 font where the glyph
+/// descriptions are supplied verbatim, so a test can probe the `d0`
+/// (self-coloured) vs. `d1` (shape-only) split. Code 97 → `g0`, 98 →
+/// `g1`. The page content is `content`.
+fn build_type3_colored_pdf(content: &[u8], glyph0: &[u8], glyph1: &[u8]) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut offs: Vec<usize> = Vec::new();
+    buf.extend_from_slice(b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+
+    offs.push(buf.len());
+    buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offs.push(buf.len());
+    buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n");
+    offs.push(buf.len());
+    buf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Resources << /Font << /F0 4 0 R >> >> /Contents 5 0 R >>\nendobj\n",
+    );
+    offs.push(buf.len());
+    buf.extend_from_slice(
+        b"4 0 obj\n<< /Type /Font /Subtype /Type3 /FontBBox [0 0 750 750] \
+         /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs 6 0 R \
+         /Encoding << /Type /Encoding /Differences [97 /g0 /g1] >> \
+         /FirstChar 97 /LastChar 98 /Widths [1000 1000] >>\nendobj\n",
+    );
+    offs.push(buf.len());
+    let header = format!("5 0 obj\n<< /Length {} >>\nstream\n", content.len());
+    buf.extend_from_slice(header.as_bytes());
+    buf.extend_from_slice(content);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offs.push(buf.len());
+    buf.extend_from_slice(b"6 0 obj\n<< /g0 7 0 R /g1 8 0 R >>\nendobj\n");
+    offs.push(buf.len());
+    buf.extend_from_slice(format!("7 0 obj\n<< /Length {} >>\nstream\n", glyph0.len()).as_bytes());
+    buf.extend_from_slice(glyph0);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+    offs.push(buf.len());
+    buf.extend_from_slice(format!("8 0 obj\n<< /Length {} >>\nstream\n", glyph1.len()).as_bytes());
+    buf.extend_from_slice(glyph1);
+    buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let xref_off = buf.len();
+    let count = offs.len() + 1;
+    buf.extend_from_slice(format!("xref\n0 {count}\n").as_bytes());
+    buf.extend_from_slice(b"0000000000 65535 f \n");
+    for o in &offs {
+        buf.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    buf.extend_from_slice(
+        format!("trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref_off}\n%%EOF\n")
+            .as_bytes(),
+    );
+    buf
+}
+
+/// Gather every solid fill colour painted anywhere in the tree.
+fn gather_fills(node: &Node, out: &mut Vec<Rgba>) {
+    match node {
+        Node::Path(p) => {
+            if let Some(Paint::Solid(c)) = &p.fill {
+                out.push(*c);
+            }
+        }
+        Node::Group(g) => {
+            for c in &g.children {
+                gather_fills(c, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// §9.6.5 Table 113 colour rule: a `d1` glyph specifies *shape only* and
+/// takes its colour from the graphics state in force at show time, while
+/// a `d0` glyph carries its own colour. Under a red (`1 0 0 rg`) fill,
+/// the `d1` glyph must surface red; the self-coloured `d0` glyph (which
+/// sets green internally) must stay green regardless of the fill.
+#[test]
+fn type3_d1_takes_current_color_d0_keeps_own() {
+    // g0 = d1 shape-only square; g1 = d0 self-coloured (green) square.
+    let g0: &[u8] = b"1000 0 0 0 750 750 d1\n0 0 750 750 re\nf\n";
+    let g1: &[u8] = b"1000 0 d0\n0 1 0 rg\n0 0 750 750 re\nf\n";
+    // Page fill is red; show both glyphs.
+    let content = b"BT /F0 12 Tf 1 0 0 rg 100 700 Td (ab) Tj ET";
+    let pdf = build_type3_colored_pdf(content, g0, g1);
+    let scene = read_pdf_to_scene(&pdf).expect("read Type 3 PDF");
+    let pages = scene.pages.as_ref().expect("scene has pages");
+    let page = &pages[0];
+
+    let mut fills = Vec::new();
+    for n in &page.content.root.children {
+        gather_fills(n, &mut fills);
+    }
+    let red = Rgba::opaque(0xFF, 0x00, 0x00);
+    let green = Rgba::opaque(0x00, 0xFF, 0x00);
+    assert!(
+        fills.contains(&red),
+        "the d1 shape-only glyph should be painted with the current red fill; got {fills:?}"
+    );
+    assert!(
+        fills.contains(&green),
+        "the d0 self-coloured glyph should keep its own green; got {fills:?}"
     );
 }
