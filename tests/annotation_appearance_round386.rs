@@ -303,6 +303,54 @@ fn appearance_matrix_rotates_before_rect_mapping() {
 }
 
 #[test]
+fn hidden_and_noview_flags_suppress_painting() {
+    // §12.5.3 Table 165 — Hidden is bit 2 (value 2), NoView bit 6
+    // (value 32); Print (bit 3, value 4) does not suppress display.
+    for (flags, expect_painted) in [(2u32, false), (32u32, false), (4u32, true)] {
+        let pdf = build_annot_pdf(
+            "[100 100 150 130]",
+            &format!("/AP << /N 5 0 R >> /F {flags}"),
+            "/BBox [0 0 10 10]",
+        );
+        let scene = read_pdf_to_scene(&pdf).expect("read PDF to scene");
+        let root = &scene.pages.as_ref().unwrap()[0].content.root;
+        let mut fills = Vec::new();
+        collect_fills(root, &mut fills);
+        let want = if expect_painted {
+            vec![(0, 0, 255), (255, 0, 0)]
+        } else {
+            vec![(0, 0, 255)]
+        };
+        assert_eq!(fills, want, "/F {flags}");
+    }
+}
+
+#[test]
+fn popup_annotation_never_paints() {
+    // §12.5.6.14 — a pop-up annotation "shall have no appearance
+    // stream … of its own"; one carrying an /AP anyway stays
+    // page-invisible.
+    let mut pdf = build_annot_pdf(
+        "[100 100 150 130]",
+        "/AP << /N 5 0 R >>",
+        "/BBox [0 0 10 10]",
+    );
+    // Rewrite the fixture's /Subtype in place (same byte length).
+    let needle = b"/Subtype /Square".as_slice();
+    let pos = pdf
+        .windows(needle.len())
+        .rposition(|w| w == needle)
+        .expect("annot subtype present");
+    pdf[pos..pos + needle.len()].copy_from_slice(b"/Subtype /Popupp");
+    pdf[pos + 15] = b' '; // "/Subtype /Popup " keeps offsets intact
+    let scene = read_pdf_to_scene(&pdf).expect("read PDF to scene");
+    let root = &scene.pages.as_ref().unwrap()[0].content.root;
+    let mut fills = Vec::new();
+    collect_fills(root, &mut fills);
+    assert_eq!(fills, vec![(0, 0, 255)]);
+}
+
+#[test]
 fn annotation_without_ap_paints_nothing() {
     let pdf = build_annot_pdf("[100 100 150 130]", "", "/BBox [0 0 10 10]");
     let scene = read_pdf_to_scene(&pdf).expect("read PDF to scene");

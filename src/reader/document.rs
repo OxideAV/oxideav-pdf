@@ -2720,6 +2720,31 @@ fn annotation_appearance_group(
     reader: &mut DocumentReader<'_>,
     annot: &Dict,
 ) -> Result<Option<Group>, PdfError> {
+    // /F (Table 164) — the §12.5.3 flag word. A Hidden (bit 2)
+    // annotation "shall not be displayed or printed … regardless of
+    // its annotation type"; a NoView (bit 6) annotation is hidden for
+    // on-screen display (Table 165). Neither reaches the scene.
+    let flags = match annot.entries().iter().find(|(k, _)| k == "F") {
+        Some((_, Object::Integer(v))) => *v,
+        _ => 0,
+    };
+    const FLAG_HIDDEN: i64 = 1 << 1; // bit 2
+    const FLAG_NO_VIEW: i64 = 1 << 5; // bit 6
+    if flags & (FLAG_HIDDEN | FLAG_NO_VIEW) != 0 {
+        return Ok(None);
+    }
+
+    // §12.5.6.14 — a pop-up annotation "shall have no appearance
+    // stream … of its own"; its text is displayed through the pop-up
+    // window machinery, not painted on the page. Skip the subtype
+    // outright.
+    if matches!(
+        annot.entries().iter().find(|(k, _)| k == "Subtype"),
+        Some((_, Object::Name(s))) if s == "Popup"
+    ) {
+        return Ok(None);
+    }
+
     // /Rect (Table 164, required) — the annotation rectangle in
     // default user space.
     let Some(rect) = dict_rect4(annot, "Rect") else {
