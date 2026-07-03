@@ -1226,7 +1226,123 @@ fn build_normal_appearance(annot: &Annotation) -> Option<Vec<u8>> {
             });
             Some(ops.into_bytes())
         }
+        AnnotationKind::Line { endpoints, .. } => {
+            // §12.5.6.7 — a straight line from (x1,y1) to (x2,y2)
+            // (the /L entry; /Rect is only the bounding box). The
+            // Table 176 line-ending glyphs (/LE) are not drawn.
+            let c = stroke_comps?;
+            let mut ops = String::new();
+            if !push_colour_op(&mut ops, c, false) {
+                return None;
+            }
+            ops.push_str(&fr(annotation_border_width(annot)));
+            ops.push_str(" w\n");
+            ops.push_str(&format!(
+                "{} {} m\n{} {} l\nS\n",
+                fr(endpoints[0]),
+                fr(endpoints[1]),
+                fr(endpoints[2]),
+                fr(endpoints[3])
+            ));
+            Some(ops.into_bytes())
+        }
+        AnnotationKind::Ink { strokes } => {
+            // §12.5.6.13 — each /InkList entry is one freehand stroke;
+            // points are connected by straight lines (the spec permits
+            // "straight lines or curves").
+            let c = stroke_comps?;
+            let mut ops = String::new();
+            if !push_colour_op(&mut ops, c, false) {
+                return None;
+            }
+            ops.push_str(&fr(annotation_border_width(annot)));
+            ops.push_str(" w\n1 J 1 j\n"); // round caps + joins
+            let mut any = false;
+            for stroke in strokes {
+                if stroke.len() < 4 {
+                    continue;
+                }
+                any = true;
+                ops.push_str(&format!("{} {} m\n", fr(stroke[0]), fr(stroke[1])));
+                for xy in stroke.chunks_exact(2).skip(1) {
+                    ops.push_str(&format!("{} {} l\n", fr(xy[0]), fr(xy[1])));
+                }
+            }
+            if !any {
+                return None;
+            }
+            ops.push_str("S\n");
+            Some(ops.into_bytes())
+        }
+        AnnotationKind::Polygon {
+            vertices,
+            interior_colour,
+            ..
+        }
+        | AnnotationKind::PolyLine {
+            vertices,
+            interior_colour,
+            ..
+        } => {
+            // §12.5.6.9 — vertices connected by straight lines; a
+            // Polygon implicitly closes (first to last vertex) and may
+            // fill its interior with /IC, a PolyLine stays open (its
+            // /IC colours only the Table 176 endings, which are not
+            // drawn here).
+            if vertices.len() < 4 {
+                return None;
+            }
+            let closed = matches!(annot.kind, AnnotationKind::Polygon { .. });
+            let fill_comps = if closed {
+                interior_colour.as_deref().filter(|c| !c.is_empty())
+            } else {
+                None
+            };
+            let mut ops = String::new();
+            let mut painted = false;
+            if let Some(c) = fill_comps {
+                painted |= push_colour_op(&mut ops, c, true);
+            }
+            let stroking = if let Some(c) = stroke_comps {
+                let ok = push_colour_op(&mut ops, c, false);
+                if ok {
+                    ops.push_str(&fr(annotation_border_width(annot)));
+                    ops.push_str(" w\n");
+                }
+                painted |= ok;
+                ok
+            } else {
+                false
+            };
+            if !painted {
+                return None;
+            }
+            ops.push_str(&format!("{} {} m\n", fr(vertices[0]), fr(vertices[1])));
+            for xy in vertices.chunks_exact(2).skip(1) {
+                ops.push_str(&format!("{} {} l\n", fr(xy[0]), fr(xy[1])));
+            }
+            if closed {
+                ops.push_str("h\n");
+            }
+            ops.push_str(match (fill_comps.is_some(), stroking) {
+                (true, true) => "B\n",
+                (true, false) => "f\n",
+                _ => "S\n",
+            });
+            Some(ops.into_bytes())
+        }
         _ => None,
+    }
+}
+
+/// The stroke width for a line-family appearance: the `/Border` array
+/// width component when the caller supplied one (Table 164 `[hr vr
+/// w]`), else the §12.5.4 "neither `Border` nor `BS` present" default
+/// of 1. A non-finite / negative width clamps to the default.
+fn annotation_border_width(annot: &Annotation) -> f32 {
+    match annot.border.as_ref().and_then(|b| b.get(2)).copied() {
+        Some(w) if w.is_finite() && w > 0.0 => w,
+        _ => 1.0,
     }
 }
 

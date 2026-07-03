@@ -234,6 +234,145 @@ fn outline_only_and_fill_only_paint_modes() {
     );
 }
 
+/// One flat point list per scene path (MoveTo/LineTo endpoints only).
+fn collect_polylines(group: &Group, out: &mut Vec<Vec<(f32, f32)>>) {
+    let mut paths = Vec::new();
+    collect_paths(group, &mut paths);
+    for cmds in paths {
+        let mut pts = Vec::new();
+        for c in &cmds {
+            match c {
+                PathCommand::MoveTo(p) | PathCommand::LineTo(p) => pts.push((p.x, p.y)),
+                _ => {}
+            }
+        }
+        out.push(pts);
+    }
+}
+
+#[test]
+fn line_appearance_round_trips_into_scene() {
+    let scene = one_page_scene();
+    let annots = [annot(
+        [10.0, 20.0, 110.0, 60.0],
+        Some(vec![1.0, 0.0, 0.0]),
+        WriterAnnotationKind::Line {
+            endpoints: [10.0, 20.0, 110.0, 60.0],
+            line_endings: None,
+            interior_colour: None,
+            leader_line: None,
+            leader_line_extension: None,
+            leader_line_offset: None,
+            cap: false,
+            intent: None,
+        },
+    )];
+    let pdf = write_pdf_with_annotations(&scene, &annots).expect("write");
+    let scene_back = read_pdf_to_scene(&pdf).expect("read back");
+    let root = &scene_back.pages.as_ref().unwrap()[0].content.root;
+    let mut lines = Vec::new();
+    collect_polylines(root, &mut lines);
+    assert!(
+        lines.contains(&vec![(10.0, 20.0), (110.0, 60.0)]),
+        "/L endpoints stroked: {lines:?}"
+    );
+    let mut paints = Vec::new();
+    collect_paints(root, &mut paints);
+    assert!(paints.contains(&(None, Some((255, 0, 0)))));
+}
+
+#[test]
+fn ink_appearance_round_trips_into_scene() {
+    let scene = one_page_scene();
+    let annots = [annot(
+        [0.0, 0.0, 200.0, 200.0],
+        None,
+        WriterAnnotationKind::Ink {
+            strokes: vec![
+                vec![10.0, 10.0, 20.0, 30.0, 40.0, 25.0],
+                vec![50.0, 50.0, 60.0, 60.0],
+                vec![99.0, 99.0], // single point — nothing to stroke
+            ],
+        },
+    )];
+    let pdf = write_pdf_with_annotations(&scene, &annots).expect("write");
+    let scene_back = read_pdf_to_scene(&pdf).expect("read back");
+    let root = &scene_back.pages.as_ref().unwrap()[0].content.root;
+    let mut lines = Vec::new();
+    collect_polylines(root, &mut lines);
+    assert!(
+        lines.contains(&vec![
+            (10.0, 10.0),
+            (20.0, 30.0),
+            (40.0, 25.0),
+            (50.0, 50.0),
+            (60.0, 60.0)
+        ]),
+        "both ink strokes in one stroked path: {lines:?}"
+    );
+}
+
+#[test]
+fn polygon_and_polyline_appearances_round_trip() {
+    let scene = one_page_scene();
+    let annots = [
+        annot(
+            [0.0, 0.0, 100.0, 100.0],
+            Some(vec![0.0, 0.0, 1.0]),
+            WriterAnnotationKind::Polygon {
+                vertices: vec![10.0, 10.0, 90.0, 10.0, 50.0, 90.0],
+                interior_colour: Some(vec![1.0, 1.0, 0.0]),
+                intent: None,
+            },
+        ),
+        annot(
+            [100.0, 100.0, 200.0, 200.0],
+            Some(vec![0.0, 1.0, 0.0]),
+            WriterAnnotationKind::PolyLine {
+                vertices: vec![110.0, 110.0, 150.0, 190.0, 190.0, 110.0],
+                line_endings: None,
+                interior_colour: Some(vec![1.0, 0.0, 0.0]), // endings only — not drawn
+                intent: None,
+            },
+        ),
+    ];
+    let pdf = write_pdf_with_annotations(&scene, &annots).expect("write");
+    let scene_back = read_pdf_to_scene(&pdf).expect("read back");
+    let root = &scene_back.pages.as_ref().unwrap()[0].content.root;
+
+    let mut paints = Vec::new();
+    collect_paints(root, &mut paints);
+    assert!(
+        paints.contains(&(Some((255, 255, 0)), Some((0, 0, 255)))),
+        "polygon fills /IC and strokes /C: {paints:?}"
+    );
+    assert!(
+        paints.contains(&(None, Some((0, 255, 0)))),
+        "polyline strokes only (its /IC colours undrawn endings): {paints:?}"
+    );
+
+    // The polygon path closes; the polyline stays open.
+    let mut paths = Vec::new();
+    collect_paths(root, &mut paths);
+    let polygon = paths
+        .iter()
+        .find(|cmds| {
+            cmds.iter().any(
+                |c| matches!(c, PathCommand::MoveTo(p) if (p.x - 10.0).abs() < 1e-3 && (p.y - 10.0).abs() < 1e-3),
+            )
+        })
+        .expect("polygon path");
+    assert!(polygon.iter().any(|c| matches!(c, PathCommand::Close)));
+    let polyline = paths
+        .iter()
+        .find(|cmds| {
+            cmds.iter()
+                .any(|c| matches!(c, PathCommand::MoveTo(p) if (p.x - 110.0).abs() < 1e-3))
+        })
+        .expect("polyline path");
+    assert!(!polyline.iter().any(|c| matches!(c, PathCommand::Close)));
+}
+
 #[test]
 fn invisible_geometry_emits_no_appearance() {
     let scene = one_page_scene();
