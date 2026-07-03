@@ -1009,10 +1009,20 @@ fn decode_to_scene(mut reader: DocumentReader<'_>) -> Result<Scene, PdfError> {
         ));
     }
 
+    // Resolve the catalog's optional-content state once (§8.11) — the
+    // annotation-appearance path consults it for per-annotation /OC
+    // visibility (§12.5.2 Table 164). A malformed /OCProperties is
+    // treated as "not layered" rather than failing the whole decode.
+    let optional_content = crate::reader::ocg::optional_content(&mut reader).unwrap_or(None);
+
     // Decode each Page → oxideav_scene::Page.
     let mut scene_pages = Vec::with_capacity(leaves.len());
     for leaf_id in leaves {
-        scene_pages.push(decode_page(&mut reader, leaf_id)?);
+        scene_pages.push(decode_page(
+            &mut reader,
+            leaf_id,
+            optional_content.as_ref(),
+        )?);
     }
 
     // /Info → Metadata.
@@ -1173,7 +1183,11 @@ fn resolve_inheritable_attr(
     Ok(None)
 }
 
-fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Page, PdfError> {
+fn decode_page(
+    reader: &mut DocumentReader<'_>,
+    page_id: ObjectId,
+    optional_content: Option<&crate::reader::ocg::OptionalContent>,
+) -> Result<Page, PdfError> {
     let page_obj = reader.resolve(page_id)?;
     let Object::Dict(page_dict) = page_obj else {
         return Err(PdfError::other(format!(
@@ -1312,7 +1326,7 @@ fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Pag
     // stream on top of the page content (the appearance composites
     // over "the page content along with any previously painted
     // annotations", so array order is paint order).
-    let annot_groups = resolve_annotation_appearances(reader, &page_dict)?;
+    let annot_groups = resolve_annotation_appearances(reader, &page_dict, optional_content)?;
     if !annot_groups.is_empty() {
         // The parsed page root is normally a bare container; if it
         // carries its own transform / clip / opacity, nest it so the
@@ -2657,6 +2671,7 @@ fn dict_rect4(dict: &Dict, key: &str) -> Option<[f32; 4]> {
 fn resolve_annotation_appearances(
     reader: &mut DocumentReader<'_>,
     page_dict: &Dict,
+    optional_content: Option<&crate::reader::ocg::OptionalContent>,
 ) -> Result<Vec<Group>, PdfError> {
     let annots = match page_dict
         .entries()
@@ -2686,11 +2701,77 @@ fn resolve_annotation_appearances(
         let Object::Dict(annot) = annot else {
             continue;
         };
+        // /OC (Table 164) — "Before the annotation is drawn, its
+        // visibility shall be determined based on this entry"; an
+        // invisible annotation "shall be skipped, as if it were not
+        // in the document" (§12.5.2).
+        if !annotation_oc_visible(reader, &annot, optional_content) {
+            continue;
+        }
         if let Some(group) = annotation_appearance_group(reader, &annot)? {
             out.push(group);
         }
     }
     Ok(out)
+}
+
+/// §12.5.2 Table 164 `/OC` — resolve the annotation's optional-content
+/// visibility under the document's default configuration (§8.11). The
+/// entry may reference an optional-content *group* (visible iff the
+/// group's resolved state is ON) or an optional-content *membership*
+/// dictionary (`/Type /OCMD`, evaluated through its `/P` policy or
+/// `/VE` visibility expression per §8.11.2.2).
+///
+/// Tolerant defaults: no `/OC` entry, no `/OCProperties` in the
+/// catalog (the document isn't layered), or an unresolvable entry all
+/// mean *visible*. An OCG referenced by id but absent from
+/// `/OCProperties /OCGs` is treated as hidden (matching
+/// [`crate::reader::ocg::OptionalContent::is_visible`]).
+fn annotation_oc_visible(
+    reader: &mut DocumentReader<'_>,
+    annot: &Dict,
+    optional_content: Option<&crate::reader::ocg::OptionalContent>,
+) -> bool {
+    let Some(entry) = annot
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "OC")
+        .map(|(_, v)| v.clone())
+    else {
+        return true;
+    };
+    let Some(oc) = optional_content else {
+        return true;
+    };
+    let (group_id, dict) = match entry {
+        Object::Reference(id) => match reader.resolve(id) {
+            Ok(Object::Dict(d)) => (Some(id), d),
+            _ => return true,
+        },
+        Object::Dict(d) => (None, d),
+        _ => return true,
+    };
+    // OCMD when tagged /Type /OCMD or carrying the OCMD-only keys;
+    // otherwise it's an OCG whose id looks up the resolved state.
+    let type_name = dict.entries().iter().find_map(|(k, v)| match (k, v) {
+        (k, Object::Name(n)) if k == "Type" => Some(n.clone()),
+        _ => None,
+    });
+    let is_ocmd = type_name.as_deref() == Some("OCMD")
+        || (type_name.is_none() && dict.entries().iter().any(|(k, _)| k == "OCGs" || k == "VE"));
+    if is_ocmd {
+        match crate::reader::ocg::parse_membership(reader, &dict) {
+            Ok(Some(mem)) => oc.evaluate_membership(&mem),
+            _ => true,
+        }
+    } else {
+        match group_id {
+            Some(id) => oc.is_visible(id),
+            // An inline (non-indirect) OCG can't be matched against
+            // /OCProperties /OCGs — tolerate as visible.
+            None => true,
+        }
+    }
 }
 
 /// §12.5.5 — resolve one annotation's normal (`/AP /N`) appearance

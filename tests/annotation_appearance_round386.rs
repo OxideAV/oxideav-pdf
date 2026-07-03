@@ -366,6 +366,99 @@ fn annotation_without_ap_paints_nothing() {
     );
 }
 
+/// Build a single-page PDF whose annotation carries `/OC 7 0 R` — an
+/// optional-content group registered in the catalog's
+/// `/OCProperties`; `d_extra` lands inside the default configuration
+/// `/D` dictionary (e.g. `/OFF [7 0 R]`).
+fn build_oc_pdf(oc_entry: &str, d_extra: &str) -> Vec<u8> {
+    let mut bytes: Vec<u8> = Vec::with_capacity(1024);
+    bytes.extend_from_slice(b"%PDF-1.5\n%\xE2\xE3\xCF\xD3\n");
+    let mut offsets: [u64; 9] = [0; 9];
+
+    offsets[1] = bytes.len() as u64;
+    bytes.extend_from_slice(
+        format!(
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+             /OCProperties << /OCGs [7 0 R] /D << {d_extra} >> >> >>\nendobj\n"
+        )
+        .as_bytes(),
+    );
+    offsets[2] = bytes.len() as u64;
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets[3] = bytes.len() as u64;
+    bytes.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] \
+          /Contents 4 0 R /Annots [6 0 R] >>\nendobj\n",
+    );
+
+    let content: &[u8] = b"0 0 1 rg 0 0 10 10 re f\n";
+    offsets[4] = bytes.len() as u64;
+    bytes.extend_from_slice(
+        format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+    );
+    bytes.extend_from_slice(content);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let form_content: &[u8] = b"1 0 0 rg 0 0 10 10 re f\n";
+    offsets[5] = bytes.len() as u64;
+    bytes.extend_from_slice(
+        format!(
+            "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Length {} >>\nstream\n",
+            form_content.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(form_content);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    offsets[6] = bytes.len() as u64;
+    bytes.extend_from_slice(
+        format!(
+            "6 0 obj\n<< /Type /Annot /Subtype /Square /Rect [100 100 150 130] \
+             /AP << /N 5 0 R >> /OC {oc_entry} >>\nendobj\n"
+        )
+        .as_bytes(),
+    );
+
+    offsets[7] = bytes.len() as u64;
+    bytes.extend_from_slice(b"7 0 obj\n<< /Type /OCG /Name (Layer1) >>\nendobj\n");
+
+    offsets[8] = bytes.len() as u64;
+    bytes.extend_from_slice(b"8 0 obj\n<< /Type /OCMD /OCGs [7 0 R] /P /AnyOn >>\nendobj\n");
+
+    classic_xref(bytes, &offsets)
+}
+
+#[test]
+fn oc_group_state_gates_annotation_painting() {
+    // OCG ON (default BaseState) → painted.
+    let scene = read_pdf_to_scene(&build_oc_pdf("7 0 R", "")).expect("read");
+    let mut fills = Vec::new();
+    collect_fills(&scene.pages.as_ref().unwrap()[0].content.root, &mut fills);
+    assert_eq!(fills, vec![(0, 0, 255), (255, 0, 0)], "ON layer paints");
+
+    // OCG OFF via the default configuration → skipped per §12.5.2.
+    let scene = read_pdf_to_scene(&build_oc_pdf("7 0 R", "/OFF [7 0 R]")).expect("read");
+    let mut fills = Vec::new();
+    collect_fills(&scene.pages.as_ref().unwrap()[0].content.root, &mut fills);
+    assert_eq!(fills, vec![(0, 0, 255)], "OFF layer hides the annotation");
+}
+
+#[test]
+fn oc_membership_dictionary_gates_annotation_painting() {
+    // OCMD /AnyOn over an ON group → painted.
+    let scene = read_pdf_to_scene(&build_oc_pdf("8 0 R", "")).expect("read");
+    let mut fills = Vec::new();
+    collect_fills(&scene.pages.as_ref().unwrap()[0].content.root, &mut fills);
+    assert_eq!(fills, vec![(0, 0, 255), (255, 0, 0)]);
+
+    // OCMD /AnyOn over an OFF group → hidden.
+    let scene = read_pdf_to_scene(&build_oc_pdf("8 0 R", "/OFF [7 0 R]")).expect("read");
+    let mut fills = Vec::new();
+    collect_fills(&scene.pages.as_ref().unwrap()[0].content.root, &mut fills);
+    assert_eq!(fills, vec![(0, 0, 255)]);
+}
+
 #[test]
 fn annotations_surface_appearance_summary_and_state() {
     // Single-stream /N: summary flags set, no states, /AS absent.
