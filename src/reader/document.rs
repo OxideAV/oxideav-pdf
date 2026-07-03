@@ -1306,7 +1306,28 @@ fn decode_page(reader: &mut DocumentReader<'_>, page_id: ObjectId) -> Result<Pag
         tiling_patterns.as_ref(),
         type3_fonts.as_ref(),
     )?;
-    let root = parsed.root;
+    let mut root = parsed.root;
+
+    // §12.5.5 — paint each /Annots annotation's applicable appearance
+    // stream on top of the page content (the appearance composites
+    // over "the page content along with any previously painted
+    // annotations", so array order is paint order).
+    let annot_groups = resolve_annotation_appearances(reader, &page_dict)?;
+    if !annot_groups.is_empty() {
+        // The parsed page root is normally a bare container; if it
+        // carries its own transform / clip / opacity, nest it so the
+        // annotation groups (positioned in default user space) don't
+        // inherit page-content state.
+        if root.transform != Transform2D::identity() || root.clip.is_some() || root.opacity != 1.0 {
+            root = Group {
+                children: vec![Node::Group(root)],
+                ..Group::default()
+            };
+        }
+        root.children
+            .extend(annot_groups.into_iter().map(Node::Group));
+    }
+
     let mut page = Page::new(width, height);
     // /Rotate (§7.7.3.3 Table 30) — degrees clockwise, a multiple of
     // 90, inheritable. Normalise any multiple of 90 (incl. negative /
@@ -2596,6 +2617,228 @@ fn form_bbox_clip(dict: &Dict) -> Option<Path> {
     path.commands.push(PathCommand::LineTo(Point::new(lx, ty)));
     path.commands.push(PathCommand::Close);
     Some(path)
+}
+
+/// A dictionary entry's 4-number rectangle, normalised so element 0/1
+/// is the lower-left corner and 2/3 the upper-right (§7.9.5 — "the
+/// form of a rectangle is not required to place the smaller values
+/// first"; consumers shall normalise). Returns `None` when the entry
+/// is absent, not a 4-array, or carries a non-numeric element.
+fn dict_rect4(dict: &Dict, key: &str) -> Option<[f32; 4]> {
+    let items = match dict.entries().iter().find(|(k, _)| k == key) {
+        Some((_, Object::Array(items))) if items.len() == 4 => items,
+        _ => return None,
+    };
+    let mut v = [0.0f32; 4];
+    for (i, slot) in v.iter_mut().enumerate() {
+        match &items[i] {
+            Object::Integer(n) => *slot = *n as f32,
+            Object::Real(n) => *slot = *n as f32,
+            _ => return None,
+        }
+    }
+    Some([
+        v[0].min(v[2]),
+        v[1].min(v[3]),
+        v[0].max(v[2]),
+        v[1].max(v[3]),
+    ])
+}
+
+/// §12.5.5 — resolve every annotation in the page's `/Annots` array
+/// (§12.5.2 Table 164) whose appearance dictionary carries an
+/// applicable appearance stream, and return one positioned [`Group`]
+/// per painted annotation, in `/Annots` array order.
+///
+/// Enumeration is best-effort like the `annotations()` surface: a
+/// malformed annotation dictionary (or one whose appearance stream
+/// can't be decoded) contributes nothing rather than aborting the
+/// page.
+fn resolve_annotation_appearances(
+    reader: &mut DocumentReader<'_>,
+    page_dict: &Dict,
+) -> Result<Vec<Group>, PdfError> {
+    let annots = match page_dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Annots")
+        .map(|(_, v)| v.clone())
+    {
+        Some(Object::Reference(id)) => match reader.resolve(id) {
+            Ok(o) => o,
+            Err(_) => return Ok(Vec::new()),
+        },
+        Some(other) => other,
+        None => return Ok(Vec::new()),
+    };
+    let Object::Array(items) = annots else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let annot = match item {
+            Object::Reference(id) => match reader.resolve(id) {
+                Ok(o) => o,
+                Err(_) => continue,
+            },
+            other => other,
+        };
+        let Object::Dict(annot) = annot else {
+            continue;
+        };
+        if let Some(group) = annotation_appearance_group(reader, &annot)? {
+            out.push(group);
+        }
+    }
+    Ok(out)
+}
+
+/// §12.5.5 — resolve one annotation's normal (`/AP /N`) appearance
+/// stream into a [`Group`] positioned inside the annotation `/Rect`.
+///
+/// The appearance stream is a Form XObject (§8.10): its content is
+/// parsed by [`resolve_one_form_xobject`] into a group carrying the
+/// form `/Matrix` as transform and `/BBox` as clip. The group is then
+/// wrapped in the §12.5.5 *Algorithm: Appearance streams* placement
+/// matrix `A`:
+///
+///   a) the `/BBox` corners are transformed by `/Matrix` and the
+///      smallest upright rectangle enclosing the quadrilateral taken
+///      (the *transformed appearance box*);
+///   b) `A` scales + translates that box onto the annotation `/Rect`
+///      (lower-left corner to lower-left corner, upper-right to
+///      upper-right);
+///   c) the effective content mapping is `AA = Matrix × A` — realised
+///      here as the outer wrapper carrying `A` and the inner form
+///      group carrying `Matrix`.
+///
+/// Returns `Ok(None)` for an annotation without an applicable
+/// appearance (no `/AP`, no usable `/N` stream, missing `/Rect` or
+/// `/BBox`, or content that parses to nothing) — NOTE 3's "reasonable
+/// behaviour (such as displaying nothing)".
+fn annotation_appearance_group(
+    reader: &mut DocumentReader<'_>,
+    annot: &Dict,
+) -> Result<Option<Group>, PdfError> {
+    // /Rect (Table 164, required) — the annotation rectangle in
+    // default user space.
+    let Some(rect) = dict_rect4(annot, "Rect") else {
+        return Ok(None);
+    };
+
+    // /AP (Table 164) → the Table 168 appearance dictionary.
+    let ap = match annot
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "AP")
+        .map(|(_, v)| v.clone())
+    {
+        Some(Object::Reference(id)) => match reader.resolve(id) {
+            Ok(o) => o,
+            Err(_) => return Ok(None),
+        },
+        Some(other) => other,
+        None => return Ok(None),
+    };
+    let Object::Dict(ap) = ap else {
+        return Ok(None);
+    };
+
+    // /N (Table 168, required) — the normal appearance, used when the
+    // annotation is not interacting with the user (and for printing).
+    let n_entry = ap
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "N")
+        .map(|(_, v)| v.clone());
+    let (stream_id, n_obj) = match n_entry {
+        Some(Object::Reference(id)) => match reader.resolve(id) {
+            Ok(o) => (Some(id), o),
+            Err(_) => return Ok(None),
+        },
+        Some(other) => (None, other),
+        None => return Ok(None),
+    };
+    let Object::Stream(stream) = n_obj else {
+        return Ok(None);
+    };
+
+    build_appearance_group(reader, &stream, stream_id, rect)
+}
+
+/// Parse one appearance stream (a Form XObject per §12.5.5) and wrap
+/// it in the placement matrix `A` mapping its transformed `/BBox` onto
+/// the annotation rectangle `rect` (already normalised lower-left /
+/// upper-right).
+fn build_appearance_group(
+    reader: &mut DocumentReader<'_>,
+    stream: &Stream,
+    stream_id: Option<ObjectId>,
+    rect: [f32; 4],
+) -> Result<Option<Group>, PdfError> {
+    // /BBox (Table 95, required for a form XObject) — an appearance
+    // without one can't be mapped onto /Rect; display nothing.
+    let Some(bbox) = dict_rect4(&stream.dict, "BBox") else {
+        return Ok(None);
+    };
+    let matrix = form_matrix(&stream.dict);
+
+    let mut visited = HashSet::new();
+    if let Some(id) = stream_id {
+        visited.insert(id);
+    }
+    let Some(form_group) = resolve_one_form_xobject(reader, stream, 0, &mut visited)? else {
+        return Ok(None);
+    };
+
+    // Step a) — transform the BBox corners by Matrix and take the
+    // smallest upright rectangle that encompasses the quadrilateral.
+    let corners = [
+        Point::new(bbox[0], bbox[1]),
+        Point::new(bbox[2], bbox[1]),
+        Point::new(bbox[2], bbox[3]),
+        Point::new(bbox[0], bbox[3]),
+    ];
+    let (mut tx0, mut ty0, mut tx1, mut ty1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for c in corners {
+        let p = matrix.apply(c);
+        tx0 = tx0.min(p.x);
+        ty0 = ty0.min(p.y);
+        tx1 = tx1.max(p.x);
+        ty1 = ty1.max(p.y);
+    }
+
+    // Step b) — A scales + translates the transformed appearance box
+    // onto /Rect. A degenerate axis (zero-width / zero-height box, or
+    // a non-finite product of a malformed matrix) keeps unit scale on
+    // that axis and aligns the lower-left corners only.
+    let (tw, th) = (tx1 - tx0, ty1 - ty0);
+    let sx = if tw.is_finite() && tw > f32::EPSILON {
+        (rect[2] - rect[0]) / tw
+    } else {
+        1.0
+    };
+    let sy = if th.is_finite() && th > f32::EPSILON {
+        (rect[3] - rect[1]) / th
+    } else {
+        1.0
+    };
+    let a = Transform2D {
+        a: sx,
+        b: 0.0,
+        c: 0.0,
+        d: sy,
+        e: rect[0] - sx * tx0,
+        f: rect[1] - sy * ty0,
+    };
+
+    // Step c) — AA = Matrix × A: the outer wrapper applies A after the
+    // inner form group's own /Matrix.
+    Ok(Some(Group {
+        transform: a,
+        children: vec![Node::Group(form_group)],
+        ..Group::default()
+    }))
 }
 
 /// Recursively dereference + simplify a colour-space `Object` so the
