@@ -134,6 +134,101 @@ fn build_annot_pdf(rect: &str, annot_extra: &str, form_dict_extra: &str) -> Vec<
     classic_xref(bytes, &offsets)
 }
 
+/// Build a single-page PDF whose annotation carries a stateful
+/// appearance subdictionary `/AP << /N << /On 5 0 R /Off 7 0 R >> >>`
+/// (§12.5.5 — checkbox-style appearance states). Object 5 paints red,
+/// object 7 paints green; `annot_extra` supplies the `/AS` selector.
+fn build_states_pdf(annot_extra: &str) -> Vec<u8> {
+    let mut bytes: Vec<u8> = Vec::with_capacity(1024);
+    bytes.extend_from_slice(b"%PDF-1.5\n%\xE2\xE3\xCF\xD3\n");
+    let mut offsets: [u64; 8] = [0; 8];
+
+    offsets[1] = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    offsets[2] = bytes.len() as u64;
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    offsets[3] = bytes.len() as u64;
+    bytes.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] \
+          /Contents 4 0 R /Annots [6 0 R] >>\nendobj\n",
+    );
+
+    let content: &[u8] = b"0 0 1 rg 0 0 10 10 re f\n";
+    offsets[4] = bytes.len() as u64;
+    bytes.extend_from_slice(
+        format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+    );
+    bytes.extend_from_slice(content);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    for (obj, colour) in [(5usize, "1 0 0"), (7usize, "0 1 0")] {
+        let form_content = format!("{colour} rg 0 0 10 10 re f\n");
+        offsets[obj] = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!(
+                "{obj} 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] \
+                 /Length {} >>\nstream\n",
+                form_content.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(form_content.as_bytes());
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    }
+
+    offsets[6] = bytes.len() as u64;
+    bytes.extend_from_slice(
+        format!(
+            "6 0 obj\n<< /Type /Annot /Subtype /Widget /Rect [100 100 120 120] \
+             /AP << /N << /On 5 0 R /Off 7 0 R >> >> {annot_extra} >>\nendobj\n"
+        )
+        .as_bytes(),
+    );
+
+    classic_xref(bytes, &offsets)
+}
+
+#[test]
+fn appearance_state_selects_subdictionary_stream() {
+    let scene = read_pdf_to_scene(&build_states_pdf("/AS /On")).expect("read");
+    let root = &scene.pages.as_ref().unwrap()[0].content.root;
+    let mut fills = Vec::new();
+    collect_fills(root, &mut fills);
+    assert_eq!(
+        fills,
+        vec![(0, 0, 255), (255, 0, 0)],
+        "/AS /On selects the On appearance stream"
+    );
+
+    let scene = read_pdf_to_scene(&build_states_pdf("/AS /Off")).expect("read");
+    let root = &scene.pages.as_ref().unwrap()[0].content.root;
+    let mut fills = Vec::new();
+    collect_fills(root, &mut fills);
+    assert_eq!(
+        fills,
+        vec![(0, 0, 255), (0, 255, 0)],
+        "/AS /Off selects the Off appearance stream"
+    );
+}
+
+#[test]
+fn appearance_state_missing_or_undefined_paints_nothing() {
+    // No /AS at all — Table 164 requires it when /N is a
+    // subdictionary; NOTE 3's reasonable behaviour is nothing.
+    let scene = read_pdf_to_scene(&build_states_pdf("")).expect("read");
+    let root = &scene.pages.as_ref().unwrap()[0].content.root;
+    let mut fills = Vec::new();
+    collect_fills(root, &mut fills);
+    assert_eq!(fills, vec![(0, 0, 255)]);
+
+    // /AS designating a state the subdictionary doesn't define.
+    let scene = read_pdf_to_scene(&build_states_pdf("/AS /Maybe")).expect("read");
+    let root = &scene.pages.as_ref().unwrap()[0].content.root;
+    let mut fills = Vec::new();
+    collect_fills(root, &mut fills);
+    assert_eq!(fills, vec![(0, 0, 255)]);
+}
+
 #[test]
 fn appearance_stream_paints_into_scene_at_rect() {
     // /BBox [0 0 10 10], identity /Matrix, /Rect [100 100 150 130]:

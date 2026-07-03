@@ -2759,8 +2759,38 @@ fn annotation_appearance_group(
         Some(other) => (None, other),
         None => return Ok(None),
     };
-    let Object::Stream(stream) = n_obj else {
-        return Ok(None);
+    let (stream_id, stream) = match n_obj {
+        Object::Stream(s) => (stream_id, s),
+        // §12.5.5 — an appearance-dictionary entry may instead be a
+        // subdictionary of appearance streams keyed by appearance
+        // state; the annotation's /AS entry (Table 164, required in
+        // that case) selects the applicable one. An absent /AS, or an
+        // /AS designating a state the subdictionary doesn't define,
+        // displays nothing (NOTE 3).
+        Object::Dict(states) => {
+            let Some(Object::Name(state)) = annot
+                .entries()
+                .iter()
+                .find(|(k, _)| k == "AS")
+                .map(|(_, v)| v.clone())
+            else {
+                return Ok(None);
+            };
+            let selected = states
+                .entries()
+                .iter()
+                .find(|(k, _)| *k == state)
+                .map(|(_, v)| v.clone());
+            match selected {
+                Some(Object::Reference(id)) => match reader.resolve(id) {
+                    Ok(Object::Stream(s)) => (Some(id), s),
+                    _ => return Ok(None),
+                },
+                Some(Object::Stream(s)) => (None, s),
+                _ => return Ok(None),
+            }
+        }
+        _ => return Ok(None),
     };
 
     build_appearance_group(reader, &stream, stream_id, rect)
