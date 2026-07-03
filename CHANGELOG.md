@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-pdf/compare/v0.1.4...v0.2.0) - 2026-07-03
+
+### Other
+
+- document the §12.5.5 appearance-stream subsystem
+- emit /AP state appearances for checkbox + radio widgets (§12.7.4.2.3)
+- gate annotation painting on /OC optional-content visibility (§12.5.2)
+- /AP appearances for the text-markup family (§12.5.6.10)
+- /AP appearances for the line family (§12.5.6.7/.9/.13)
+- emit /AP /N appearance streams for Square/Circle (§12.5.5 + §12.5.6.8)
+- surface /AP + /AS on the annotations() walker (§12.5.5 Table 168)
+- Hidden/NoView flags + Popup exclusion on appearance paint (§12.5.3)
+- select annotation appearance by /AS state (§12.5.5 Table 168)
+- paint annotation /AP /N appearance streams into the Scene (§12.5.5)
+- Type 3 glyph /Resources fall back to the enclosing dict (§9.6.5)
+- honour the Type 3 d1/d0 colour rule (§9.6.5 Table 113)
+- paint Type 3 font glyphs into the Scene (§9.6.5)
+- paint clipped axial/radial sh shadings into the Scene (§8.7.4.5)
+- pour uncoloured (/PaintType 2) tiling-pattern stencils (§8.7.3.3)
+- replicate /PatternType 1 tiling-pattern fills (§8.7.3)
+- consume BI…ID…EI inline images in the content-stream walker (§8.9.7)
+- gradient fills survive write_pdf → read_pdf_to_scene round trip
+- paint /PatternType 2 shading-pattern fills (§8.7.3.3 + §8.7.4.5)
+- resolve a shading /ColorSpace named resource key (§8.7.4.5.2)
+- Indexed colour table over a CIE-based base (§8.6.6.3)
+- accept CIE-based alternate for Separation/DeviceN (§8.6.6.4–5)
+- evaluate CIE-based colour spaces (CalGray/CalRGB/Lab, §8.6.5.2–4)
+- read inheritable page /Rotate onto Page::orientation (§7.7.3.3)
+- inherit MediaBox and Resources through the page tree (§7.7.3.4)
+- paint Form XObjects on the Do operator into the Scene (§8.10)
+- scale Type 3 font advances by /FontMatrix, not 1/1000 (§9.6.5)
+- evaluate Order-3 cubic-spline Type 0 (sampled) functions (§7.10.2)
+- advance extracted text origin between shows in text_extraction (§9.4.4)
+- advance text matrix between text-showing operators (§9.4.3 / §9.4.4)
+- evaluate Type 1–3 shadings to gradient stops (§8.7.4.5.2–4)
+- evaluate Type 4–7 mesh shadings (§8.7.4.5.5–8.7.4.5.8)
+- evaluate /DeviceN colour spaces with multi-input tint transforms (§8.6.6.5)
+- round-323 — evaluate Type 4 (PostScript calculator) tint transforms in /Separation spaces (§7.10.5)
+- round-317 — evaluate Type 0 (sampled) tint transforms in /Separation spaces (§7.10.2)
+- refresh to current status, drop per-round changelog cruft
+
 ### Other
 
 - emit **AcroForm button-widget appearance states** (§12.5.5 + §12.7.4.2.3): `write_pdf_with_form` check-boxes and radio-button kids now carry a two-state `/AP << /N << /<on> … /Off … >> >>` subdictionary matching the `/AS` name each widget already declared, instead of leaning solely on `/NeedAppearances` regeneration (deprecated in PDF 2.0). The appearances are self-contained vector streams — no font program is referenced (the classical ZapfDingbats check would drag in a font resource): a check-box paints a 1-pt border box plus, in the `/Yes` state, a three-point round-capped check-mark at 12 % of the box's smaller dimension; a radio kid paints a four-arc ellipse border plus, in its export-value state, a filled inner dot at half the radii. Each stream's `/BBox` is the widget `/Rect` (identity §12.5.5 placement). Round-trip tests: the checked box paints border + check strokes through the reader's `/AS`-selection path while the unchecked box paints the border only; a two-option radio group paints two borders and exactly one active dot, and the `annotations()` summary reports the `Off`/`Yes` (and export-value) state names
