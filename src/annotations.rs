@@ -1331,8 +1331,131 @@ fn build_normal_appearance(annot: &Annotation) -> Option<Vec<u8>> {
             });
             Some(ops.into_bytes())
         }
+        AnnotationKind::Highlight { quad_points } => {
+            // §12.5.6.10 — one filled region per /QuadPoints quad. The
+            // quad's axis-aligned bounding box is filled (robust to
+            // the divergent vertex-order conventions producers emit
+            // for Table 179's counterclockwise rule).
+            let c = stroke_comps?;
+            let mut ops = String::new();
+            if !push_colour_op(&mut ops, c, true) {
+                return None;
+            }
+            let mut any = false;
+            for q in quad_points {
+                let Some((x0, y0, x1, y1)) = quad_bbox(q) else {
+                    continue;
+                };
+                any = true;
+                ops.push_str(&format!(
+                    "{} {} {} {} re\n",
+                    fr(x0),
+                    fr(y0),
+                    fr(x1 - x0),
+                    fr(y1 - y0)
+                ));
+            }
+            if !any {
+                return None;
+            }
+            ops.push_str("f\n");
+            Some(ops.into_bytes())
+        }
+        AnnotationKind::Underline { quad_points }
+        | AnnotationKind::StrikeOut { quad_points }
+        | AnnotationKind::Squiggly { quad_points } => {
+            // §12.5.6.10 — the spec leaves the markup geometry to the
+            // producer; this writer's convention (documented, stable):
+            // stroke width = 7 % of the quad height; an underline
+            // sits 10 % above the quad bottom, a strike-out at the
+            // vertical midpoint, and a squiggly is a sawtooth along
+            // the bottom with amplitude 10 % of the quad height.
+            let c = stroke_comps?;
+            let mut ops = String::new();
+            if !push_colour_op(&mut ops, c, false) {
+                return None;
+            }
+            let mut any = false;
+            for q in quad_points {
+                let Some((x0, y0, x1, y1)) = quad_bbox(q) else {
+                    continue;
+                };
+                let h = y1 - y0;
+                let w = h * 0.07;
+                any = true;
+                ops.push_str(&fr(w.max(0.1)));
+                ops.push_str(" w\n");
+                match &annot.kind {
+                    AnnotationKind::Underline { .. } => {
+                        let y = y0 + h * 0.1;
+                        ops.push_str(&format!(
+                            "{} {} m\n{} {} l\nS\n",
+                            fr(x0),
+                            fr(y),
+                            fr(x1),
+                            fr(y)
+                        ));
+                    }
+                    AnnotationKind::StrikeOut { .. } => {
+                        let y = y0 + h * 0.5;
+                        ops.push_str(&format!(
+                            "{} {} m\n{} {} l\nS\n",
+                            fr(x0),
+                            fr(y),
+                            fr(x1),
+                            fr(y)
+                        ));
+                    }
+                    _ => {
+                        // Squiggly sawtooth: alternate between the
+                        // quad bottom and bottom + amplitude every
+                        // `amp` user-space units.
+                        let amp = (h * 0.1).max(0.1);
+                        ops.push_str(&format!("{} {} m\n", fr(x0), fr(y0)));
+                        let mut x = x0 + amp;
+                        let mut up = true;
+                        while x < x1 {
+                            let y = if up { y0 + amp } else { y0 };
+                            ops.push_str(&format!("{} {} l\n", fr(x), fr(y)));
+                            up = !up;
+                            x += amp;
+                        }
+                        ops.push_str("S\n");
+                    }
+                }
+            }
+            if !any {
+                return None;
+            }
+            Some(ops.into_bytes())
+        }
         _ => None,
     }
+}
+
+/// The axis-aligned bounding box of one Table 179 `/QuadPoints`
+/// 8-tuple, or `None` when degenerate (zero width or height) or
+/// non-finite.
+fn quad_bbox(q: &[f32; 8]) -> Option<(f32, f32, f32, f32)> {
+    let xs = [q[0], q[2], q[4], q[6]];
+    let ys = [q[1], q[3], q[5], q[7]];
+    let (mut x0, mut x1) = (f32::MAX, f32::MIN);
+    let (mut y0, mut y1) = (f32::MAX, f32::MIN);
+    for x in xs {
+        x0 = x0.min(x);
+        x1 = x1.max(x);
+    }
+    for y in ys {
+        y0 = y0.min(y);
+        y1 = y1.max(y);
+    }
+    if !(x0.is_finite() && x1.is_finite() && y0.is_finite() && y1.is_finite())
+        || x1 <= x0
+        || y1 <= y0
+    {
+        return None;
+    }
+    Some((x0, y0, x1, y1))
 }
 
 /// The stroke width for a line-family appearance: the `/Border` array

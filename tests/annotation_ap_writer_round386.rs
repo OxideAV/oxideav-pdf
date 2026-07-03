@@ -374,6 +374,113 @@ fn polygon_and_polyline_appearances_round_trip() {
 }
 
 #[test]
+fn highlight_appearance_fills_each_quad() {
+    let scene = one_page_scene();
+    // Two quads in the Table 179 8-tuple layout.
+    let annots = [annot(
+        [0.0, 0.0, 200.0, 100.0],
+        Some(vec![1.0, 1.0, 0.0]), // yellow highlight
+        WriterAnnotationKind::Highlight {
+            quad_points: vec![
+                [10.0, 60.0, 90.0, 60.0, 10.0, 50.0, 90.0, 50.0],
+                [10.0, 40.0, 60.0, 40.0, 10.0, 30.0, 60.0, 30.0],
+            ],
+        },
+    )];
+    let pdf = write_pdf_with_annotations(&scene, &annots).expect("write");
+    let scene_back = read_pdf_to_scene(&pdf).expect("read back");
+    let root = &scene_back.pages.as_ref().unwrap()[0].content.root;
+
+    let mut paints = Vec::new();
+    collect_paints(root, &mut paints);
+    assert!(
+        paints.contains(&(Some((255, 255, 0)), None)),
+        "yellow quad fills: {paints:?}"
+    );
+    // Both quads land in one filled path (two `re` subpaths → two
+    // MoveTo commands at the quad corners).
+    let mut paths = Vec::new();
+    collect_paths(root, &mut paths);
+    let quad_path = paths
+        .iter()
+        .find(|cmds| {
+            cmds.iter()
+                .any(|c| matches!(c, PathCommand::MoveTo(p) if (p.x - 10.0).abs() < 1e-3 && (p.y - 50.0).abs() < 1e-3))
+        })
+        .expect("highlight path");
+    assert!(
+        quad_path
+            .iter()
+            .any(|c| matches!(c, PathCommand::MoveTo(p) if (p.y - 30.0).abs() < 1e-3)),
+        "second quad in the same path"
+    );
+}
+
+#[test]
+fn underline_and_strikeout_stroke_positions() {
+    let scene = one_page_scene();
+    // One quad spanning x 10..90, y 50..60 (height 10).
+    let quad = [10.0, 60.0, 90.0, 60.0, 10.0, 50.0, 90.0, 50.0];
+    for (kind, want_y) in [
+        (
+            WriterAnnotationKind::Underline {
+                quad_points: vec![quad],
+            },
+            51.0, // bottom + 10 % of height
+        ),
+        (
+            WriterAnnotationKind::StrikeOut {
+                quad_points: vec![quad],
+            },
+            55.0, // vertical midpoint
+        ),
+    ] {
+        let annots = [annot(
+            [0.0, 0.0, 200.0, 100.0],
+            Some(vec![1.0, 0.0, 0.0]),
+            kind,
+        )];
+        let pdf = write_pdf_with_annotations(&scene, &annots).expect("write");
+        let scene_back = read_pdf_to_scene(&pdf).expect("read back");
+        let root = &scene_back.pages.as_ref().unwrap()[0].content.root;
+        let mut lines = Vec::new();
+        collect_polylines(root, &mut lines);
+        assert!(
+            lines.contains(&vec![(10.0, want_y), (90.0, want_y)]),
+            "markup line at y {want_y}: {lines:?}"
+        );
+    }
+}
+
+#[test]
+fn squiggly_appearance_zigzags_along_quad_bottom() {
+    let scene = one_page_scene();
+    let annots = [annot(
+        [0.0, 0.0, 200.0, 100.0],
+        Some(vec![0.0, 0.0, 1.0]),
+        WriterAnnotationKind::Squiggly {
+            quad_points: vec![[10.0, 60.0, 90.0, 60.0, 10.0, 50.0, 90.0, 50.0]],
+        },
+    )];
+    let pdf = write_pdf_with_annotations(&scene, &annots).expect("write");
+    let scene_back = read_pdf_to_scene(&pdf).expect("read back");
+    let root = &scene_back.pages.as_ref().unwrap()[0].content.root;
+    let mut lines = Vec::new();
+    collect_polylines(root, &mut lines);
+    // Sawtooth with amplitude 1 (10 % of the quad height 10): starts
+    // at the quad bottom (10, 50) and alternates y 51 / 50 every 1
+    // user-space unit — many points, alternating between the two rows.
+    let saw = lines
+        .iter()
+        .find(|pts| pts.first() == Some(&(10.0, 50.0)) && pts.len() > 20)
+        .expect("sawtooth path");
+    assert!(saw.iter().any(|&(_, y)| (y - 51.0).abs() < 1e-3));
+    assert!(saw
+        .iter()
+        .all(|&(_, y)| (50.0 - 1e-3..=51.0 + 1e-3).contains(&y)));
+}
+
+#[test]
 fn invisible_geometry_emits_no_appearance() {
     let scene = one_page_scene();
     // Transparent border (/C []) and no interior colour — nothing to
