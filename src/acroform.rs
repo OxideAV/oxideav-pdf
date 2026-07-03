@@ -357,7 +357,17 @@ pub fn write_pdf_with_form(scene: &Scene, form_fields: &[FormField]) -> Result<V
                 doc.add_object(id, Object::Dict(dict));
             }
             FormField::Checkbox(c) => {
-                let dict = build_checkbox_dict(c);
+                let mut dict = build_checkbox_dict(c);
+                // §12.5.5 + §12.7.4.2.3 — the /AS state (Yes / Off)
+                // selects its stream from the /AP /N subdictionary.
+                let ap = button_appearance_dict(
+                    &mut doc,
+                    c.rect,
+                    "Yes",
+                    checkbox_appearance_content(c.rect, true),
+                    checkbox_appearance_content(c.rect, false),
+                );
+                dict.set("AP", ap);
                 doc.add_object(id, Object::Dict(dict));
             }
             FormField::RadioGroup(r) => {
@@ -366,7 +376,18 @@ pub fn write_pdf_with_form(scene: &Scene, form_fields: &[FormField]) -> Result<V
                 doc.add_object(id, Object::Dict(aggregate));
                 for (opt, kid_id) in r.options.iter().zip(kid_ids.iter()) {
                     let active = matches!(&r.value, Some(v) if v == &opt.export_value);
-                    let kid = build_radio_kid_dict(opt, id, active);
+                    let mut kid = build_radio_kid_dict(opt, id, active);
+                    // Each kid's /AP /N maps its export-value state to
+                    // the "on" (dotted) appearance plus the shared
+                    // /Off state (§12.7.4.2.3 Table 239).
+                    let ap = button_appearance_dict(
+                        &mut doc,
+                        opt.rect,
+                        &opt.export_value,
+                        radio_appearance_content(opt.rect, true),
+                        radio_appearance_content(opt.rect, false),
+                    );
+                    kid.set("AP", ap);
                     doc.add_object(*kid_id, Object::Dict(kid));
                 }
             }
@@ -509,6 +530,121 @@ pub fn write_pdf_with_form(scene: &Scene, form_fields: &[FormField]) -> Result<V
 
 fn rect_array(rect: [f32; 4]) -> Object {
     Object::Array(rect.iter().map(|v| Object::Real(*v as f64)).collect())
+}
+
+// ---------------------------------------------------------------------
+// §12.5.5 widget appearance streams.
+//
+// A check-box / radio-button widget carries an /AS appearance state
+// (§12.7.4.2.3) that selects a stream from the /AP /N subdictionary;
+// without /AP the /AS name has nothing to select and the widget's
+// rendering is left to /NeedAppearances regeneration (deprecated in
+// PDF 2.0). The writer therefore emits self-contained vector
+// appearances: no font program is referenced (the classical
+// ZapfDingbats check would need a font resource), so the streams
+// render under any conforming reader.
+// ---------------------------------------------------------------------
+
+/// Emit one `/Type /XObject /Subtype /Form` appearance stream whose
+/// `/BBox` is the widget `/Rect` — the §12.5.5 placement algorithm
+/// then maps it onto the rectangle by identity, so `content` paints
+/// directly in default user space.
+fn emit_widget_appearance(doc: &mut Document, rect: [f32; 4], content: String) -> ObjectId {
+    let dict = Dict::new()
+        .with("Type", Object::Name("XObject".into()))
+        .with("Subtype", Object::Name("Form".into()))
+        .with("BBox", rect_array(rect));
+    doc.add(Object::Stream(crate::objects::Stream::new(
+        dict,
+        content.into_bytes(),
+    )))
+}
+
+/// Check-box appearance content: a 1-pt black border box, plus (when
+/// `checked`) a three-point check-mark polyline stroked with round
+/// caps at 12 % of the box's smaller dimension.
+fn checkbox_appearance_content(rect: [f32; 4], checked: bool) -> String {
+    use crate::operators::format_real;
+    let fr = |v: f32| format_real(f64::from(v));
+    let (x0, y0) = (rect[0] + 0.5, rect[1] + 0.5);
+    let (x1, y1) = (rect[2] - 0.5, rect[3] - 0.5);
+    let (w, h) = (x1 - x0, y1 - y0);
+    let mut ops = format!("0 G 1 w\n{} {} {} {} re\nS\n", fr(x0), fr(y0), fr(w), fr(h));
+    if checked && w > 0.0 && h > 0.0 {
+        let lw = (w.min(h) * 0.12).max(0.4);
+        ops.push_str(&format!(
+            "{} w\n1 J 1 j\n{} {} m\n{} {} l\n{} {} l\nS\n",
+            fr(lw),
+            fr(x0 + 0.20 * w),
+            fr(y0 + 0.50 * h),
+            fr(x0 + 0.45 * w),
+            fr(y0 + 0.25 * h),
+            fr(x0 + 0.80 * w),
+            fr(y0 + 0.75 * h),
+        ));
+    }
+    ops
+}
+
+/// Radio-button appearance content: a 1-pt black ellipse border
+/// inscribed in the widget rect, plus (when `on`) a filled inner dot
+/// at half the border's radii.
+fn radio_appearance_content(rect: [f32; 4], on: bool) -> String {
+    use crate::operators::format_real;
+    let fr = |v: f32| format_real(f64::from(v));
+    let (x0, y0) = (rect[0] + 0.5, rect[1] + 0.5);
+    let (x1, y1) = (rect[2] - 0.5, rect[3] - 0.5);
+    let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    let (rx, ry) = (((x1 - x0) / 2.0).max(0.0), ((y1 - y0) / 2.0).max(0.0));
+    let ellipse = |ops: &mut String, rx: f32, ry: f32| {
+        let k = crate::annotations::ARC_KAPPA;
+        let (kx, ky) = (rx * k, ry * k);
+        ops.push_str(&format!("{} {} m\n", fr(cx + rx), fr(cy)));
+        for (c1, c2, end) in [
+            ((cx + rx, cy + ky), (cx + kx, cy + ry), (cx, cy + ry)),
+            ((cx - kx, cy + ry), (cx - rx, cy + ky), (cx - rx, cy)),
+            ((cx - rx, cy - ky), (cx - kx, cy - ry), (cx, cy - ry)),
+            ((cx + kx, cy - ry), (cx + rx, cy - ky), (cx + rx, cy)),
+        ] {
+            ops.push_str(&format!(
+                "{} {} {} {} {} {} c\n",
+                fr(c1.0),
+                fr(c1.1),
+                fr(c2.0),
+                fr(c2.1),
+                fr(end.0),
+                fr(end.1)
+            ));
+        }
+        ops.push_str("h\n");
+    };
+    let mut ops = String::from("0 G 1 w\n");
+    ellipse(&mut ops, rx, ry);
+    ops.push_str("S\n");
+    if on {
+        ops.push_str("0 g\n");
+        ellipse(&mut ops, rx * 0.5, ry * 0.5);
+        ops.push_str("f\n");
+    }
+    ops
+}
+
+/// Build the two-state `/AP << /N << /<on> … /Off … >> >>` appearance
+/// dictionary for a button widget (§12.5.5 + §12.7.4.2.3), emitting
+/// both state streams.
+fn button_appearance_dict(
+    doc: &mut Document,
+    rect: [f32; 4],
+    on_state: &str,
+    on_content: String,
+    off_content: String,
+) -> Object {
+    let on_id = emit_widget_appearance(doc, rect, on_content);
+    let off_id = emit_widget_appearance(doc, rect, off_content);
+    let states = Dict::new()
+        .with(on_state, Object::Reference(on_id))
+        .with("Off", Object::Reference(off_id));
+    Object::Dict(Dict::new().with("N", Object::Dict(states)))
 }
 
 fn text_string(s: &str) -> Object {

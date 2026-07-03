@@ -1122,7 +1122,7 @@ fn push_colour_op(out: &mut String, comps: &[f32], fill: bool) -> bool {
 
 /// Cubic-Bézier circle constant: the control-point offset that makes
 /// four cubic segments approximate a quarter arc, `4·(√2 − 1)/3`.
-const ARC_KAPPA: f32 = 0.552_284_8;
+pub(crate) const ARC_KAPPA: f32 = 0.552_284_8;
 
 /// §12.5.5 — build the normal-appearance content stream for an
 /// annotation whose visual is fully determined by its dictionary
