@@ -781,18 +781,37 @@ pub fn write_pdf_with_annotations(
         }
     }
 
+    // ---- Pre-pass: §12.5.5 normal appearance streams. Each
+    //      geometry-determined annotation kind gets a form-XObject
+    //      appearance whose /BBox is the annotation /Rect, referenced
+    //      from the dict's /AP << /N … >> so conforming readers render
+    //      the authored appearance instead of a handler-invented one.
+    let appearance_ids: Vec<Option<ObjectId>> = annotations
+        .iter()
+        .map(|annot| {
+            build_normal_appearance(annot)
+                .map(|content| emit_appearance_stream(&mut doc, content, annot.rect))
+        })
+        .collect();
+
     // ---- Pass 2: build each annotation dict + commit it under its
     //              pre-allocated id, bucketing by source page so the
     //              `/Annots` array can be patched onto each page after.
     let mut by_page: Vec<Vec<ObjectId>> = (0..n_pages).map(|_| Vec::new()).collect();
     for (i, annot) in annotations.iter().enumerate() {
-        let dict = build_annotation_dict(
+        let mut dict = build_annotation_dict(
             annot,
             pages_build.page_ids[annot.source_page_index],
             &annotation_ids,
             filespec_ids[i],
             sound_stream_ids[i],
         )?;
+        if let Some(ap_id) = appearance_ids[i] {
+            dict.set(
+                "AP",
+                Object::Dict(Dict::new().with("N", Object::Reference(ap_id))),
+            );
+        }
         doc.add_object(annotation_ids[i], Object::Dict(dict));
         by_page[annot.source_page_index].push(annotation_ids[i]);
     }
@@ -1059,6 +1078,156 @@ fn validate_annotations(annotations: &[Annotation], n_pages: usize) -> Result<()
 
 fn rect_array(rect: [f32; 4]) -> Object {
     Object::Array(rect.iter().map(|v| Object::Real(*v as f64)).collect())
+}
+
+/// Emit one `/Type /XObject /Subtype /Form` appearance stream
+/// (§12.5.5 — "Each appearance stream is a form XObject") whose
+/// `/BBox` equals the annotation `/Rect`, so the §12.5.5 placement
+/// algorithm maps it onto the rectangle by identity and the content
+/// operators paint directly in default-user-space coordinates.
+fn emit_appearance_stream(doc: &mut Document, content: Vec<u8>, bbox: [f32; 4]) -> ObjectId {
+    let dict = Dict::new()
+        .with("Type", Object::Name("XObject".into()))
+        .with("Subtype", Object::Name("Form".into()))
+        .with("BBox", rect_array(bbox));
+    doc.add(Object::Stream(crate::objects::Stream::new(dict, content)))
+}
+
+/// Append the colour operator for a Table 164-shape colour array
+/// (0 / 1 / 3 / 4 components — transparent / DeviceGray / DeviceRGB /
+/// DeviceCMYK) to appearance-stream content. `fill` selects the
+/// non-stroking (`g` / `rg` / `k`) vs stroking (`G` / `RG` / `K`)
+/// operator family. Returns `false` (nothing appended) for the
+/// zero-component "no colour; transparent" form or an arity the table
+/// doesn't define.
+fn push_colour_op(out: &mut String, comps: &[f32], fill: bool) -> bool {
+    use crate::operators::format_real;
+    let op = match (comps.len(), fill) {
+        (1, true) => "g",
+        (1, false) => "G",
+        (3, true) => "rg",
+        (3, false) => "RG",
+        (4, true) => "k",
+        (4, false) => "K",
+        _ => return false,
+    };
+    for c in comps {
+        out.push_str(&format_real(f64::from(*c)));
+        out.push(' ');
+    }
+    out.push_str(op);
+    out.push('\n');
+    true
+}
+
+/// Cubic-Bézier circle constant: the control-point offset that makes
+/// four cubic segments approximate a quarter arc, `4·(√2 − 1)/3`.
+const ARC_KAPPA: f32 = 0.552_284_8;
+
+/// §12.5.5 — build the normal-appearance content stream for an
+/// annotation whose visual is fully determined by its dictionary
+/// geometry. Returns `None` for kinds whose presentation is
+/// viewer-supplied (Text note icons, Stamp artwork, Popup windows, …)
+/// or whose effective paint is empty (no interior colour and a
+/// zero-width / transparent border).
+///
+/// The content paints in default user space (the emitted form's
+/// `/BBox` is the annotation `/Rect` with an identity `/Matrix`, so
+/// the §12.5.5 placement is the identity map).
+fn build_normal_appearance(annot: &Annotation) -> Option<Vec<u8>> {
+    use crate::operators::format_real;
+    let fr = |v: f32| format_real(f64::from(v));
+
+    // Stroke colour: /C per Table 164 (None ⇒ the conventional black;
+    // an explicit empty array ⇒ transparent, i.e. no stroke).
+    let stroke_comps: Option<&[f32]> = match &annot.colour {
+        Some(c) if c.is_empty() => None,
+        Some(c) => Some(c.as_slice()),
+        None => Some(&[0.0f32; 1][..]),
+    };
+
+    match &annot.kind {
+        AnnotationKind::Square {
+            interior_colour,
+            line_width,
+        }
+        | AnnotationKind::Circle {
+            interior_colour,
+            line_width,
+        } => {
+            // §12.5.6.8 — the rectangle / ellipse is inscribed within
+            // /Rect; §12.5.4 — the border is drawn completely inside
+            // the annotation rectangle, hence the half-width inset.
+            let w = line_width.unwrap_or(1.0).max(0.0);
+            let fill_comps = interior_colour.as_deref().filter(|c| !c.is_empty());
+            let stroking = w > 0.0 && stroke_comps.is_some();
+            let filling = fill_comps.is_some();
+            if !filling && !stroking {
+                return None;
+            }
+            let mut ops = String::new();
+            let mut painted_colour = false;
+            if let Some(c) = fill_comps {
+                painted_colour |= push_colour_op(&mut ops, c, true);
+            }
+            if stroking {
+                if let Some(c) = stroke_comps {
+                    painted_colour |= push_colour_op(&mut ops, c, false);
+                }
+                ops.push_str(&fr(w));
+                ops.push_str(" w\n");
+            }
+            if !painted_colour {
+                return None;
+            }
+            let inset = if stroking { w / 2.0 } else { 0.0 };
+            let (x0, y0) = (annot.rect[0] + inset, annot.rect[1] + inset);
+            let (x1, y1) = (annot.rect[2] - inset, annot.rect[3] - inset);
+            if x1 <= x0 || y1 <= y0 {
+                return None;
+            }
+            if matches!(annot.kind, AnnotationKind::Square { .. }) {
+                ops.push_str(&format!(
+                    "{} {} {} {} re\n",
+                    fr(x0),
+                    fr(y0),
+                    fr(x1 - x0),
+                    fr(y1 - y0)
+                ));
+            } else {
+                // Ellipse inscribed in the (inset) rectangle as four
+                // cubic quarter-arcs.
+                let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+                let (rx, ry) = ((x1 - x0) / 2.0, (y1 - y0) / 2.0);
+                let (kx, ky) = (rx * ARC_KAPPA, ry * ARC_KAPPA);
+                ops.push_str(&format!("{} {} m\n", fr(cx + rx), fr(cy)));
+                for (c1, c2, end) in [
+                    ((cx + rx, cy + ky), (cx + kx, cy + ry), (cx, cy + ry)),
+                    ((cx - kx, cy + ry), (cx - rx, cy + ky), (cx - rx, cy)),
+                    ((cx - rx, cy - ky), (cx - kx, cy - ry), (cx, cy - ry)),
+                    ((cx + kx, cy - ry), (cx + rx, cy - ky), (cx + rx, cy)),
+                ] {
+                    ops.push_str(&format!(
+                        "{} {} {} {} {} {} c\n",
+                        fr(c1.0),
+                        fr(c1.1),
+                        fr(c2.0),
+                        fr(c2.1),
+                        fr(end.0),
+                        fr(end.1)
+                    ));
+                }
+                ops.push_str("h\n");
+            }
+            ops.push_str(match (filling, stroking) {
+                (true, true) => "B\n",
+                (true, false) => "f\n",
+                _ => "S\n",
+            });
+            Some(ops.into_bytes())
+        }
+        _ => None,
+    }
 }
 
 fn colour_array(values: &[f32]) -> Object {
