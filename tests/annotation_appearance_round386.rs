@@ -25,7 +25,8 @@
 //! * an appearance stream missing its `/BBox` painting nothing.
 
 use oxideav_core::vector::{Group, Node, Paint, Transform2D};
-use oxideav_pdf::read_pdf_to_scene;
+use oxideav_pdf::reader::DocumentReader;
+use oxideav_pdf::{read_pdf_annotations, read_pdf_to_scene};
 
 /// Collect every `PathNode` fill colour in tree order (depth-first).
 fn collect_fills(group: &Group, out: &mut Vec<(u8, u8, u8)>) {
@@ -363,6 +364,41 @@ fn annotation_without_ap_paints_nothing() {
         vec![(0, 0, 255)],
         "an annotation without /AP contributes nothing to the scene"
     );
+}
+
+#[test]
+fn annotations_surface_appearance_summary_and_state() {
+    // Single-stream /N: summary flags set, no states, /AS absent.
+    let pdf = build_annot_pdf(
+        "[100 100 150 130]",
+        "/AP << /N 5 0 R >>",
+        "/BBox [0 0 10 10]",
+    );
+    let mut r = DocumentReader::open(&pdf).unwrap();
+    let anns = read_pdf_annotations(&mut r).unwrap();
+    assert_eq!(anns.len(), 1);
+    let ap = anns[0].appearance.as_ref().expect("appearance summary");
+    assert!(ap.has_normal);
+    assert!(!ap.has_rollover && !ap.has_down);
+    assert!(ap.states.is_empty());
+    assert_eq!(anns[0].appearance_state, None);
+
+    // Subdictionary /N with /AS: state names surface sorted.
+    let pdf = build_states_pdf("/AS /On");
+    let mut r = DocumentReader::open(&pdf).unwrap();
+    let anns = read_pdf_annotations(&mut r).unwrap();
+    assert_eq!(anns.len(), 1);
+    let ap = anns[0].appearance.as_ref().expect("appearance summary");
+    assert!(ap.has_normal);
+    assert_eq!(ap.states, vec!["Off".to_string(), "On".to_string()]);
+    assert_eq!(anns[0].appearance_state.as_deref(), Some("On"));
+
+    // No /AP at all → summary is None.
+    let pdf = build_annot_pdf("[100 100 150 130]", "", "/BBox [0 0 10 10]");
+    let mut r = DocumentReader::open(&pdf).unwrap();
+    let anns = read_pdf_annotations(&mut r).unwrap();
+    assert_eq!(anns.len(), 1);
+    assert!(anns[0].appearance.is_none());
 }
 
 #[test]

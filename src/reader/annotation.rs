@@ -153,8 +153,38 @@ pub struct PdfAnnotation {
     /// `/Border` — `[hr vr w]` or `[hr vr w dash]`. Most PDFs ship the
     /// 3-element variant; round-26 surfaces it untouched.
     pub border: Option<Vec<f32>>,
+    /// `/AP` — §12.5.5 appearance-dictionary summary (Table 168).
+    /// `None` when the annotation carries no appearance dictionary.
+    pub appearance: Option<AnnotationAppearance>,
+    /// `/AS` — the appearance state selecting the applicable stream
+    /// from an appearance subdictionary (required by Table 164 when
+    /// `/AP` contains one or more subdictionaries).
+    pub appearance_state: Option<String>,
     /// Per-subtype payload.
     pub kind: AnnotationKind,
+}
+
+/// Summary of an annotation's §12.5.5 appearance dictionary
+/// (Table 168) as surfaced on [`PdfAnnotation::appearance`].
+///
+/// Each of the three entries (`/N` normal — required, `/R` rollover,
+/// `/D` down) is either a single appearance stream or a subdictionary
+/// of streams keyed by appearance state; [`Self::states`] is the
+/// union of state names across all three (empty when every present
+/// entry is a single stream).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnnotationAppearance {
+    /// `/N` — normal appearance present (Table 168 requires it, but
+    /// the enumeration is tolerant of producers that omit it).
+    pub has_normal: bool,
+    /// `/R` — rollover appearance present (defaults to `/N` per
+    /// Table 168 when absent).
+    pub has_rollover: bool,
+    /// `/D` — down appearance present (defaults to `/N`).
+    pub has_down: bool,
+    /// Union of appearance-state names across the `/N` / `/R` / `/D`
+    /// subdictionaries, sorted and de-duplicated.
+    pub states: Vec<String>,
 }
 
 /// Per-subtype annotation payload.
@@ -790,6 +820,11 @@ fn decode_annotation(
     };
     let colour = decode_real_array(find_entry(annot, "C"));
     let border = decode_real_array(find_entry(annot, "Border"));
+    let appearance = decode_appearance_summary(reader, annot)?;
+    let appearance_state = match find_entry(annot, "AS") {
+        Some(Object::Name(s)) => Some(s.clone()),
+        _ => None,
+    };
 
     let kind = match subtype.as_str() {
         "Text" => AnnotationKind::Text {
@@ -1146,8 +1181,51 @@ fn decode_annotation(
         flags,
         colour,
         border,
+        appearance,
+        appearance_state,
         kind,
     }))
+}
+
+/// Decode the `/AP` appearance dictionary (§12.5.5 Table 168) into an
+/// [`AnnotationAppearance`] summary: which of `/N` / `/R` / `/D` are
+/// present, plus the union of appearance-state names across any
+/// subdictionary-form entries.
+fn decode_appearance_summary(
+    reader: &mut DocumentReader<'_>,
+    annot: &Dict,
+) -> Result<Option<AnnotationAppearance>, PdfError> {
+    let ap = match find_entry(annot, "AP").cloned() {
+        Some(obj) => match reader.deref(obj) {
+            Ok(Object::Dict(d)) => d,
+            _ => return Ok(None),
+        },
+        None => return Ok(None),
+    };
+    let mut summary = AnnotationAppearance::default();
+    let mut states: Vec<String> = Vec::new();
+    for (key, flag) in [("N", 0usize), ("R", 1), ("D", 2)] {
+        let Some(entry) = find_entry(&ap, key).cloned() else {
+            continue;
+        };
+        match flag {
+            0 => summary.has_normal = true,
+            1 => summary.has_rollover = true,
+            _ => summary.has_down = true,
+        }
+        // A subdictionary entry defines one stream per appearance
+        // state; collect the state names. (A single-stream entry —
+        // the common form — resolves to a Stream and adds nothing.)
+        if let Ok(Object::Dict(sub)) = reader.deref(entry) {
+            for (state, _) in sub.entries() {
+                states.push(state.clone());
+            }
+        }
+    }
+    states.sort();
+    states.dedup();
+    summary.states = states;
+    Ok(Some(summary))
 }
 
 /// Resolve `/Dest` or `/A << /S … >>` for a Link annotation. Mirrors

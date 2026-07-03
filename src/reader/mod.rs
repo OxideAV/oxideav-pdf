@@ -44,8 +44,8 @@ pub mod xref;
 
 pub use actions::{actions, ActionKind, ActionTrigger, PdfAction};
 pub use annotation::{
-    annotations, AnnotationKind, FixedPrint, MovieActivation, PdfAnnotation, TextMarkupVariant,
-    ThreeDActivation, ThreeDViewSelector,
+    annotations, AnnotationAppearance, AnnotationKind, FixedPrint, MovieActivation, PdfAnnotation,
+    TextMarkupVariant, ThreeDActivation, ThreeDViewSelector,
 };
 pub use attachments::{attachments, PdfAttachment};
 pub use content::{
