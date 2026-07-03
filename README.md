@@ -208,7 +208,9 @@ for an end-to-end verify.
 - **Annotations** — `annotations()` decodes the §12.5.6 subtype taxonomy
   (Text, FreeText, the markup variants, Line, Polygon, PolyLine, Ink,
   Caret, Popup, FileAttachment, Watermark, Redact, Sound, Movie, Screen,
-  PrinterMark, TrapNet, 3D, …) with common Table 164 fields.
+  PrinterMark, TrapNet, 3D, …) with common Table 164 fields, plus each
+  annotation's `/AP` appearance summary (`N`/`R`/`D` presence + the
+  union of appearance-state names) and its `/AS` selector.
 - **Optional content / OCG layers** — `optional_content()` resolves
   group visibility from `/OCProperties` (§8.11), including OCMD
   membership and `/VE` visibility expressions.
@@ -305,6 +307,21 @@ triangle/patch continuation (Tables 85/86) is honoured. `mesh` and
 shading's `/ColorSpace` may be an inline array or a *named*
 `/Resources /ColorSpace` key (resolved like `cs`/`CS`).
 
+**Annotation appearance streams** (§12.5.5) paint into the `Scene` on
+top of the page content. Each `/Annots` annotation's applicable
+appearance — the normal (`/N`) stream, or the `/AS`-selected entry when
+`/N` is a state subdictionary (the checkbox `On`/`Off` shape) — is a
+Form XObject parsed against its own `/Resources` and placed by the
+§12.5.5 algorithm: the `/BBox` corners transform through `/Matrix`, the
+enclosing upright rectangle maps onto the annotation `/Rect` by a
+scale+translate `A`, and content maps through `AA = Matrix × A`.
+Hidden / NoView-flagged annotations (§12.5.3) and Popups (§12.5.6.14)
+paint nothing, and the `/OC` entry (§12.5.2) is honoured — an
+annotation on an OFF optional-content layer (direct OCG or OCMD with
+`/P` policy / `/VE` expression, §8.11) is skipped as if absent.
+Annotations without a usable appearance stay event-only on the
+`annotations()` surface.
+
 **Shading-pattern fills** (`/PatternType 2`, §8.7.3.3) paint directly
 into the `Scene`: a `scn`/`SCN` whose `/Pattern` operand names a shading
 pattern becomes a `Paint::LinearGradient` (axial) or
@@ -332,11 +349,23 @@ colours.
 ## Interactive-form & annotation writers
 
 - [`write_pdf_with_form`] emits an `/AcroForm` with Text, Checkbox,
-  Radio, Choice, and Signature widgets (§12.7.4).
+  Radio, Choice, and Signature widgets (§12.7.4). Checkbox and
+  radio-kid widgets carry two-state `/AP << /N << /<on> … /Off … >> >>`
+  appearance subdictionaries (self-contained vector streams — border
+  box + check mark, ellipse border + dot) matching their `/AS`, so
+  rendering no longer depends on the PDF 2.0-deprecated
+  `/NeedAppearances`.
 - [`write_pdf_with_annotations`] emits the §12.5.6 subtype taxonomy
   symmetric to the reader (Text, Link, FreeText, the markup variants,
   Square, Circle, Ink, Line, Polygon, PolyLine, Caret, Popup,
-  FileAttachment, Sound, Watermark, PrinterMark).
+  FileAttachment, Sound, Watermark, PrinterMark). Geometry-determined
+  kinds additionally get a **normal appearance stream** (§12.5.5 —
+  `/AP /N` form XObject with `/BBox` = `/Rect`): Square / Circle
+  (inscribed per §12.5.6.8, border inset per §12.5.4, `/IC` fill +
+  `/C` stroke), Line / Ink / Polygon / PolyLine (stroked geometry,
+  Polygon pours `/IC`), and the text-markup family (Highlight quad
+  fills; Underline / StrikeOut / Squiggly strokes at documented
+  quad-relative positions).
 - [`write_pdf_with_attachments`] embeds files as `/EmbeddedFile` streams
   with `/Filespec` dictionaries in the `/Names → /EmbeddedFiles` tree,
   optionally with `/FileAttachment` annotation markers and PDF 2.0
@@ -365,7 +394,10 @@ cargo bench -p oxideav-pdf --bench reader_open
 ## Deferred
 
 - Writer-side `BT … Tj … ET` text emission for `Node::Text` (the
-  reader-side extraction surface is complete).
+  reader-side extraction surface is complete). The same gap defers
+  FreeText annotation appearance streams (they need laid-out text).
+- Table 176 line-ending glyphs (`/LE` arrows / diamonds / …) in the
+  generated Line / PolyLine appearances.
 - Writer-side JPEG passthrough on `ImageRef` (needs core IR support for
   raw codec bytes; the reader-side surface is complete).
 - Ed25519 / Ed448 signature dispatch in `pubsec::verify`.
