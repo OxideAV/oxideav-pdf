@@ -1,5 +1,7 @@
 # oxideav-pdf
 
+[![CI](https://github.com/OxideAV/oxideav-pdf/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-pdf/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-pdf.svg)](https://crates.io/crates/oxideav-pdf) [![docs.rs](https://docs.rs/oxideav-pdf/badge.svg)](https://docs.rs/oxideav-pdf) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **PDF writer + reader** for the oxideav framework. The writer
 emits PDF 1.4+ vector documents from
 [`VectorFrame`](https://docs.rs/oxideav-core) /
