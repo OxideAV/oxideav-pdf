@@ -14,7 +14,10 @@
 //! [`crate::resources::ResourceCollector`] so the page's `/Resources`
 //! dictionary stays in sync.
 
-use oxideav_core::vector::{FillRule, Group, ImageRef, Node, PathNode, VectorFrame};
+use oxideav_core::vector::{
+    FillRule, Group, ImageRef, MaskKind, Node, PathCommand, PathNode, Point, Transform2D,
+    VectorFrame,
+};
 use oxideav_scene::Scene;
 
 use crate::encrypt::{EncryptionConfig, EncryptionState};
@@ -1381,11 +1384,147 @@ fn emit_node(op: &mut OpBuf, node: &Node, resources: &mut ResourceCollector) {
         Node::Group(g) => emit_group(op, g, resources),
         Node::Path(p) => emit_path_node(op, p, resources),
         Node::Image(img) => emit_image(op, img, resources),
-        // Node is `#[non_exhaustive]` (text / mask / filter variants
-        // will land in future rounds). Round 1 silently skips
-        // unknown node kinds so the writer stays forward-compatible.
+        Node::SoftMask {
+            mask,
+            mask_kind,
+            content,
+        } => emit_soft_mask(op, mask, *mask_kind, content, resources),
+        // Node is `#[non_exhaustive]` (text / filter variants will
+        // land in future rounds). Unknown node kinds are silently
+        // skipped so the writer stays forward-compatible.
         _ => {}
     }
+}
+
+/// Emit a [`Node::SoftMask`] composite as an `/ExtGState /SMask`
+/// soft-mask dictionary (ISO 32000-1 §11.6.4.3 + §11.6.5.2 Table 144):
+/// the `mask` subtree is serialised into its own transparency-group
+/// form XObject (§11.6.6 — the `/G` entry, with its own `/Resources`
+/// and a `/BBox` covering the mask geometry), referenced from a
+/// graphics-state parameter dictionary whose `/SMask` subtype maps
+/// [`MaskKind::Luminance`] → `/Luminosity` and [`MaskKind::Alpha`] →
+/// `/Alpha`; the `content` subtree then paints inside a `q … Q`
+/// bracket with that state set, so the mask applies to exactly this
+/// composite and nothing after it.
+fn emit_soft_mask(
+    op: &mut OpBuf,
+    mask: &Node,
+    kind: MaskKind,
+    content: &Node,
+    resources: &mut ResourceCollector,
+) {
+    // Nothing renderable in the mask subtree (no geometry at all) —
+    // the group's luminosity (over the default black backdrop) and
+    // alpha are 0.0 everywhere, so the masked content is fully hidden
+    // (§11.6.5.2). Emit nothing.
+    let Some(bbox) = node_bounds(mask, Transform2D::identity()) else {
+        return;
+    };
+    // Serialise the mask subtree into its own content stream with its
+    // own resource collector (the /G form carries its own /Resources).
+    let mut mask_op = OpBuf::new();
+    let mut mask_resources = ResourceCollector::new();
+    emit_node(&mut mask_op, mask, &mut mask_resources);
+    let name = resources.add_soft_mask(kind, mask_op.into_bytes(), mask_resources, bbox);
+
+    save(op);
+    set_ext_gstate(op, &name);
+    emit_node(op, content, resources);
+    restore(op);
+}
+
+/// Conservative axis-aligned bounds of a node subtree under `t`, in
+/// the space the subtree is emitted in — the `/BBox` for a soft mask's
+/// `/G` form XObject. Path bounds include control points (a safe
+/// over-estimate for Béziers); group clips are ignored (also a safe
+/// over-estimate).
+fn node_bounds(node: &Node, t: Transform2D) -> Option<[f32; 4]> {
+    fn mul(a: &Transform2D, b: &Transform2D) -> Transform2D {
+        Transform2D {
+            a: a.a * b.a + a.c * b.b,
+            b: a.b * b.a + a.d * b.b,
+            c: a.a * b.c + a.c * b.d,
+            d: a.b * b.c + a.d * b.d,
+            e: a.a * b.e + a.c * b.f + a.e,
+            f: a.b * b.e + a.d * b.f + a.f,
+        }
+    }
+    fn grow(acc: &mut Option<[f32; 4]>, p: Point) {
+        if !p.x.is_finite() || !p.y.is_finite() {
+            return;
+        }
+        match acc {
+            None => *acc = Some([p.x, p.y, p.x, p.y]),
+            Some(b) => {
+                b[0] = b[0].min(p.x);
+                b[1] = b[1].min(p.y);
+                b[2] = b[2].max(p.x);
+                b[3] = b[3].max(p.y);
+            }
+        }
+    }
+    fn walk(node: &Node, t: &Transform2D, acc: &mut Option<[f32; 4]>) {
+        match node {
+            Node::Path(p) => {
+                for cmd in &p.path.commands {
+                    match cmd {
+                        PathCommand::MoveTo(a) | PathCommand::LineTo(a) => grow(acc, t.apply(*a)),
+                        PathCommand::QuadCurveTo { control, end } => {
+                            grow(acc, t.apply(*control));
+                            grow(acc, t.apply(*end));
+                        }
+                        PathCommand::CubicCurveTo { c1, c2, end } => {
+                            grow(acc, t.apply(*c1));
+                            grow(acc, t.apply(*c2));
+                            grow(acc, t.apply(*end));
+                        }
+                        PathCommand::ArcTo { rx, ry, end, .. } => {
+                            // The arc bulge can reach up to the larger
+                            // radius away from the endpoint — inflate
+                            // by it on both axes (conservative).
+                            let r = rx.abs().max(ry.abs()) * 2.0;
+                            grow(acc, t.apply(Point::new(end.x - r, end.y - r)));
+                            grow(acc, t.apply(Point::new(end.x + r, end.y + r)));
+                        }
+                        PathCommand::Close => {}
+                        // `PathCommand` is `#[non_exhaustive]`.
+                        _ => {}
+                    }
+                }
+            }
+            Node::Group(g) => {
+                let t2 = mul(t, &g.transform);
+                for child in &g.children {
+                    walk(child, &t2, acc);
+                }
+            }
+            Node::Image(img) => {
+                let t2 = mul(t, &img.transform);
+                let (x, y, w, h) = (
+                    img.bounds.x,
+                    img.bounds.y,
+                    img.bounds.width,
+                    img.bounds.height,
+                );
+                for p in [
+                    Point::new(x, y),
+                    Point::new(x + w, y),
+                    Point::new(x, y + h),
+                    Point::new(x + w, y + h),
+                ] {
+                    grow(acc, t2.apply(p));
+                }
+            }
+            Node::SoftMask { mask, content, .. } => {
+                walk(mask, t, acc);
+                walk(content, t, acc);
+            }
+            _ => {}
+        }
+    }
+    let mut acc = None;
+    walk(node, &t, &mut acc);
+    acc
 }
 
 fn emit_path_node(op: &mut OpBuf, node: &PathNode, resources: &mut ResourceCollector) {

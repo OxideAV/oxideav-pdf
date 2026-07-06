@@ -18,14 +18,14 @@
 //! `/Resources` dictionary entries (`/ExtGState`, `/Pattern`,
 //! `/XObject`) in one pass.
 
-use oxideav_core::vector::{GradientStop, LinearGradient, RadialGradient, SpreadMethod};
+use oxideav_core::vector::{GradientStop, LinearGradient, MaskKind, RadialGradient, SpreadMethod};
 use oxideav_core::VideoFrame;
 
 use crate::objects::{Dict, Document, Object, ObjectId, Stream};
 
 // ---- Public collector ---------------------------------------------------
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ResourceCollector {
     pub(crate) ext_gstates: Vec<ExtGState>,
     pub(crate) gradients: Vec<GradientResource>,
@@ -52,6 +52,31 @@ impl ResourceCollector {
         }
         let i = self.ext_gstates.len();
         self.ext_gstates.push(ExtGState::Opacity(key));
+        format!("GS{i}")
+    }
+
+    /// Register a soft mask (ISO 32000-1 §11.6.4.3): `content` is the
+    /// mask subtree already serialised as a content stream,
+    /// `mask_resources` the resources it references, `bbox` the
+    /// `/BBox` covering its geometry, and `kind` the `/S` subtype
+    /// (`Luminosity` / `Alpha`). Returns the `GS<n>` name to set via
+    /// `gs` before painting the masked content. Flattening emits the
+    /// `/G` transparency-group form XObject (§11.6.6) and the
+    /// graphics-state parameter dictionary around it.
+    pub fn add_soft_mask(
+        &mut self,
+        kind: MaskKind,
+        content: Vec<u8>,
+        mask_resources: ResourceCollector,
+        bbox: [f32; 4],
+    ) -> String {
+        let i = self.ext_gstates.len();
+        self.ext_gstates.push(ExtGState::SoftMask {
+            kind,
+            content,
+            mask_resources: Box::new(mask_resources),
+            bbox,
+        });
         format!("GS{i}")
     }
 
@@ -158,6 +183,60 @@ impl ResourceCollector {
                             .with("ca", Object::Real(alpha))
                             .with("CA", Object::Real(alpha))
                     }
+                    ExtGState::SoftMask {
+                        kind,
+                        content,
+                        mask_resources,
+                        bbox,
+                    } => {
+                        // /G — the transparency-group form XObject the
+                        // mask values derive from (§11.6.5.2 Table 144
+                        // + §11.6.6 Table 147). A luminosity mask's
+                        // group must carry /CS (Table 147: required
+                        // when the group "has no parent group or page
+                        // from which to inherit — in particular, one
+                        // that is the value of the G entry in a
+                        // soft-mask dictionary of subtype Luminosity").
+                        let mut form_dict = Dict::new()
+                            .with("Type", Object::Name("XObject".into()))
+                            .with("Subtype", Object::Name("Form".into()))
+                            .with("FormType", Object::Integer(1))
+                            .with(
+                                "BBox",
+                                Object::Array(
+                                    bbox.iter().map(|v| Object::Real(*v as f64)).collect(),
+                                ),
+                            )
+                            .with(
+                                "Group",
+                                Object::Dict(
+                                    Dict::new()
+                                        .with("Type", Object::Name("Group".into()))
+                                        .with("S", Object::Name("Transparency".into()))
+                                        .with("CS", Object::Name("DeviceRGB".into())),
+                                ),
+                            );
+                        if !mask_resources.is_empty() {
+                            let nested = mask_resources.flatten_into_resources_dict(doc);
+                            form_dict.set("Resources", nested);
+                        }
+                        let g_id = doc.add(Object::Stream(Stream::new(form_dict, content.clone())));
+                        let subtype = match kind {
+                            MaskKind::Luminance => "Luminosity",
+                            MaskKind::Alpha => "Alpha",
+                        };
+                        Dict::new()
+                            .with("Type", Object::Name("ExtGState".into()))
+                            .with(
+                                "SMask",
+                                Object::Dict(
+                                    Dict::new()
+                                        .with("Type", Object::Name("Mask".into()))
+                                        .with("S", Object::Name(subtype.into()))
+                                        .with("G", Object::Reference(g_id)),
+                                ),
+                            )
+                    }
                 };
                 ext.set(&format!("GS{i}"), Object::Dict(dict));
             }
@@ -209,6 +288,15 @@ impl ResourceCollector {
 #[derive(Clone)]
 pub(crate) enum ExtGState {
     Opacity(u32),
+    /// A soft-mask graphics state (§11.6.4.3): the serialised mask
+    /// content stream + its own resources become the `/G`
+    /// transparency-group form XObject at flatten time.
+    SoftMask {
+        kind: MaskKind,
+        content: Vec<u8>,
+        mask_resources: Box<ResourceCollector>,
+        bbox: [f32; 4],
+    },
 }
 
 #[derive(Clone)]
