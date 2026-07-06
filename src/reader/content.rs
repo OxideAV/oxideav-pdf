@@ -1104,6 +1104,46 @@ struct Frame {
     children: Vec<Node>,
     /// Clip path, if a `W`/`W*` was issued.
     clip: Option<Path>,
+    /// Snapshot of the device-independent graphics-state parameters
+    /// (§8.4.1 Table 52) taken by the `q` that opened this frame, so the
+    /// matching `Q` can "restore the graphics state by removing the most
+    /// recently saved state from the stack and making it the current
+    /// state" (§8.4.4 Table 57). The root frame — which no `q` opened —
+    /// carries `None` and restores nothing.
+    saved: Option<Box<GStateSnapshot>>,
+}
+
+/// The subset of §8.4.1 Table 52 graphics-state parameters this walker
+/// tracks as mutable `State` fields, captured on `q` and restored on
+/// `Q`. The CTM and clipping path are excluded — they live on [`Frame`]
+/// itself (the nested-group structure *is* their save/restore). The
+/// text-object matrices (`Tm` / `Tlm`) are also excluded: they are not
+/// graphics-state parameters (§9.4.2 — they exist only within a
+/// `BT`…`ET` block), unlike the Table 52 *text state* parameters
+/// (`Tc` / `Tw` / `Th` / `Tl` / font / `Tmode` / `Trise`) which are
+/// saved here.
+struct GStateSnapshot {
+    fill_paint: Option<Paint>,
+    stroke_paint: Option<Paint>,
+    fill_cs: ColorSpaceKind,
+    stroke_cs: ColorSpaceKind,
+    stroke_width: f32,
+    line_cap: LineCap,
+    line_join: LineJoin,
+    miter_limit: f32,
+    dash: Option<DashPattern>,
+    fill_alpha: f32,
+    stroke_alpha: f32,
+    current_font: Option<(String, f32)>,
+    text_leading: f32,
+    char_spacing: f32,
+    word_spacing: f32,
+    horiz_scale: f32,
+    text_render_mode: i64,
+    text_rise: f32,
+    fill_tiling: Option<String>,
+    fill_tiling_color: Option<Rgba>,
+    stroke_tiling: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -3071,8 +3111,66 @@ impl<'a> State<'a> {
         self.stack.last_mut().expect("at least the root frame")
     }
 
+    /// Capture the Table 52 parameters `q` saves (§8.4.4).
+    fn snapshot_gstate(&self) -> GStateSnapshot {
+        GStateSnapshot {
+            fill_paint: self.fill_paint.clone(),
+            stroke_paint: self.stroke_paint.clone(),
+            fill_cs: self.fill_cs.clone(),
+            stroke_cs: self.stroke_cs.clone(),
+            stroke_width: self.stroke_width,
+            line_cap: self.line_cap,
+            line_join: self.line_join,
+            miter_limit: self.miter_limit,
+            dash: self.dash.clone(),
+            fill_alpha: self.fill_alpha,
+            stroke_alpha: self.stroke_alpha,
+            current_font: self.current_font.clone(),
+            text_leading: self.text_leading,
+            char_spacing: self.char_spacing,
+            word_spacing: self.word_spacing,
+            horiz_scale: self.horiz_scale,
+            text_render_mode: self.text_render_mode,
+            text_rise: self.text_rise,
+            fill_tiling: self.fill_tiling.clone(),
+            fill_tiling_color: self.fill_tiling_color,
+            stroke_tiling: self.stroke_tiling.clone(),
+        }
+    }
+
+    /// Reinstate the parameters the matching `q` saved (§8.4.4 `Q`).
+    fn restore_gstate(&mut self, s: GStateSnapshot) {
+        self.fill_paint = s.fill_paint;
+        self.stroke_paint = s.stroke_paint;
+        self.fill_cs = s.fill_cs;
+        self.stroke_cs = s.stroke_cs;
+        self.stroke_width = s.stroke_width;
+        self.line_cap = s.line_cap;
+        self.line_join = s.line_join;
+        self.miter_limit = s.miter_limit;
+        self.dash = s.dash;
+        self.fill_alpha = s.fill_alpha;
+        self.stroke_alpha = s.stroke_alpha;
+        self.current_font = s.current_font;
+        self.text_leading = s.text_leading;
+        self.char_spacing = s.char_spacing;
+        self.word_spacing = s.word_spacing;
+        self.horiz_scale = s.horiz_scale;
+        self.text_render_mode = s.text_render_mode;
+        self.text_rise = s.text_rise;
+        self.fill_tiling = s.fill_tiling;
+        self.fill_tiling_color = s.fill_tiling_color;
+        self.stroke_tiling = s.stroke_tiling;
+    }
+
     fn push_q(&mut self) {
-        self.stack.push(Frame::new());
+        // `q` saves the entire graphics state (§8.4.4 Table 57). The
+        // CTM + clip save/restore is structural (each frame nests a
+        // `Group`); the rest of the Table 52 parameters are snapshotted
+        // here and restored by the matching `Q` in `pop_q`.
+        let mut frame = Frame::new();
+        frame.saved = Some(Box::new(self.snapshot_gstate()));
+        self.stack.push(frame);
     }
 
     fn pop_q(&mut self) {
@@ -3082,7 +3180,10 @@ impl<'a> State<'a> {
         if self.stack.len() <= 1 {
             return;
         }
-        let frame = self.stack.pop().unwrap();
+        let mut frame = self.stack.pop().unwrap();
+        if let Some(saved) = frame.saved.take() {
+            self.restore_gstate(*saved);
+        }
         // Translate the frame into a Node::Group child of its parent
         // — but skip empty groups (just `q Q` with nothing in
         // between is a no-op for the IR).
@@ -4873,6 +4974,7 @@ impl Frame {
             transform: Transform2D::identity(),
             children: Vec::new(),
             clip: None,
+            saved: None,
         }
     }
 
@@ -8696,6 +8798,62 @@ mod tests {
         assert_eq!((c.r, c.g, c.b), (0, 255, 0));
         // 1.0 * 0.25 * 255 = 63.75 → rounds to 64.
         assert_eq!(c.a, 64);
+    }
+
+    /// `Q` restores the fill colour and the nonstroking alpha constant
+    /// saved by the matching `q` (§8.4.4 Table 57 — "restore the
+    /// graphics state … making it the current state").
+    #[test]
+    fn q_restores_fill_colour_and_alpha() {
+        let ext = ext_gstate_with("GS1", Dict::new().with("ca", Object::Real(0.5)));
+        // Inside the bracket: red at alpha 0.5. After `Q`: the initial
+        // state — black fill (§8.6.3 initial colour) at alpha 1.0.
+        let bytes = b"q 1 0 0 rg /GS1 gs Q 0 0 m 10 10 l 10 0 l h f\n";
+        let root = parse_with(bytes, &ext);
+        let Node::Path(p) = &root.children[0] else {
+            panic!("expected root-level path, got {:?}", root.children[0]);
+        };
+        let Some(Paint::Solid(c)) = &p.fill else {
+            panic!("fill")
+        };
+        assert_eq!((c.r, c.g, c.b, c.a), (0, 0, 0, 255));
+    }
+
+    /// `Q` restores the line state (width / cap / join / dash) the
+    /// bracket changed (§8.4.4).
+    #[test]
+    fn q_restores_line_state() {
+        let ext = Dict::new();
+        let bytes = b"q 5 w 1 J 1 j [4 2] 1 d Q 0 0 m 10 10 l S\n";
+        let root = parse_with(bytes, &ext);
+        let Node::Path(p) = &root.children[0] else {
+            panic!("expected root-level path");
+        };
+        let s = p.stroke.as_ref().expect("stroke set");
+        assert!((s.width - 1.0).abs() < 1e-6, "width restored to 1.0");
+        assert!(matches!(s.cap, LineCap::Butt));
+        assert!(matches!(s.join, LineJoin::Miter));
+        assert!(s.dash.is_none(), "dash restored to solid");
+    }
+
+    /// Nested `q … q … Q … Q` brackets restore level by level.
+    #[test]
+    fn nested_q_restores_outer_colour() {
+        let ext = Dict::new();
+        // Outer bracket paints red; inner bracket switches to green,
+        // pops, and the path painted after the inner `Q` must be red.
+        let bytes = b"q 1 0 0 rg q 0 1 0 rg Q 0 0 m 10 10 l 10 0 l h f Q\n";
+        let root = parse_with(bytes, &ext);
+        let Node::Group(g) = &root.children[0] else {
+            panic!("outer q group");
+        };
+        let Node::Path(p) = &g.children[0] else {
+            panic!("path inside outer bracket");
+        };
+        let Some(Paint::Solid(c)) = &p.fill else {
+            panic!("fill")
+        };
+        assert_eq!((c.r, c.g, c.b), (255, 0, 0), "outer red restored");
     }
 
     /// A `gs` against an undefined ExtGState name is a tolerated no-op

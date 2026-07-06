@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- save/restore the graphics state across `q`/`Q` (§8.4.4 Table 57): the content walker's `q` now snapshots every Table 52 parameter it tracks — fill/stroke colour + colour space, line width/cap/join/miter/dash, the §11.6.4.4 alpha constants, the text-state parameters (`Tc`/`Tw`/`Th`/`TL`/font/`Tr`/`Ts`), and the active tiling-pattern selection — and the matching `Q` reinstates the snapshot, so state set inside a bracket no longer leaks past it (previously only the CTM and clip were bracketed, via the nested-group structure). The text-object matrices (`Tm`/`Tlm`) stay unbracketed per §9.4.2 (they are not graphics-state parameters)
+
 ## [0.2.0](https://github.com/OxideAV/oxideav-pdf/compare/v0.1.4...v0.2.0) - 2026-07-03
 
 ### Other
