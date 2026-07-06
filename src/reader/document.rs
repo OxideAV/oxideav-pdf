@@ -1313,6 +1313,11 @@ fn decode_page(
     } else {
         None
     };
+    let transparency_groups = if let Some(rdict) = resources_dict.as_ref() {
+        transparency_group_names(reader, rdict)?
+    } else {
+        None
+    };
 
     let parsed = parse_content_stream_full_with_soft_masks(
         &content_bytes,
@@ -1326,6 +1331,7 @@ fn decode_page(
         tiling_patterns.as_ref(),
         type3_fonts.as_ref(),
         soft_masks.as_ref(),
+        transparency_groups.as_ref(),
     )?;
     let mut root = parsed.root;
 
@@ -2412,6 +2418,67 @@ const MAX_XOBJECT_DEPTH: usize = 12;
 /// `None`, missing a usable `/S` or `/G`, or whose group parses to
 /// nothing are skipped (the walker then paints unmasked — the same
 /// tolerant degradation every unresolvable resource takes).
+/// Collect the names of the `/Resources /XObject` entries that are
+/// *transparency-group* XObjects — form XObjects whose `/Group`
+/// attributes dictionary has subtype `/S /Transparency` (§11.6.6
+/// Table 147). A `Do` on one of these composites the group's results
+/// into the parent as a unit, so the content walker applies the
+/// §11.6.4.4 nonstroking alpha constant to the spliced group. Only
+/// dictionary keys are read — the streams themselves were already
+/// parsed by [`resolve_xobject_forms`].
+fn transparency_group_names(
+    reader: &mut DocumentReader<'_>,
+    resources: &Dict,
+) -> Result<Option<BTreeSet<String>>, PdfError> {
+    let xobj_obj = resources
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "XObject")
+        .map(|(_, v)| v.clone());
+    let xobj_obj = match xobj_obj {
+        Some(Object::Reference(id)) => reader.resolve(id)?,
+        Some(other) => other,
+        None => return Ok(None),
+    };
+    let Object::Dict(xobj_dict) = xobj_obj else {
+        return Ok(None);
+    };
+    let mut out = BTreeSet::new();
+    for (name, value) in xobj_dict.entries() {
+        let resolved = match value {
+            Object::Reference(id) => reader.resolve(*id)?,
+            other => other.clone(),
+        };
+        let Object::Stream(stream) = resolved else {
+            continue;
+        };
+        let group = stream
+            .dict
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Group")
+            .map(|(_, v)| v.clone());
+        let group = match group {
+            Some(Object::Reference(id)) => reader.resolve(id)?,
+            Some(other) => other,
+            None => continue,
+        };
+        let Object::Dict(group) = group else { continue };
+        let is_transparency = matches!(
+            group.entries().iter().find(|(k, _)| k == "S").map(|(_, v)| v),
+            Some(Object::Name(s)) if s == "Transparency"
+        );
+        if is_transparency {
+            out.insert(name.clone());
+        }
+    }
+    if out.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(out))
+    }
+}
+
 /// Read a PDF object as a flat numeric array.
 fn number_array(obj: &Object) -> Option<Vec<f32>> {
     let Object::Array(items) = obj else {
@@ -2709,6 +2776,10 @@ fn resolve_one_form_xobject(
         Some(r) => resolve_soft_masks(reader, r, depth + 1, visited)?,
         None => None,
     };
+    let transparency_groups = match form_resources.as_ref() {
+        Some(r) => transparency_group_names(reader, r)?,
+        None => None,
+    };
 
     let parsed = parse_content_stream_full_with_soft_masks(
         &content_bytes,
@@ -2722,6 +2793,7 @@ fn resolve_one_form_xobject(
         tiling_patterns.as_ref(),
         type3_fonts.as_ref(),
         soft_masks.as_ref(),
+        transparency_groups.as_ref(),
     )?;
 
     // The content parser returns a root `Group` carrying any top-level

@@ -464,6 +464,7 @@ pub fn parse_content_stream_full_with_soft_masks(
     tiling_patterns: Option<&BTreeMap<String, TilingPattern>>,
     type3_fonts: Option<&BTreeMap<String, Type3Font>>,
     soft_masks: Option<&BTreeMap<String, ResolvedSoftMask>>,
+    transparency_groups: Option<&BTreeSet<String>>,
 ) -> Result<ParsedContent, PdfError> {
     let mut state = State::new(
         ext_gstate,
@@ -476,7 +477,8 @@ pub fn parse_content_stream_full_with_soft_masks(
     .with_pattern_resources(pattern_resources)
     .with_tiling_patterns(tiling_patterns)
     .with_type3_fonts(type3_fonts)
-    .with_soft_masks(soft_masks);
+    .with_soft_masks(soft_masks)
+    .with_transparency_groups(transparency_groups);
     state.parse(input)?;
     Ok(state.finish())
 }
@@ -1082,6 +1084,17 @@ struct State<'a> {
     /// The soft mask currently in force (§11.6.4.3). Part of the
     /// graphics state — bracketed by `q`/`Q` via [`GStateSnapshot`].
     active_smask: Option<ActiveSoftMask>,
+    /// Names (within `xobject_forms`) of the forms that are
+    /// *transparency-group* XObjects — a `/Group` entry whose subtype
+    /// `/S` is `/Transparency` (§11.6.6 Table 147). A `Do` on one
+    /// composites the group's results into the parent as a unit, so
+    /// the §11.6.4.4 nonstroking alpha constant lands on the spliced
+    /// group's opacity ("The nonstroking alpha constant shall also be
+    /// applied when painting a transparency group's results onto its
+    /// backdrop"). An ordinary form — no `/Group` entry — "shall not
+    /// be subject to any grouping behaviour for transparency
+    /// purposes".
+    transparency_groups: Option<&'a BTreeSet<String>>,
 }
 
 /// A `/PatternType 1` tiling pattern (§8.7.3) reduced to what the
@@ -3146,6 +3159,7 @@ impl<'a> State<'a> {
             type3_depth: 0,
             soft_masks: None,
             active_smask: None,
+            transparency_groups: None,
         }
     }
 
@@ -3197,6 +3211,13 @@ impl<'a> State<'a> {
     /// and `/SMask` stays a tolerated no-op.
     fn with_soft_masks(mut self, masks: Option<&'a BTreeMap<String, ResolvedSoftMask>>) -> Self {
         self.soft_masks = masks;
+        self
+    }
+
+    /// Mark which pre-parsed forms are transparency-group XObjects
+    /// (§11.6.6) so `Do` applies group-level compositing semantics.
+    fn with_transparency_groups(mut self, groups: Option<&'a BTreeSet<String>>) -> Self {
+        self.transparency_groups = groups;
         self
     }
 
@@ -4004,7 +4025,26 @@ impl<'a> State<'a> {
                 if !name.is_empty() {
                     if let Some(form) = self.xobject_forms.and_then(|m| m.get(&name)) {
                         if !form.children.is_empty() {
-                            self.push_painted(Node::Group(form.clone()));
+                            let mut group = form.clone();
+                            // §11.6.6 — a *transparency-group* XObject
+                            // composites into its parent as a unit, so
+                            // the current nonstroking alpha constant
+                            // applies to the group's results
+                            // (§11.6.4.4), not to each object inside
+                            // it. (The group's own content already
+                            // parsed with fresh state — blend Normal,
+                            // alphas 1.0, soft mask None — per the
+                            // §11.6.6 initialisation rule, so nothing
+                            // is applied twice.) An ordinary form gets
+                            // no grouping behaviour.
+                            if self.fill_alpha < 1.0
+                                && self
+                                    .transparency_groups
+                                    .is_some_and(|set| set.contains(&name))
+                            {
+                                group.opacity *= self.fill_alpha;
+                            }
+                            self.push_painted(Node::Group(group));
                         }
                     }
                 }
@@ -9136,6 +9176,7 @@ mod tests {
             None,
             None,
             Some(masks),
+            None,
         )
         .unwrap()
         .root
