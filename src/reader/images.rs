@@ -121,7 +121,7 @@ impl ColorSpace {
 /// They should match the JPEG's intrinsic SOF0 marker dimensions; if
 /// they don't, the PDF dictionary wins for layout and the decoder
 /// re-samples on the way out.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PdfImageXObject {
     /// Raw JPEG bytes — a self-contained JPEG-1 / JFIF stream ready
     /// to be passed to a JPEG decoder.
@@ -138,6 +138,37 @@ pub struct PdfImageXObject {
     /// required, but real-world PDFs occasionally omit it for
     /// JPEG XObjects since the JPEG itself carries the value).
     pub bits_per_component: u8,
+    /// The image's **soft-mask image** (§11.6.5.3) — the subsidiary
+    /// image XObject named by the parent dict's `/SMask` entry, which
+    /// supplies per-sample alpha for the parent ("This mask, if
+    /// present, shall override any explicit or colour key mask
+    /// specified by the image dictionary's Mask entry"). `None` when
+    /// the parent has no `/SMask` or the entry is unusable.
+    pub smask: Option<SoftMaskImage>,
+}
+
+/// A soft-mask image (§11.6.5.3 Tables 145 + 146): the subsidiary
+/// `/SMask` image XObject supplying per-sample alpha for its parent.
+/// Per Table 145 its colour space is required to be `/DeviceGray`, so
+/// the decoded samples are single-component gray values.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SoftMaskImage {
+    /// `/Width` of the mask (Table 145: independent of the parent's
+    /// unless `/Matte` is present — both map onto the unit square).
+    pub width: u32,
+    /// `/Height` of the mask.
+    pub height: u32,
+    /// `/BitsPerComponent` (required, Table 145).
+    pub bits_per_component: u8,
+    /// The decoded mask samples (the `/Filter` chain applied), when
+    /// the chain is one this crate decodes (Flate / LZW / ASCII /
+    /// RunLength / none). `None` for image-codec filters (DCTDecode /
+    /// JPXDecode / …) — the raw stream still lives in the document.
+    pub data: Option<Vec<u8>>,
+    /// `/Matte` (Table 146) — the preblending matte colour, in the
+    /// *parent* image's colour space, when the parent's samples were
+    /// premultiplied against it. `None` = not preblended.
+    pub matte: Option<Vec<f32>>,
 }
 
 impl<'a> DocumentReader<'a> {
@@ -416,12 +447,87 @@ fn try_extract_jpeg(
         )));
     }
 
+    // /SMask (§11.6.4.3 + §11.6.5.3) — a subsidiary image XObject
+    // holding per-sample alpha for this image.
+    let smask = extract_soft_mask_image(reader, &s.dict)?;
+
     Ok(Some(PdfImageXObject {
         data: payload,
         width: width as u32,
         height: height as u32,
         color_space,
         bits_per_component: bpc as u8,
+        smask,
+    }))
+}
+
+/// Resolve `parent_dict`'s `/SMask` entry into a [`SoftMaskImage`]
+/// (§11.6.5.3). Tolerant: a missing / non-stream / malformed entry
+/// returns `Ok(None)` rather than failing the parent's extraction.
+fn extract_soft_mask_image(
+    reader: &mut DocumentReader<'_>,
+    parent_dict: &Dict,
+) -> Result<Option<SoftMaskImage>, PdfError> {
+    let sm = parent_dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "SMask")
+        .map(|(_, v)| v.clone());
+    let sm = match sm {
+        Some(Object::Reference(id)) => reader.resolve(id)?,
+        Some(other) => other,
+        None => return Ok(None),
+    };
+    let Object::Stream(s) = sm else {
+        return Ok(None);
+    };
+    // Table 145: /Subtype shall be /Image, /ColorSpace shall be
+    // /DeviceGray, /ImageMask shall be false or absent.
+    let subtype = s.dict.entries().iter().find(|(k, _)| k == "Subtype");
+    if !matches!(subtype, Some((_, Object::Name(n))) if n == "Image") {
+        return Ok(None);
+    }
+    let (Some(width), Some(height)) = (lookup_int(&s.dict, "Width"), lookup_int(&s.dict, "Height"))
+    else {
+        return Ok(None);
+    };
+    if width < 0 || height < 0 {
+        return Ok(None);
+    }
+    let bpc = lookup_int(&s.dict, "BitsPerComponent").unwrap_or(8);
+    if !(1..=16).contains(&bpc) {
+        return Ok(None);
+    }
+    // Decode the sample stream when the filter chain is decodable
+    // (Flate / LZW / ASCII / RunLength / none). An image-codec filter
+    // (DCTDecode / JPXDecode / …) surfaces `data: None`.
+    let data = crate::reader::document::decode_stream(&s).ok();
+    // /Matte (Table 146): n numbers in the parent's colour space.
+    let matte = s
+        .dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Matte")
+        .and_then(|(_, v)| match v {
+            Object::Array(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        Object::Integer(n) => out.push(*n as f32),
+                        Object::Real(n) => out.push(*n as f32),
+                        _ => return None,
+                    }
+                }
+                Some(out)
+            }
+            _ => None,
+        });
+    Ok(Some(SoftMaskImage {
+        width: width as u32,
+        height: height as u32,
+        bits_per_component: bpc as u8,
+        data,
+        matte,
     }))
 }
 

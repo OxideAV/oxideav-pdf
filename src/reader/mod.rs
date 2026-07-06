@@ -66,7 +66,7 @@ pub use encoding::{
     EncodingMap, EncodingOverride,
 };
 pub use hierarchy::{verify_hierarchy, HierarchyIssue, HierarchyReport, IssueSeverity};
-pub use images::{image_xobjects, ColorSpace, PdfImageXObject};
+pub use images::{image_xobjects, ColorSpace, PdfImageXObject, SoftMaskImage};
 pub use inline_images::{inline_images, InlineImageFilter, PdfInlineImage};
 pub use layout::{read_in_logical_order, LayoutMode, ReadingOrderText};
 pub use linearize::{parse_linearization_dict, LinearizationParams};

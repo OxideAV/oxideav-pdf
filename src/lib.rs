@@ -99,7 +99,7 @@ pub use reader::{
     MarkedTextRun, MovieActivation, OutlineNode, PdfACatalogSignals, PdfAConformance, PdfAction,
     PdfAnnotation, PdfAttachment, PdfDocTimestamp, PdfImageXObject, PdfInlineImage, PdfLink,
     PdfLinkTarget, PdfMarkedTextExtraction, PdfOutline, PdfSignature, PdfTextExtraction,
-    ReadingOrderText, TextMarkupVariant, TextRenderMode, TextRun, ThreeDActivation,
+    ReadingOrderText, SoftMaskImage, TextMarkupVariant, TextRenderMode, TextRun, ThreeDActivation,
     ThreeDViewSelector, XmpPacket,
 };
 pub use sig::{
