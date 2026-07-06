@@ -38,7 +38,8 @@ use crate::pubsec::{
 };
 use crate::reader::content::{
     parse_content_stream_full_with_soft_masks, parse_content_stream_full_with_tiling,
-    parse_content_stream_full_with_type3, ResolvedSoftMask, TilingPattern, Type3Font,
+    parse_content_stream_full_with_type3, ResolvedImageXObject, ResolvedSoftMask, TilingPattern,
+    Type3Font,
 };
 use crate::reader::parse::Parser;
 use crate::reader::xref::{parse_xref, XrefEntry, XrefTable};
@@ -1318,6 +1319,11 @@ fn decode_page(
     } else {
         None
     };
+    let image_xobjects = if let Some(rdict) = resources_dict.as_ref() {
+        resolve_image_xobjects(reader, rdict)?
+    } else {
+        None
+    };
 
     let parsed = parse_content_stream_full_with_soft_masks(
         &content_bytes,
@@ -1332,6 +1338,7 @@ fn decode_page(
         type3_fonts.as_ref(),
         soft_masks.as_ref(),
         transparency_groups.as_ref(),
+        image_xobjects.as_ref(),
     )?;
     let mut root = parsed.root;
 
@@ -2418,6 +2425,214 @@ const MAX_XOBJECT_DEPTH: usize = 12;
 /// `None`, missing a usable `/S` or `/G`, or whose group parses to
 /// nothing are skipped (the walker then paints unmasked — the same
 /// tolerant degradation every unresolvable resource takes).
+/// Decode every `/Resources /XObject` entry that is a
+/// straight-decodable Image XObject (§8.9.5) into RGBA8 for scene
+/// splicing at `Do` time: the `/Filter` chain must decode end-to-end
+/// (Flate / LZW / ASCII / RunLength / none — image-codec payloads
+/// stay on the passthrough walker), `/BitsPerComponent` must be 8,
+/// and `/ColorSpace` must be `/DeviceRGB` (3 samples/pixel) or
+/// `/DeviceGray` (1). A `/SMask` soft-mask image (§11.6.5.3) of the
+/// same decodable shape supplies the alpha channel, resampled
+/// nearest-neighbour when its dimensions differ from the parent's
+/// (Table 145 — both map onto the unit square). Oversized images are
+/// skipped (64 MB decoded-RGBA cap) rather than ballooning memory.
+fn resolve_image_xobjects(
+    reader: &mut DocumentReader<'_>,
+    resources: &Dict,
+) -> Result<Option<BTreeMap<String, ResolvedImageXObject>>, PdfError> {
+    const MAX_RGBA_BYTES: usize = 64 << 20;
+    let xobj_obj = resources
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "XObject")
+        .map(|(_, v)| v.clone());
+    let xobj_obj = match xobj_obj {
+        Some(Object::Reference(id)) => reader.resolve(id)?,
+        Some(other) => other,
+        None => return Ok(None),
+    };
+    let Object::Dict(xobj_dict) = xobj_obj else {
+        return Ok(None);
+    };
+    let mut out: BTreeMap<String, ResolvedImageXObject> = BTreeMap::new();
+    for (name, value) in xobj_dict.entries() {
+        let resolved = match value {
+            Object::Reference(id) => reader.resolve(*id)?,
+            other => other.clone(),
+        };
+        let Object::Stream(stream) = resolved else {
+            continue;
+        };
+        let Some((w, h, comps)) = decodable_image_shape(reader, &stream.dict)? else {
+            continue;
+        };
+        let rgba_len = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+        if rgba_len == 0 || rgba_len > MAX_RGBA_BYTES {
+            continue;
+        }
+        let Ok(samples) = decode_stream(&stream) else {
+            continue;
+        };
+        let need = (w as usize) * (h as usize) * comps;
+        if samples.len() < need {
+            continue;
+        }
+        // /SMask (§11.6.5.3) — the alpha channel, when decodable.
+        let alpha = resolve_image_alpha(reader, &stream.dict, w, h)?;
+        let mut rgba = Vec::with_capacity(rgba_len);
+        for i in 0..(w as usize) * (h as usize) {
+            let (r, g, b) = if comps == 3 {
+                (samples[i * 3], samples[i * 3 + 1], samples[i * 3 + 2])
+            } else {
+                (samples[i], samples[i], samples[i])
+            };
+            let a = alpha.as_ref().map_or(255, |al| al[i]);
+            rgba.extend_from_slice(&[r, g, b, a]);
+        }
+        out.insert(
+            name.clone(),
+            ResolvedImageXObject {
+                width: w,
+                height: h,
+                rgba,
+            },
+        );
+    }
+    if out.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(out))
+    }
+}
+
+/// Check an image dictionary for the straight-decodable shape and
+/// return `(width, height, components)`. `None` = leave the image to
+/// the passthrough walker.
+fn decodable_image_shape(
+    reader: &mut DocumentReader<'_>,
+    dict: &Dict,
+) -> Result<Option<(u32, u32, usize)>, PdfError> {
+    let subtype = dict.entries().iter().find(|(k, _)| k == "Subtype");
+    if !matches!(subtype, Some((_, Object::Name(n))) if n == "Image") {
+        return Ok(None);
+    }
+    // /ImageMask stencils (§8.9.6.2) carry no colour samples.
+    if matches!(
+        dict.entries().iter().find(|(k, _)| k == "ImageMask"),
+        Some((_, Object::Bool(true)))
+    ) {
+        return Ok(None);
+    }
+    let (Some(w), Some(h)) = (int_entry(dict, "Width"), int_entry(dict, "Height")) else {
+        return Ok(None);
+    };
+    if w <= 0 || h <= 0 {
+        return Ok(None);
+    }
+    if int_entry(dict, "BitsPerComponent").unwrap_or(8) != 8 {
+        return Ok(None);
+    }
+    // Filter chain must be fully decodable — no image-codec terminal.
+    let decodable = |n: &str| {
+        matches!(
+            n,
+            "FlateDecode"
+                | "Fl"
+                | "LZWDecode"
+                | "LZW"
+                | "ASCII85Decode"
+                | "A85"
+                | "ASCIIHexDecode"
+                | "AHx"
+                | "RunLengthDecode"
+                | "RL"
+        )
+    };
+    match dict.entries().iter().find(|(k, _)| k == "Filter") {
+        None => {}
+        Some((_, Object::Name(n))) if decodable(n) => {}
+        Some((_, Object::Array(items)))
+            if items
+                .iter()
+                .all(|i| matches!(i, Object::Name(n) if decodable(n))) => {}
+        Some(_) => return Ok(None),
+    }
+    let cs = dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "ColorSpace")
+        .map(|(_, v)| v.clone());
+    let cs = match cs {
+        Some(Object::Reference(id)) => Some(reader.resolve(id)?),
+        other => other,
+    };
+    let comps = match cs {
+        Some(Object::Name(n)) if n == "DeviceRGB" => 3,
+        Some(Object::Name(n)) if n == "DeviceGray" => 1,
+        _ => return Ok(None),
+    };
+    Ok(Some((w as u32, h as u32, comps)))
+}
+
+/// Resolve a scene-spliced image's `/SMask` (§11.6.5.3) to a per-pixel
+/// alpha plane at the parent's `w × h`, nearest-neighbour resampled
+/// when the mask's own dimensions differ. `Ok(None)` = fully opaque.
+fn resolve_image_alpha(
+    reader: &mut DocumentReader<'_>,
+    parent_dict: &Dict,
+    w: u32,
+    h: u32,
+) -> Result<Option<Vec<u8>>, PdfError> {
+    let sm = parent_dict
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "SMask")
+        .map(|(_, v)| v.clone());
+    let sm = match sm {
+        Some(Object::Reference(id)) => reader.resolve(id)?,
+        Some(other) => other,
+        None => return Ok(None),
+    };
+    let Object::Stream(stream) = sm else {
+        return Ok(None);
+    };
+    let Some((mw, mh, comps)) = decodable_image_shape(reader, &stream.dict)? else {
+        return Ok(None);
+    };
+    if comps != 1 {
+        // Table 145: the soft-mask image's colour space shall be
+        // /DeviceGray.
+        return Ok(None);
+    }
+    let Ok(samples) = decode_stream(&stream) else {
+        return Ok(None);
+    };
+    if samples.len() < (mw as usize) * (mh as usize) {
+        return Ok(None);
+    }
+    let mut alpha = Vec::with_capacity((w as usize) * (h as usize));
+    for y in 0..h {
+        let my = (y as u64 * mh as u64 / h as u64).min(mh as u64 - 1) as usize;
+        for x in 0..w {
+            let mx = (x as u64 * mw as u64 / w as u64).min(mw as u64 - 1) as usize;
+            alpha.push(samples[my * mw as usize + mx]);
+        }
+    }
+    Ok(Some(alpha))
+}
+
+/// A dictionary entry read as an integer, or `None`.
+fn int_entry(d: &Dict, key: &str) -> Option<i64> {
+    d.entries()
+        .iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| match v {
+            Object::Integer(n) => Some(*n),
+            Object::Real(f) => Some(*f as i64),
+            _ => None,
+        })
+}
+
 /// Collect the names of the `/Resources /XObject` entries that are
 /// *transparency-group* XObjects — form XObjects whose `/Group`
 /// attributes dictionary has subtype `/S /Transparency` (§11.6.6
@@ -2780,6 +2995,10 @@ fn resolve_one_form_xobject(
         Some(r) => transparency_group_names(reader, r)?,
         None => None,
     };
+    let image_xobjects = match form_resources.as_ref() {
+        Some(r) => resolve_image_xobjects(reader, r)?,
+        None => None,
+    };
 
     let parsed = parse_content_stream_full_with_soft_masks(
         &content_bytes,
@@ -2794,6 +3013,7 @@ fn resolve_one_form_xobject(
         type3_fonts.as_ref(),
         soft_masks.as_ref(),
         transparency_groups.as_ref(),
+        image_xobjects.as_ref(),
     )?;
 
     // The content parser returns a root `Group` carrying any top-level

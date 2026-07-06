@@ -390,6 +390,9 @@ fn cyclic_form_xobject_is_guarded() {
 
 #[test]
 fn image_xobject_do_is_scene_noop() {
+    // Round 393 update: a *straight-decodable* Image XObject `Do` now
+    // splices a `Node::Image` into the scene (§8.9.5.2) — it still
+    // contributes no vector geometry.
     let pdf = build_image_xobject_pdf();
     let scene = read_pdf_to_scene(&pdf).expect("read PDF to scene");
     let root = &scene.pages.as_ref().unwrap()[0].content.root;
@@ -400,9 +403,19 @@ fn image_xobject_do_is_scene_noop() {
         fills.is_empty(),
         "an Image XObject Do does not splice vector geometry, got {fills:?}"
     );
-    // The vector tree should have no painted children from the image.
-    assert!(
-        root.children.is_empty(),
-        "image XObject leaves the scene tree empty on the vector side"
+    fn count_images(g: &oxideav_core::vector::Group) -> usize {
+        g.children
+            .iter()
+            .map(|c| match c {
+                Node::Image(_) => 1,
+                Node::Group(gg) => count_images(gg),
+                _ => 0,
+            })
+            .sum()
+    }
+    assert_eq!(
+        count_images(root),
+        1,
+        "the decodable gray image splices as one Node::Image"
     );
 }

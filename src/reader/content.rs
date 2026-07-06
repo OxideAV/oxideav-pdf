@@ -86,10 +86,11 @@ use std::str;
 use std::rc::Rc;
 
 use oxideav_core::vector::{
-    DashPattern, FillRule, GradientStop, Group, LineCap, LineJoin, LinearGradient, MaskKind, Node,
-    Paint, Path, PathCommand, PathNode, Point, RadialGradient, Rgba, SpreadMethod, Stroke,
-    Transform2D,
+    DashPattern, FillRule, GradientStop, Group, ImageRef, LineCap, LineJoin, LinearGradient,
+    MaskKind, Node, Paint, Path, PathCommand, PathNode, Point, RadialGradient, Rect, Rgba,
+    SpreadMethod, Stroke, Transform2D,
 };
+use oxideav_core::{VideoFrame, VideoPlane};
 
 use crate::error::PdfError;
 use crate::objects::{Dict, Object};
@@ -465,6 +466,7 @@ pub fn parse_content_stream_full_with_soft_masks(
     type3_fonts: Option<&BTreeMap<String, Type3Font>>,
     soft_masks: Option<&BTreeMap<String, ResolvedSoftMask>>,
     transparency_groups: Option<&BTreeSet<String>>,
+    image_xobjects: Option<&BTreeMap<String, ResolvedImageXObject>>,
 ) -> Result<ParsedContent, PdfError> {
     let mut state = State::new(
         ext_gstate,
@@ -478,7 +480,8 @@ pub fn parse_content_stream_full_with_soft_masks(
     .with_tiling_patterns(tiling_patterns)
     .with_type3_fonts(type3_fonts)
     .with_soft_masks(soft_masks)
-    .with_transparency_groups(transparency_groups);
+    .with_transparency_groups(transparency_groups)
+    .with_image_xobjects(image_xobjects);
     state.parse(input)?;
     Ok(state.finish())
 }
@@ -1095,6 +1098,15 @@ struct State<'a> {
     /// be subject to any grouping behaviour for transparency
     /// purposes".
     transparency_groups: Option<&'a BTreeSet<String>>,
+    /// Pre-decoded Image XObjects (§8.9.5) from the page's
+    /// `/Resources /XObject` subdictionary, keyed by resource name. A
+    /// `Do` naming one splices a [`Node::Image`] into the scene — the
+    /// image fills the unit square of the space the `Do` executes in
+    /// (§8.9.5.2), with sample (0,0) on the top edge. `None` (or a
+    /// name not present, e.g. an undecodable codec payload) keeps the
+    /// image-`Do` a scene no-op, surfaced separately by the
+    /// passthrough walker.
+    image_xobjects: Option<&'a BTreeMap<String, ResolvedImageXObject>>,
 }
 
 /// A `/PatternType 1` tiling pattern (§8.7.3) reduced to what the
@@ -1189,6 +1201,26 @@ pub struct ResolvedSoftMask {
     /// (default: black, which the unpainted mask area already
     /// evaluates to, so no rectangle is inserted).
     pub mask: Group,
+}
+
+/// An Image XObject (§8.9.5) decoded to straight RGBA8 for splicing
+/// into the `Scene` at `Do` time. Only the fully-decodable shape is
+/// resolved here — a filter chain the crate decodes end-to-end
+/// (Flate / LZW / ASCII / RunLength / none), `/BitsPerComponent 8`,
+/// and a `/DeviceRGB` or `/DeviceGray` colour space — optionally
+/// combined with a same-shape `/SMask` soft-mask image (§11.6.5.3)
+/// supplying the alpha channel. Image-codec payloads (DCTDecode /
+/// JPXDecode / …) stay on the [`crate::reader::images`] passthrough
+/// walker.
+#[derive(Clone, Debug)]
+pub struct ResolvedImageXObject {
+    /// `/Width` in samples.
+    pub width: u32,
+    /// `/Height` in samples.
+    pub height: u32,
+    /// Straight (non-premultiplied) RGBA8, row-major, row 0 = the
+    /// image's top row (§8.9.5.2 sample (0,0)).
+    pub rgba: Vec<u8>,
 }
 
 /// The soft mask currently in force in the graphics state (§11.6.4.3),
@@ -3160,6 +3192,7 @@ impl<'a> State<'a> {
             soft_masks: None,
             active_smask: None,
             transparency_groups: None,
+            image_xobjects: None,
         }
     }
 
@@ -3218,6 +3251,16 @@ impl<'a> State<'a> {
     /// (§11.6.6) so `Do` applies group-level compositing semantics.
     fn with_transparency_groups(mut self, groups: Option<&'a BTreeSet<String>>) -> Self {
         self.transparency_groups = groups;
+        self
+    }
+
+    /// Attach the pre-decoded Image XObjects (§8.9.5) so a `Do`
+    /// naming one splices a [`Node::Image`] into the scene.
+    fn with_image_xobjects(
+        mut self,
+        images: Option<&'a BTreeMap<String, ResolvedImageXObject>>,
+    ) -> Self {
+        self.image_xobjects = images;
         self
     }
 
@@ -4023,6 +4066,41 @@ impl<'a> State<'a> {
                     _ => String::new(),
                 };
                 if !name.is_empty() {
+                    // Image XObject (§8.9.5.2): the image fills the
+                    // unit square of the current space, sample (0,0)
+                    // on the top edge. The `ImageRef` convention
+                    // (established by this crate's writer) doubles
+                    // `bounds` as the pixel dimensions with data row 0
+                    // at the top of the rect, so the splice is
+                    // `bounds = (0, 0, w, h)` under a `1/w × 1/h`
+                    // scale: the writer's own `T(bx, by+bh)·S(bw,-bh)`
+                    // placement composed with that scale reproduces
+                    // the §8.9.5.2 unit-square map exactly (the two
+                    // vertical flips cancel), making the node
+                    // writer-round-trippable.
+                    if let Some(img) = self.image_xobjects.and_then(|m| m.get(&name)) {
+                        let node = Node::Image(ImageRef {
+                            frame: Box::new(VideoFrame {
+                                pts: None,
+                                planes: vec![VideoPlane {
+                                    stride: img.width as usize * 4,
+                                    data: img.rgba.clone(),
+                                }],
+                            }),
+                            bounds: Rect::new(0.0, 0.0, img.width as f32, img.height as f32),
+                            transform: Transform2D {
+                                a: 1.0 / img.width as f32,
+                                b: 0.0,
+                                c: 0.0,
+                                d: 1.0 / img.height as f32,
+                                e: 0.0,
+                                f: 0.0,
+                            },
+                        });
+                        self.push_painted(node);
+                        self.operands.clear();
+                        return Ok(());
+                    }
                     if let Some(form) = self.xobject_forms.and_then(|m| m.get(&name)) {
                         if !form.children.is_empty() {
                             let mut group = form.clone();
@@ -9176,6 +9254,7 @@ mod tests {
             None,
             None,
             Some(masks),
+            None,
             None,
         )
         .unwrap()

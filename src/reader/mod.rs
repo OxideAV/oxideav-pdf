@@ -53,8 +53,8 @@ pub use content::{
     parse_content_stream_full_with_properties, parse_content_stream_full_with_shading,
     parse_content_stream_full_with_soft_masks, parse_content_stream_with_resources,
     ContentInlineImage, ContentMarkedContent, ContentShading, ContentTextShow, MarkedContentOp,
-    MeshPatch, MeshShading, MeshTriangle, MeshVertex, ParsedContent, ResolvedSoftMask,
-    ShadingGradient, TextShowOp,
+    MeshPatch, MeshShading, MeshTriangle, MeshVertex, ParsedContent, ResolvedImageXObject,
+    ResolvedSoftMask, ShadingGradient, TextShowOp,
 };
 pub use document::{
     read_pdf_to_scene, read_pdf_to_scene_with_certificate,
