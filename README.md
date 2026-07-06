@@ -200,7 +200,9 @@ for an end-to-end verify.
   author order, falling back to raster order when no struct tree exists.
 - **Image XObjects** — `image_xobjects()` surfaces every `/DCTDecode`
   Image XObject as a self-contained JPEG stream with dimensions,
-  colour space, and bits-per-component.
+  colour space, and bits-per-component, plus its `/SMask` soft-mask
+  image (§11.6.5.3) — dimensions, decoded gray samples, and the
+  `/Matte` preblending colour.
 - **Inline images** — `inline_images()` surfaces every `BI … ID … EI`
   triplet (§8.9.7) with its filter tag. The content-stream walker also
   consumes inline images in place (so a binary payload no longer
@@ -254,8 +256,19 @@ result becomes a nested `Group` carrying the form's `/Matrix` as its
 transform and the `/BBox` rectangle as its clip — the §8.10.1
 q / concat-Matrix / clip-BBox / paint / Q algorithm. Form recursion is
 depth-bounded and cycle-guarded, so a self-referential appearance stream
-terminates. Image XObjects stay a vector-side no-op (surfaced separately
-by `image_xobjects()`).
+terminates.
+
+**Image XObjects** (§8.9.5) whose `/Filter` chain the crate decodes
+end-to-end (Flate / LZW / ASCII / RunLength / none, 8 bits/component,
+`/DeviceRGB` / `/DeviceGray`) are painted into the `Scene` as
+`Node::Image`: the RGBA8 payload combines the colour samples with the
+`/SMask` soft-mask image's alpha (§11.6.5.3 — nearest-neighbour
+resampled when its dimensions differ), placed on the §8.9.5.2 unit
+square with sample (0,0) on the top edge, in the writer's own
+`ImageRef` convention — so `write_pdf` → `read_pdf_to_scene`
+reproduces an authored image node's pixels, alpha, and placement
+exactly. Image-codec payloads (`DCTDecode` / `JPXDecode` / …) stay
+scene-side no-ops, surfaced by `image_xobjects()`.
 
 **Type 3 font glyphs** (§9.6.5) are painted into the `Scene` as vector
 geometry. A Type 3 font is the one simple-font family whose glyphs are
