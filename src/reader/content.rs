@@ -83,9 +83,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::str;
 
+use std::rc::Rc;
+
 use oxideav_core::vector::{
-    DashPattern, FillRule, GradientStop, Group, LineCap, LineJoin, LinearGradient, Node, Paint,
-    Path, PathCommand, PathNode, Point, RadialGradient, Rgba, SpreadMethod, Stroke, Transform2D,
+    DashPattern, FillRule, GradientStop, Group, LineCap, LineJoin, LinearGradient, MaskKind, Node,
+    Paint, Path, PathCommand, PathNode, Point, RadialGradient, Rgba, SpreadMethod, Stroke,
+    Transform2D,
 };
 
 use crate::error::PdfError;
@@ -434,6 +437,46 @@ pub fn parse_content_stream_full_with_type3(
     .with_pattern_resources(pattern_resources)
     .with_tiling_patterns(tiling_patterns)
     .with_type3_fonts(type3_fonts);
+    state.parse(input)?;
+    Ok(state.finish())
+}
+
+/// Like [`parse_content_stream_full_with_type3`] but also accepts the
+/// pre-resolved `/ExtGState /SMask` soft masks (§11.6.5.2), keyed by
+/// ExtGState resource name. A `gs` naming an entry establishes it as
+/// the current soft mask (§11.6.4.3); every subsequently painted
+/// object (path, form splice, clipped `sh`, tiling fill, Type 3
+/// glyph) is wrapped in a [`Node::SoftMask`] whose `mask` subtree is
+/// the `/G` transparency group at `/Matrix ∘ CTM-at-gs-time` and whose
+/// `mask_kind` maps `/Luminosity` → [`MaskKind::Luminance`] and
+/// `/Alpha` → [`MaskKind::Alpha`]. `/SMask /None` — and a `Q`
+/// restoring a state saved before the mask was set — clears it.
+#[allow(clippy::too_many_arguments)]
+pub fn parse_content_stream_full_with_soft_masks(
+    input: &[u8],
+    ext_gstate: Option<&Dict>,
+    font_resources: Option<&Dict>,
+    shading_resources: Option<&Dict>,
+    color_space_resources: Option<&Dict>,
+    properties_resources: Option<&Dict>,
+    xobject_forms: Option<&BTreeMap<String, Group>>,
+    pattern_resources: Option<&Dict>,
+    tiling_patterns: Option<&BTreeMap<String, TilingPattern>>,
+    type3_fonts: Option<&BTreeMap<String, Type3Font>>,
+    soft_masks: Option<&BTreeMap<String, ResolvedSoftMask>>,
+) -> Result<ParsedContent, PdfError> {
+    let mut state = State::new(
+        ext_gstate,
+        font_resources,
+        shading_resources,
+        color_space_resources,
+        properties_resources,
+    )
+    .with_xobject_forms(xobject_forms)
+    .with_pattern_resources(pattern_resources)
+    .with_tiling_patterns(tiling_patterns)
+    .with_type3_fonts(type3_fonts)
+    .with_soft_masks(soft_masks);
     state.parse(input)?;
     Ok(state.finish())
 }
@@ -1028,6 +1071,17 @@ struct State<'a> {
     /// another (or the same) Type 3 font; this caps the nesting so a
     /// self-referential `/CharProcs` entry can't recurse without bound.
     type3_depth: u32,
+    /// Pre-resolved `/ExtGState /SMask` soft-mask dictionaries
+    /// (§11.6.5.2), keyed by ExtGState resource name, supplied by
+    /// [`parse_content_stream_full_with_soft_masks`]. When a `gs`
+    /// names an entry present here, the mask becomes the current soft
+    /// mask (§11.6.4.3) and subsequently painted objects are wrapped
+    /// in [`Node::SoftMask`]. `None` (the legacy entry points) leaves
+    /// `/SMask` a tolerated no-op.
+    soft_masks: Option<&'a BTreeMap<String, ResolvedSoftMask>>,
+    /// The soft mask currently in force (§11.6.4.3). Part of the
+    /// graphics state — bracketed by `q`/`Q` via [`GStateSnapshot`].
+    active_smask: Option<ActiveSoftMask>,
 }
 
 /// A `/PatternType 1` tiling pattern (§8.7.3) reduced to what the
@@ -1097,6 +1151,45 @@ pub struct Type3Font {
     pub shape_only: BTreeSet<String>,
 }
 
+/// An `/ExtGState /SMask` soft-mask dictionary (§11.6.5.2 Table 144)
+/// resolved to what the content walker needs to composite painted
+/// objects through it: the `/G` transparency-group XObject pre-parsed
+/// into a [`Group`] (its `/Matrix` on the group transform, its `/BBox`
+/// as the group clip, its content parsed against its own
+/// `/Resources`), and the `/S` subtype mapped onto the core IR's
+/// [`MaskKind`] — `/Luminosity` (§11.5.3, the group's computed colour
+/// converted to a single-component luminosity) becomes
+/// [`MaskKind::Luminance`], `/Alpha` (§11.5.2, the group's computed
+/// alpha with colours disregarded) becomes [`MaskKind::Alpha`].
+#[derive(Clone, Debug)]
+pub struct ResolvedSoftMask {
+    /// `/S` — the mask-derivation subtype (Table 144).
+    pub kind: MaskKind,
+    /// `/G` — the transparency-group XObject parsed into a group
+    /// exactly like a `Do`-spliced Form XObject (§8.10.1).
+    pub mask: Group,
+}
+
+/// The soft mask currently in force in the graphics state (§11.6.4.3),
+/// established by a `gs` whose parameter dictionary carried an
+/// `/SMask` soft-mask dictionary and cleared by `/SMask /None` (or a
+/// `Q` restoring a state saved before the mask was set).
+#[derive(Clone)]
+struct ActiveSoftMask {
+    /// The resolved `/G` group, shared so per-paint wrapping doesn't
+    /// deep-clone until a painted node actually needs it.
+    mask: Rc<Node>,
+    /// `/S` subtype mapped to the IR mask kind.
+    kind: MaskKind,
+    /// User-space CTM at the moment the mask was established — §11.6.5.2:
+    /// "The mask's coordinate system shall be defined by concatenating
+    /// the … Matrix entry in the transparency group's form dictionary
+    /// with the current transformation matrix at the moment the soft
+    /// mask is established in the graphics state with the gs operator."
+    /// (`Matrix` is already on the mask group's transform.)
+    ctm: Transform2D,
+}
+
 struct Frame {
     /// Transform applied to this group via `cm` operators since `q`.
     transform: Transform2D,
@@ -1144,6 +1237,9 @@ struct GStateSnapshot {
     fill_tiling: Option<String>,
     fill_tiling_color: Option<Rgba>,
     stroke_tiling: Option<String>,
+    /// Current soft mask (§11.6.4.3 Table 52 — part of the graphics
+    /// state, so saved/restored with the rest of the snapshot).
+    active_smask: Option<ActiveSoftMask>,
 }
 
 #[derive(Clone, Debug)]
@@ -3040,6 +3136,8 @@ impl<'a> State<'a> {
             text_render_mode: 0,
             text_rise: 0.0,
             type3_depth: 0,
+            soft_masks: None,
+            active_smask: None,
         }
     }
 
@@ -3081,6 +3179,16 @@ impl<'a> State<'a> {
     /// vector side.
     fn with_type3_fonts(mut self, fonts: Option<&'a BTreeMap<String, Type3Font>>) -> Self {
         self.type3_fonts = fonts;
+        self
+    }
+
+    /// Attach the pre-resolved `/ExtGState /SMask` soft masks
+    /// (§11.6.5.2) so a `gs` naming one establishes it as the current
+    /// soft mask and painted objects composite through it as
+    /// [`Node::SoftMask`]. The legacy entry points leave this `None`
+    /// and `/SMask` stays a tolerated no-op.
+    fn with_soft_masks(mut self, masks: Option<&'a BTreeMap<String, ResolvedSoftMask>>) -> Self {
+        self.soft_masks = masks;
         self
     }
 
@@ -3135,6 +3243,7 @@ impl<'a> State<'a> {
             fill_tiling: self.fill_tiling.clone(),
             fill_tiling_color: self.fill_tiling_color,
             stroke_tiling: self.stroke_tiling.clone(),
+            active_smask: self.active_smask.clone(),
         }
     }
 
@@ -3161,6 +3270,45 @@ impl<'a> State<'a> {
         self.fill_tiling = s.fill_tiling;
         self.fill_tiling_color = s.fill_tiling_color;
         self.stroke_tiling = s.stroke_tiling;
+        self.active_smask = s.active_smask;
+    }
+
+    /// Wrap a freshly painted node in the current soft mask
+    /// (§11.6.4.3 — "At most one mask input … shall be provided to any
+    /// PDF compositing operation") and attach it to the current frame.
+    /// With no mask in force this is a plain push.
+    fn push_painted(&mut self, node: Node) {
+        let node = self.wrap_soft_mask(node, self.effective_ctm());
+        self.current().children.push(node);
+    }
+
+    /// Wrap `node` in the active soft mask, if any. `local_to_user` is
+    /// the transform from the coordinate space `node` sits in (the
+    /// frame it will be attached to) up to user space — the mask's
+    /// coordinate system is `/Matrix ∘ CTM-at-gs-time` (§11.6.5.2), so
+    /// the mask subtree is re-expressed relative to the node's local
+    /// space by `inverse(local_to_user) ∘ ctm_gs`. In the common case
+    /// (mask established and used under the same CTM) that composes to
+    /// the identity.
+    fn wrap_soft_mask(&self, node: Node, local_to_user: Transform2D) -> Node {
+        let Some(sm) = &self.active_smask else {
+            return node;
+        };
+        let rel = match invert_transform(local_to_user) {
+            Some(inv) => compose(inv, sm.ctm),
+            // A singular CTM collapses everything painted under it
+            // anyway; anchor the mask in user space as a fallback.
+            None => sm.ctm,
+        };
+        Node::SoftMask {
+            mask: Box::new(Node::Group(Group {
+                transform: rel,
+                children: vec![(*sm.mask).clone()],
+                ..Group::default()
+            })),
+            mask_kind: sm.kind,
+            content: Box::new(node),
+        }
     }
 
     fn push_q(&mut self) {
@@ -3241,6 +3389,7 @@ impl<'a> State<'a> {
                 if let (Some(name), Some(ext_gstate)) = (name, self.ext_gstate) {
                     if let Some(dict) = lookup_dict(ext_gstate, &name) {
                         self.apply_ext_gstate(dict);
+                        self.apply_soft_mask_entry(&name, dict);
                     }
                 }
             }
@@ -3847,7 +3996,7 @@ impl<'a> State<'a> {
                 if !name.is_empty() {
                     if let Some(form) = self.xobject_forms.and_then(|m| m.get(&name)) {
                         if !form.children.is_empty() {
-                            self.current().children.push(Node::Group(form.clone()));
+                            self.push_painted(Node::Group(form.clone()));
                         }
                     }
                 }
@@ -3916,7 +4065,7 @@ impl<'a> State<'a> {
                             stroke: None,
                             fill_rule: FillRule::NonZero,
                         });
-                        self.current().children.push(node);
+                        self.push_painted(node);
                     }
                 }
                 self.shadings.push(ContentShading {
@@ -4141,7 +4290,7 @@ impl<'a> State<'a> {
             stroke: stroke_obj,
             fill_rule: rule,
         });
-        self.current().children.push(node);
+        self.push_painted(node);
         self.operands.clear();
     }
 
@@ -4285,7 +4434,12 @@ impl<'a> State<'a> {
             children: tiles,
             ..Group::default()
         };
-        self.stack[0].children.push(Node::Group(group));
+        // The tiled group is attached to the *root* frame (its lattice
+        // is anchored to the page's default space, §8.7.2 NOTE 1), so
+        // the soft-mask wrap — if one is in force — is expressed
+        // relative to root-local space rather than the current frame's.
+        let node = self.wrap_soft_mask(Node::Group(group), self.stack[0].transform);
+        self.stack[0].children.push(node);
         true
     }
 
@@ -4508,7 +4662,17 @@ impl<'a> State<'a> {
         // resolve time), so the runtime guard simply caps how deep a
         // single show's nodes nest before they're attached here.
         self.type3_depth += 1;
-        self.current().children.extend(nodes);
+        // Each glyph is an elementary object for compositing purposes
+        // (§11.6.4.2) — the active soft mask wraps every one.
+        if self.active_smask.is_some() {
+            let ctm = self.effective_ctm();
+            for node in nodes {
+                let wrapped = self.wrap_soft_mask(node, ctm);
+                self.current().children.push(wrapped);
+            }
+        } else {
+            self.current().children.extend(nodes);
+        }
         self.type3_depth -= 1;
     }
 
@@ -4588,10 +4752,50 @@ impl<'a> State<'a> {
                         self.fill_alpha = n.clamp(0.0, 1.0);
                     }
                 }
+                // `SMask` is handled by `apply_soft_mask_entry` (the
+                // dispatcher passes the ExtGState resource *name*,
+                // which the pre-resolved soft-mask map is keyed by).
+                //
                 // Tolerated-but-unhandled keys (Table 58):
                 //   Type, RI, OP, op, OPM, Font, BG, BG2, UCR, UCR2,
-                //   TR, TR2, HT, FL, SM, SA, BM, SMask, AIS, TK.
+                //   TR, TR2, HT, FL, SM, SA, BM, AIS, TK.
                 _ => {}
+            }
+        }
+    }
+
+    /// Handle the `/SMask` entry of a `gs` parameter dictionary
+    /// (§11.6.4.3): the name `None` denotes the absence of a soft mask
+    /// ("the mask shape or opacity shall be implicitly 1.0
+    /// everywhere"); a soft-mask dictionary establishes the current
+    /// soft mask, resolved through the pre-parsed map keyed by the
+    /// ExtGState resource name. A dictionary that didn't resolve (bad
+    /// `/G`, unknown `/S`) also clears the mask — painting unmasked is
+    /// the same tolerant degradation every other unresolvable resource
+    /// takes, and safer than leaving a stale mask in force.
+    fn apply_soft_mask_entry(&mut self, gs_name: &str, dict: &Dict) {
+        let Some(value) = dict
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "SMask")
+            .map(|(_, v)| v)
+        else {
+            return;
+        };
+        if matches!(value, Object::Name(n) if n == "None") {
+            self.active_smask = None;
+            return;
+        }
+        match self.soft_masks.and_then(|m| m.get(gs_name)) {
+            Some(resolved) => {
+                self.active_smask = Some(ActiveSoftMask {
+                    mask: Rc::new(Node::Group(resolved.mask.clone())),
+                    kind: resolved.kind,
+                    ctm: self.effective_ctm(),
+                });
+            }
+            None => {
+                self.active_smask = None;
             }
         }
     }
@@ -8854,6 +9058,190 @@ mod tests {
             panic!("fill")
         };
         assert_eq!((c.r, c.g, c.b), (255, 0, 0), "outer red restored");
+    }
+
+    // ── /SMask soft masks (§11.6.4.3 + §11.6.5.2) ──
+
+    /// Build a soft-mask map with one entry (`GS1`) whose mask group
+    /// is a white 10×10 square.
+    fn smask_map(kind: MaskKind) -> BTreeMap<String, ResolvedSoftMask> {
+        let mut p = Path::new();
+        p.commands.push(PathCommand::MoveTo(Point::new(0.0, 0.0)));
+        p.commands.push(PathCommand::LineTo(Point::new(10.0, 0.0)));
+        p.commands.push(PathCommand::LineTo(Point::new(10.0, 10.0)));
+        p.commands.push(PathCommand::LineTo(Point::new(0.0, 10.0)));
+        p.commands.push(PathCommand::Close);
+        let mask = Group {
+            children: vec![Node::Path(PathNode {
+                path: p,
+                fill: Some(Paint::Solid(Rgba::opaque(255, 255, 255))),
+                stroke: None,
+                fill_rule: FillRule::NonZero,
+            })],
+            ..Group::default()
+        };
+        let mut m = BTreeMap::new();
+        m.insert("GS1".to_string(), ResolvedSoftMask { kind, mask });
+        m
+    }
+
+    /// ExtGState resources where `GS1` carries an `/SMask` soft-mask
+    /// dictionary and `GS2` carries `/SMask /None`.
+    fn smask_ext_gstate() -> Dict {
+        let sm = Dict::new()
+            .with("Type", Object::Name("Mask".into()))
+            .with("S", Object::Name("Luminosity".into()));
+        let mut ext = Dict::new();
+        ext.set(
+            "GS1",
+            Object::Dict(
+                Dict::new()
+                    .with("Type", Object::Name("ExtGState".into()))
+                    .with("SMask", Object::Dict(sm)),
+            ),
+        );
+        ext.set(
+            "GS2",
+            Object::Dict(
+                Dict::new()
+                    .with("Type", Object::Name("ExtGState".into()))
+                    .with("SMask", Object::Name("None".into())),
+            ),
+        );
+        ext
+    }
+
+    fn parse_with_smask(
+        input: &[u8],
+        ext: &Dict,
+        masks: &BTreeMap<String, ResolvedSoftMask>,
+    ) -> Group {
+        parse_content_stream_full_with_soft_masks(
+            input,
+            Some(ext),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(masks),
+        )
+        .unwrap()
+        .root
+    }
+
+    /// A path painted under an established soft mask is wrapped in
+    /// `Node::SoftMask` with the resolved kind and mask geometry.
+    #[test]
+    fn smask_wraps_painted_path() {
+        let ext = smask_ext_gstate();
+        let masks = smask_map(MaskKind::Luminance);
+        let bytes = b"q /GS1 gs 1 0 0 rg 0 0 m 20 0 l 20 20 l h f Q\n";
+        let root = parse_with_smask(bytes, &ext, &masks);
+        let Node::Group(g) = &root.children[0] else {
+            panic!("q frame group");
+        };
+        let Node::SoftMask {
+            mask,
+            mask_kind,
+            content,
+        } = &g.children[0]
+        else {
+            panic!("expected SoftMask wrap, got {:?}", g.children[0]);
+        };
+        assert_eq!(*mask_kind, MaskKind::Luminance);
+        // Content is the red path.
+        let Node::Path(p) = content.as_ref() else {
+            panic!("content path");
+        };
+        let Some(Paint::Solid(c)) = &p.fill else {
+            panic!("fill");
+        };
+        assert_eq!((c.r, c.g, c.b), (255, 0, 0));
+        // Mask subtree carries the white square, under an identity
+        // relative transform (mask established and used at the same
+        // CTM).
+        let Node::Group(mg) = mask.as_ref() else {
+            panic!("mask group");
+        };
+        assert!(mg.transform.is_identity(), "same-CTM mask is identity");
+        let Node::Group(inner) = &mg.children[0] else {
+            panic!("resolved mask group");
+        };
+        assert!(matches!(inner.children[0], Node::Path(_)));
+    }
+
+    /// `/SMask /None` clears the mask — later paints are unwrapped.
+    #[test]
+    fn smask_none_resets() {
+        let ext = smask_ext_gstate();
+        let masks = smask_map(MaskKind::Luminance);
+        let bytes = b"/GS1 gs /GS2 gs 0 0 m 20 0 l 20 20 l h f\n";
+        let root = parse_with_smask(bytes, &ext, &masks);
+        assert!(
+            matches!(root.children[0], Node::Path(_)),
+            "path painted unmasked after /SMask /None, got {:?}",
+            root.children[0]
+        );
+    }
+
+    /// The soft mask is part of the graphics state — a `Q` restores
+    /// the state saved before the mask was established (§8.4.4).
+    #[test]
+    fn smask_restored_by_q() {
+        let ext = smask_ext_gstate();
+        let masks = smask_map(MaskKind::Luminance);
+        let bytes = b"q /GS1 gs Q 0 0 m 20 0 l 20 20 l h f\n";
+        let root = parse_with_smask(bytes, &ext, &masks);
+        assert!(
+            matches!(root.children[0], Node::Path(_)),
+            "path painted unmasked after Q, got {:?}",
+            root.children[0]
+        );
+    }
+
+    /// `/S /Alpha` maps onto `MaskKind::Alpha` (§11.5.2).
+    #[test]
+    fn smask_alpha_subtype() {
+        let ext = smask_ext_gstate();
+        let masks = smask_map(MaskKind::Alpha);
+        let bytes = b"q /GS1 gs 0 0 m 20 0 l 20 20 l h f Q\n";
+        let root = parse_with_smask(bytes, &ext, &masks);
+        let Node::Group(g) = &root.children[0] else {
+            panic!("q frame group");
+        };
+        let Node::SoftMask { mask_kind, .. } = &g.children[0] else {
+            panic!("SoftMask wrap");
+        };
+        assert_eq!(*mask_kind, MaskKind::Alpha);
+    }
+
+    /// The mask's coordinate system is fixed at `gs` time
+    /// (§11.6.5.2): painting under a later `cm` re-expresses the mask
+    /// by the inverse of the intervening transform.
+    #[test]
+    fn smask_anchored_to_gs_time_ctm() {
+        let ext = smask_ext_gstate();
+        let masks = smask_map(MaskKind::Luminance);
+        // Mask established at identity; the paint happens under a 2×
+        // scale, so the mask subtree must carry the 0.5× inverse to
+        // stay anchored where it was established.
+        let bytes = b"/GS1 gs q 2 0 0 2 0 0 cm 0 0 m 20 0 l 20 20 l h f Q\n";
+        let root = parse_with_smask(bytes, &ext, &masks);
+        let Node::Group(g) = &root.children[0] else {
+            panic!("q frame group");
+        };
+        let Node::SoftMask { mask, .. } = &g.children[0] else {
+            panic!("SoftMask wrap, got {:?}", g.children[0]);
+        };
+        let Node::Group(mg) = mask.as_ref() else {
+            panic!("mask group");
+        };
+        assert!((mg.transform.a - 0.5).abs() < 1e-6);
+        assert!((mg.transform.d - 0.5).abs() < 1e-6);
     }
 
     /// A `gs` against an undefined ExtGState name is a tolerated no-op

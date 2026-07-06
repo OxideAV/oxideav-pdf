@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use oxideav_core::vector::{
-    FillRule, Group, Node, Paint, Path, PathCommand, PathNode, Point, Rgba, Transform2D,
+    FillRule, Group, MaskKind, Node, Paint, Path, PathCommand, PathNode, Point, Rgba, Transform2D,
     VectorFrame,
 };
 use oxideav_core::TimeBase;
@@ -37,8 +37,8 @@ use crate::pubsec::{
     open_with_certificate, open_with_certificate_and_trust_store, PubSecCredential, TrustStore,
 };
 use crate::reader::content::{
-    parse_content_stream_full_with_tiling, parse_content_stream_full_with_type3, TilingPattern,
-    Type3Font,
+    parse_content_stream_full_with_soft_masks, parse_content_stream_full_with_tiling,
+    parse_content_stream_full_with_type3, ResolvedSoftMask, TilingPattern, Type3Font,
 };
 use crate::reader::parse::Parser;
 use crate::reader::xref::{parse_xref, XrefEntry, XrefTable};
@@ -1307,8 +1307,14 @@ fn decode_page(
     } else {
         None
     };
+    let soft_masks = if let Some(rdict) = resources_dict.as_ref() {
+        let mut seen = HashSet::new();
+        resolve_soft_masks(reader, rdict, 0, &mut seen)?
+    } else {
+        None
+    };
 
-    let parsed = parse_content_stream_full_with_type3(
+    let parsed = parse_content_stream_full_with_soft_masks(
         &content_bytes,
         ext_gstate_dict.as_ref(),
         fonts_dict.as_ref(),
@@ -1319,6 +1325,7 @@ fn decode_page(
         pattern_dict.as_ref(),
         tiling_patterns.as_ref(),
         type3_fonts.as_ref(),
+        soft_masks.as_ref(),
     )?;
     let mut root = parsed.root;
 
@@ -2394,6 +2401,101 @@ const MAX_XOBJECT_DEPTH: usize = 12;
 ///
 /// Returns `Ok(None)` when the resources dict carries no `/XObject`
 /// entry or when no entry resolved to a non-empty Form group.
+/// Resolve every `/Resources /ExtGState` entry's `/SMask` soft-mask
+/// dictionary (§11.6.5.2 Table 144) into a [`ResolvedSoftMask`], keyed
+/// by the ExtGState resource name (the same key a `gs` operator names,
+/// §8.4.5). The `/G` transparency-group XObject is parsed exactly like
+/// a `Do`-spliced form — `/Matrix` on the group transform, `/BBox` as
+/// the group clip, content against its own `/Resources` — and the `/S`
+/// subtype maps `/Luminosity` → [`MaskKind::Luminance`] and `/Alpha` →
+/// [`MaskKind::Alpha`]. Entries whose `/SMask` is absent, the name
+/// `None`, missing a usable `/S` or `/G`, or whose group parses to
+/// nothing are skipped (the walker then paints unmasked — the same
+/// tolerant degradation every unresolvable resource takes).
+fn resolve_soft_masks(
+    reader: &mut DocumentReader<'_>,
+    resources: &Dict,
+    depth: usize,
+    visited: &mut HashSet<ObjectId>,
+) -> Result<Option<BTreeMap<String, ResolvedSoftMask>>, PdfError> {
+    if depth >= MAX_XOBJECT_DEPTH {
+        return Ok(None);
+    }
+    let ext_obj = resources
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "ExtGState")
+        .map(|(_, v)| v.clone());
+    let ext_obj = match ext_obj {
+        Some(Object::Reference(id)) => reader.resolve(id)?,
+        Some(other) => other,
+        None => return Ok(None),
+    };
+    let Object::Dict(ext_dict) = ext_obj else {
+        return Ok(None);
+    };
+    let mut out: BTreeMap<String, ResolvedSoftMask> = BTreeMap::new();
+    for (name, value) in ext_dict.entries() {
+        let gs = match value {
+            Object::Reference(id) => reader.resolve(*id)?,
+            other => other.clone(),
+        };
+        let Object::Dict(gs) = gs else { continue };
+        let sm = gs
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "SMask")
+            .map(|(_, v)| v.clone());
+        let sm = match sm {
+            Some(Object::Reference(id)) => reader.resolve(id)?,
+            Some(other) => other,
+            None => continue,
+        };
+        // `/SMask /None` (§11.6.4.3) carries nothing to resolve — the
+        // walker handles the reset at `gs` time.
+        let Object::Dict(sm) = sm else { continue };
+        // `/S` — required subtype (Table 144).
+        let kind = match sm.entries().iter().find(|(k, _)| k == "S").map(|(_, v)| v) {
+            Some(Object::Name(s)) if s == "Luminosity" => MaskKind::Luminance,
+            Some(Object::Name(s)) if s == "Alpha" => MaskKind::Alpha,
+            _ => continue,
+        };
+        // `/G` — required transparency-group XObject (Table 144). An
+        // XObject is an indirect stream object; capture the id so a
+        // self-referential mask group is cycle-guarded.
+        let g = sm
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "G")
+            .map(|(_, v)| v.clone());
+        let (g_id, g_obj) = match g {
+            Some(Object::Reference(id)) => (Some(id), reader.resolve(id)?),
+            Some(other) => (None, other),
+            None => continue,
+        };
+        let Object::Stream(stream) = g_obj else {
+            continue;
+        };
+        if let Some(id) = g_id {
+            if visited.contains(&id) {
+                continue;
+            }
+            visited.insert(id);
+        }
+        let group = resolve_one_form_xobject(reader, &stream, depth, visited)?;
+        if let Some(id) = g_id {
+            visited.remove(&id);
+        }
+        let Some(mask) = group else { continue };
+        out.insert(name.clone(), ResolvedSoftMask { kind, mask });
+    }
+    if out.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(out))
+    }
+}
+
 fn resolve_xobject_forms(
     reader: &mut DocumentReader<'_>,
     resources: &Dict,
@@ -2527,8 +2629,16 @@ fn resolve_one_form_xobject(
         Some(r) => resolve_type3_fonts(reader, r, depth + 1)?,
         None => None,
     };
+    // A form's own content may establish a soft mask from its own
+    // /Resources /ExtGState (§11.6.5.2); `visited` doubles as the /G
+    // cycle guard so a mask group referencing its enclosing form
+    // terminates.
+    let soft_masks = match form_resources.as_ref() {
+        Some(r) => resolve_soft_masks(reader, r, depth + 1, visited)?,
+        None => None,
+    };
 
-    let parsed = parse_content_stream_full_with_type3(
+    let parsed = parse_content_stream_full_with_soft_masks(
         &content_bytes,
         ext_gstate_dict.as_ref(),
         fonts_dict.as_ref(),
@@ -2539,6 +2649,7 @@ fn resolve_one_form_xobject(
         pattern_dict.as_ref(),
         tiling_patterns.as_ref(),
         type3_fonts.as_ref(),
+        soft_masks.as_ref(),
     )?;
 
     // The content parser returns a root `Group` carrying any top-level
