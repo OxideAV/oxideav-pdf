@@ -348,6 +348,51 @@ pattern name (`c… /Pname scn`, read by component count — gray / RGB /
 CMYK), so the same cell shape tiles different regions in different
 colours.
 
+## Transparency (§11.6)
+
+The **graphics state is saved and restored across `q`/`Q`** (§8.4.4
+Table 57): colour + colour space, line state, the §11.6.4.4 alpha
+constants, the text-state parameters, the tiling-pattern selection, and
+the current soft mask are all snapshotted by `q` and reinstated by the
+matching `Q` (the CTM and clip save/restore is structural — each
+bracket nests a `Group`).
+
+**Soft masks** (§11.6.4.3 + §11.6.5.2) paint into the `Scene`: a `gs`
+whose parameter dictionary carries an `/SMask` soft-mask dictionary
+establishes the current soft mask, and every object painted while it
+is in force — paths, `Do` form splices, clipped `sh` gradients, tiling
+fills, Type 3 glyphs — is wrapped in the core IR's `Node::SoftMask`.
+The `/G` transparency-group XObject resolves exactly like a
+`Do`-spliced form (`/Matrix` on the transform, `/BBox` as the clip,
+content against its own `/Resources`, cycle-guarded); `/S /Luminosity`
+maps to `MaskKind::Luminance` (§11.5.3) and `/S /Alpha` to
+`MaskKind::Alpha` (§11.5.2). The mask's coordinate system is fixed at
+the moment the `gs` executes (§11.6.5.2 — `/Matrix ∘ CTM-at-gs-time`),
+so painting under a later `cm` re-expresses the mask by the inverse of
+the intervening transform. A non-black `/BC` backdrop pours the `/BBox`
+rectangle with the colour under the group content (1 gray / 3 RGB /
+4 CMYK component reduction); `/SMask /None` — and a `Q` restoring a
+state saved before the mask was set — clears it.
+
+**Transparency-group XObjects** (§11.6.6) composite as a unit on `Do`:
+a form whose `/Group` subtype is `/Transparency` takes the current
+nonstroking alpha constant on the spliced group's opacity (§11.6.4.4),
+while an ordinary form gets no grouping behaviour. Group content
+starts from a fresh state (alphas 1.0, soft mask `None`) per the
+§11.6.6 initialisation rule, so nothing applies twice.
+
+The **writer emits `Node::SoftMask` symmetrically**: the mask subtree
+becomes a `/G` transparency-group form XObject (own `/Resources`,
+computed `/BBox`), an `/ExtGState` entry carries the
+`/SMask << /S /Luminosity|/Alpha … >>` dictionary, and the content
+paints inside a `q /GSn gs … Q` bracket. Writer output round-trips
+through the reader and passes `qpdf --check`.
+
+**Soft-mask images** (§11.6.5.3) surface on `image_xobjects()`:
+`PdfImageXObject.smask` carries the subsidiary `/SMask` image's
+dimensions, bits, decoded `/DeviceGray` samples, and the `/Matte`
+preblending colour (Table 146).
+
 ## Interactive-form & annotation writers
 
 - [`write_pdf_with_form`] emits an `/AcroForm` with Text, Checkbox,
@@ -403,7 +448,13 @@ cargo bench -p oxideav-pdf --bench reader_open
 - Writer-side JPEG passthrough on `ImageRef` (needs core IR support for
   raw codec bytes; the reader-side surface is complete).
 - Ed25519 / Ed448 signature dispatch in `pubsec::verify`.
-- Transparency groups beyond per-`Group` `/ca` + `/CA` opacity.
+- Soft-mask edges with no vector-IR analogue: a non-identity `/TR`
+  transfer function (per-pixel remap — tolerated-ignored), a non-black
+  `/BC` *outside* the group's `/BBox` (the inside-`/BBox` backdrop is
+  exact), and the alpha-is-shape flag (`/AIS`).
+- Blend modes beyond `Normal` (`/BM`, §11.3.5) and the isolated /
+  knockout group flags (`/I` / `/K`, §11.6.6) — the IR composites with
+  plain alpha.
 - DeviceN `/Attributes` NChannel custom-blending hints (`/Colorants`,
   `/Process`, `/MixingHints`); the space still renders through its
   `alternateSpace` + `tintTransform`, which §8.6.6.5 permits.
