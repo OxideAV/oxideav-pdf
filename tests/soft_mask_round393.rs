@@ -224,3 +224,46 @@ fn smask_none_paints_unmasked() {
     collect_bare_fills(root, &mut bare);
     assert_eq!(bare, vec![(255, 0, 0), (0, 255, 0)], "both fills bare");
 }
+
+#[test]
+fn bc_backdrop_pours_bbox_under_mask_content() {
+    // /BC [0.5] on a /DeviceGray luminosity group — §11.6.5.2: the
+    // group composites over a fully opaque backdrop of the /BC colour,
+    // so the mask subtree's /Matrix group gains a first child: the
+    // /BBox rectangle poured with 50 % gray, under the white square.
+    let pdf = build_smask_pdf(
+        "Luminosity",
+        Some("<< /Type /Mask /S /Luminosity /G 5 0 R /BC [0.5] /TR /Identity >>"),
+    );
+    let scene = read_pdf_to_scene(&pdf).expect("read PDF to scene");
+    let root = &scene.pages.as_ref().unwrap()[0].content.root;
+    let (mask, kind, _) = find_soft_mask(root).expect("SoftMask node in scene");
+    assert_eq!(kind, MaskKind::Luminance);
+    let Node::Group(anchor) = mask else {
+        panic!("mask anchor group");
+    };
+    let mut fills = Vec::new();
+    collect_bare_fills(anchor, &mut fills);
+    assert_eq!(
+        fills,
+        vec![(128, 128, 128), (255, 255, 255)],
+        "backdrop first (under), group content second"
+    );
+}
+
+#[test]
+fn absent_bc_defaults_to_black_backdrop_without_rect() {
+    // Default /BC is black (Table 144) — the unpainted mask area
+    // already evaluates to zero luminosity, so no rectangle is
+    // inserted and the mask subtree carries only the white square.
+    let pdf = build_smask_pdf("Luminosity", None);
+    let scene = read_pdf_to_scene(&pdf).expect("read PDF to scene");
+    let root = &scene.pages.as_ref().unwrap()[0].content.root;
+    let (mask, _, _) = find_soft_mask(root).expect("SoftMask node in scene");
+    let Node::Group(anchor) = mask else {
+        panic!("mask anchor group");
+    };
+    let mut fills = Vec::new();
+    collect_bare_fills(anchor, &mut fills);
+    assert_eq!(fills, vec![(255, 255, 255)], "no backdrop rectangle");
+}

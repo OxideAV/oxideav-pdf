@@ -1166,7 +1166,15 @@ pub struct ResolvedSoftMask {
     /// `/S` — the mask-derivation subtype (Table 144).
     pub kind: MaskKind,
     /// `/G` — the transparency-group XObject parsed into a group
-    /// exactly like a `Do`-spliced Form XObject (§8.10.1).
+    /// exactly like a `Do`-spliced Form XObject (§8.10.1). For a
+    /// luminosity mask whose dictionary carries a `/BC` backdrop
+    /// colour, the group's first child is the backdrop: a `/BBox`
+    /// rectangle poured with `/BC` *under* the group content —
+    /// §11.6.5.2, "the transparency group XObject G shall be
+    /// composited with a fully opaque backdrop whose colour is
+    /// everywhere defined by the soft-mask dictionary's BC entry"
+    /// (default: black, which the unpainted mask area already
+    /// evaluates to, so no rectangle is inserted).
     pub mask: Group,
 }
 

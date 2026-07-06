@@ -2412,6 +2412,44 @@ const MAX_XOBJECT_DEPTH: usize = 12;
 /// `None`, missing a usable `/S` or `/G`, or whose group parses to
 /// nothing are skipped (the walker then paints unmasked — the same
 /// tolerant degradation every unresolvable resource takes).
+/// Read a PDF object as a flat numeric array.
+fn number_array(obj: &Object) -> Option<Vec<f32>> {
+    let Object::Array(items) = obj else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Object::Integer(n) => out.push(*n as f32),
+            Object::Real(n) => out.push(*n as f32),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Reduce a soft-mask `/BC` backdrop colour (§11.6.5.2 Table 144 — "an
+/// array of n numbers, where n is the number of components in the
+/// colour space specified by the CS entry in the group attributes
+/// dictionary") to device RGB by component count: 1 → DeviceGray,
+/// 3 → DeviceRGB, 4 → DeviceCMYK (the §11.5.3 NOTE 3 device
+/// conversions). Anything else — including the CIE-based group colour
+/// spaces this reduction doesn't model — returns `None` and the mask
+/// keeps the default black backdrop.
+fn backdrop_color(comps: &[f32]) -> Option<Rgba> {
+    let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    match comps {
+        [g] => Some(Rgba::opaque(to8(*g), to8(*g), to8(*g))),
+        [r, g, b] => Some(Rgba::opaque(to8(*r), to8(*g), to8(*b))),
+        [c, m, y, k] => Some(Rgba::opaque(
+            to8((1.0 - c) * (1.0 - k)),
+            to8((1.0 - m) * (1.0 - k)),
+            to8((1.0 - y) * (1.0 - k)),
+        )),
+        _ => None,
+    }
+}
+
 fn resolve_soft_masks(
     reader: &mut DocumentReader<'_>,
     resources: &Dict,
@@ -2486,7 +2524,41 @@ fn resolve_soft_masks(
         if let Some(id) = g_id {
             visited.remove(&id);
         }
-        let Some(mask) = group else { continue };
+        let Some(mut mask) = group else { continue };
+        // `/BC` — the backdrop colour a *luminosity* mask composites
+        // its group against (§11.6.5.2: "composited with a fully
+        // opaque backdrop whose colour is everywhere defined by the
+        // soft-mask dictionary's BC entry"; Table 144: "consulted only
+        // if the subtype S is Luminosity"; default black). The
+        // backdrop lands as a `/BBox` rectangle poured with the colour
+        // *under* the group content, in form space — exactly the
+        // §11.5.3 "fully opaque backdrop of a specified colour" the
+        // group composites over inside its bounds. An absent `/BC` (or
+        // one that reduces to black) needs no rectangle: the unpainted
+        // mask area already evaluates to zero luminosity.
+        if kind == MaskKind::Luminance {
+            let bc = sm
+                .entries()
+                .iter()
+                .find(|(k, _)| k == "BC")
+                .and_then(|(_, v)| number_array(v))
+                .and_then(|comps| backdrop_color(&comps));
+            if let Some(color) = bc {
+                if (color.r, color.g, color.b) != (0, 0, 0) {
+                    if let Some(bbox) = form_bbox_clip(&stream.dict) {
+                        mask.children.insert(
+                            0,
+                            Node::Path(PathNode {
+                                path: bbox,
+                                fill: Some(Paint::Solid(color)),
+                                stroke: None,
+                                fill_rule: FillRule::NonZero,
+                            }),
+                        );
+                    }
+                }
+            }
+        }
         out.insert(name.clone(), ResolvedSoftMask { kind, mask });
     }
     if out.is_empty() {
