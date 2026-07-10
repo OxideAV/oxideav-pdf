@@ -94,7 +94,11 @@ use oxideav_core::{VideoFrame, VideoPlane};
 
 use crate::error::PdfError;
 use crate::objects::{Dict, Object};
-use crate::reader::inline_images::{find_inline_image_ei, parse_one_inline_image, PdfInlineImage};
+use crate::reader::image_decode::{decode_image_to_rgba, decode_stencil_coverage};
+use crate::reader::inline_images::{
+    find_inline_image_ei, parse_one_inline_image_full, InlineColorSpace, InlineImageFilter,
+    ParsedInlineImage, PdfInlineImage,
+};
 
 /// Parse a content-stream byte sequence into a single [`Group`]
 /// containing every shape painted by the stream. Nested `q`/`Q`
@@ -5314,12 +5318,16 @@ impl<'a> State<'a> {
     /// stream still parses, rather than aborting the whole document.
     fn consume_inline_image(&mut self, input: &[u8], after_bi: usize) -> usize {
         self.operands.clear();
-        match parse_one_inline_image(input, after_bi) {
-            Ok((image, resume)) => {
+        match parse_one_inline_image_full(input, after_bi) {
+            Ok((parsed, resume)) => {
                 let ctm = self.effective_ctm();
                 let clip = self.current_clip();
-                self.inline_images
-                    .push(ContentInlineImage { image, ctm, clip });
+                self.splice_inline_image(&parsed);
+                self.inline_images.push(ContentInlineImage {
+                    image: parsed.image,
+                    ctm,
+                    clip,
+                });
                 resume
             }
             // Salvage: skip to the next `EI` (past it) so the trailing
@@ -5330,6 +5338,104 @@ impl<'a> State<'a> {
                 None => input.len(),
             },
         }
+    }
+
+    /// Paint a decodable inline image (§8.9.7) into the scene as a
+    /// [`Node::Image`], mirroring the `Do` Image-XObject splice: the
+    /// image fills the unit square of the space in force (§8.9.5.2),
+    /// carried by the pixel-dimension `bounds` under a `1/w × 1/h`
+    /// scale. Decodable = the wrapping filters already peeled (no
+    /// terminal image codec) and a colour space the crate reduces —
+    /// a device family, an inline `[/I …]` Indexed array, or a
+    /// `/Resources /ColorSpace` name — with the `/D` (`/Decode`)
+    /// array honoured. An `/IM true` stencil is poured with the
+    /// current nonstroking colour (§8.9.6.2). Anything else stays
+    /// event-only on [`ParsedContent::inline_images`].
+    fn splice_inline_image(&mut self, parsed: &ParsedInlineImage) {
+        // Same decoded-payload ceiling the Image-XObject resolver
+        // applies — inline images are "4 KB or less" per §8.9.7, but
+        // a hostile stream shouldn't balloon memory either way.
+        const MAX_RGBA_BYTES: usize = 64 << 20;
+        let img = &parsed.image;
+        if img.filter != InlineImageFilter::Raw {
+            return;
+        }
+        let (w, h) = (img.width, img.height);
+        let rgba_len = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+        if rgba_len == 0 || rgba_len > MAX_RGBA_BYTES {
+            return;
+        }
+        let rgba = if img.image_mask {
+            // §8.9.6.2 — 1-bit stencil poured with the nonstroking
+            // colour; Decode [1 0] flips the paint/skip meanings.
+            if img.bits_per_component != 1 {
+                return;
+            }
+            let flip = parsed
+                .decode
+                .as_ref()
+                .map(|d| d.first().copied() == Some(1.0))
+                .unwrap_or(false);
+            let Some(coverage) = decode_stencil_coverage(&img.data, w, h, flip) else {
+                return;
+            };
+            let fill = match &self.fill_paint {
+                Some(Paint::Solid(c)) => *c,
+                _ => Rgba::opaque(0, 0, 0),
+            };
+            let mut rgba = Vec::with_capacity(rgba_len);
+            for a in coverage {
+                rgba.extend_from_slice(&[
+                    fill.r,
+                    fill.g,
+                    fill.b,
+                    ((a as u16 * fill.a as u16) / 255) as u8,
+                ]);
+            }
+            rgba
+        } else {
+            let cs = match &parsed.cs {
+                InlineColorSpace::Kind(kind) => kind.clone(),
+                InlineColorSpace::Named(name) => {
+                    ColorSpaceKind::resolve_with_resources(name, self.color_space_resources)
+                }
+                InlineColorSpace::Unsupported => return,
+            };
+            if cs == ColorSpaceKind::Unknown {
+                return;
+            }
+            let Some(rgba) = decode_image_to_rgba(
+                &img.data,
+                w,
+                h,
+                img.bits_per_component as u32,
+                &cs,
+                parsed.decode.as_deref(),
+                None,
+            ) else {
+                return;
+            };
+            rgba
+        };
+        let node = Node::Image(ImageRef {
+            frame: Box::new(VideoFrame {
+                pts: None,
+                planes: vec![VideoPlane {
+                    stride: w as usize * 4,
+                    data: rgba,
+                }],
+            }),
+            bounds: Rect::new(0.0, 0.0, w as f32, h as f32),
+            transform: Transform2D {
+                a: 1.0 / w as f32,
+                b: 0.0,
+                c: 0.0,
+                d: 1.0 / h as f32,
+                e: 0.0,
+                f: 0.0,
+            },
+        });
+        self.push_painted(node);
     }
 }
 

@@ -264,14 +264,48 @@ fn is_ws(b: u8) -> bool {
     matches!(b, 0x00 | b'\t' | b'\n' | 0x0C | b'\r' | b' ')
 }
 
+/// Colour-space detail the scene-splicing path needs beyond the
+/// public [`ColorSpace`] tag: a fully-parsed inline space the sample
+/// decoder can consume directly, a resource name still to be resolved
+/// against `/Resources /ColorSpace`, or an unsupported shape.
+#[derive(Clone, Debug)]
+pub(crate) enum InlineColorSpace {
+    /// A self-contained space — a device family or an inline
+    /// `[/I base hival lookup]` Indexed array (§8.9.7 Table 94).
+    Kind(crate::reader::content::ColorSpaceKind),
+    /// A non-device name — per §8.9.5.2 it refers to the content
+    /// stream's `/Resources /ColorSpace` subdictionary.
+    Named(String),
+    /// A shape the splicer doesn't decode (the image still surfaces
+    /// on the event path).
+    Unsupported,
+}
+
+/// [`parse_one_inline_image`] plus the fields the scene splicer needs:
+/// the `/D` (`/Decode`) array and the structured colour space.
+pub(crate) struct ParsedInlineImage {
+    pub image: PdfInlineImage,
+    pub decode: Option<Vec<f32>>,
+    pub cs: InlineColorSpace,
+}
+
 /// Parse the bytes starting just past the `BI` keyword: an
 /// abbreviated inline-image dict, then the `ID` keyword, then the raw
 /// payload up to `EI`. Returns the parsed image and the byte offset
 /// in the parent stream just past the `EI` keyword.
 pub(crate) fn parse_one_inline_image(
     bytes: &[u8],
-    mut i: usize,
+    i: usize,
 ) -> Result<(PdfInlineImage, usize), PdfError> {
+    parse_one_inline_image_full(bytes, i).map(|(parsed, resume)| (parsed.image, resume))
+}
+
+/// Full-detail variant of [`parse_one_inline_image`] for the
+/// scene-splicing path.
+pub(crate) fn parse_one_inline_image_full(
+    bytes: &[u8],
+    mut i: usize,
+) -> Result<(ParsedInlineImage, usize), PdfError> {
     // Inline-image dict: a sequence of `/Name <value>` pairs until
     // the `ID` keyword. Values may be names, numbers, strings,
     // arrays, dicts, or booleans. We collect them as raw key/value
@@ -341,6 +375,8 @@ pub(crate) fn parse_one_inline_image(
     let mut height: Option<u32> = None;
     let mut bpc: Option<u8> = None;
     let mut cs: Option<ColorSpace> = None;
+    let mut cs_value: Option<DictValue> = None;
+    let mut decode: Option<Vec<f32>> = None;
     let mut filter_names: Vec<String> = Vec::new();
     let mut image_mask = false;
     for (key, val) in &dict_entries {
@@ -349,9 +385,17 @@ pub(crate) fn parse_one_inline_image(
             "H" | "Height" => height = val.as_u32(),
             "BPC" | "BitsPerComponent" => bpc = val.as_u8(),
             "IM" | "ImageMask" => image_mask = val.as_bool().unwrap_or(false),
-            "CS" | "ColorSpace" => cs = val.as_color_space(),
+            "CS" | "ColorSpace" => {
+                cs = val.as_color_space();
+                cs_value = Some(val.clone());
+            }
+            "D" | "Decode" => {
+                if let DictValue::NumberList(nums) = val {
+                    decode = Some(nums.iter().map(|n| *n as f32).collect());
+                }
+            }
             "F" | "Filter" => filter_names = val.as_name_list(),
-            _ => {} // Ignored — Decode, DecodeParms, Intent, …
+            _ => {} // Ignored — DecodeParms, Intent, Interpolate, …
         }
     }
 
@@ -370,6 +414,36 @@ pub(crate) fn parse_one_inline_image(
     // the payload to a real codec.
     let (peeled, terminal) = peel_inline_filters(payload, &filter_names)?;
 
+    // Structured colour space for the scene splicer (§8.9.5.2 +
+    // Table 94). An inline `[/I base hival lookup]` array is parsed to
+    // a self-contained Indexed space; a bare non-device name refers to
+    // `/Resources /ColorSpace`.
+    use crate::reader::content::ColorSpaceKind;
+    let structured = if image_mask {
+        // A stencil has no colour space of its own (§8.9.6.2).
+        InlineColorSpace::Kind(ColorSpaceKind::DeviceGray)
+    } else {
+        match &cs_value {
+            None => InlineColorSpace::Unsupported,
+            Some(DictValue::Name(n)) => match ColorSpaceKind::from_name(n) {
+                ColorSpaceKind::Unknown => InlineColorSpace::Named(n.clone()),
+                kind => InlineColorSpace::Kind(kind),
+            },
+            Some(DictValue::Raw(raw)) => match parse_inline_indexed_array(raw) {
+                Some(kind) => InlineColorSpace::Kind(kind),
+                None => InlineColorSpace::Unsupported,
+            },
+            Some(_) => InlineColorSpace::Unsupported,
+        }
+    };
+    // An inline Indexed array previously fell through to the
+    // DeviceRGB default on the public tag; report it as what it is.
+    if cs.is_none()
+        && matches!(&structured, InlineColorSpace::Kind(k) if matches!(k, ColorSpaceKind::Indexed { .. }))
+    {
+        cs = Some(ColorSpace::Indexed);
+    }
+
     // Image mask payloads have no /CS — they're 1-bit stencils.
     let color_space = if image_mask {
         ColorSpace::DeviceGray
@@ -378,22 +452,162 @@ pub(crate) fn parse_one_inline_image(
     };
 
     Ok((
-        PdfInlineImage {
-            data: peeled,
-            width,
-            height,
-            color_space,
-            bits_per_component: bpc,
-            filter: terminal,
-            image_mask,
-            source_page_index: 0,
-            source_page_obj: ObjectId {
-                number: 0,
-                generation: 0,
+        ParsedInlineImage {
+            image: PdfInlineImage {
+                data: peeled,
+                width,
+                height,
+                color_space,
+                bits_per_component: bpc,
+                filter: terminal,
+                image_mask,
+                source_page_index: 0,
+                source_page_obj: ObjectId {
+                    number: 0,
+                    generation: 0,
+                },
             },
+            decode,
+            cs: structured,
         },
         resume,
     ))
+}
+
+/// Parse an inline-image `[/I base hival lookup]` (or spelled-out
+/// `/Indexed`) colour-space array (§8.6.6.3 + Table 94) out of its raw
+/// bytes: `base` must be a device-family name, `hival` a non-negative
+/// integer, and `lookup` a hex `<…>` or literal `(…)` string holding
+/// `(hival+1) × base-components` bytes. `None` for any other shape.
+fn parse_inline_indexed_array(raw: &[u8]) -> Option<crate::reader::content::ColorSpaceKind> {
+    use crate::reader::content::ColorSpaceKind;
+    if raw.first() != Some(&b'[') {
+        return None;
+    }
+    let mut i = skip_ws_and_comments(raw, 1);
+    // Family name.
+    if raw.get(i) != Some(&b'/') {
+        return None;
+    }
+    let (family, end) = read_name(raw, i).ok()?;
+    if family != "I" && family != "Indexed" {
+        return None;
+    }
+    i = skip_ws_and_comments(raw, end);
+    // Base — a device-family name (a nested array base is out of the
+    // splicer's scope).
+    if raw.get(i) != Some(&b'/') {
+        return None;
+    }
+    let (base_name, end) = read_name(raw, i).ok()?;
+    let base = ColorSpaceKind::from_name(&base_name);
+    if base == ColorSpaceKind::Unknown {
+        return None;
+    }
+    i = skip_ws_and_comments(raw, end);
+    // hival.
+    let end = skip_token(raw, i);
+    let hival: u32 = str::from_utf8(raw.get(i..end)?).ok()?.parse().ok()?;
+    i = skip_ws_and_comments(raw, end);
+    // Lookup string.
+    let table = match raw.get(i) {
+        Some(b'<') => {
+            let close = raw[i + 1..].iter().position(|&b| b == b'>')? + i + 1;
+            let mut bytes = Vec::new();
+            let mut hi: Option<u8> = None;
+            for &b in &raw[i + 1..close] {
+                let nib = match b {
+                    b'0'..=b'9' => b - b'0',
+                    b'a'..=b'f' => b - b'a' + 10,
+                    b'A'..=b'F' => b - b'A' + 10,
+                    _ if is_ws(b) => continue,
+                    _ => return None,
+                };
+                match hi.take() {
+                    Some(h) => bytes.push((h << 4) | nib),
+                    None => hi = Some(nib),
+                }
+            }
+            // §7.3.4.3 — an odd final digit behaves as if followed by 0.
+            if let Some(h) = hi {
+                bytes.push(h << 4);
+            }
+            bytes
+        }
+        Some(b'(') => unescape_literal_string(&raw[i..])?,
+        _ => return None,
+    };
+    Some(ColorSpaceKind::Indexed {
+        base: Box::new(base),
+        hival,
+        table,
+    })
+}
+
+/// Decode a `(…)`-literal string's escapes (§7.3.4.2) — enough for an
+/// Indexed lookup table: `\n \r \t \b \f \\ \( \)`, octal `\ddd`, and
+/// the line-continuation `\<newline>`.
+fn unescape_literal_string(raw: &[u8]) -> Option<Vec<u8>> {
+    if raw.first() != Some(&b'(') {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut depth = 1i32;
+    let mut i = 1;
+    while i < raw.len() {
+        match raw[i] {
+            b'\\' => {
+                let esc = *raw.get(i + 1)?;
+                i += 2;
+                match esc {
+                    b'n' => out.push(b'\n'),
+                    b'r' => out.push(b'\r'),
+                    b't' => out.push(b'\t'),
+                    b'b' => out.push(0x08),
+                    b'f' => out.push(0x0C),
+                    b'(' | b')' | b'\\' => out.push(esc),
+                    b'0'..=b'7' => {
+                        let mut v = (esc - b'0') as u16;
+                        for _ in 0..2 {
+                            match raw.get(i) {
+                                Some(&d @ b'0'..=b'7') => {
+                                    v = v * 8 + (d - b'0') as u16;
+                                    i += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+                        out.push((v & 0xFF) as u8);
+                    }
+                    b'\n' => {}
+                    b'\r' => {
+                        if raw.get(i) == Some(&b'\n') {
+                            i += 1;
+                        }
+                    }
+                    other => out.push(other),
+                }
+            }
+            b'(' => {
+                depth += 1;
+                out.push(b'(');
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(out);
+                }
+                out.push(b')');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    None
 }
 
 /// §8.9.7 EI-locator: first occurrence of `EI` such that the
@@ -427,9 +641,11 @@ enum DictValue {
     Real(f64),
     Bool(bool),
     NameList(Vec<String>),
-    /// Anything else — arrays of non-names, strings, dicts, etc. Kept
-    /// as raw bytes for round 35; future rounds may upgrade.
-    #[allow(dead_code)]
+    /// An all-number array — the shape `/D [0 1]` (Decode) uses.
+    NumberList(Vec<f64>),
+    /// Anything else — mixed arrays, strings, dicts, etc. Kept as raw
+    /// bytes; the colour-space reader re-parses an `[/I …]` Indexed
+    /// array out of this shape.
     Raw(Vec<u8>),
 }
 
@@ -508,12 +724,13 @@ fn read_dict_value(bytes: &[u8], from: usize) -> Result<(DictValue, usize), PdfE
         return Ok((DictValue::Bool(false), from + 5));
     }
     if b == b'[' {
-        // Array — for our purposes only matters when it's a list of
-        // /Name (e.g. /F [/A85 /Fl]). Parse the array body collecting
-        // names; bail out if we see anything else.
+        // Array — a list of /Name (e.g. /F [/A85 /Fl]), a list of
+        // numbers (e.g. /D [1 0]), or anything else (kept raw — the
+        // colour-space reader re-parses an `[/I …]` Indexed array).
         let mut i = from + 1;
         let mut names: Vec<String> = Vec::new();
-        let mut had_non_name = false;
+        let mut numbers: Vec<f64> = Vec::new();
+        let mut had_other = false;
         loop {
             i = skip_ws_and_comments(bytes, i);
             if i >= bytes.len() {
@@ -529,11 +746,45 @@ fn read_dict_value(bytes: &[u8], from: usize) -> Result<(DictValue, usize), PdfE
                 let (n, end) = read_name(bytes, i)?;
                 names.push(n);
                 i = end;
+            } else if bytes[i] == b'<' {
+                // Hex string element (e.g. an Indexed lookup table) —
+                // skip past the closing `>`; the raw fallback keeps
+                // the bytes for the colour-space reader.
+                had_other = true;
+                let close = bytes[i + 1..]
+                    .iter()
+                    .position(|&b| b == b'>')
+                    .ok_or_else(|| {
+                        PdfError::other("PDF inline image: unterminated `<` in BI dict array")
+                    })?;
+                i = i + 1 + close + 1;
+            } else if bytes[i] == b'(' {
+                // Literal string element — skip balanced parens with
+                // backslash escapes (§7.3.4.2).
+                had_other = true;
+                let mut depth = 1i32;
+                let mut j = i + 1;
+                while j < bytes.len() && depth > 0 {
+                    match bytes[j] {
+                        b'\\' => j = j.saturating_add(2),
+                        b'(' => {
+                            depth += 1;
+                            j += 1;
+                        }
+                        b')' => {
+                            depth -= 1;
+                            j += 1;
+                        }
+                        _ => j += 1,
+                    }
+                }
+                if depth > 0 {
+                    return Err(PdfError::other(
+                        "PDF inline image: unterminated `(` in BI dict array",
+                    ));
+                }
+                i = j.min(bytes.len());
             } else {
-                // Skip a number token (the only other thing we expect
-                // is something like `/Decode [0 1]` — we don't use it
-                // but we should walk past it cleanly).
-                had_non_name = true;
                 let end = skip_token(bytes, i);
                 if end == i {
                     return Err(PdfError::other(format!(
@@ -541,13 +792,23 @@ fn read_dict_value(bytes: &[u8], from: usize) -> Result<(DictValue, usize), PdfE
                         bytes[i]
                     )));
                 }
+                match str::from_utf8(&bytes[i..end])
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                {
+                    Some(n) => numbers.push(n),
+                    None => had_other = true,
+                }
                 i = end;
             }
         }
-        if had_non_name {
-            return Ok((DictValue::Raw(bytes[from..i].to_vec()), i));
+        if !had_other && names.is_empty() && !numbers.is_empty() {
+            return Ok((DictValue::NumberList(numbers), i));
         }
-        return Ok((DictValue::NameList(names), i));
+        if !had_other && numbers.is_empty() {
+            return Ok((DictValue::NameList(names), i));
+        }
+        return Ok((DictValue::Raw(bytes[from..i].to_vec()), i));
     }
     if b == b'<' && bytes.get(from + 1) == Some(&b'<') {
         // Nested dict (e.g. /DP <</K -1>>) — skip the body.
