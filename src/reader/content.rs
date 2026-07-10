@@ -1980,11 +1980,10 @@ where
                 let text = str::from_utf8(other).ok()?;
                 if let Ok(num) = text.parse::<f32>() {
                     tokens.push(PsToken::Number(num));
-                } else if let Some(op) = PsOp::from_keyword(text) {
-                    tokens.push(PsToken::Op(op));
                 } else {
-                    // Unknown token — a syntax error.
-                    return None;
+                    // A keyword operator; anything unknown is a
+                    // syntax error (`from_keyword` -> `None`).
+                    tokens.push(PsToken::Op(PsOp::from_keyword(text)?));
                 }
             }
         }
