@@ -27,6 +27,7 @@ pub mod document;
 pub mod encoding;
 pub mod filters;
 pub mod hierarchy;
+pub(crate) mod image_decode;
 pub mod images;
 pub mod inline_images;
 pub mod layout;

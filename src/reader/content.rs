@@ -1206,12 +1206,16 @@ pub struct ResolvedSoftMask {
 /// An Image XObject (§8.9.5) decoded to straight RGBA8 for splicing
 /// into the `Scene` at `Do` time. Only the fully-decodable shape is
 /// resolved here — a filter chain the crate decodes end-to-end
-/// (Flate / LZW / ASCII / RunLength / none), `/BitsPerComponent 8`,
-/// and a `/DeviceRGB` or `/DeviceGray` colour space — optionally
-/// combined with a same-shape `/SMask` soft-mask image (§11.6.5.3)
-/// supplying the alpha channel. Image-codec payloads (DCTDecode /
-/// JPXDecode / …) stay on the [`crate::reader::images`] passthrough
-/// walker.
+/// (Flate / LZW / ASCII / RunLength / none), `/BitsPerComponent`
+/// 1 / 2 / 4 / 8 / 16, and a colour space the crate reduces to device
+/// RGB (the device families, `Indexed`, `ICCBased` via its alternate,
+/// the CIE-based `CalGray` / `CalRGB` / `Lab` families, and
+/// `Separation` / `DeviceN` through their tint transforms) — with the
+/// `/Decode` array (§8.9.5.2 Table 90) honoured, optionally combined
+/// with a `/SMask` soft-mask image (§11.6.5.3) or a `/Mask` stencil /
+/// colour-key mask (§8.9.6.3–4) supplying the alpha channel.
+/// Image-codec payloads (DCTDecode / JPXDecode / …) stay on the
+/// [`crate::reader::images`] passthrough walker.
 #[derive(Clone, Debug)]
 pub struct ResolvedImageXObject {
     /// `/Width` in samples.
@@ -1219,8 +1223,16 @@ pub struct ResolvedImageXObject {
     /// `/Height` in samples.
     pub height: u32,
     /// Straight (non-premultiplied) RGBA8, row-major, row 0 = the
-    /// image's top row (§8.9.5.2 sample (0,0)).
+    /// image's top row (§8.9.5.2 sample (0,0)). For a stencil mask
+    /// (`stencil` = `true`) the RGB channels are a white placeholder
+    /// and the alpha channel carries the stencil coverage — the `Do`
+    /// handler recolours the payload with the fill colour in force.
     pub rgba: Vec<u8>,
+    /// `true` for an `/ImageMask true` stencil mask (§8.9.6.2): the
+    /// samples designate places to mark with the *current nonstroking
+    /// colour* rather than carrying colours of their own, so the final
+    /// RGB is only known at `Do` time.
+    pub stencil: bool,
 }
 
 /// The soft mask currently in force in the graphics state (§11.6.4.3),
@@ -1364,7 +1376,7 @@ enum TjElem {
 /// Type 2/3. A malformed program leaves the owning Separation space
 /// `Unknown` (conservative black fallback).
 #[derive(Clone, Debug, PartialEq)]
-enum PdfFunction {
+pub(crate) enum PdfFunction {
     /// §7.10.3 Type 2: exponential interpolation between `c0` and `c1`
     /// with exponent `n`. `domain` is `[d0, d1]` (input clip);
     /// `range`, when present, is `2·outputs` output-clip bounds.
@@ -1433,7 +1445,7 @@ enum PdfFunction {
 /// variables — only numbers, booleans, the Table 42 operators, and brace
 /// blocks used as the operands of `if` / `ifelse`.
 #[derive(Clone, Debug, PartialEq)]
-enum PsToken {
+pub(crate) enum PsToken {
     /// A numeric literal (integer or real; both stored as `f32`).
     Number(f32),
     /// The `true` / `false` boolean literals.
@@ -1450,7 +1462,7 @@ enum PsToken {
 /// function. `if` / `ifelse` are handled structurally against preceding
 /// [`PsToken::Block`]s, so they are part of this set too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PsOp {
+pub(crate) enum PsOp {
     // B.2 Arithmetic.
     Abs,
     Add,
@@ -2632,7 +2644,7 @@ fn read_num_array(obj: &Object) -> Option<Vec<f32>> {
 /// collapses to `Unknown`, for which `sc`/`scn` keep the conservative
 /// black fallback.
 #[derive(Clone, Debug, PartialEq)]
-enum ColorSpaceKind {
+pub(crate) enum ColorSpaceKind {
     /// `/DeviceGray` — one component (§8.6.4.2).
     DeviceGray,
     /// `/DeviceRGB` — three components (§8.6.4.3).
@@ -2712,7 +2724,7 @@ impl ColorSpaceKind {
     /// `/Pattern` and any resource key — is `Unknown` until
     /// [`resolve_with_resources`](Self::resolve_with_resources) gets a
     /// chance to look the key up.
-    fn from_name(name: &str) -> Self {
+    pub(crate) fn from_name(name: &str) -> Self {
         match name {
             "DeviceGray" | "G" => ColorSpaceKind::DeviceGray,
             "DeviceRGB" | "RGB" => ColorSpaceKind::DeviceRgb,
@@ -2725,7 +2737,7 @@ impl ColorSpaceKind {
     /// space. `Indexed` always carries a single index component
     /// (§8.6.6.3). `None` for `Unknown` (where the count is unknowable
     /// without resolving the resource definition).
-    fn components(&self) -> Option<usize> {
+    pub(crate) fn components(&self) -> Option<usize> {
         match self {
             ColorSpaceKind::DeviceGray => Some(1),
             ColorSpaceKind::DeviceRgb => Some(3),
@@ -2753,7 +2765,7 @@ impl ColorSpaceKind {
     /// [`color_space_from_object`]; an absent key (or one this round
     /// can't reduce to a device fallback) stays `Unknown`, preserving
     /// the conservative black fallback.
-    fn resolve_with_resources(name: &str, resources: Option<&Dict>) -> Self {
+    pub(crate) fn resolve_with_resources(name: &str, resources: Option<&Dict>) -> Self {
         let direct = ColorSpaceKind::from_name(name);
         if direct != ColorSpaceKind::Unknown {
             return direct;
@@ -2791,7 +2803,7 @@ impl ColorSpaceKind {
 /// CalRGB / CalGray / Lab (CIE-based, need a gamut-mapping pass),
 /// Separation / DeviceN (need tint-transform function evaluation), and
 /// `/Pattern` all stay `Unknown`.
-fn color_space_from_object(obj: &Object) -> ColorSpaceKind {
+pub(crate) fn color_space_from_object(obj: &Object) -> ColorSpaceKind {
     match obj {
         Object::Name(n) => ColorSpaceKind::from_name(n),
         Object::Array(items) => match items.first() {
@@ -4079,12 +4091,35 @@ impl<'a> State<'a> {
                     // vertical flips cancel), making the node
                     // writer-round-trippable.
                     if let Some(img) = self.image_xobjects.and_then(|m| m.get(&name)) {
+                        let mut data = img.rgba.clone();
+                        if img.stencil {
+                            // §8.9.6.2 stencil masking: samples mark
+                            // places on the page with the *current
+                            // nonstroking colour*; masked-out areas
+                            // stay transparent. The resolved payload
+                            // carries the coverage in its alpha
+                            // channel — pour the fill colour in force
+                            // at `Do` time (a non-solid fill has no
+                            // single stencil colour; black is the
+                            // conservative fallback the path painter
+                            // also uses).
+                            let fill = match &self.fill_paint {
+                                Some(Paint::Solid(c)) => *c,
+                                _ => Rgba::opaque(0, 0, 0),
+                            };
+                            for px in data.chunks_exact_mut(4) {
+                                px[0] = fill.r;
+                                px[1] = fill.g;
+                                px[2] = fill.b;
+                                px[3] = ((px[3] as u16 * fill.a as u16) / 255) as u8;
+                            }
+                        }
                         let node = Node::Image(ImageRef {
                             frame: Box::new(VideoFrame {
                                 pts: None,
                                 planes: vec![VideoPlane {
                                     stride: img.width as usize * 4,
-                                    data: img.rgba.clone(),
+                                    data,
                                 }],
                             }),
                             bounds: Rect::new(0.0, 0.0, img.width as f32, img.height as f32),
@@ -5546,7 +5581,7 @@ fn paint_from_device_components(cs: &ColorSpaceKind, comps: &[f32]) -> Option<Pa
 /// `Separation` / `DeviceN` tint transforms), so a mesh vertex / patch
 /// corner colour is reduced exactly as a fill colour would be. Returns
 /// `None` for an `Unknown` space or a component-count mismatch.
-fn rgba_from_components(cs: &ColorSpaceKind, comps: &[f32]) -> Option<Rgba> {
+pub(crate) fn rgba_from_components(cs: &ColorSpaceKind, comps: &[f32]) -> Option<Rgba> {
     let paint = match cs {
         ColorSpaceKind::DeviceGray | ColorSpaceKind::DeviceRgb | ColorSpaceKind::DeviceCmyk => {
             paint_from_device_components(cs, comps)?
