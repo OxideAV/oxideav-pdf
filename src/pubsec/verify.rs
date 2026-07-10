@@ -71,8 +71,7 @@
 //! Implemented from RFC 5652 §5.4 + RFC 8017 (PKCS#1 v2.2 — RSA-PKCS#1
 //! v1.5 + RSA-PSS) + RFC 5754 (NIST hash OIDs in CMS) + RFC 5758
 //! (ECDSA-with-SHA-{256,384,512} OIDs in CMS) + RFC 5280 §4 (X.509
-//! AlgorithmIdentifier shapes). No third-party CMS / OpenSSL source
-//! consulted.
+//! AlgorithmIdentifier shapes). No third-party source consulted.
 
 use rsa::pkcs1v15::Pkcs1v15Sign;
 use rsa::pss::Pss;

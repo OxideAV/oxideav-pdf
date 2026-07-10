@@ -37,8 +37,8 @@
 //! Provenance: ISO 32000-1 §7.11 (file specifications), §3.10 (file
 //! specification dictionaries), §12.5.6.15 (FileAttachment
 //! annotations), §7.7.4 (catalog `/Names`), §7.9.6 (name tree
-//! structure). qpdf documentation consulted as a black-box validator
-//! only — no qpdf source code referenced.
+//! structure). Validated against external tooling as an opaque black box
+//! only — no third-party source code referenced.
 //!
 //! # Wire shape (one attachment, no annotation)
 //!
