@@ -421,6 +421,78 @@ fn calgray_image_reduces_through_cie_pipeline() {
 }
 
 #[test]
+fn lab_image_uses_range_scaled_decode_default() {
+    // A /Lab image's default Decode is [0 100 amin amax bmin bmax]
+    // (Table 90). Code 255 on L* with a*/b* mid-range (0 under the
+    // symmetric default range) must land near white; code 0 near
+    // black.
+    let data = [255u8, 128, 128, 0, 128, 128];
+    let pdf = one_page_pdf(
+        "/XObject << /Im0 5 0 R >>",
+        b"q 100 0 0 100 0 0 cm /Im0 Do Q",
+        vec![(
+            5,
+            stream_obj(
+                "/Type /XObject /Subtype /Image /Width 2 /Height 1 \
+                 /ColorSpace [/Lab << /WhitePoint [0.9505 1.0 1.089] \
+                 /Range [-100 100 -100 100] >>] /BitsPerComponent 8",
+                &data,
+            ),
+        )],
+    );
+    let px = pixels(&single_image(&pdf));
+    assert!(
+        px[0][0] > 240 && px[0][1] > 240 && px[0][2] > 240,
+        "L*=100 a*≈0 b*≈0 → near white, got {:?}",
+        px[0]
+    );
+    assert!(
+        px[1][0] < 15 && px[1][1] < 15 && px[1][2] < 15,
+        "L*=0 → near black, got {:?}",
+        px[1]
+    );
+}
+
+#[test]
+fn device_n_image_through_type4_tint_transform() {
+    // A 2-colorant /DeviceN image mapped into DeviceRGB by a Type 4
+    // (PostScript calculator) tint transform: r = t1, g = t2, b = 0.
+    let data = [
+        255u8, 0, // (1, 0) → red
+        0, 255, // (0, 1) → green
+        255, 255, // (1, 1) → yellow
+    ];
+    let pdf = one_page_pdf(
+        "/XObject << /Im0 5 0 R >>",
+        b"q 100 0 0 100 0 0 cm /Im0 Do Q",
+        vec![
+            (
+                5,
+                stream_obj(
+                    "/Type /XObject /Subtype /Image /Width 3 /Height 1 \
+                     /ColorSpace [/DeviceN [/InkA /InkB] /DeviceRGB 6 0 R] \
+                     /BitsPerComponent 8",
+                    &data,
+                ),
+            ),
+            (
+                6,
+                // The two tints stay on the operand stack; pushing 0
+                // yields exactly (t1, t2, 0) as the RGB outputs.
+                stream_obj(
+                    "/FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1]",
+                    b"{ 0 }",
+                ),
+            ),
+        ],
+    );
+    let px = pixels(&single_image(&pdf));
+    assert_eq!(px[0], [255, 0, 0, 255], "tints (1,0) → red");
+    assert_eq!(px[1], [0, 255, 0, 255], "tints (0,1) → green");
+    assert_eq!(px[2], [255, 255, 0, 255], "tints (1,1) → yellow");
+}
+
+#[test]
 fn unknown_color_space_stays_passthrough() {
     // A colour space the crate can't reduce (bare /Pattern) leaves the
     // image on the passthrough surface — no scene splice, no panic.
