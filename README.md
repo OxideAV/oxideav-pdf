@@ -259,16 +259,37 @@ depth-bounded and cycle-guarded, so a self-referential appearance stream
 terminates.
 
 **Image XObjects** (§8.9.5) whose `/Filter` chain the crate decodes
-end-to-end (Flate / LZW / ASCII / RunLength / none, 8 bits/component,
-`/DeviceRGB` / `/DeviceGray`) are painted into the `Scene` as
-`Node::Image`: the RGBA8 payload combines the colour samples with the
-`/SMask` soft-mask image's alpha (§11.6.5.3 — nearest-neighbour
-resampled when its dimensions differ), placed on the §8.9.5.2 unit
-square with sample (0,0) on the top edge, in the writer's own
-`ImageRef` convention — so `write_pdf` → `read_pdf_to_scene`
-reproduces an authored image node's pixels, alpha, and placement
-exactly. Image-codec payloads (`DCTDecode` / `JPXDecode` / …) stay
-scene-side no-ops, surfaced by `image_xobjects()`.
+end-to-end (Flate / LZW / ASCII / RunLength / none) are painted into
+the `Scene` as `Node::Image` at the **full §8.9.5.2 sample model**:
+`/BitsPerComponent` 1 / 2 / 4 / 8 / 16 (rows byte-aligned, samples
+MSB-first per §8.9.3), the `/Decode` array (Table 90 per-space
+defaults, inversion per NOTE 3), and every colour space the crate
+reduces to device RGB — the device families, `Indexed`, `ICCBased`
+via its alternate, `CalGray` / `CalRGB` / `Lab`, and `Separation` /
+`DeviceN` through their §7.10 tint transforms, with a *named*
+`/ColorSpace` resolved through `/Resources /ColorSpace`. **Masking
+(§8.9.6)** folds into the alpha channel: an `/ImageMask true` stencil
+(§8.9.6.2) is poured with the nonstroking colour in force at `Do`
+time (`Decode [1 0]` reversal honoured); an explicit `/Mask` stencil
+stream (§8.9.6.3) resamples onto the base image's grid; a `/Mask`
+colour-key array (§8.9.6.4) tests raw pre-`Decode` codes; and
+`/SMask` (§11.6.5.3 — any supported bit depth, own `/Decode`,
+nearest-neighbour resampled) **overrides** `/Mask` per Table 89. The
+image is placed on the §8.9.5.2 unit square with sample (0,0) on the
+top edge, in the writer's own `ImageRef` convention — so `write_pdf`
+→ `read_pdf_to_scene` reproduces an authored image node's pixels,
+alpha, and placement exactly, and the decoded pixels are black-box
+validated against Ghostscript renders of the same fixtures.
+Image-codec payloads (`DCTDecode` / `JPXDecode` / …) stay scene-side
+no-ops, surfaced by `image_xobjects()`.
+
+**Inline images** (§8.9.7) paint into the `Scene` the same way: a
+`BI … ID … EI` triplet with no terminal image-codec filter splices a
+`Node::Image` under the CTM in force — device colour spaces, an
+inline `[/I base hival lookup]` Indexed array (Table 94), or a named
+`/Resources /ColorSpace` key, with `/D` honoured and `/IM true`
+stencils poured with the current nonstroking colour. Terminal-codec
+inline payloads stay event-only on `inline_images()`.
 
 **Type 3 font glyphs** (§9.6.5) are painted into the `Scene` as vector
 geometry. A Type 3 font is the one simple-font family whose glyphs are
