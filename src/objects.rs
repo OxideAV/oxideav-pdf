@@ -1023,9 +1023,9 @@ fn format_real(f: f64) -> String {
         // Integer-valued — emit without a fractional component.
         return format!("{}", f as i64);
     }
-    // 6 digits of fractional precision is what most PDF writers use
-    // (matches qpdf's default). Trim trailing zeros to keep streams
-    // small; never leave a bare trailing dot.
+    // 6 digits of fractional precision is a common writer choice
+    // (observed across black-box tool output). Trim trailing zeros to
+    // keep streams small; never leave a bare trailing dot.
     let s = format!("{:.6}", f);
     let trimmed = s.trim_end_matches('0').trim_end_matches('.');
     if trimmed.is_empty() || trimmed == "-" {
