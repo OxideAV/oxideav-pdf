@@ -15,9 +15,9 @@
 //! aren't worth giving their own indirect object. Authoring tools
 //! that emit a lot of tiny raster glyphs (ticks, bullets, fake-glyph
 //! workarounds) save indirect-object overhead by inlining them.
-//! Real-world PDFs use them sparingly but they show up — `pdfimages -all`
-//! covers them, so a reader that wants byte-parity with poppler needs
-//! to surface them too.
+//! Real-world PDFs use them sparingly but they show up — standard
+//! image-extraction tooling (`pdfimages -all`) covers them, so a
+//! complete extraction surface needs to cover them too.
 //!
 //! ## What round 35 surfaces
 //!

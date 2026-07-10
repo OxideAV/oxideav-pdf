@@ -5,8 +5,8 @@
 //! upstream wrapping filters such as `/ASCII85Decode` or
 //! `/ASCIIHexDecode`). The returned [`PdfImageXObject`] carries the
 //! raw JPEG bytes — the unmodified DCT-encoded payload, ready to be
-//! handed to a JPEG decoder (`oxideav-jpeg`, `image-rs`, libjpeg,
-//! poppler's `pdfimages -all`, …) without any further filter step.
+//! handed to any JPEG decoder (`oxideav-jpeg`, an extraction tool
+//! like `pdfimages -all`, …) without any further filter step.
 //!
 //! ## Why JPEG passthrough specifically
 //!
