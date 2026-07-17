@@ -25,22 +25,30 @@ pub mod attachments;
 pub mod content;
 pub mod document;
 pub mod encoding;
+// Internal: stream-filter implementations behind `decode_stream` (exposed for tests).
+#[doc(hidden)]
 pub mod filters;
 pub mod hierarchy;
 pub(crate) mod image_decode;
 pub mod images;
 pub mod inline_images;
 pub mod layout;
+// Internal: tokenizer plumbing behind the object parser (exposed for tests).
+#[doc(hidden)]
 pub mod lex;
 pub mod linearize;
 pub mod link;
 pub mod ocg;
 pub mod outline;
+// Internal: object-parser plumbing behind `DocumentReader` (exposed for tests).
+#[doc(hidden)]
 pub mod parse;
 pub mod pdfa;
 pub mod sig;
 pub mod text;
 pub mod xmp;
+// Internal: xref-walker plumbing behind `DocumentReader` (exposed for tests).
+#[doc(hidden)]
 pub mod xref;
 
 pub use actions::{actions, ActionKind, ActionTrigger, PdfAction};

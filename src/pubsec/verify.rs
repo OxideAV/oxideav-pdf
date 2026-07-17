@@ -90,46 +90,84 @@ use super::x509::Certificate;
 // ---------------------------------------------------------------------
 
 /// 1.3.14.3.2.26 — SHA-1 (RFC 3279 §2.2.1).
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_SHA1: [u64; 6] = [1, 3, 14, 3, 2, 26];
 /// 2.16.840.1.101.3.4.2.1 — SHA-256 (RFC 5754 §2.1).
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_SHA256: [u64; 9] = [2, 16, 840, 1, 101, 3, 4, 2, 1];
 /// 2.16.840.1.101.3.4.2.2 — SHA-384 (RFC 5754 §2.2).
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_SHA384: [u64; 9] = [2, 16, 840, 1, 101, 3, 4, 2, 2];
 /// 2.16.840.1.101.3.4.2.3 — SHA-512 (RFC 5754 §2.3).
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_SHA512: [u64; 9] = [2, 16, 840, 1, 101, 3, 4, 2, 3];
 
 /// 1.2.840.113549.1.1.1 — rsaEncryption (RSA-PKCS#1 v1.5 — RFC 8017).
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_RSA_ENCRYPTION: [u64; 7] = [1, 2, 840, 113549, 1, 1, 1];
 /// 1.2.840.113549.1.1.5 — sha1WithRSAEncryption (RFC 8017).
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_SHA1_WITH_RSA: [u64; 7] = [1, 2, 840, 113549, 1, 1, 5];
 /// 1.2.840.113549.1.1.11 — sha256WithRSAEncryption (RFC 8017).
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_SHA256_WITH_RSA: [u64; 7] = [1, 2, 840, 113549, 1, 1, 11];
 /// 1.2.840.113549.1.1.12 — sha384WithRSAEncryption (RFC 8017).
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_SHA384_WITH_RSA: [u64; 7] = [1, 2, 840, 113549, 1, 1, 12];
 /// 1.2.840.113549.1.1.13 — sha512WithRSAEncryption (RFC 8017).
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_SHA512_WITH_RSA: [u64; 7] = [1, 2, 840, 113549, 1, 1, 13];
 /// 1.2.840.113549.1.1.10 — id-RSASSA-PSS (RFC 8017 §A.2.4).
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_RSA_PSS: [u64; 7] = [1, 2, 840, 113549, 1, 1, 10];
 
 /// 1.2.840.10045.2.1 — id-ecPublicKey (RFC 5480 §2.1.1).
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_EC_PUBLIC_KEY: [u64; 6] = [1, 2, 840, 10045, 2, 1];
 /// 1.2.840.10045.4.1 — ecdsa-with-SHA1 (RFC 3279).
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_ECDSA_WITH_SHA1: [u64; 6] = [1, 2, 840, 10045, 4, 1];
 /// 1.2.840.10045.4.3.2 — ecdsa-with-SHA256 (RFC 5758 §3.2).
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_ECDSA_WITH_SHA256: [u64; 7] = [1, 2, 840, 10045, 4, 3, 2];
 /// 1.2.840.10045.4.3.3 — ecdsa-with-SHA384 (RFC 5758 §3.2).
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_ECDSA_WITH_SHA384: [u64; 7] = [1, 2, 840, 10045, 4, 3, 3];
 /// 1.2.840.10045.4.3.4 — ecdsa-with-SHA512 (RFC 5758 §3.2).
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_ECDSA_WITH_SHA512: [u64; 7] = [1, 2, 840, 10045, 4, 3, 4];
 
 /// 1.2.840.10045.3.1.7 — secp256r1 / P-256 (RFC 5480 §2.1.1.1).
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_NAMED_CURVE_P256: [u64; 7] = [1, 2, 840, 10045, 3, 1, 7];
 /// 1.3.132.0.34 — secp384r1 / P-384 (RFC 5480 §2.1.1.1).
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_NAMED_CURVE_P384: [u64; 5] = [1, 3, 132, 0, 34];
 /// 1.3.132.0.35 — secp521r1 / P-521 (RFC 5480 §2.1.1.1).
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_NAMED_CURVE_P521: [u64; 5] = [1, 3, 132, 0, 35];
 
 /// 1.2.840.113549.1.9.4 — id-messageDigest (RFC 5652 §11.2).
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_ATTR_MESSAGE_DIGEST: [u64; 7] = [1, 2, 840, 113549, 1, 9, 4];
 
 /// OID 1.2.840.113549.1.9.3 — `contentType` signed-attribute (RFC 5652
@@ -137,6 +175,8 @@ pub const OID_ATTR_MESSAGE_DIGEST: [u64; 7] = [1, 2, 840, 113549, 1, 9, 4];
 /// `signedAttrs` SET as required by §11.1 ("a contentType attribute,
 /// having as its value the content type of the EncapsulatedContentInfo
 /// value being signed").
+// Internal: OID table for the verifier (exposed for tests).
+#[doc(hidden)]
 pub const OID_ATTR_CONTENT_TYPE: [u64; 7] = [1, 2, 840, 113549, 1, 9, 3];
 
 // ---------------------------------------------------------------------
@@ -301,6 +341,8 @@ pub fn resolve_signer_cert<'a>(
 /// hash, we have to put the universal tag back. This is a straight
 /// `write_tlv(Universal, constructed=true, tag=SET)` over the same body
 /// bytes.
+// Internal: signedAttrs re-encoding plumbing behind `verify_signature` (exposed for tests).
+#[doc(hidden)]
 pub fn signed_attrs_to_be_signed(signed_attrs_der: &[u8]) -> Vec<u8> {
     write_set(signed_attrs_der)
 }
@@ -310,6 +352,8 @@ pub fn signed_attrs_to_be_signed(signed_attrs_der: &[u8]) -> Vec<u8> {
 ///
 /// Per RFC 5652 §11.2 the attribute is a SET with a single
 /// `messageDigest OCTET STRING` inside.
+// Internal: attribute-lookup plumbing behind `verify_signature` (exposed for tests).
+#[doc(hidden)]
 pub fn message_digest_attr(attrs: &[Attribute]) -> Option<Vec<u8>> {
     for a in attrs {
         if a.oid == OID_ATTR_MESSAGE_DIGEST {
@@ -574,6 +618,8 @@ fn verify_ecdsa_p521(spki: &[u8], digest: &[u8], sig_der: &[u8]) -> Result<bool,
 /// `Attribute` SEQUENCE. The caller stitches multiple attributes
 /// together and wraps the result in an `IMPLICIT [0]` tag for the
 /// SignerInfo wire form.
+// Internal: DER attribute-builder plumbing (exposed for tests).
+#[doc(hidden)]
 pub fn build_message_digest_attribute_der(content_hash: &[u8]) -> Vec<u8> {
     use super::der::{write_octet_string, write_oid, write_sequence};
     let oid = write_oid(&OID_ATTR_MESSAGE_DIGEST);
@@ -587,6 +633,8 @@ pub fn build_message_digest_attribute_der(content_hash: &[u8]) -> Vec<u8> {
 /// Convenience: pack a sequence of pre-encoded `Attribute` DER bytes
 /// into a wire-form `[0] IMPLICIT SET` (the body the parser surfaces as
 /// `signed_attrs_der`).
+// Internal: DER attribute-builder plumbing (exposed for tests).
+#[doc(hidden)]
 pub fn pack_signed_attrs_implicit(attrs_der: &[Vec<u8>]) -> Vec<u8> {
     // The body bytes are simply the concatenation of the per-attribute
     // SEQUENCE TLVs — the SET ordering is not enforced by us (the
@@ -601,6 +649,8 @@ pub fn pack_signed_attrs_implicit(attrs_der: &[Vec<u8>]) -> Vec<u8> {
 
 /// Build a `[0] IMPLICIT` TLV around an already-packed signed_attrs
 /// body — useful for stitching together a SignerInfo by hand.
+// Internal: DER attribute-builder plumbing (exposed for tests).
+#[doc(hidden)]
 pub fn implicit_signed_attrs_tlv(attrs_body: &[u8]) -> Vec<u8> {
     write_tlv(Class::ContextSpecific, true, 0, attrs_body)
 }
@@ -609,6 +659,8 @@ pub fn implicit_signed_attrs_tlv(attrs_body: &[u8]) -> Vec<u8> {
 /// an RSA key — i.e. the PKCS#1 `RSAPublicKey ::= SEQUENCE { n INTEGER,
 /// e INTEGER }` DER. The caller wraps it in a BIT STRING + the SPKI
 /// AlgorithmIdentifier when synthesising a full cert.
+// Internal: key-encoding plumbing (exposed for tests).
+#[doc(hidden)]
 pub fn rsa_pubkey_to_pkcs1_der(pubkey: &RsaPublicKey) -> Vec<u8> {
     use rsa::pkcs1::EncodeRsaPublicKey;
     pubkey
@@ -621,6 +673,8 @@ pub fn rsa_pubkey_to_pkcs1_der(pubkey: &RsaPublicKey) -> Vec<u8> {
 /// Round-trip a raw PKCS#1 `RSAPublicKey` SEQUENCE into a public key
 /// the `rsa` crate can verify with — only used by the test code to
 /// build synthetic certs.
+// Internal: key-encoding plumbing (exposed for tests).
+#[doc(hidden)]
 pub fn parse_rsa_pubkey_pkcs1(der: &[u8]) -> Result<RsaPublicKey, PdfError> {
     use rsa::pkcs1::DecodeRsaPublicKey;
     RsaPublicKey::from_pkcs1_der(der)
@@ -630,6 +684,8 @@ pub fn parse_rsa_pubkey_pkcs1(der: &[u8]) -> Result<RsaPublicKey, PdfError> {
 /// Read an RSA INTEGER component out of an RSAPublicKey SEQUENCE — used
 /// by the synthetic cert builders so they can copy the `(n, e)` pair
 /// into a freshly-built BIT STRING.
+// Internal: key-encoding plumbing (exposed for tests).
+#[doc(hidden)]
 pub fn rsa_pubkey_components(pubkey: &RsaPublicKey) -> (Vec<u8>, Vec<u8>) {
     use rsa::traits::PublicKeyParts;
     let n = pubkey.n();

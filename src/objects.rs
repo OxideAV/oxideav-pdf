@@ -1005,6 +1005,8 @@ fn write_dict(out: &mut Vec<u8>, d: &Dict) -> io::Result<()> {
 /// section so the appended-revision objects (Catalog override,
 /// AcroForm, Sig field) come out byte-stable with the rest of the
 /// file.
+// Internal: sig-writer serialization plumbing (exposed for tests).
+#[doc(hidden)]
 pub fn write_dict_to(out: &mut Vec<u8>, d: &Dict) -> Result<(), PdfError> {
     write_dict(out, d).map_err(PdfError::Io)
 }

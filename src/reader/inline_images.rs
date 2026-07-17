@@ -201,6 +201,8 @@ pub fn inline_images(reader: &mut DocumentReader<'_>) -> Result<Vec<PdfInlineIma
 /// inline image (`BI … ID … EI`) found. `source_page_index` and
 /// `source_page_obj` are filled in by the per-page driver — the
 /// returned images carry placeholder values for those fields.
+// Internal: per-stream walker plumbing behind `inline_images` (exposed for tests).
+#[doc(hidden)]
 pub fn extract_inline_images_from_stream(bytes: &[u8]) -> Result<Vec<PdfInlineImage>, PdfError> {
     let mut out = Vec::new();
     let mut i = 0;

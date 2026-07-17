@@ -279,6 +279,8 @@ pub fn extract_text_marked(
 /// Exposed `pub` for sibling reader modules that need the same content
 /// stream view (e.g. inline-image extraction) without rebuilding the
 /// `/Resources /Font` walker the round-22 text extractor needs.
+// Internal: shared content-stream plumbing for sibling reader modules (exposed for tests).
+#[doc(hidden)]
 pub fn concatenate_page_contents(
     reader: &mut DocumentReader<'_>,
     page_id: ObjectId,

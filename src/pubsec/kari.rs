@@ -68,26 +68,36 @@ use super::der::{read_oid, read_sequence, write_oid, write_sequence};
 
 /// OID `1.2.840.10045.2.1` — ecPublicKey (RFC 5480 §2.1.1). Identifies
 /// an EC public key inside `OriginatorPublicKey.algorithm`.
+// Internal: KARI wire-level plumbing (exposed for tests).
+#[doc(hidden)]
 pub const OID_EC_PUBLIC_KEY: [u64; 6] = [1, 2, 840, 10045, 2, 1];
 
 /// OID `1.2.840.10045.3.1.7` — secp256r1 / NIST P-256 (RFC 5480 §2.1.1.1).
+// Internal: KARI wire-level plumbing (exposed for tests).
+#[doc(hidden)]
 pub const OID_SECP256R1: [u64; 7] = [1, 2, 840, 10045, 3, 1, 7];
 
 /// OID `1.3.132.0.34` — secp384r1 / NIST P-384 (RFC 5480 §2.1.1.1 +
 /// SECG SEC 2). Same encoding as P-256: a named-curve OID inside the
 /// `ecPublicKey` AlgorithmIdentifier's `parameters`.
+// Internal: KARI wire-level plumbing (exposed for tests).
+#[doc(hidden)]
 pub const OID_SECP384R1: [u64; 5] = [1, 3, 132, 0, 34];
 
 /// OID `1.3.132.0.35` — secp521r1 / NIST P-521 (RFC 5480 §2.1.1.1 +
 /// SECG SEC 2). Round-16: same encoding shape as P-256 / P-384 — a
 /// named-curve OID inside the `ecPublicKey` AlgorithmIdentifier's
 /// `parameters`.
+// Internal: KARI wire-level plumbing (exposed for tests).
+#[doc(hidden)]
 pub const OID_SECP521R1: [u64; 5] = [1, 3, 132, 0, 35];
 
 /// OID `1.3.101.110` — `id-X25519` (RFC 8410 §3 — the curve identifier
 /// used by both X.509 SPKIs and CMS KARI's `OriginatorPublicKey`). RFC
 /// 8418 §2 mandates an absent `parameters` field (no OID nor NULL) for
 /// the AlgorithmIdentifier carrying this OID.
+// Internal: KARI wire-level plumbing (exposed for tests).
+#[doc(hidden)]
 pub const OID_X25519: [u64; 4] = [1, 3, 101, 110];
 
 /// OID `1.3.101.111` — `id-X448` (RFC 8410 §3). Round-24 curve identifier
@@ -95,21 +105,29 @@ pub const OID_X25519: [u64; 4] = [1, 3, 101, 110];
 /// Same encoding shape as `id-X25519`: parameters MUST be absent (no OID,
 /// no NULL); the BIT STRING contents IS the raw 56-byte u-coordinate (RFC
 /// 7748 §5).
+// Internal: KARI wire-level plumbing (exposed for tests).
+#[doc(hidden)]
 pub const OID_X448: [u64; 4] = [1, 3, 101, 111];
 
 /// OID `1.3.132.1.11.1` — `dhSinglePass-stdDH-sha256kdf-scheme` (RFC
 /// 5753 §7.1.4 + RFC 8418 §2.1). Combined ECDH + X9.63-SHA-256 KDF
 /// identifier. Used for both P-256 and X25519 in the round-15 dispatch.
+// Internal: KARI wire-level plumbing (exposed for tests).
+#[doc(hidden)]
 pub const OID_DH_SINGLE_PASS_STDDH_SHA256_KDF: [u64; 6] = [1, 3, 132, 1, 11, 1];
 
 /// OID `1.3.132.1.11.2` — `dhSinglePass-stdDH-sha384kdf-scheme` (RFC
 /// 5753 §7.1.4). Combined ECDH + X9.63-SHA-384 KDF identifier. Round-15
 /// dispatch binds this to P-384.
+// Internal: KARI wire-level plumbing (exposed for tests).
+#[doc(hidden)]
 pub const OID_DH_SINGLE_PASS_STDDH_SHA384_KDF: [u64; 6] = [1, 3, 132, 1, 11, 2];
 
 /// OID `1.3.132.1.11.3` — `dhSinglePass-stdDH-sha512kdf-scheme` (RFC
 /// 5753 §7.1.4). Combined ECDH + X9.63-SHA-512 KDF identifier.
 /// Round-16 dispatch binds this to P-521.
+// Internal: KARI wire-level plumbing (exposed for tests).
+#[doc(hidden)]
 pub const OID_DH_SINGLE_PASS_STDDH_SHA512_KDF: [u64; 6] = [1, 3, 132, 1, 11, 3];
 
 /// OID `1.2.840.113549.1.9.16.3.19` — `dhSinglePass-stdDH-hkdf-sha256-scheme`
@@ -117,35 +135,49 @@ pub const OID_DH_SINGLE_PASS_STDDH_SHA512_KDF: [u64; 6] = [1, 3, 132, 1, 11, 3];
 /// identifier. Round-16 dispatch routes X25519 (and any other DH/ECDH
 /// curve) to HKDF-SHA-256 when the `keyEncryptionAlgorithm` carries
 /// this OID instead of the X9.63 family.
+// Internal: KARI wire-level plumbing (exposed for tests).
+#[doc(hidden)]
 pub const OID_DH_SINGLE_PASS_STDDH_HKDF_SHA256_SCHEME: [u64; 9] =
     [1, 2, 840, 113549, 1, 9, 16, 3, 19];
 
 /// OID `1.2.840.113549.1.9.16.3.20` — `dhSinglePass-stdDH-hkdf-sha384-scheme`
 /// (RFC 8418 §2.2, smime-alg 20). Combined ECDH + HKDF-SHA-384 KDF
 /// identifier.
+// Internal: KARI wire-level plumbing (exposed for tests).
+#[doc(hidden)]
 pub const OID_DH_SINGLE_PASS_STDDH_HKDF_SHA384_SCHEME: [u64; 9] =
     [1, 2, 840, 113549, 1, 9, 16, 3, 20];
 
 /// OID `1.2.840.113549.1.9.16.3.21` — `dhSinglePass-stdDH-hkdf-sha512-scheme`
 /// (RFC 8418 §2.2, smime-alg 21). Combined ECDH + HKDF-SHA-512 KDF
 /// identifier.
+// Internal: KARI wire-level plumbing (exposed for tests).
+#[doc(hidden)]
 pub const OID_DH_SINGLE_PASS_STDDH_HKDF_SHA512_SCHEME: [u64; 9] =
     [1, 2, 840, 113549, 1, 9, 16, 3, 21];
 
 /// OID `2.16.840.1.101.3.4.1.5` — `id-aes128-wrap` (RFC 5649 §3 / RFC
 /// 3394 §3 OID list).
+// Internal: KARI wire-level plumbing (exposed for tests).
+#[doc(hidden)]
 pub const OID_AES128_WRAP: [u64; 9] = [2, 16, 840, 1, 101, 3, 4, 1, 5];
 
 /// OID `2.16.840.1.101.3.4.1.25` — `id-aes192-wrap`.
+// Internal: KARI wire-level plumbing (exposed for tests).
+#[doc(hidden)]
 pub const OID_AES192_WRAP: [u64; 9] = [2, 16, 840, 1, 101, 3, 4, 1, 25];
 
 /// OID `2.16.840.1.101.3.4.1.45` — `id-aes256-wrap`.
+// Internal: KARI wire-level plumbing (exposed for tests).
+#[doc(hidden)]
 pub const OID_AES256_WRAP: [u64; 9] = [2, 16, 840, 1, 101, 3, 4, 1, 45];
 
 /// AES wrap variants supported by the round-14 KARI unwrap path. The
 /// width determines both the KEK byte length the X9.63 KDF emits and
 /// the AES-KW variant used to unwrap the CEK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Internal: key-wrap selector plumbing (exposed for tests).
+#[doc(hidden)]
 pub enum WrapAlgorithm {
     /// `id-aes128-wrap`: 128-bit KEK + AES-128 key wrap.
     Aes128,
@@ -404,6 +436,8 @@ impl KariKdf {
 ///     K_counter = hash(z || counter (32-bit big-endian) || shared_info)
 /// keydata = (K_1 || K_2 || ...) truncated to keydatalen bytes
 /// ```
+// Internal: KDF primitive (exposed for tests).
+#[doc(hidden)]
 pub fn x963_kdf<H: sha2::Digest>(z: &[u8], shared_info: &[u8], keydatalen: usize) -> Vec<u8> {
     let hashlen = <H as sha2::Digest>::output_size();
     let n = keydatalen.div_ceil(hashlen);
@@ -421,6 +455,8 @@ pub fn x963_kdf<H: sha2::Digest>(z: &[u8], shared_info: &[u8], keydatalen: usize
 
 /// Convenience wrapper that pins X9.63 KDF to SHA-256 — the round-14
 /// hot path. Round-15 callers use the generic [`x963_kdf`] directly.
+// Internal: KDF primitive (exposed for tests).
+#[doc(hidden)]
 pub fn x963_kdf_sha256(z: &[u8], shared_info: &[u8], keydatalen: usize) -> Vec<u8> {
     x963_kdf::<sha2::Sha256>(z, shared_info, keydatalen)
 }
@@ -430,6 +466,8 @@ pub fn x963_kdf_sha256(z: &[u8], shared_info: &[u8], keydatalen: usize) -> Vec<u
 /// the ECDH shared secret `Z`, `info` is the DER `ECC-CMS-SharedInfo`,
 /// and the output is `keydatalen` bytes. Computes
 /// `HKDF-Extract(salt, ikm)` followed by `HKDF-Expand(prk, info, keydatalen)`.
+// Internal: KDF primitive (exposed for tests).
+#[doc(hidden)]
 pub fn hkdf_kdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], keydatalen: usize) -> Vec<u8> {
     let salt_opt = if salt.is_empty() { None } else { Some(salt) };
     let hk = hkdf::Hkdf::<sha2::Sha256>::new(salt_opt, ikm);
@@ -440,6 +478,8 @@ pub fn hkdf_kdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], keydatalen: usize) 
 }
 
 /// HKDF-SHA-384 KEK derivation per RFC 5869 + RFC 8418 §2.2.
+// Internal: KDF primitive (exposed for tests).
+#[doc(hidden)]
 pub fn hkdf_kdf_sha384(salt: &[u8], ikm: &[u8], info: &[u8], keydatalen: usize) -> Vec<u8> {
     let salt_opt = if salt.is_empty() { None } else { Some(salt) };
     let hk = hkdf::Hkdf::<sha2::Sha384>::new(salt_opt, ikm);
@@ -450,6 +490,8 @@ pub fn hkdf_kdf_sha384(salt: &[u8], ikm: &[u8], info: &[u8], keydatalen: usize) 
 }
 
 /// HKDF-SHA-512 KEK derivation per RFC 5869 + RFC 8418 §2.2.
+// Internal: KDF primitive (exposed for tests).
+#[doc(hidden)]
 pub fn hkdf_kdf_sha512(salt: &[u8], ikm: &[u8], info: &[u8], keydatalen: usize) -> Vec<u8> {
     let salt_opt = if salt.is_empty() { None } else { Some(salt) };
     let hk = hkdf::Hkdf::<sha2::Sha512>::new(salt_opt, ikm);
@@ -464,6 +506,8 @@ pub fn hkdf_kdf_sha512(salt: &[u8], ikm: &[u8], info: &[u8], keydatalen: usize) 
 /// `shared_info` by the caller (it's already in the
 /// `ECC-CMS-SharedInfo`); for HKDF the UKM is the salt per RFC 8418
 /// §2.2 and is supplied separately.
+// Internal: KEK-derivation plumbing (exposed for tests).
+#[doc(hidden)]
 pub fn derive_kek(
     kdf: KariKdf,
     z: &[u8],
@@ -496,6 +540,8 @@ pub fn derive_kek(
 /// `entity_u_info` is the optional UKM (RFC 5652 §6.2.2 — KARI's
 /// `ukm`). `key_bit_length` is the wrap's KEK length in bits (128 /
 /// 192 / 256).
+// Internal: ECC-CMS-SharedInfo encoder plumbing (exposed for tests).
+#[doc(hidden)]
 pub fn build_ecc_cms_shared_info(
     wrap_oid: &[u64],
     entity_u_info: Option<&[u8]>,
@@ -524,6 +570,8 @@ pub fn build_ecc_cms_shared_info(
 /// uncompressed point (P-256 / P-384) or the raw 32-byte u-coordinate
 /// (X25519).
 #[derive(Debug, Clone)]
+// Internal: reader-side recipient key material plumbing (exposed for tests).
+#[doc(hidden)]
 pub struct EcRecipient {
     /// Curve the scalar / point belong to. Defaults to [`KariCurve::P256`]
     /// for backwards-compat with round-14 callers via [`Self::p256`].
@@ -607,6 +655,8 @@ impl EcRecipient {
 /// to unwrap. Caller is responsible for matching the slot's RID to
 /// the recipient's certificate; this function performs the
 /// cryptographic unwrap given a matched slot.
+// Internal: envelope-unwrap plumbing behind `open_with_certificate` (exposed for tests).
+#[doc(hidden)]
 pub fn unwrap_kari_p256(
     kari: &KeyAgreeRecipientInfo,
     recipient_slot: &RecipientEncryptedKey,
@@ -626,6 +676,8 @@ pub fn unwrap_kari_p256(
 /// the parsed KDF is one the recipient's curve permits per RFC 5753 /
 /// RFC 8418, runs the right ECDH primitive, derives the KEK with the
 /// chosen KDF (X9.63 or HKDF), and AES-KW unwraps the CEK.
+// Internal: envelope-unwrap plumbing behind `open_with_certificate` (exposed for tests).
+#[doc(hidden)]
 pub fn unwrap_kari(
     kari: &KeyAgreeRecipientInfo,
     recipient_slot: &RecipientEncryptedKey,
@@ -644,6 +696,8 @@ pub fn unwrap_kari(
 /// `trust_store = None` keeps the round-14 behaviour (long-term-cert
 /// originator forms produce a structured error). Pass `Some(&store)` to
 /// enable the lookup path.
+// Internal: envelope-unwrap plumbing behind `open_with_certificate_and_trust_store` (exposed for tests).
+#[doc(hidden)]
 pub fn unwrap_kari_with_trust_store(
     kari: &KeyAgreeRecipientInfo,
     recipient_slot: &RecipientEncryptedKey,
@@ -1022,6 +1076,8 @@ fn extract_originator_point(
 ///   cert's SubjectPublicKeyInfo BIT STRING contents (RFC 5280
 ///   §4.2.1.2 method 1). For an EC cert the SPKI BIT STRING contents
 ///   is the SEC1-encoded point itself.
+// Internal: recipient-matching plumbing (exposed for tests).
+#[doc(hidden)]
 pub fn match_kari_slot<'a>(
     kari: &'a KeyAgreeRecipientInfo,
     issuer_der: &[u8],
@@ -1095,6 +1151,8 @@ pub fn wrap_cek_for_p256_recipient(
 /// X25519 → SHA-256 per RFC 8418 §2.1). Use
 /// [`wrap_cek_for_recipient_with_kdf`] to override (e.g. to bind X25519
 /// to HKDF-SHA-256 / 384 / 512 per RFC 8418 §2.2).
+// Internal: writer-side wrap plumbing (exposed for tests).
+#[doc(hidden)]
 pub fn wrap_cek_for_recipient(
     curve: KariCurve,
     ephemeral_scalar: &[u8],
@@ -1119,6 +1177,8 @@ pub fn wrap_cek_for_recipient(
 /// directly; the (curve, KDF) pair must be permitted by RFC 5753 /
 /// RFC 8418 (see [`KariKdf::is_valid_for`]).
 #[allow(clippy::too_many_arguments)]
+// Internal: writer-side wrap plumbing (exposed for tests).
+#[doc(hidden)]
 pub fn wrap_cek_for_recipient_with_kdf(
     curve: KariCurve,
     kdf: KariKdf,

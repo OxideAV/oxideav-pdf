@@ -44,14 +44,22 @@
 
 pub mod acroform;
 pub mod annotations;
+// Internal: SVG-arc → cubic flattening math used by the writer.
+#[doc(hidden)]
 pub mod arc;
 pub mod attachments;
 pub mod decrypt;
 pub mod encrypt;
 pub mod error;
+// Internal: /Info dictionary construction plumbing for the writer.
+#[doc(hidden)]
 pub mod info;
+// Internal: linearization plumbing behind `write_pdf_from_scene_linearized`.
+#[doc(hidden)]
 pub mod linearize;
 pub mod objects;
+// Internal: content-stream operator emission machinery (exposed for tests).
+#[doc(hidden)]
 pub mod operators;
 pub mod outline;
 pub mod page;

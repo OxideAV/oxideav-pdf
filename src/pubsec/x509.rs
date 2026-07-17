@@ -258,6 +258,8 @@ fn parse_time(data: &[u8]) -> Result<(Vec<u8>, &[u8]), PdfError> {
 /// big-endian decimal.
 ///
 /// Returns `true` when `not_before <= instant <= not_after`.
+// Internal: validity-window comparison plumbing (exposed for tests).
+#[doc(hidden)]
 pub fn time_within(instant: &[u8], not_before: &[u8], not_after: &[u8]) -> bool {
     instant >= not_before && instant <= not_after
 }

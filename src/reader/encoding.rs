@@ -252,6 +252,8 @@ pub fn apply_encoding_differences(
 /// occasionally emit these escapes directly in a `/Differences` array
 /// rather than the AGL-aliased name (e.g. `/uni201C` instead of
 /// `/quotedblleft`), and the spec mandates we honour them.
+// Internal: glyph-name lookup plumbing behind the text extractor (exposed for tests).
+#[doc(hidden)]
 pub fn glyph_name_to_unicode(name: &str) -> Option<Cow<'static, str>> {
     // Special PDF-spec aliases — `.notdef` is rendered as nothing, the
     // `uniXXXX` / `uXXXXXXXX` forms are Unicode-by-name escapes that the

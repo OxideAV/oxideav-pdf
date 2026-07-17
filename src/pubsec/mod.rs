@@ -215,8 +215,14 @@
 //!   explicit MGF1 hash / salt-length parameters if they differ from
 //!   the digest hash).
 
+// Internal: CMS EnvelopedData parsing plumbing (exposed for tests).
+#[doc(hidden)]
 pub mod cms;
+// Internal: CMS envelope construction plumbing (exposed for tests).
+#[doc(hidden)]
 pub mod cms_build;
+// Internal: DER read/write primitives (exposed for tests).
+#[doc(hidden)]
 pub mod der;
 pub mod encode;
 pub mod kari;

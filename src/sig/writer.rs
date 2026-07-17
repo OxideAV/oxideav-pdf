@@ -738,6 +738,8 @@ pub fn pkcs7_wrap_signed_data(
 /// eContent OID. The result is one DER `Attribute` SEQUENCE — caller
 /// stitches it together with `messageDigest` (and any other attrs) via
 /// [`pack_signed_attrs_implicit`].
+// Internal: DER attribute-builder plumbing (exposed for tests).
+#[doc(hidden)]
 pub fn build_content_type_attribute_der(content_type_oid: &[u64]) -> Vec<u8> {
     use crate::pubsec::verify::OID_ATTR_CONTENT_TYPE;
     let oid = write_oid(&OID_ATTR_CONTENT_TYPE);

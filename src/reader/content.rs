@@ -323,6 +323,8 @@ pub fn parse_content_stream_full_with_properties(
 /// never touches the reader: each form's own `/Resources` are resolved
 /// and its content recursively parsed before the map is built, with a
 /// depth guard against nested-form cycles.
+// Internal: intermediate walker entry point (exposed for tests).
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn parse_content_stream_full_with_xobjects(
     input: &[u8],
@@ -352,6 +354,8 @@ pub fn parse_content_stream_full_with_xobjects(
 /// `/Shading` is evaluated through the same axial / radial machinery the
 /// `sh` operator uses; the shading `Coords` are mapped to device space
 /// through the pattern `/Matrix` composed with the CTM in effect.
+// Internal: intermediate walker entry point (exposed for tests).
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn parse_content_stream_full_with_patterns(
     input: &[u8],
@@ -383,6 +387,8 @@ pub fn parse_content_stream_full_with_patterns(
 /// is a [`TilingPattern`] carrying the cell content parsed into a
 /// [`Group`] (against the pattern's own `/Resources`), the `/BBox` clip,
 /// the `/XStep` / `/YStep` spacing, and the pattern `/Matrix`.
+// Internal: intermediate walker entry point (exposed for tests).
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn parse_content_stream_full_with_tiling(
     input: &[u8],
@@ -418,6 +424,8 @@ pub fn parse_content_stream_full_with_tiling(
 /// `/FontMatrix`, the `/Encoding` code→glyph-name map, and every glyph
 /// description pre-parsed into a [`Group`] against the font's own
 /// `/Resources`.
+// Internal: intermediate walker entry point (exposed for tests).
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn parse_content_stream_full_with_type3(
     input: &[u8],

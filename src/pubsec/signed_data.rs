@@ -191,6 +191,8 @@ pub fn parse_signed_data(data: &[u8]) -> Result<SignedData, PdfError> {
 }
 
 /// Parse a bare `SignedData` SEQUENCE (no surrounding ContentInfo).
+// Internal: content-only parse plumbing behind `parse_signed_data` (exposed for tests).
+#[doc(hidden)]
 pub fn parse_signed_data_inner(data: &[u8]) -> Result<SignedData, PdfError> {
     let (body, rest) = read_sequence(data)?;
     if !rest.is_empty() {

@@ -156,6 +156,8 @@ impl<'a> DocumentReader<'a> {
     }
 
     /// The trailer dict (carries `/Root`, optional `/Info`, etc.).
+    // Internal: exposes the xref-walker plumbing (exposed for tests).
+    #[doc(hidden)]
     pub fn xref(&self) -> &XrefTable {
         &self.xref
     }
@@ -4121,6 +4123,8 @@ fn decode_metadata(info: Object) -> Result<Metadata, PdfError> {
 /// Convert a PDF date `D:YYYYMMDDHHmmSSOHH'mm'` back to ISO-8601.
 /// Inputs that don't start with `D:` are returned as-is so the
 /// scene's metadata round-trip is lossless for non-date strings.
+// Internal: metadata date-conversion helper (exposed for tests).
+#[doc(hidden)]
 pub fn pdf_date_to_iso8601(s: String) -> String {
     let bytes = s.as_bytes();
     if !bytes.starts_with(b"D:") {

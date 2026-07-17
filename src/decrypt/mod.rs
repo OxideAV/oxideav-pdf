@@ -62,6 +62,8 @@
 //! `aes` + `cbc` RustCrypto crates — pure-Rust, constant-time, no
 //! `*-sys` wrappers.
 
+// Internal: R5/R6 hash-chain algorithm plumbing (exposed for tests).
+#[doc(hidden)]
 pub mod r5_r6;
 
 use crate::error::PdfError;
@@ -196,6 +198,8 @@ impl StandardHandler {
 ///
 /// `password` is the raw bytes the caller supplied (often `b""` for the
 /// "default user password" path described in §7.6.3.1).
+// Internal: handler-construction plumbing behind `DocumentReader::open_with_password`.
+#[doc(hidden)]
 pub fn open_with_password(
     encrypt: &crate::objects::Dict,
     file_id: &[u8],
@@ -616,6 +620,8 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Symmetric: `rc4(key, rc4(key, plain)) == plain`. Pure 40-line
 /// implementation; the algorithm's tiny S-table key schedule + PRGA
 /// is well-described in any cryptography textbook.
+// Internal: cipher primitive (exposed for tests).
+#[doc(hidden)]
 pub fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
     debug_assert!(!key.is_empty(), "RC4 key must not be empty");
     let mut s: [u8; 256] = [0; 256];
@@ -808,6 +814,8 @@ const MD5_K: [u32; 64] = [
 ];
 
 /// MD5 of the input bytes. Returns the 16-byte digest.
+// Internal: digest primitive (exposed for tests).
+#[doc(hidden)]
 pub fn md5(input: &[u8]) -> [u8; 16] {
     let mut state: [u32; 4] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476];
 
