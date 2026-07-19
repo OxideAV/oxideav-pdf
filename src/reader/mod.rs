@@ -50,6 +50,7 @@ pub mod parse;
 pub mod pdfa;
 pub mod sig;
 pub mod text;
+pub mod threads;
 pub mod xmp;
 // Internal: xref-walker plumbing behind `DocumentReader` (exposed for tests).
 #[doc(hidden)]
@@ -101,4 +102,5 @@ pub use text::{
     extract_text, extract_text_marked, MarkedTextRun, PdfMarkedTextExtraction, PdfTextExtraction,
     TextRenderMode, TextRun,
 };
+pub use threads::{threads, PdfBead, PdfThread};
 pub use xmp::XmpPacket;

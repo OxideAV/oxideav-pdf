@@ -219,6 +219,10 @@ for an end-to-end verify.
   label strings from the catalogue `/PageLabels` number tree (decimal
   / Roman / letter styles, prefix, `/St` start value);
   `page_label_ranges()` surfaces the raw Table 159 ranges.
+- **Article threads** — `threads()` unrolls each §12.4.3 thread's
+  circular bead ring into reading order (per-bead page index + `/R`
+  rectangle, `/I` title/author/subject), stopping at the ring closure
+  or any malformed revisit.
 - **Logical reading order** — `read_in_logical_order()` walks the
   `/StructTreeRoot` tree (Tagged PDF, §14.6–14.8) and emits runs in
   author order, falling back to raster order when no struct tree exists.
