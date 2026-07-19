@@ -100,9 +100,13 @@ pub fn attachments(reader: &mut DocumentReader<'_>) -> Result<Vec<PdfAttachment>
         _ => return Ok(Vec::new()),
     };
 
-    // Walk the name tree, collecting (name, filespec_ref) pairs.
-    let mut entries: Vec<(String, Object)> = Vec::new();
-    walk_name_tree(reader, &root_node, &mut entries, 0)?;
+    // Walk the name tree, collecting (name, filespec_ref) pairs via
+    // the shared §7.9.6 walker (round 418 — was a local ad-hoc walk).
+    let entries: Vec<(String, Object)> =
+        crate::reader::nametree::name_tree_entries(reader, &root_node)?
+            .into_iter()
+            .map(|(key, value)| (crate::reader::nametree::decode_key_text(&key), value))
+            .collect();
 
     // Resolve each filespec → PdfAttachment.
     let mut out = Vec::with_capacity(entries.len());
@@ -171,62 +175,6 @@ pub fn attachments(reader: &mut DocumentReader<'_>) -> Result<Vec<PdfAttachment>
     }
 
     Ok(out)
-}
-
-/// Walk a name-tree node — either an intermediate node (carrying
-/// `/Kids` whose entries are sub-node refs) or a leaf (carrying
-/// `/Names [key value …]`). Per §7.9.6.
-///
-/// Bounded recursion (depth ≤ 32) so a malformed tree can't blow the
-/// stack.
-fn walk_name_tree(
-    reader: &mut DocumentReader<'_>,
-    node: &Dict,
-    out: &mut Vec<(String, Object)>,
-    depth: usize,
-) -> Result<(), PdfError> {
-    if depth > 32 {
-        return Ok(()); // defensive — bound recursion
-    }
-    if out.len() > 100_000 {
-        return Ok(()); // defensive — bound output
-    }
-    // Leaf node: `/Names [key1 val1 key2 val2 …]`.
-    if let Some(Object::Array(items)) = node
-        .entries()
-        .iter()
-        .find(|(k, _)| k == "Names")
-        .map(|(_, v)| v)
-    {
-        let mut iter = items.iter();
-        while let (Some(key_obj), Some(val_obj)) = (iter.next(), iter.next()) {
-            let Some(key) = decode_text_obj(key_obj) else {
-                continue;
-            };
-            out.push((key, val_obj.clone()));
-        }
-        return Ok(());
-    }
-    // Intermediate node: `/Kids [child-ref child-ref …]`.
-    if let Some(kids_obj) = node
-        .entries()
-        .iter()
-        .find(|(k, _)| k == "Kids")
-        .map(|(_, v)| v.clone())
-    {
-        let kids = match reader.deref(kids_obj)? {
-            Object::Array(items) => items,
-            _ => return Ok(()),
-        };
-        for kid in kids {
-            let kid_dict = match reader.deref(kid)? {
-                Object::Dict(d) => d,
-                _ => continue,
-            };
-            walk_name_tree(reader, &kid_dict, out, depth + 1)?;
-        }
-    }
-    Ok(())
 }
 
 /// Decode the `/UF` (preferred, PDF 1.7+) or `/F` filename entry from
