@@ -202,7 +202,10 @@ for an end-to-end verify.
   inheritance resolves from the Table 120 stream-dictionary entry.
   (The non-Identity *predefined* CMap names index Adobe character
   collections whose data tables ISO 32000 doesn't carry — those fall
-  back to Identity.)
+  back to Identity.) **Vertical writing mode** (`Identity-V`, or an
+  embedded CMap with `/WMode 1`) advances runs down the column by the
+  §9.7.4.3 `/W2` / `/DW2` vertical displacements, `TJ` adjustments
+  included, per the §9.4.4 `ty` equation (no `Th`).
 - **Document outline + links** — `outline()` collapses the §12.3.3
   bookmark tree's `/First`/`/Next` lists into a parent-owned tree;
   `links()` surfaces every Link annotation (§12.5.6.5) with its

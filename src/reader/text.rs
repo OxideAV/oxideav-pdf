@@ -435,20 +435,52 @@ enum FontAdvance {
         missing: f32,
         text_scale: f32,
     },
-    /// Composite font (§9.7.4.3): `/W` runs over `default` (the
-    /// `/DW`). With `cmap: None` the encoding is an Identity CMap —
-    /// two bytes per code, CID = code. With `cmap: Some`, the font's
-    /// `/Encoding` is an embedded CMap stream (§9.7.5.3): codes are
-    /// extracted at the CMap's codespace widths (§9.7.6.2) and mapped
-    /// code → CID before the `/W` lookup, so a mixed-width encoding
-    /// advances by the right per-glyph widths.
-    Cid {
-        default: f32,
-        ranges: Vec<(i64, Vec<f32>)>,
-        cmap: Option<Box<CidCMap>>,
-    },
+    /// Composite font (§9.7.4.3) — see [`CidAdvance`].
+    Cid(Box<CidAdvance>),
     /// No resolvable widths — every glyph advances 0 (prior behaviour).
     None,
+}
+
+/// Composite-font advance metrics (§9.7.4.3): the `/DW` + `/W`
+/// horizontal widths, the optional embedded-CMap code → CID mapping
+/// (§9.7.5.3 — `None` means the Identity two-bytes-per-code
+/// convention), and the vertical-writing metrics used when the CMap
+/// selects `WMode` 1: `/DW2[1]` + the `w1y` components of `/W2`.
+///
+/// The §9.7.4.3 position vector `v` relates the horizontal and
+/// vertical writing *origins of an individual glyph's rendering*; it
+/// does not enter the §9.4.4 text-matrix update, so the extraction
+/// walker (which reports accumulated run origins) parses past it.
+#[derive(Clone, Debug)]
+struct CidAdvance {
+    /// `/DW` (default 1000).
+    default: f32,
+    /// `/W` runs — `(start_cid, per-CID widths)`.
+    ranges: Vec<(i64, Vec<f32>)>,
+    /// Embedded `/Encoding` CMap (§9.7.5.3), when present.
+    cmap: Option<Box<CidCMap>>,
+    /// Writing mode: 0 horizontal, 1 vertical (§9.7.5 `WMode` — from
+    /// the `Identity-V` name or the embedded CMap's `/WMode`).
+    wmode: u8,
+    /// `/DW2[1]` — default vertical displacement `w1y` (default
+    /// −1000 per Table 117).
+    v_default: f32,
+    /// `/W2` runs — `(start_cid, per-CID w1y)`.
+    v_ranges: Vec<(i64, Vec<f32>)>,
+}
+
+impl CidAdvance {
+    /// Vertical displacement `w1y` for `cid` (§9.7.4.3 `/W2`, falling
+    /// back to `/DW2[1]`).
+    fn vertical(&self, cid: i64) -> f32 {
+        for (start, run) in &self.v_ranges {
+            let off = cid - start;
+            if off >= 0 && (off as usize) < run.len() {
+                return run[off as usize];
+            }
+        }
+        self.v_default
+    }
 }
 
 impl FontAdvance {
@@ -467,23 +499,22 @@ impl FontAdvance {
                     *missing
                 }
             }
-            FontAdvance::Cid {
-                default, ranges, ..
-            } => {
-                for (start, run) in ranges {
+            FontAdvance::Cid(cid) => {
+                for (start, run) in &cid.ranges {
                     let off = code - start;
                     if off >= 0 && (off as usize) < run.len() {
                         return run[off as usize];
                     }
                 }
-                *default
+                cid.default
             }
             FontAdvance::None => 0.0,
         }
     }
 
-    fn is_cid(&self) -> bool {
-        matches!(self, FontAdvance::Cid { .. })
+    /// True when this font advances vertically (§9.4.4 `ty` path).
+    fn is_vertical(&self) -> bool {
+        matches!(self, FontAdvance::Cid(cid) if cid.wmode == 1)
     }
 
     /// Factor converting a [`Self::width`] result into text-space units
@@ -586,18 +617,29 @@ fn build_cid_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvanc
     // both code segmentation and the code → CID mapping ahead of the
     // /W width lookup. A Name (Identity-H / Identity-V, or a
     // predefined CMap this crate has no data tables for) leaves the
-    // Identity two-bytes-per-code behaviour.
-    let cmap = font
+    // Identity two-bytes-per-code behaviour. The writing mode
+    // (§9.7.5 WMode) comes from the Identity-V name or the embedded
+    // CMap's /WMode and selects the §9.4.4 ty displacement path.
+    let enc_obj = font
         .entries()
         .iter()
         .find(|(k, _)| k == "Encoding")
-        .map(|(_, v)| v.clone())
-        .and_then(|obj| match reader.deref(obj) {
-            Ok(Object::Stream(stream)) => {
-                CidCMap::from_stream(reader, &stream, 0).ok().map(Box::new)
+        .map(|(_, v)| v.clone());
+    let mut wmode = 0u8;
+    let mut cmap: Option<Box<CidCMap>> = None;
+    match enc_obj {
+        Some(Object::Name(name)) if name == "Identity-V" => wmode = 1,
+        Some(Object::Name(_)) => {}
+        Some(obj) => {
+            if let Ok(Object::Stream(stream)) = reader.deref(obj) {
+                if let Ok(cm) = CidCMap::from_stream(reader, &stream, 0) {
+                    wmode = cm.wmode;
+                    cmap = Some(Box::new(cm));
+                }
             }
-            _ => None,
-        });
+        }
+        None => {}
+    }
     let desc_obj = font
         .entries()
         .iter()
@@ -618,11 +660,14 @@ fn build_cid_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvanc
         other => other,
     };
     let Some(Object::Dict(cid_font)) = cid_obj else {
-        return FontAdvance::Cid {
+        return FontAdvance::Cid(Box::new(CidAdvance {
             default: 1000.0,
             ranges: Vec::new(),
             cmap,
-        };
+            wmode,
+            v_default: -1000.0,
+            v_ranges: Vec::new(),
+        }));
     };
     let default = cid_font
         .entries()
@@ -643,11 +688,79 @@ fn build_cid_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvanc
         Some(Object::Array(items)) => parse_w_array(&items),
         _ => Vec::new(),
     };
-    FontAdvance::Cid {
+    // §9.7.4.3 vertical metrics: /DW2 [v_y w1y] (default [880 −1000])
+    // and /W2. Only the displacement components enter the §9.4.4
+    // text-matrix update; position vectors are parsed past.
+    let v_default = cid_font
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "DW2")
+        .and_then(|(_, v)| match v {
+            Object::Array(items) if items.len() == 2 => obj_as_f32(&items[1]),
+            _ => None,
+        })
+        .unwrap_or(-1000.0);
+    let w2_obj = cid_font
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "W2")
+        .map(|(_, v)| v.clone());
+    let w2_obj = match w2_obj {
+        Some(Object::Reference(id)) => reader.resolve(id).ok(),
+        other => other,
+    };
+    let v_ranges = match w2_obj {
+        Some(Object::Array(items)) => parse_w2_array(&items),
+        _ => Vec::new(),
+    };
+    FontAdvance::Cid(Box::new(CidAdvance {
         default,
         ranges,
         cmap,
+        wmode,
+        v_default,
+        v_ranges,
+    }))
+}
+
+/// Parse a CIDFont `/W2` array (§9.7.4.3) into `(start_cid, w1y)`
+/// runs. Groups are `c [w1y v1x v1y …]` (numbers in threes — only
+/// the displacement component is kept) or
+/// `cfirst clast w1y v1x v1y`.
+fn parse_w2_array(items: &[Object]) -> Vec<(i64, Vec<f32>)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        let Some(c) = obj_as_i64(&items[i]) else {
+            i += 1;
+            continue;
+        };
+        match items.get(i + 1) {
+            Some(Object::Array(triples)) => {
+                let run: Vec<f32> = triples
+                    .chunks(3)
+                    .filter_map(|g| g.first().and_then(obj_as_f32))
+                    .collect();
+                out.push((c, run));
+                i += 2;
+            }
+            Some(obj) => {
+                let clast = obj_as_i64(obj);
+                let w1y = items.get(i + 2).and_then(obj_as_f32);
+                // Positions i+3 / i+4 hold v1x / v1y — skipped.
+                match (clast, w1y) {
+                    (Some(clast), Some(w1y)) if clast >= c => {
+                        let count = (clast - c + 1).min(1 << 20) as usize;
+                        out.push((c, vec![w1y; count]));
+                        i += 5;
+                    }
+                    _ => i += 1,
+                }
+            }
+            None => break,
+        }
     }
+    out
 }
 
 /// Parse a CIDFont `/W` array (§9.7.4.3) into `(start_cid, widths)`
@@ -2263,38 +2376,50 @@ impl TextWalker {
         let adv = self.advances.get(&self.cur_font).cloned();
         let adv = adv.unwrap_or(FontAdvance::None);
         let scale = adv.text_scale();
-        if let FontAdvance::Cid {
-            cmap: Some(cmap), ..
-        } = &adv
-        {
-            // Embedded-CMap composite (§9.7.6.2): extract codes at
-            // the codespace widths, map each to its CID, then apply
-            // the §9.4.4 displacement. Word spacing applies only to a
-            // *single-byte* code 32 (§9.3.3 — "It shall not apply to
-            // occurrences of the byte value 32 in multiple-byte
-            // codes").
-            let mut i = 0;
-            while i < bytes.len() {
-                let (consumed, code) = cmap.next_code(&bytes[i..]);
-                let cid = cmap.cid_for_code(code) as i64;
-                let w0 = adv.width(cid) * scale;
-                let tw = if consumed == 1 && bytes[i] == 32 {
-                    self.word_spacing
-                } else {
-                    0.0
-                };
-                let tx = (w0 * tfs + tc + tw) * th;
-                self.translate_tm(tx);
-                i += consumed.max(1);
-            }
-        } else if adv.is_cid() {
-            let mut i = 0;
-            while i + 1 < bytes.len() {
-                let cid = ((bytes[i] as i64) << 8) | bytes[i + 1] as i64;
-                let w0 = adv.width(cid) * scale;
-                let tx = (w0 * tfs + tc) * th;
-                self.translate_tm(tx);
-                i += 2;
+        if let FontAdvance::Cid(cid) = &adv {
+            let vertical = cid.wmode == 1;
+            if let Some(cmap) = &cid.cmap {
+                // Embedded-CMap composite (§9.7.6.2): extract codes
+                // at the codespace widths, map each to its CID, then
+                // apply the §9.4.4 displacement. Word spacing applies
+                // only to a *single-byte* code 32 (§9.3.3 — "It shall
+                // not apply to occurrences of the byte value 32 in
+                // multiple-byte codes").
+                let mut i = 0;
+                while i < bytes.len() {
+                    let (consumed, code) = cmap.next_code(&bytes[i..]);
+                    let cid_val = cmap.cid_for_code(code) as i64;
+                    let tw = if consumed == 1 && bytes[i] == 32 {
+                        self.word_spacing
+                    } else {
+                        0.0
+                    };
+                    if vertical {
+                        // §9.4.4: ty = (w1 − Tj/1000)·Tfs + Tc + Tw —
+                        // the horizontal-scaling Th does not apply.
+                        let w1 = cid.vertical(cid_val) * scale;
+                        self.translate_tm_v(w1 * tfs + tc + tw);
+                    } else {
+                        let w0 = adv.width(cid_val) * scale;
+                        self.translate_tm((w0 * tfs + tc + tw) * th);
+                    }
+                    i += consumed.max(1);
+                }
+            } else {
+                // Identity CMap: two bytes per code, CID = code. A
+                // 2-byte code never triggers word spacing (§9.3.3).
+                let mut i = 0;
+                while i + 1 < bytes.len() {
+                    let code = ((bytes[i] as i64) << 8) | bytes[i + 1] as i64;
+                    if vertical {
+                        let w1 = cid.vertical(code) * scale;
+                        self.translate_tm_v(w1 * tfs + tc);
+                    } else {
+                        let w0 = adv.width(code) * scale;
+                        self.translate_tm((w0 * tfs + tc) * th);
+                    }
+                    i += 2;
+                }
             }
         } else {
             for &b in bytes {
@@ -2306,17 +2431,37 @@ impl TextWalker {
         }
     }
 
-    /// Apply a `TJ` numeric kern (§9.4.3): translate `Tm` by
-    /// `−adj/1000 × Tfs × Th`.
+    /// Apply a `TJ` numeric kern (§9.4.3 + §9.4.4): in horizontal
+    /// writing the adjustment translates `Tm` by
+    /// `−adj/1000 × Tfs × Th`; in vertical writing by
+    /// `−adj/1000 × Tfs` on the vertical axis (`Th` applies only to
+    /// horizontal writing per the §9.4.4 displacement equations).
     fn advance_kern(&mut self, adj: f32) {
-        let tx = -adj / 1000.0 * self.cur_size * self.horiz_scale;
-        self.translate_tm(tx);
+        let vertical = self
+            .advances
+            .get(&self.cur_font)
+            .map(FontAdvance::is_vertical)
+            .unwrap_or(false);
+        if vertical {
+            let ty = -adj / 1000.0 * self.cur_size;
+            self.translate_tm_v(ty);
+        } else {
+            let tx = -adj / 1000.0 * self.cur_size * self.horiz_scale;
+            self.translate_tm(tx);
+        }
     }
 
     /// Translate `Tm` by `(tx, 0)` in text space
     /// (`Tm = [1 0 0 1 tx 0] × Tm`).
     fn translate_tm(&mut self, tx: f32) {
         let translate = [1.0, 0.0, 0.0, 1.0, tx, 0.0];
+        self.tm = mul(translate, self.tm);
+    }
+
+    /// Translate `Tm` by `(0, ty)` in text space — the §9.4.4
+    /// vertical-writing update (`Tm = [1 0 0 1 0 ty] × Tm`).
+    fn translate_tm_v(&mut self, ty: f32) {
+        let translate = [1.0, 0.0, 0.0, 1.0, 0.0, ty];
         self.tm = mul(translate, self.tm);
     }
 
