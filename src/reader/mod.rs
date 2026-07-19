@@ -42,6 +42,7 @@ pub mod named_dest;
 pub mod nametree;
 pub mod ocg;
 pub mod outline;
+pub mod page_labels;
 // Internal: object-parser plumbing behind `DocumentReader` (exposed for tests).
 #[doc(hidden)]
 pub mod parse;
@@ -90,6 +91,9 @@ pub use ocg::{
     OptionalContentGroup,
 };
 pub use outline::{outline, OutlineNode, PdfOutline};
+pub use page_labels::{
+    page_label_map, page_label_ranges, page_labels, PageLabelRange, PageLabelStyle,
+};
 pub use pdfa::{pdfa_signals, PdfACatalogSignals, PdfAConformance};
 pub use sig::{doc_timestamps, signatures, signed_bytes, PdfDocTimestamp, PdfSignature};
 pub use text::{
