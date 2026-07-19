@@ -186,15 +186,14 @@ impl CidCMap {
                 .find(|(k, _)| k == "UseCMap")
                 .map(|(_, v)| v.clone());
             match use_obj {
-                Some(Object::Name(name)) => {
-                    if name == "Identity-H" || name == "Identity-V" {
-                        cm.merge_base(CidCMap::identity());
-                    }
-                    // Any other predefined name would need the Adobe
-                    // character-collection CMap data, which ISO 32000
-                    // does not carry — the overlay's own mappings
-                    // still apply (tolerant degradation).
+                Some(Object::Name(name)) if name == "Identity-H" || name == "Identity-V" => {
+                    cm.merge_base(CidCMap::identity());
                 }
+                // Any other predefined name would need the Adobe
+                // character-collection CMap data, which ISO 32000
+                // does not carry — the overlay's own mappings
+                // still apply (tolerant degradation).
+                Some(Object::Name(_)) => {}
                 Some(obj) => {
                     if let Ok(Object::Stream(base)) = reader.deref(obj) {
                         let base_cm = CidCMap::from_stream(reader, &base, depth + 1)?;
@@ -317,8 +316,12 @@ impl CidCMap {
         0
     }
 
-    /// Split a show-operand byte string into CIDs.
-    pub(crate) fn cids(&self, bytes: &[u8]) -> Vec<u32> {
+    /// Split a show-operand byte string into CIDs (test harness for
+    /// the segmentation + mapping pipeline; production callers drive
+    /// `next_code` / `cid_for_code` directly to thread widths and
+    /// word spacing through).
+    #[cfg(test)]
+    fn cids(&self, bytes: &[u8]) -> Vec<u32> {
         let mut out = Vec::new();
         let mut i = 0;
         while i < bytes.len() {
@@ -329,9 +332,9 @@ impl CidCMap {
         out
     }
 
-    /// Number of codes the operand splits into (for callers that
-    /// only need the glyph count).
-    pub(crate) fn code_count(&self, bytes: &[u8]) -> usize {
+    /// Number of codes the operand splits into.
+    #[cfg(test)]
+    fn code_count(&self, bytes: &[u8]) -> usize {
         let mut count = 0;
         let mut i = 0;
         while i < bytes.len() {

@@ -43,6 +43,7 @@ use std::str;
 
 use crate::error::PdfError;
 use crate::objects::{Dict, Object, ObjectId};
+use crate::reader::cid_cmap::CidCMap;
 use crate::reader::document::{decode_stream, DocumentReader};
 use crate::reader::encoding::{
     apply_encoding_differences, parse_encoding_differences, BaseEncoding, EncodingMap,
@@ -416,11 +417,17 @@ enum FontAdvance {
         missing: f32,
         text_scale: f32,
     },
-    /// Composite Identity font (two bytes per code, CID = code,
-    /// §9.7.4.3): `/W` runs over `default` (the `/DW`).
+    /// Composite font (§9.7.4.3): `/W` runs over `default` (the
+    /// `/DW`). With `cmap: None` the encoding is an Identity CMap —
+    /// two bytes per code, CID = code. With `cmap: Some`, the font's
+    /// `/Encoding` is an embedded CMap stream (§9.7.5.3): codes are
+    /// extracted at the CMap's codespace widths (§9.7.6.2) and mapped
+    /// code → CID before the `/W` lookup, so a mixed-width encoding
+    /// advances by the right per-glyph widths.
     Cid {
         default: f32,
         ranges: Vec<(i64, Vec<f32>)>,
+        cmap: Option<Box<CidCMap>>,
     },
     /// No resolvable widths — every glyph advances 0 (prior behaviour).
     None,
@@ -442,7 +449,9 @@ impl FontAdvance {
                     *missing
                 }
             }
-            FontAdvance::Cid { default, ranges } => {
+            FontAdvance::Cid {
+                default, ranges, ..
+            } => {
                 for (start, run) in ranges {
                     let off = code - start;
                     if off >= 0 && (off as usize) < run.len() {
@@ -555,6 +564,22 @@ fn build_font_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvan
 /// Resolve a Type0 font's descendant CIDFont advance metrics
 /// (§9.7.4.3): `/DW` default + `/W` per-CID runs.
 fn build_cid_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvance {
+    // §9.7.5.3 — an /Encoding that is an embedded CMap stream drives
+    // both code segmentation and the code → CID mapping ahead of the
+    // /W width lookup. A Name (Identity-H / Identity-V, or a
+    // predefined CMap this crate has no data tables for) leaves the
+    // Identity two-bytes-per-code behaviour.
+    let cmap = font
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "Encoding")
+        .map(|(_, v)| v.clone())
+        .and_then(|obj| match reader.deref(obj) {
+            Ok(Object::Stream(stream)) => {
+                CidCMap::from_stream(reader, &stream, 0).ok().map(Box::new)
+            }
+            _ => None,
+        });
     let desc_obj = font
         .entries()
         .iter()
@@ -578,6 +603,7 @@ fn build_cid_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvanc
         return FontAdvance::Cid {
             default: 1000.0,
             ranges: Vec::new(),
+            cmap,
         };
     };
     let default = cid_font
@@ -599,7 +625,11 @@ fn build_cid_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvanc
         Some(Object::Array(items)) => parse_w_array(&items),
         _ => Vec::new(),
     };
-    FontAdvance::Cid { default, ranges }
+    FontAdvance::Cid {
+        default,
+        ranges,
+        cmap,
+    }
 }
 
 /// Parse a CIDFont `/W` array (§9.7.4.3) into `(start_cid, widths)`
@@ -797,6 +827,15 @@ enum FontDecoder {
     /// Identity-H / Identity-V without /ToUnicode — interpret each
     /// 2-byte CID as the equivalent BMP code point.
     IdentityNoCMap,
+    /// Type 0 font whose `/Encoding` is an **embedded CMap stream**
+    /// (§9.7.5.3) and which carries no `/ToUnicode`. The code → CID
+    /// mapping is known, but a CID indexes a glyph collection, not a
+    /// character — there is no Unicode source — so each shown code
+    /// emits U+FFFD as an explicit lossy marker while segmentation
+    /// (and therefore glyph counts and §9.4.4 advances) follows the
+    /// CMap's codespace widths. Supply a `/ToUnicode` CMap for real
+    /// text recovery (§9.10.2's first method).
+    CidEncoding { cmap: Box<CidCMap> },
     /// Simple font (Type1 / TrueType / Type3) with a resolved
     /// 256-entry byte → Unicode table. Captures every variant of
     /// ISO 32000-1 §9.6.6.1 — named base encodings, encoding-dict
@@ -846,21 +885,36 @@ impl FontDecoder {
             })
             .unwrap_or("");
         if subtype == "Type0" {
-            // /Encoding tells us Identity-H / Identity-V vs a named
-            // CMap. Round-22 supports the identities (the only ones
-            // the writer would ever emit).
+            // /Encoding is one of (§9.7.6.1 Table 121): the
+            // Identity-H / Identity-V predefined names, another
+            // predefined CMap name, or an embedded CMap stream
+            // (§9.7.5.3).
             let enc = font
                 .entries()
                 .iter()
                 .find(|(k, _)| k == "Encoding")
                 .map(|(_, v)| v.clone());
-            if let Some(Object::Name(name)) = enc {
-                if name == "Identity-H" || name == "Identity-V" {
+            match enc {
+                Some(Object::Name(_)) => {
+                    // Identity-H / Identity-V decode as CID = code.
+                    // The other predefined CMap names index Adobe
+                    // character collections whose data tables ISO
+                    // 32000 does not carry — Identity is the safest
+                    // in-spec fallback for those too.
                     return Ok(FontDecoder::IdentityNoCMap);
                 }
+                Some(obj) => {
+                    if let Ok(Object::Stream(stream)) = reader.deref(obj) {
+                        if let Ok(cmap) = CidCMap::from_stream(reader, &stream, 0) {
+                            return Ok(FontDecoder::CidEncoding {
+                                cmap: Box::new(cmap),
+                            });
+                        }
+                    }
+                    return Ok(FontDecoder::IdentityNoCMap);
+                }
+                None => return Ok(FontDecoder::IdentityNoCMap),
             }
-            // Unknown composite — Identity is the safest default.
-            return Ok(FontDecoder::IdentityNoCMap);
         }
 
         // 3. Simple font with named /Encoding.
@@ -1014,6 +1068,18 @@ impl FontDecoder {
                         out.push(c);
                     }
                     i += 2;
+                }
+                out
+            }
+            FontDecoder::CidEncoding { cmap } => {
+                // Correct segmentation, no Unicode source: one
+                // U+FFFD marker per §9.7.6.2-extracted code.
+                let mut out = String::new();
+                let mut i = 0;
+                while i < bytes.len() {
+                    let (consumed, _code) = cmap.next_code(&bytes[i..]);
+                    out.push('\u{FFFD}');
+                    i += consumed.max(1);
                 }
                 out
             }
@@ -2179,7 +2245,31 @@ impl TextWalker {
         let adv = self.advances.get(&self.cur_font).cloned();
         let adv = adv.unwrap_or(FontAdvance::None);
         let scale = adv.text_scale();
-        if adv.is_cid() {
+        if let FontAdvance::Cid {
+            cmap: Some(cmap), ..
+        } = &adv
+        {
+            // Embedded-CMap composite (§9.7.6.2): extract codes at
+            // the codespace widths, map each to its CID, then apply
+            // the §9.4.4 displacement. Word spacing applies only to a
+            // *single-byte* code 32 (§9.3.3 — "It shall not apply to
+            // occurrences of the byte value 32 in multiple-byte
+            // codes").
+            let mut i = 0;
+            while i < bytes.len() {
+                let (consumed, code) = cmap.next_code(&bytes[i..]);
+                let cid = cmap.cid_for_code(code) as i64;
+                let w0 = adv.width(cid) * scale;
+                let tw = if consumed == 1 && bytes[i] == 32 {
+                    self.word_spacing
+                } else {
+                    0.0
+                };
+                let tx = (w0 * tfs + tc + tw) * th;
+                self.translate_tm(tx);
+                i += consumed.max(1);
+            }
+        } else if adv.is_cid() {
             let mut i = 0;
             while i + 1 < bytes.len() {
                 let cid = ((bytes[i] as i64) << 8) | bytes[i + 1] as i64;
