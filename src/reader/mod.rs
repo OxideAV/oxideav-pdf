@@ -38,6 +38,7 @@ pub mod layout;
 pub mod lex;
 pub mod linearize;
 pub mod link;
+pub mod named_dest;
 pub mod nametree;
 pub mod ocg;
 pub mod outline;
@@ -81,6 +82,7 @@ pub use inline_images::{inline_images, InlineImageFilter, PdfInlineImage};
 pub use layout::{read_in_logical_order, LayoutMode, ReadingOrderText};
 pub use linearize::{parse_linearization_dict, LinearizationParams};
 pub use link::{links, PdfLink, PdfLinkTarget};
+pub use named_dest::{named_destinations, resolve_named_destination, NamedDestination};
 pub use nametree::{decode_key_text, name_tree_entries, name_tree_lookup, number_tree_entries};
 pub use ocg::{
     optional_content, parse_membership, OcBaseState, OcConfig, OcListMode, OcMembership,

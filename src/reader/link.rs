@@ -4,7 +4,11 @@
 //! `/Subtype` is `/Link`, and surfaces them as [`PdfLink`] values.
 //! Each link's destination decodes to either an
 //! [`crate::outline::OutlineDestination`] (internal go-to) or a URI
-//! (`/A << /S /URI /URI (...) >>`).
+//! (`/A << /S /URI /URI (...) >>`). A **named** destination (`/Dest`
+//! as a Name or byte string, §12.3.2.3) resolves through the
+//! document's named-destination sources (round 418) and surfaces as
+//! `Internal`; only a name the document doesn't define stays
+//! [`PdfLinkTarget::Named`].
 //!
 //! Pages without annotations or without any Link entries return an
 //! empty Vec. Malformed annotation dicts are skipped (best-effort
@@ -16,7 +20,13 @@ use crate::error::PdfError;
 use crate::objects::{Dict, Object, ObjectId};
 use crate::outline::OutlineDestination;
 use crate::reader::document::DocumentReader;
+use crate::reader::named_dest::{named_dest_map, ResolvedNamedDest};
+use crate::reader::nametree::decode_key_text;
 use crate::reader::outline::build_page_index_map;
+
+/// The raw-name → resolved-destination lookaside built once per walk
+/// (§12.3.2.3). Empty for the (common) document with no named dests.
+type NamedDests = HashMap<Vec<u8>, ResolvedNamedDest>;
 
 /// One Link annotation, ready for a caller to follow.
 #[derive(Debug, Clone)]
@@ -41,8 +51,11 @@ pub enum PdfLinkTarget {
     /// External URI (HTTP, mailto, etc.).
     Uri(String),
     /// A named destination (`/Dest` was a Name or string instead of
-    /// the explicit array form). The catalog's `/Dests` name tree
-    /// would resolve this — round-25 surfaces it untouched.
+    /// the explicit array form) that the document does **not** define
+    /// in either §12.3.2.3 source (catalogue `/Dests` dictionary or
+    /// `/Names → /Dests` name tree) — a defined name resolves to
+    /// [`Self::Internal`] since round 418. The string is the display
+    /// form of the undefined name.
     Named(String),
 }
 
@@ -51,6 +64,7 @@ pub enum PdfLinkTarget {
 /// have to re-thread it.
 pub fn links(reader: &mut DocumentReader<'_>) -> Result<Vec<PdfLink>, PdfError> {
     let page_index_map = build_page_index_map(reader)?;
+    let named_dests = named_dest_map(reader, &page_index_map)?;
     // Inverse: position-in-DFS → ObjectId.
     let mut pages_by_index: Vec<ObjectId> = Vec::with_capacity(page_index_map.len());
     pages_by_index.resize(page_index_map.len(), ObjectId::new(0));
@@ -94,7 +108,7 @@ pub fn links(reader: &mut DocumentReader<'_>) -> Result<Vec<PdfLink>, PdfError> 
             if !is_link {
                 continue;
             }
-            if let Some(link) = decode_link(reader, &annot, idx, &page_index_map)? {
+            if let Some(link) = decode_link(reader, &annot, idx, &page_index_map, &named_dests)? {
                 out.push(link);
             }
         }
@@ -107,6 +121,7 @@ fn decode_link(
     annot: &Dict,
     page_index: usize,
     page_index_map: &HashMap<u32, usize>,
+    named_dests: &NamedDests,
 ) -> Result<Option<PdfLink>, PdfError> {
     let rect = match annot
         .entries()
@@ -128,7 +143,7 @@ fn decode_link(
         _ => return Ok(None),
     };
 
-    let target = decode_link_target(reader, annot, page_index_map)?;
+    let target = decode_link_target(reader, annot, page_index_map, named_dests)?;
 
     Ok(Some(PdfLink {
         source_page_index: page_index,
@@ -141,6 +156,7 @@ fn decode_link_target(
     reader: &mut DocumentReader<'_>,
     annot: &Dict,
     page_index_map: &HashMap<u32, usize>,
+    named_dests: &NamedDests,
 ) -> Result<Option<PdfLinkTarget>, PdfError> {
     // /Dest takes precedence over /A per Table 173.
     if let Some(dest) = annot
@@ -150,7 +166,7 @@ fn decode_link_target(
         .map(|(_, v)| v.clone())
     {
         let dest = reader.deref(dest)?;
-        return Ok(decode_dest_value(dest, page_index_map));
+        return Ok(decode_dest_value(dest, page_index_map, named_dests));
     }
     if let Some(action) = annot
         .entries()
@@ -189,7 +205,7 @@ fn decode_link_target(
                         .map(|(_, v)| v.clone())
                     {
                         let d = reader.deref(d)?;
-                        return Ok(decode_dest_value(d, page_index_map));
+                        return Ok(decode_dest_value(d, page_index_map, named_dests));
                     }
                 }
                 _ => {}
@@ -199,16 +215,27 @@ fn decode_link_target(
     Ok(None)
 }
 
-fn decode_dest_value(dest: Object, page_index_map: &HashMap<u32, usize>) -> Option<PdfLinkTarget> {
+fn decode_dest_value(
+    dest: Object,
+    page_index_map: &HashMap<u32, usize>,
+    named_dests: &NamedDests,
+) -> Option<PdfLinkTarget> {
     match dest {
         Object::Array(items) => {
             decode_explicit_dest(&items, page_index_map).map(PdfLinkTarget::Internal)
         }
-        Object::Name(s) => Some(PdfLinkTarget::Named(s)),
-        Object::LiteralString(b) | Object::HexString(b) => Some(PdfLinkTarget::Named(
-            String::from_utf8_lossy(&b).into_owned(),
-        )),
+        Object::Name(s) => named_target(named_dests, s.as_bytes()),
+        Object::LiteralString(b) | Object::HexString(b) => named_target(named_dests, &b),
         _ => None,
+    }
+}
+
+/// §12.3.2.3 — a defined name becomes `Internal`; an undefined one
+/// stays `Named` with its display text.
+fn named_target(named_dests: &NamedDests, raw: &[u8]) -> Option<PdfLinkTarget> {
+    match named_dests.get(raw).and_then(|(d, _)| d.clone()) {
+        Some(dest) => Some(PdfLinkTarget::Internal(dest)),
+        None => Some(PdfLinkTarget::Named(decode_key_text(raw))),
     }
 }
 
@@ -282,13 +309,36 @@ mod tests {
 
     #[test]
     fn decode_dest_value_named_byte_string() {
+        // Undefined name → stays Named.
         let v = decode_dest_value(
             Object::LiteralString(b"Chap6.begin".to_vec()),
+            &HashMap::new(),
             &HashMap::new(),
         );
         match v {
             Some(PdfLinkTarget::Named(s)) => assert_eq!(s, "Chap6.begin"),
             other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_dest_value_named_resolves_to_internal() {
+        // Defined name → resolves to Internal per §12.3.2.3.
+        let mut named: NamedDests = HashMap::new();
+        named.insert(
+            b"Chap6.begin".to_vec(),
+            (Some(OutlineDestination::Fit { page_index: 4 }), None),
+        );
+        let v = decode_dest_value(
+            Object::LiteralString(b"Chap6.begin".to_vec()),
+            &HashMap::new(),
+            &named,
+        );
+        match v {
+            Some(PdfLinkTarget::Internal(OutlineDestination::Fit { page_index })) => {
+                assert_eq!(page_index, 4);
+            }
+            other => panic!("expected Internal Fit, got {other:?}"),
         }
     }
 
@@ -302,6 +352,7 @@ mod tests {
                 Object::Name("Fit".into()),
             ]),
             &map,
+            &HashMap::new(),
         );
         match v {
             Some(PdfLinkTarget::Internal(OutlineDestination::Fit { page_index })) => {

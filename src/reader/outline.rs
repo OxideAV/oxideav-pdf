@@ -12,11 +12,17 @@
 //! the destination's `page_index()` matches the writer-side input
 //! (0-based, in `/Pages` tree DFS order).
 //!
-//! Unsupported destinations (named destinations, remote go-to,
-//! action chains) surface as `destination = None` with the original
-//! raw text in [`OutlineNode::raw_dest`] — the tree is still walked
-//! end-to-end rather than aborting, so callers that just want the
-//! title hierarchy still get a usable result.
+//! A **named** destination (`/Dest` as a Name or byte string,
+//! §12.3.2.3) resolves through the document's named-destination
+//! sources — the catalogue `/Dests` dictionary and the `/Names →
+//! /Dests` name tree (round 418) — so `destination` carries the
+//! structured form whenever the name is defined; `raw_dest` retains
+//! the `named:<name>` text either way. Destinations this reader still
+//! can't structure (remote go-to, unresolvable names, exotic action
+//! chains) surface as `destination = None` with the original raw text
+//! in [`OutlineNode::raw_dest`] — the tree is still walked end-to-end
+//! rather than aborting, so callers that just want the title
+//! hierarchy still get a usable result.
 //!
 //! Cycle detection: outline trees are required to be acyclic
 //! (Table 153's /Parent / /Prev / /Next forms a strict tree), but a
@@ -30,6 +36,12 @@ use crate::error::PdfError;
 use crate::objects::{Dict, Object, ObjectId};
 use crate::outline::OutlineDestination;
 use crate::reader::document::DocumentReader;
+use crate::reader::named_dest::{named_dest_map, ResolvedNamedDest};
+use crate::reader::nametree::decode_key_text;
+
+/// The raw-name → resolved-destination lookaside built once per walk
+/// (§12.3.2.3). Empty for the (common) document with no named dests.
+type NamedDests = HashMap<Vec<u8>, ResolvedNamedDest>;
 
 /// One node in the parsed outline tree.
 #[derive(Debug, Clone)]
@@ -37,16 +49,18 @@ pub struct OutlineNode {
     /// `/Title` text (decoded — `LiteralString` PDFDocEncoding or
     /// `HexString` UTF-16BE with BOM).
     pub title: String,
-    /// `/Dest` parsed back to a structured destination, when the dest
-    /// is an explicit array per Table 151. Named destinations (where
-    /// `/Dest` is a Name or string) and action-driven destinations
-    /// (where `/A` carries a `/GoTo` action) lower to `None` here;
-    /// the raw text is retained in [`Self::raw_dest`].
+    /// `/Dest` parsed back to a structured destination — an explicit
+    /// array per Table 151, or (round 418) a named destination
+    /// (§12.3.2.3 Name / byte string) resolved through the
+    /// catalogue's named-destination sources. `/A` `/GoTo` action
+    /// destinations decode the same way. `None` when the destination
+    /// is absent, remote, or names an undefined entry; the raw text
+    /// is retained in [`Self::raw_dest`].
     pub destination: Option<OutlineDestination>,
-    /// Verbatim text of the `/Dest` entry, in case the structured
-    /// parse above fell back to `None`. Useful for callers that want
-    /// to surface named destinations or unsupported variants
-    /// untouched.
+    /// Verbatim text of the `/Dest` entry — `named:<name>` for a
+    /// named destination (kept even when `destination` resolved, so
+    /// the name itself stays observable), or the raw array text when
+    /// the structured parse fell back to `None`.
     pub raw_dest: Option<String>,
     /// `/Count` value when present. Per Table 153, a positive value
     /// means "open with N visible descendants"; a negative value
@@ -96,8 +110,11 @@ pub struct PdfOutline {
 /// document).
 pub fn outline(reader: &mut DocumentReader<'_>) -> Result<Option<PdfOutline>, PdfError> {
     // Build a 0-based page-index map so each `/Dest [<page-ref> ...]`
-    // can resolve back to the same index the writer started from.
+    // can resolve back to the same index the writer started from,
+    // plus the §12.3.2.3 named-destination lookaside (empty when the
+    // document defines none).
     let page_index_map = build_page_index_map(reader)?;
+    let named_dests = named_dest_map(reader, &page_index_map)?;
 
     let root_id = reader.xref().root()?;
     let catalog = reader.resolve(root_id)?;
@@ -151,7 +168,7 @@ pub fn outline(reader: &mut DocumentReader<'_>) -> Result<Option<PdfOutline>, Pd
         });
 
     let roots = match first_id {
-        Some(first) => walk_level(reader, first, &page_index_map)?,
+        Some(first) => walk_level(reader, first, &page_index_map, &named_dests)?,
         None => Vec::new(),
     };
 
@@ -165,6 +182,7 @@ fn walk_level(
     reader: &mut DocumentReader<'_>,
     first_id: ObjectId,
     page_index_map: &HashMap<u32, usize>,
+    named_dests: &NamedDests,
 ) -> Result<Vec<OutlineNode>, PdfError> {
     let mut out = Vec::new();
     let mut visited: HashSet<u32> = HashSet::new();
@@ -196,7 +214,8 @@ fn walk_level(
                 .find(|(k, _)| k == "Title")
                 .map(|(_, v)| v),
         );
-        let (destination, raw_dest) = decode_dest_or_action(reader, &item, page_index_map)?;
+        let (destination, raw_dest) =
+            decode_dest_or_action(reader, &item, page_index_map, named_dests)?;
         let count = item
             .entries()
             .iter()
@@ -214,7 +233,7 @@ fn walk_level(
                 Object::Reference(id) => Some(*id),
                 _ => None,
             }) {
-            Some(child_first) => walk_level(reader, child_first, page_index_map)?,
+            Some(child_first) => walk_level(reader, child_first, page_index_map, named_dests)?,
             None => Vec::new(),
         };
 
@@ -246,6 +265,7 @@ fn decode_dest_or_action(
     reader: &mut DocumentReader<'_>,
     item: &Dict,
     page_index_map: &HashMap<u32, usize>,
+    named_dests: &NamedDests,
 ) -> Result<(Option<OutlineDestination>, Option<String>), PdfError> {
     // /Dest takes precedence over /A per Table 153.
     if let Some(dest) = item
@@ -254,7 +274,12 @@ fn decode_dest_or_action(
         .find(|(k, _)| k == "Dest")
         .map(|(_, v)| v.clone())
     {
-        return Ok(decode_dest_value(reader, dest, page_index_map));
+        return Ok(decode_dest_value(
+            reader,
+            dest,
+            page_index_map,
+            Some(named_dests),
+        ));
     }
     if let Some(action) = item
         .entries()
@@ -276,7 +301,12 @@ fn decode_dest_or_action(
                     .find(|(k, _)| k == "D")
                     .map(|(_, v)| v.clone())
                 {
-                    return Ok(decode_dest_value(reader, d, page_index_map));
+                    return Ok(decode_dest_value(
+                        reader,
+                        d,
+                        page_index_map,
+                        Some(named_dests),
+                    ));
                 }
             }
             // /S /URI — surface the URI text in raw_dest.
@@ -304,13 +334,19 @@ fn decode_dest_or_action(
 }
 
 /// Decode a `/Dest` (or action `/D`) value into a structured
-/// [`OutlineDestination`] when it's an explicit array, falling back
-/// to the raw text when it's a named destination or otherwise
-/// unparseable.
-fn decode_dest_value(
+/// [`OutlineDestination`]: an explicit array parses per Table 151; a
+/// Name / byte string (§12.3.2.3 named destination) consults the
+/// `named` lookaside when one is supplied. The raw text is retained
+/// alongside either way — `named:<name>` for names (resolved or
+/// not), the array text when an explicit parse falls back to `None`.
+///
+/// `named` is `None` when decoding a named destination's *own*
+/// target, so a malformed name-valued entry cannot recurse.
+pub(crate) fn decode_dest_value(
     reader: &mut DocumentReader<'_>,
     dest: Object,
     page_index_map: &HashMap<u32, usize>,
+    named: Option<&NamedDests>,
 ) -> (Option<OutlineDestination>, Option<String>) {
     let dest = match reader.deref(dest) {
         Ok(d) => d,
@@ -321,10 +357,8 @@ fn decode_dest_value(
             Some(d) => (Some(d), None),
             None => (None, Some(format_array_dest(&items))),
         },
-        Object::Name(s) => (None, Some(format!("named:{s}"))),
-        Object::LiteralString(b) | Object::HexString(b) => {
-            (None, Some(format!("named:{}", String::from_utf8_lossy(&b))))
-        }
+        Object::Name(s) => named_lookup(named, s.as_bytes()),
+        Object::LiteralString(b) | Object::HexString(b) => named_lookup(named, &b),
         _ => (None, None),
     }
 }
@@ -397,6 +431,20 @@ fn decode_explicit_dest(
         }),
         _ => None,
     }
+}
+
+/// Consult the named-destination lookaside for `raw` (§12.3.2.3).
+/// The `named:<name>` display text keeps the name observable whether
+/// or not resolution produced a structured destination; `None` for
+/// the lookaside (the named-dest module decoding its own targets)
+/// never resolves, so a name-valued named-dest entry cannot loop.
+fn named_lookup(
+    named: Option<&NamedDests>,
+    raw: &[u8],
+) -> (Option<OutlineDestination>, Option<String>) {
+    let display = format!("named:{}", decode_key_text(raw));
+    let dest = named.and_then(|m| m.get(raw)).and_then(|(d, _)| d.clone());
+    (dest, Some(display))
 }
 
 fn format_array_dest(items: &[Object]) -> String {
