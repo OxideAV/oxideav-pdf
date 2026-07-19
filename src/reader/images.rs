@@ -227,6 +227,24 @@ fn walk_pages(
     node_id: ObjectId,
     out: &mut Vec<ObjectId>,
 ) -> Result<(), PdfError> {
+    let mut visited: HashSet<u32> = HashSet::new();
+    walk_pages_inner(reader, node_id, out, &mut visited, 0)
+}
+
+/// Bounded: a visited-set drops re-visited node ids (a malformed
+/// `/Pages` tree can self-reference — `2 0 obj << /Kids [2 0 R] >>`
+/// previously recursed to a stack overflow, caught by the round-418
+/// parse fuzzer) and the depth is capped like the Scene-side walker.
+fn walk_pages_inner(
+    reader: &mut DocumentReader<'_>,
+    node_id: ObjectId,
+    out: &mut Vec<ObjectId>,
+    visited: &mut HashSet<u32>,
+    depth: u32,
+) -> Result<(), PdfError> {
+    if depth > 64 || !visited.insert(node_id.number) || out.len() > 100_000 {
+        return Ok(());
+    }
     let node = reader.resolve(node_id)?;
     let Object::Dict(d) = node else {
         return Err(PdfError::other(format!(
@@ -264,7 +282,7 @@ fn walk_pages(
             };
             for item in items {
                 if let Object::Reference(id) = item {
-                    walk_pages(reader, id, out)?;
+                    walk_pages_inner(reader, id, out, visited, depth + 1)?;
                 }
             }
             Ok(())

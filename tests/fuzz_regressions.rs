@@ -69,3 +69,35 @@ fn parse_objstm_self_container_no_stack_overflow() {
     let _ = read_pdf_to_scene(bytes);
     let _ = extract_inline_images_from_stream(bytes);
 }
+
+/// Round 418 fuzz: the parse target began driving the catalog-level
+/// extraction surfaces (outline, named destinations, page labels,
+/// text extraction) and immediately caught a crafted `/Pages` tree
+/// whose root lists **itself** as a kid (`2 0 obj << /Type /Pages
+/// /Kids [2 0 R] /Count 1 >>`). The Scene-side walker
+/// (`walk_pages_tree`) had been cycle-guarded since round 145, but
+/// three per-surface page walkers — the outline/link/annotation
+/// page-index map, the text-extraction walker, and the
+/// image-XObject walker — still recursed unboundedly and blew the
+/// stack under the AddressSanitizer-instrumented harness. The fix
+/// gives each the same visited-set + depth bound treatment.
+///
+/// Crash discovered: local round-418 bounded fuzz smoke run of the
+/// extended `parse` target.
+#[test]
+fn extraction_surfaces_no_stack_overflow_on_pages_cycle() {
+    use oxideav_pdf::reader::{
+        extract_text, image_xobjects, links, named_destinations, outline, page_labels,
+        DocumentReader,
+    };
+    let bytes = include_bytes!("fixtures/fuzz_parse_extraction_pages_cycle.bin");
+    let _ = read_pdf_to_scene(bytes);
+    if let Ok(mut reader) = DocumentReader::open(bytes) {
+        let _ = outline(&mut reader);
+        let _ = named_destinations(&mut reader);
+        let _ = page_labels(&mut reader);
+        let _ = extract_text(&mut reader);
+        let _ = image_xobjects(&mut reader);
+        let _ = links(&mut reader);
+    }
+}
