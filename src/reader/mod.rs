@@ -22,6 +22,7 @@
 pub mod actions;
 pub mod annotation;
 pub mod attachments;
+pub(crate) mod cid_cmap;
 pub mod content;
 pub mod document;
 pub mod encoding;

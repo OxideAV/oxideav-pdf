@@ -1047,13 +1047,13 @@ pub(crate) struct CodespaceRange {
 }
 
 impl CodespaceRange {
-    fn width(&self) -> usize {
+    pub(crate) fn width(&self) -> usize {
         self.lo.len()
     }
 
     /// True iff `bytes[..self.width()]` is component-wise inside
     /// `lo..=hi` per Adobe Tech Note #5014 §3.1.
-    fn matches(&self, bytes: &[u8]) -> bool {
+    pub(crate) fn matches(&self, bytes: &[u8]) -> bool {
         let w = self.width();
         if bytes.len() < w {
             return false;
@@ -1312,7 +1312,10 @@ fn parse_bfrange(bytes: &[u8], mut i: usize, cm: &mut CMap) -> Result<usize, Pdf
     }
 }
 
-fn read_hex_string_payload(bytes: &[u8], start: usize) -> Result<(Vec<u8>, usize), PdfError> {
+pub(crate) fn read_hex_string_payload(
+    bytes: &[u8],
+    start: usize,
+) -> Result<(Vec<u8>, usize), PdfError> {
     if start >= bytes.len() || bytes[start] != b'<' {
         return Err(PdfError::other(format!(
             "PDF CMap: expected hex string at byte {start}"
@@ -1348,7 +1351,7 @@ fn read_hex_string_payload(bytes: &[u8], start: usize) -> Result<(Vec<u8>, usize
     Ok((out, i))
 }
 
-fn bytes_to_u32(b: &[u8]) -> u32 {
+pub(crate) fn bytes_to_u32(b: &[u8]) -> u32 {
     let mut v = 0u32;
     for &x in b {
         v = (v << 8) | (x as u32);
@@ -1370,7 +1373,7 @@ fn utf16be_to_string(b: &[u8]) -> String {
     String::from_utf16_lossy(&units)
 }
 
-fn hex_nibble(b: u8) -> Option<u8> {
+pub(crate) fn hex_nibble(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
         b'a'..=b'f' => Some(10 + (b - b'a')),
@@ -1379,11 +1382,11 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-fn is_ws(b: u8) -> bool {
+pub(crate) fn is_ws(b: u8) -> bool {
     matches!(b, 0x00 | b'\t' | b'\n' | 0x0C | b'\r' | b' ')
 }
 
-fn skip_ws_and_comments(bytes: &[u8], mut i: usize) -> usize {
+pub(crate) fn skip_ws_and_comments(bytes: &[u8], mut i: usize) -> usize {
     loop {
         while i < bytes.len() && is_ws(bytes[i]) {
             i += 1;
@@ -1399,7 +1402,7 @@ fn skip_ws_and_comments(bytes: &[u8], mut i: usize) -> usize {
     }
 }
 
-fn peek_keyword(bytes: &[u8], i: usize, kw: &[u8]) -> Option<usize> {
+pub(crate) fn peek_keyword(bytes: &[u8], i: usize, kw: &[u8]) -> Option<usize> {
     if i + kw.len() > bytes.len() {
         return None;
     }
@@ -1422,7 +1425,7 @@ fn peek_keyword(bytes: &[u8], i: usize, kw: &[u8]) -> Option<usize> {
 /// **Always advances at least one byte** so callers using this in a loop
 /// can't spin forever, even on input shapes the function doesn't
 /// recognise.
-fn skip_token(bytes: &[u8], i: usize) -> usize {
+pub(crate) fn skip_token(bytes: &[u8], i: usize) -> usize {
     if i >= bytes.len() {
         return i;
     }
