@@ -191,10 +191,34 @@ for an end-to-end verify.
   mode (`Tr` — including the invisible OCR layer) and text rise (`Ts`).
   Consecutive shows on one line advance the text origin per §9.4.4
   (`tx = ((w0 − Tj/1000)·Tfs + Tc + Tw)·Th`) using per-glyph `/Widths`
-  (simple) or `/W` / `/DW` (Type0 Identity) metrics, so runs without an
+  (simple) or `/W` / `/DW` (Type0) metrics, so runs without an
   explicit `Td` / `Tm` still get distinct positions. Type 3 font widths
   are scaled into text space by the font's `/FontMatrix` (§9.6.5), not
-  the 1/1000 Type1 convention.
+  the 1/1000 Type1 convention. A Type 0 font whose `/Encoding` is an
+  **embedded CMap stream** (§9.7.5.3) segments show operands at the
+  CMap's codespace widths (§9.7.6.2, with the §9.7.6.3 invalid-code
+  partial-match and notdef → CID 0 fallbacks) and maps each code to
+  its CID before the CID-keyed `/W` width lookup; `/UseCMap`
+  inheritance resolves from the Table 120 stream-dictionary entry.
+  (The non-Identity *predefined* CMap names index Adobe character
+  collections whose data tables ISO 32000 doesn't carry — those fall
+  back to Identity.)
+- **Document outline + links** — `outline()` collapses the §12.3.3
+  bookmark tree's `/First`/`/Next` lists into a parent-owned tree;
+  `links()` surfaces every Link annotation (§12.5.6.5) with its
+  rectangle and target. **Named destinations** (§12.3.2.3) resolve
+  through both definition sources — the PDF 1.1 catalogue `/Dests`
+  dictionary and the `/Names → /Dests` name tree — so a bookmark or
+  link whose `/Dest` is a Name / byte string carries the structured
+  Table 151 destination; `named_destinations()` enumerates the merged
+  set and `resolve_named_destination()` resolves one name via the
+  §7.9.6 `/Limits`-guided descent. The shared `nametree` module
+  (§7.9.6 name trees + §7.9.7 number trees) backs these plus the
+  attachments walker.
+- **Page labels** — `page_labels()` synthesises the §12.4.2 per-page
+  label strings from the catalogue `/PageLabels` number tree (decimal
+  / Roman / letter styles, prefix, `/St` start value);
+  `page_label_ranges()` surfaces the raw Table 159 ranges.
 - **Logical reading order** — `read_in_logical_order()` walks the
   `/StructTreeRoot` tree (Tagged PDF, §14.6–14.8) and emits runs in
   author order, falling back to raster order when no struct tree exists.
@@ -459,8 +483,11 @@ preblending colour (Table 146).
 A cargo-fuzz harness lives under `fuzz/` with three decode-side targets
 (`parse`, `xref`, `decrypt`) asserting the public reader entry points
 always return a `Result` rather than panicking, aborting, or OOMing.
-The corpus is seeded with in-tree fixtures; a hard parse-depth ceiling
-and cycle guards protect the resolver and parser. CI runs the suite
+The `parse` target also drives the catalog-level extraction surfaces
+(outline + named destinations, page labels, text extraction) on any
+input that opens as a document. The corpus is seeded with in-tree
+fixtures; a hard parse-depth ceiling and cycle guards protect the
+resolver, the parser, and every page-tree walker. CI runs the suite
 daily.
 
 Three Criterion bench binaries under `benches/` measure the reader hot
