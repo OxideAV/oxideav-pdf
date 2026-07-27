@@ -25,10 +25,17 @@
 //! hierarchy still get a usable result.
 //!
 //! Cycle detection: outline trees are required to be acyclic
-//! (Table 153's /Parent / /Prev / /Next forms a strict tree), but a
-//! malformed PDF could close a /Next cycle. The walker carries a
-//! visited-set keyed by outline-item id and aborts the level when a
-//! cycle is observed (returns the prefix walked so far).
+//! (Table 153's /Parent / /Prev / /Next / /First / /Last forms a
+//! strict tree), but a malformed PDF could close a /Next *or* a
+//! /First cycle. The walker carries a single visited-set keyed by
+//! outline-item id, **shared across every level of the descent**, and
+//! aborts a branch when a cycle is observed (returns the prefix
+//! walked so far). A self-referential outline item — e.g.
+//! `8 0 obj << /Type /Outlines /First 8 0 R >>` — would otherwise
+//! drive [`walk_level`] into unbounded `/First` recursion and
+//! overflow the thread stack (caught by the `parse` fuzzer); the
+//! shared visited-set plus a hard [`MAX_OUTLINE_DEPTH`] nesting cap
+//! bound the descent unconditionally.
 
 use std::collections::{HashMap, HashSet};
 
@@ -42,6 +49,18 @@ use crate::reader::nametree::decode_key_text;
 /// The raw-name → resolved-destination lookaside built once per walk
 /// (§12.3.2.3). Empty for the (common) document with no named dests.
 type NamedDests = HashMap<Vec<u8>, ResolvedNamedDest>;
+
+/// Hard ceiling on outline-tree nesting depth (`/First` recursion).
+/// ISO 32000-1 §12.3.3 places no explicit cap on bookmark nesting,
+/// but real documents rarely nest past a handful of levels (parts →
+/// chapters → sections → subsections). 64 is far above any
+/// legitimate bookmark hierarchy while staying low enough that the
+/// per-frame `walk_level` recursion (a `Vec` + a few dict lookups)
+/// cannot exhaust a typical 8 MB thread stack. Deeper trees — only
+/// reachable via a malformed/adversarial `/First` chain or cycle —
+/// are treated as truncated at the cap rather than aborting the whole
+/// read, so callers still get the bookmark prefix walked so far.
+const MAX_OUTLINE_DEPTH: usize = 64;
 
 /// One node in the parsed outline tree.
 #[derive(Debug, Clone)]
@@ -168,7 +187,17 @@ pub fn outline(reader: &mut DocumentReader<'_>) -> Result<Option<PdfOutline>, Pd
         });
 
     let roots = match first_id {
-        Some(first) => walk_level(reader, first, &page_index_map, &named_dests)?,
+        Some(first) => {
+            let mut visited: HashSet<u32> = HashSet::new();
+            walk_level(
+                reader,
+                first,
+                &page_index_map,
+                &named_dests,
+                &mut visited,
+                0,
+            )?
+        }
         None => Vec::new(),
     };
 
@@ -178,18 +207,32 @@ pub fn outline(reader: &mut DocumentReader<'_>) -> Result<Option<PdfOutline>, Pd
 /// Walk one level of the outline, starting at `first_id` and
 /// following `/Next` until exhausted (or a cycle is hit). Per item
 /// also recurses through `/First` to collect the children.
+///
+/// `visited` is a single set shared across **every** level of the
+/// descent so a `/First` (child) or `/Next` (sibling) reference back
+/// to any already-emitted item is caught — a self-referential
+/// `/First 8 0 R` would otherwise recurse without bound. `depth` is
+/// the current `/First` nesting depth, capped at [`MAX_OUTLINE_DEPTH`]
+/// as a second, unconditional stack-overflow guard.
 fn walk_level(
     reader: &mut DocumentReader<'_>,
     first_id: ObjectId,
     page_index_map: &HashMap<u32, usize>,
     named_dests: &NamedDests,
+    visited: &mut HashSet<u32>,
+    depth: usize,
 ) -> Result<Vec<OutlineNode>, PdfError> {
     let mut out = Vec::new();
-    let mut visited: HashSet<u32> = HashSet::new();
+    // Nesting cap — bound the `/First` recursion unconditionally so a
+    // deep (even acyclic) chain cannot overflow the thread stack.
+    if depth > MAX_OUTLINE_DEPTH {
+        return Ok(out);
+    }
     let mut cur = Some(first_id);
     while let Some(id) = cur {
-        // Cycle guard — refuse to walk through a node we've already
-        // emitted at this level.
+        // Cycle guard — refuse to walk through any node we've already
+        // emitted anywhere in the tree (covers /Next siblings and
+        // /First descendants alike).
         if !visited.insert(id.number) {
             break;
         }
@@ -233,7 +276,14 @@ fn walk_level(
                 Object::Reference(id) => Some(*id),
                 _ => None,
             }) {
-            Some(child_first) => walk_level(reader, child_first, page_index_map, named_dests)?,
+            Some(child_first) => walk_level(
+                reader,
+                child_first,
+                page_index_map,
+                named_dests,
+                visited,
+                depth + 1,
+            )?,
             None => Vec::new(),
         };
 

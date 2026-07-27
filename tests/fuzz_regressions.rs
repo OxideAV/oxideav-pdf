@@ -101,3 +101,36 @@ fn extraction_surfaces_no_stack_overflow_on_pages_cycle() {
         let _ = links(&mut reader);
     }
 }
+
+/// Scheduled Fuzz workflow run 30251641843 (against master e58c857):
+/// the `parse` target caught a crafted document whose §12.3.3 outline
+/// item references **itself** as its first child —
+/// `8 0 obj << /Type /Outlines /First 8 0 R /Last 9 0 R /Count 1 >>`.
+/// The reader-side bookmark walker (`reader::outline::walk_level`)
+/// recursed through `/First` with a *per-level* visited-set, so the
+/// self-reference was never seen as already-visited across levels and
+/// the `/First` recursion never terminated — the call stack overflowed
+/// under the AddressSanitizer-instrumented harness
+/// (`ERROR: AddressSanitizer: stack-overflow` in the `parse` target).
+/// The fix shares a single visited-set across every level of the
+/// descent and adds a hard `MAX_OUTLINE_DEPTH` (64) nesting cap, so a
+/// `/First` cycle or an over-deep chain is truncated instead of
+/// recursing forever.
+///
+/// Crash artifact: `crash-8fab8e8b5f10f5dffe5377c216489cc411d816f0`.
+#[test]
+fn parse_outline_first_self_cycle_no_stack_overflow() {
+    use oxideav_pdf::reader::{
+        extract_text, named_destinations, outline, page_labels, DocumentReader,
+    };
+    let bytes = include_bytes!("fixtures/fuzz_parse_outline_first_cycle.bin");
+    // Pre-fix this aborts via stack overflow; post-fix every call
+    // returns (Ok or Err — never a SIGSEGV/SIGABRT).
+    let _ = read_pdf_to_scene(bytes);
+    if let Ok(mut reader) = DocumentReader::open(bytes) {
+        let _ = outline(&mut reader);
+        let _ = named_destinations(&mut reader);
+        let _ = page_labels(&mut reader);
+        let _ = extract_text(&mut reader);
+    }
+}
