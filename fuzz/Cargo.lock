@@ -658,7 +658,9 @@ name = "oxideav-pdf-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "oxideav-core",
  "oxideav-pdf",
+ "oxideav-scene",
 ]
 
 [[package]]

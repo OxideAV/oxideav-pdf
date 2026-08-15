@@ -17,6 +17,16 @@
 use crate::error::PdfError;
 use compcol::zlib::Zlib;
 
+/// Hard ceiling on the plaintext a single `/FlateDecode` stream may
+/// inflate to. `/FlateDecode` (ISO 32000-1 §7.4.4) is unbounded on
+/// paper — a few compressed bytes can declare gigabytes of output — so
+/// a hostile file can weaponise it as a decompression bomb. 512 MiB is
+/// far past any legitimate single PDF stream (the largest realistic
+/// content is a full-page 16-bit image, tens of MiB) while denying a
+/// bomb the unbounded allocation. Exceeding it is a decode error, not
+/// a panic or an OOM abort.
+const MAX_FLATE_OUTPUT: u64 = 512 * 1024 * 1024;
+
 /// Compress `data` into a zlib (RFC 1950) stream at `compcol`'s default
 /// DEFLATE level (6 — the zlib default). The writer leaves the level
 /// choice to the compressor; every `/FlateDecode` stream the crate
@@ -33,7 +43,7 @@ pub(crate) fn flate_compress(data: &[u8]) -> Vec<u8> {
 /// wraps the error with stream-specific context (`/FlateDecode`
 /// content stream vs cross-reference stream vs object stream …).
 pub(crate) fn flate_decompress(data: &[u8]) -> Result<Vec<u8>, PdfError> {
-    compcol::vec::decompress_to_vec::<Zlib>(data)
+    compcol::vec::decompress_to_vec_capped::<Zlib>(data, MAX_FLATE_OUTPUT)
         .map_err(|e| PdfError::other(format!("PDF filter: FlateDecode failed: {e:?}")))
 }
 

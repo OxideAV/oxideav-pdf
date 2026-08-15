@@ -1479,14 +1479,31 @@ fn parse_bfrange(bytes: &[u8], mut i: usize, cm: &mut CMap) -> Result<usize, Pdf
             // implement the simplified rule: increment the trailing
             // 16-bit unit (or 8-bit if the dst is a single byte).
             let dst_str = utf16be_to_string(&dst_bytes);
-            let count = hi.saturating_sub(lo) + 1;
+            // Number of source codes the range covers. A well-formed
+            // `/ToUnicode` bfrange varies only the low-order byte of the
+            // source codespace (Adobe Tech Note #5411 §2 + ISO 32000-1
+            // §9.10.3), so a legitimate range is at most 256 codes; a
+            // hostile CMap can instead declare `<0000> <FFFFFFFF>`, whose
+            // 2^32-iteration expansion is a denial-of-service (each
+            // iteration is cheap and `char::from_u32` rejects most values,
+            // so it spins CPU-bound without growing memory). Cap the span
+            // at a generous ceiling that still covers any realistic
+            // multi-byte range; the tail of an over-long range is dropped
+            // rather than expanded (tolerant degradation — the rest of the
+            // document still extracts). `saturating_add` also avoids the
+            // `+1` overflow when `hi == u32::MAX`.
+            const MAX_BFRANGE_SPAN: u32 = 0x1_0000;
+            let count = hi
+                .saturating_sub(lo)
+                .saturating_add(1)
+                .min(MAX_BFRANGE_SPAN);
             // Decompose the dst string into chars; for the
             // single-char-target case (the common one), iterate chars.
             if dst_str.chars().count() == 1 {
                 let base = dst_str.chars().next().unwrap() as u32;
                 for k in 0..count {
-                    let cid = lo + k;
-                    if let Some(c) = char::from_u32(base + k) {
+                    let cid = lo.saturating_add(k);
+                    if let Some(c) = char::from_u32(base.saturating_add(k)) {
                         cm.table.insert(cid, String::from(c));
                     }
                 }
@@ -1496,7 +1513,7 @@ fn parse_bfrange(bytes: &[u8], mut i: usize, cm: &mut CMap) -> Result<usize, Pdf
                 // last-char-incremented form.
                 let mut chars: Vec<char> = dst_str.chars().collect();
                 for k in 0..count {
-                    let cid = lo + k;
+                    let cid = lo.saturating_add(k);
                     cm.table.insert(cid, chars.iter().collect::<String>());
                     if let Some(last) = chars.last_mut() {
                         if let Some(next) = char::from_u32(*last as u32 + 1) {

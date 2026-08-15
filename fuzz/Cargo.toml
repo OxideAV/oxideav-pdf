@@ -39,6 +39,13 @@ cargo-fuzz = true
 # always return a `Result` rather than panicking / aborting / OOMing.
 [dependencies]
 libfuzzer-sys = "0.4"
+# The `roundtrip` target builds a valid-by-construction document plan
+# and drives it through the writer, so it needs the core vector IR and
+# the multi-page scene model as a consumer would. These unify with the
+# same registry versions `oxideav-pdf` already resolves, so the built
+# `VectorFrame` / `Scene` types match the writer's exactly.
+oxideav-core = "0.1"
+oxideav-scene = { version = "0.1", default-features = false }
 
 [dependencies.oxideav-pdf]
 path = ".."
@@ -82,5 +89,30 @@ doc = false
 [[bin]]
 name = "decrypt"
 path = "fuzz_targets/decrypt.rs"
+test = false
+doc = false
+
+# Stream filters — drives the §7.4 decode primitives (ASCIIHex /
+# ASCII85 / RunLength / LZW both /EarlyChange settings / Flate) and
+# the §7.4.4.4 PNG/TIFF predictor post-filter directly on hostile
+# bytes, with attacker-controlled /Colors / /BitsPerComponent /
+# /Columns / /Predictor geometry so the per-row byte arithmetic and
+# the LZW decompression-bomb path are fuzzed in isolation.
+[[bin]]
+name = "filters"
+path = "fuzz_targets/filters.rs"
+test = false
+doc = false
+
+# Write → read round-trip — builds a valid-by-construction VectorFrame
+# / Scene page plan from the fuzz input (some coordinates reinterpreted
+# as raw f32 so NaN / ±Inf / subnormal reach the writer) and drives it
+# through every §7.5 file-structure serialiser (plain / xref-stream /
+# object-stream / linearized / incremental), feeding each output back
+# through the reader. Attacks the encode surface + the write→read
+# contract rather than the decode surface.
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
 test = false
 doc = false

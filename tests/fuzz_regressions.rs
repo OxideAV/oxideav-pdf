@@ -10,6 +10,7 @@
 
 use oxideav_pdf::read_pdf_to_scene;
 use oxideav_pdf::reader::inline_images::extract_inline_images_from_stream;
+use std::time::{Duration, Instant};
 
 /// Round 145 fuzz: a crafted PDF whose §7.7.3.2 /Pages tree
 /// references its own /Kids back to the root produced infinite
@@ -133,4 +134,43 @@ fn parse_outline_first_self_cycle_no_stack_overflow() {
         let _ = page_labels(&mut reader);
         let _ = extract_text(&mut reader);
     }
+}
+
+/// Round 445 fuzz (structure-aware `parse` target, extraction-surface
+/// campaign): a crafted document whose Type 0 font `/ToUnicode` CMap
+/// declares a scalar `beginbfrange` whose source span is enormous
+/// (`<lo> <hi> <dst>` with `hi − lo` near `u32::MAX`). The §9.10.3
+/// scalar-form expansion `for k in 0..(hi − lo + 1)` then iterated ~2^32
+/// times inside `reader::text::parse_bfrange` — a CPU-bound
+/// denial-of-service that never grew memory (`char::from_u32` rejects
+/// most code points, so nothing was inserted) and so slipped past the
+/// RSS limit while hanging `extract_text` (and thus every
+/// `text_extraction()` caller) indefinitely. The fix caps the expanded
+/// span at a generous ceiling (a well-formed `/ToUnicode` bfrange varies
+/// only the low-order source byte per Adobe Tech Note #5411 §2, so a
+/// legitimate range is ≤ 256 codes) and uses saturating arithmetic so
+/// the `hi == u32::MAX` `+1` cannot overflow.
+///
+/// Crash discovered: local round-445 bounded fuzz campaign of the
+/// widened `parse` target (`-timeout=10`), artifact
+/// `timeout-4ef63c68…`-class input.
+#[test]
+fn parse_tounicode_bfrange_span_terminates() {
+    use oxideav_pdf::reader::{extract_text, DocumentReader};
+    let bytes = include_bytes!("fixtures/fuzz_parse_tounicode_bfrange_span.bin");
+    // The whole point is that this *returns promptly*: pre-fix it spins
+    // for minutes, post-fix it completes in milliseconds. Guard with a
+    // wall-clock ceiling so a regression re-introduces a visible failure
+    // instead of a hung test process.
+    let start = Instant::now();
+    let _ = read_pdf_to_scene(bytes);
+    if let Ok(mut reader) = DocumentReader::open(bytes) {
+        let _ = extract_text(&mut reader);
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "text extraction over a huge-span /ToUnicode bfrange should be \
+         bounded, not spin for {:?}",
+        start.elapsed()
+    );
 }

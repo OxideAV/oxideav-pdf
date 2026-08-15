@@ -487,14 +487,42 @@ preblending colour (Table 146).
 
 ## Fuzzing & benchmarks
 
-A cargo-fuzz harness lives under `fuzz/` with three decode-side targets
-(`parse`, `xref`, `decrypt`) asserting the public reader entry points
-always return a `Result` rather than panicking, aborting, or OOMing.
-The `parse` target also drives the catalog-level extraction surfaces
-(outline + named destinations, page labels, text extraction) on any
-input that opens as a document. The corpus is seeded with in-tree
-fixtures; a hard parse-depth ceiling and cycle guards protect the
-resolver, the parser, and every page-tree walker. CI runs the suite
+A cargo-fuzz harness lives under `fuzz/` with five targets asserting
+the public entry points always return a `Result` rather than panicking,
+aborting, hanging, or OOMing:
+
+- **`parse`** — the full reader on arbitrary bytes (lexer, object
+  parser, xref walker, filter chain, content-stream evaluator), plus
+  the standalone linearization-dict parser and inline-image scanner.
+  On any input that opens as a document it additionally drives **every**
+  catalog-level extraction walker — outline + named destinations, page
+  labels, text extraction, annotations, actions, links, attachments,
+  article threads, image + inline-image XObjects, optional content,
+  logical reading order, signatures + document timestamps, PDF/A
+  signals, hierarchy verification, XMP — so the whole §12 interactive
+  tree surface is exercised behind its depth bounds and cycle guards.
+- **`xref`** — the §7.5.4 classic table, §7.5.8 stream, and §7.5.8.4
+  hybrid-reference parsers, plus the byte-precision offset arithmetic.
+- **`decrypt`** — the §7.6 standard-handler R=2..R=6 dispatch with a
+  fuzzer-supplied password split off the input.
+- **`filters`** — the §7.4 stream-decode primitives (ASCIIHex /
+  ASCII85 / RunLength / LZW both `/EarlyChange` settings / Flate) and
+  the §7.4.4.4 predictor post-filter driven directly on hostile bytes
+  with attacker-controlled `/Colors` / `/BitsPerComponent` /
+  `/Columns` / `/Predictor` geometry. `/FlateDecode` output is capped
+  (512 MiB) so a decompression bomb returns an error instead of an
+  unbounded allocation.
+- **`roundtrip`** — the write→read contract: a valid-by-construction
+  `VectorFrame` / `Scene` page plan built from the fuzz input (some
+  coordinates reinterpreted as raw `f32`, so NaN / ±Inf / subnormal
+  reach the writer) driven through every §7.5 file-structure serialiser
+  (plain / xref-stream / object-stream / linearized / incremental) and
+  fed back through the reader.
+
+The corpus is seeded with in-tree fixtures; a hard parse-depth ceiling
+and cycle guards protect the resolver, the parser, and every page-tree
+walker, and expansion loops (`/W`, `/ToUnicode` bfrange spans) are
+bounded so a hostile CMap cannot spin the extractor. CI runs the suite
 daily.
 
 Three Criterion bench binaries under `benches/` measure the reader hot
