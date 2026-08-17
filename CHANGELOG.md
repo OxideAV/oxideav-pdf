@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/OxideAV/oxideav-pdf/compare/v0.2.0...v0.3.0) - 2026-08-17
+
+### Other
+
+- re-lock compcol at the 0.6.9 loop-guard line
+- structure-aware campaign — bfrange DoS fix, flate bomb cap, +2 targets
+- bound /First recursion — fix stack-overflow on self-referential outline item
+- vertical writing mode advances (sections 9.7.4.3 + 9.4.4 W2/DW2, vertical TJ kerns)
+- section 12.4.3 article threads (bead rings, info dicts, page mapping)
+- document the round-418 navigation + embedded-CMap reader surfaces
+- drive round-418 extraction surfaces; guard three page walkers against /Pages self-cycles
+- Type 0 embedded-CMap /Encoding drives segmentation, CID widths, and extraction
+- parse embedded CID CMap streams (sections 9.7.5.3-9.7.6.3 code-to-CID machinery)
+- section 12.4.2 page labels (ranges + per-page label synthesis)
+- resolve \xc2\xa712.3.2.3 named destinations across outline + link surfaces
+- shared \xc2\xa77.9.6/\xc2\xa77.9.7 name/number-tree walkers with Limits-guided lookup
+- doc(hidden) the internal public surface so semver tooling tracks only the documented API
+- drop a tool-attribution aside from the number-serialization comment
+- generalize two module-doc provenance notes to name no external tools
+- rewrite the PS-calculator keyword branch with the ? operator
+- scrub implementation-naming prose from the image walker module docs
+- Lab range-scaled Decode default + DeviceN Type-4 tint image coverage
+- document the §8.9 image-decode subsystem (sample model, masking, inline splicing)
+- image-decode robustness smoke + Ghostscript pixel validation + fuzz corpus seeds
+- splice inline images into the Scene (§8.9.7)
+- decode the full §8.9.5.2 image sample model + §8.9.6 masking on the scene splice
+- image-XObject scene splicing + soft-mask image surfaces
+- splice decodable Image XObjects into the Scene with /SMask alpha (§8.9.5 + §11.6.5.3)
+- document the §11.6 transparency subsystem
+- surface /SMask soft-mask images on image_xobjects() (§11.6.5.3)
+- emit Node::SoftMask as an /SMask luminosity/alpha soft mask (§11.6.4.3 + §11.6.6)
+- composite transparency-group XObjects as a unit on Do (§11.6.6)
+- pour the /BC backdrop under luminosity soft masks (§11.6.5.2 + §11.5.3)
+- paint /SMask soft masks into the Scene as Node::SoftMask (§11.6.4.3 + §11.6.5.2)
+- save/restore the graphics state across q/Q (§8.4.4)
+- add CI / crates.io / docs.rs / MIT-license badges
+
 ### Other
 
 - fuzz (round 445, structure-aware hardening campaign): fix a **text-extraction denial-of-service** on a hostile `/ToUnicode` CMap. A scalar `beginbfrange` maps a contiguous source-code span to consecutive Unicode destinations (§9.10.3), and the reader expanded it with `for k in 0..(hi − lo + 1)`. A crafted range such as `<0000> <FFFFFFFF> <0041>` made that loop iterate ~2³² times — a CPU-bound spin that never grew memory (`char::from_u32` rejects most code points, so nothing was inserted into the map), so it slipped past the fuzzer's RSS limit while hanging `extract_text` and every `text_extraction()` caller indefinitely. `reader::text::parse_bfrange` now caps the expanded span at a generous ceiling (a well-formed bfrange varies only the low-order source byte per Adobe Tech Note #5411 §2, so a legitimate range is ≤ 256 codes; the tail of an over-long range is dropped as tolerant degradation) and uses saturating arithmetic so the `hi == u32::MAX` `+ 1` cannot overflow. Captured crash regression-tested in `tests/fuzz_regressions.rs` (`fixtures/fuzz_parse_tounicode_bfrange_span.bin`, wall-clock-bounded)
