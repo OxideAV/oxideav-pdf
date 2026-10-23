@@ -263,8 +263,8 @@ fn parse_encrypt_dict(d: &crate::objects::Dict) -> Result<EncryptParams, PdfErro
         Some(Object::Name(s)) if s == "Standard" => {}
         Some(other) => {
             return Err(PdfError::other(format!(
-            "PDF decrypt: only the Standard security handler is supported (got Filter={other:?})"
-        )))
+                "PDF decrypt: only the Standard security handler is supported (got Filter={other:?})"
+            )));
         }
         None => return Err(PdfError::other("PDF decrypt: /Encrypt missing /Filter")),
     }
@@ -408,12 +408,12 @@ fn parse_encrypt_dict(d: &crate::objects::Dict) -> Result<EncryptParams, PdfErro
                     Some(Object::Name(s)) if s == "None" => {
                         return Err(PdfError::other(
                             "PDF decrypt: CFM=None requires a custom security handler",
-                        ))
+                        ));
                     }
                     Some(other) => {
                         return Err(PdfError::other(format!(
                             "PDF decrypt: unsupported CFM={other:?}"
-                        )))
+                        )));
                     }
                     None => {
                         if v >= 5 {
@@ -428,7 +428,7 @@ fn parse_encrypt_dict(d: &crate::objects::Dict) -> Result<EncryptParams, PdfErro
         _ => {
             return Err(PdfError::other(format!(
                 "PDF decrypt: V={v} not supported (handler accepts V∈[1,2,4,5])"
-            )))
+            )));
         }
     };
 
@@ -683,7 +683,7 @@ fn aes256_cbc_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, PdfError> {
             "PDF decrypt: AES-256 ciphertext shorter than IV",
         ));
     }
-    if (data.len() - 16) % 16 != 0 {
+    if !(data.len() - 16).is_multiple_of(16) {
         return Err(PdfError::other(format!(
             "PDF decrypt: AES-256 ciphertext length {} not aligned to 16-byte blocks (after IV)",
             data.len() - 16
@@ -766,7 +766,7 @@ fn aes128_cbc_decrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>, PdfError> {
             "PDF decrypt: AES-128 ciphertext shorter than IV",
         ));
     }
-    if (data.len() - 16) % 16 != 0 {
+    if !(data.len() - 16).is_multiple_of(16) {
         return Err(PdfError::other(format!(
             "PDF decrypt: AES-128 ciphertext length {} not aligned to 16-byte blocks (after IV)",
             data.len() - 16
@@ -829,9 +829,9 @@ pub fn md5(input: &[u8]) -> [u8; 16] {
     }
     buf.extend_from_slice(&bit_len.to_le_bytes());
 
-    for chunk in buf.chunks_exact(64) {
+    for chunk in buf.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
-        for (i, w) in chunk.chunks_exact(4).enumerate() {
+        for (i, w) in chunk.as_chunks::<4>().0.iter().enumerate() {
             m[i] = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
         }
         let mut a = state[0];

@@ -464,10 +464,10 @@ impl Document {
             // Account for compressed-object ids (they're not in
             // `objects_to_emit` after the ObjStm-packing drain, but
             // they still occupy id slots in the cross-reference).
-            if let Some(top) = compressed_map.keys().max() {
-                if *top > max_existing {
-                    max_existing = *top;
-                }
+            if let Some(top) = compressed_map.keys().max()
+                && *top > max_existing
+            {
+                max_existing = *top;
             }
             Some(ObjectId::new(max_existing + 1))
         } else {
@@ -496,10 +496,10 @@ impl Document {
         }
         // Honour the requested minimum (incremental updates: trailer
         // /Size must be at least the previous revision's value).
-        if let Some(min) = self.min_size {
-            if (min as usize) > max_id + 1 {
-                max_id = (min as usize).saturating_sub(1);
-            }
+        if let Some(min) = self.min_size
+            && (min as usize) > max_id + 1
+        {
+            max_id = (min as usize).saturating_sub(1);
         }
         let mut offsets: Vec<u64> = vec![0; max_id + 1];
 

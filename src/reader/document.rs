@@ -23,29 +23,29 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use oxideav_core::TimeBase;
 use oxideav_core::vector::{
     FillRule, Group, MaskKind, Node, Paint, Path, PathCommand, PathNode, Point, Rgba, Transform2D,
     VectorFrame,
 };
-use oxideav_core::TimeBase;
 use oxideav_scene::{Metadata, Page, Scene};
 
-use crate::decrypt::{open_with_password, StandardHandler};
+use crate::decrypt::{StandardHandler, open_with_password};
 use crate::error::PdfError;
 use crate::objects::{Dict, Object, ObjectId, Stream};
 use crate::pubsec::{
-    open_with_certificate, open_with_certificate_and_trust_store, PubSecCredential, TrustStore,
+    PubSecCredential, TrustStore, open_with_certificate, open_with_certificate_and_trust_store,
 };
 use crate::reader::content::{
+    ColorSpaceKind, ResolvedImageXObject, ResolvedSoftMask, TilingPattern, Type3Font,
     color_space_from_object, parse_content_stream_full_with_soft_masks,
-    parse_content_stream_full_with_tiling, parse_content_stream_full_with_type3, ColorSpaceKind,
-    ResolvedImageXObject, ResolvedSoftMask, TilingPattern, Type3Font,
+    parse_content_stream_full_with_tiling, parse_content_stream_full_with_type3,
 };
 use crate::reader::image_decode::{
     decode_gray_plane, decode_image_to_rgba, decode_stencil_coverage, resample_nearest,
 };
 use crate::reader::parse::Parser;
-use crate::reader::xref::{parse_xref, XrefEntry, XrefTable};
+use crate::reader::xref::{XrefEntry, XrefTable, parse_xref};
 
 /// A read-time view of the PDF document — owns the byte slice plus a
 /// resolved cross-reference table and a small object cache. Indirect
@@ -487,7 +487,7 @@ impl<'a> DocumentReader<'a> {
             other => {
                 return Err(PdfError::other(format!(
                     "PDF reader: ObjStm /N must be a non-negative integer (got {other:?})"
-                )))
+                )));
             }
         };
         let first = match lookup("First") {
@@ -495,7 +495,7 @@ impl<'a> DocumentReader<'a> {
             other => {
                 return Err(PdfError::other(format!(
                     "PDF reader: ObjStm /First must be a non-negative integer (got {other:?})"
-                )))
+                )));
             }
         };
         let payload = decode_stream(&s)?;
@@ -698,14 +698,14 @@ fn build_crypt(
                 other => {
                     return Err(PdfError::other(format!(
                         "PDF reader: /Encrypt must resolve to a dict (got {other:?})"
-                    )))
+                    )));
                 }
             }
         }
         other => {
             return Err(PdfError::other(format!(
                 "PDF reader: /Encrypt must be a dict or reference (got {other:?})"
-            )))
+            )));
         }
     };
 
@@ -729,7 +729,7 @@ fn build_crypt(
         other => {
             return Err(PdfError::other(format!(
                 "PDF reader: /ID[0] must be a string (got {other:?})"
-            )))
+            )));
         }
     };
 
@@ -771,14 +771,14 @@ fn build_crypt_pubsec(
                 other => {
                     return Err(PdfError::other(format!(
                         "PDF reader: /Encrypt must resolve to a dict (got {other:?})"
-                    )))
+                    )));
                 }
             }
         }
         other => {
             return Err(PdfError::other(format!(
                 "PDF reader: /Encrypt must be a dict or reference (got {other:?})"
-            )))
+            )));
         }
     };
     let handler = match trust_store {
@@ -1373,10 +1373,10 @@ fn decode_page(
     // > 360 values some producers emit) into the canonical 0 / 90 /
     // 180 / 270 the scene `Page::orientation` carries; a non-multiple
     // of 90 is malformed and left at the default 0.
-    if let Some(Object::Integer(deg)) = resolve_inheritable_attr(reader, &page_dict, "Rotate")? {
-        if deg % 90 == 0 {
-            page.orientation = (deg.rem_euclid(360)) as u16;
-        }
+    if let Some(Object::Integer(deg)) = resolve_inheritable_attr(reader, &page_dict, "Rotate")?
+        && deg % 90 == 0
+    {
+        page.orientation = (deg.rem_euclid(360)) as u16;
     }
     page.content = VectorFrame {
         width,
@@ -1501,10 +1501,10 @@ fn resolve_font_resources(
 ///   as a direct `Object::Dict` so `build_cid_metrics` finds it.
 fn resolve_font_widths(reader: &mut DocumentReader<'_>, font: &mut Dict) -> Result<(), PdfError> {
     // /Widths (simple fonts) — resolve an indirect array.
-    if let Some(Object::Reference(id)) =
-        font.entries()
-            .iter()
-            .find_map(|(k, v)| if k == "Widths" { Some(v.clone()) } else { None })
+    if let Some(Object::Reference(id)) = font
+        .entries()
+        .iter()
+        .find_map(|(k, v)| if k == "Widths" { Some(v.clone()) } else { None })
     {
         let resolved = reader.resolve(id)?;
         font.set("Widths", resolved);
@@ -1516,10 +1516,9 @@ fn resolve_font_widths(reader: &mut DocumentReader<'_>, font: &mut Dict) -> Resu
         } else {
             None
         }
-    }) {
-        if let Ok(Object::Dict(d)) = reader.resolve(id) {
-            font.set("FontDescriptor", Object::Dict(d));
-        }
+    }) && let Ok(Object::Dict(d)) = reader.resolve(id)
+    {
+        font.set("FontDescriptor", Object::Dict(d));
     }
     // /DescendantFonts (Type0) — resolve the array + CIDFont + its /W.
     let descendant_ref = font.entries().iter().find_map(|(k, v)| {
@@ -1547,13 +1546,11 @@ fn resolve_font_widths(reader: &mut DocumentReader<'_>, font: &mut Dict) -> Resu
             };
             if let Object::Dict(mut cid_font) = cid_obj {
                 // Resolve the CIDFont's /W array (often indirect).
-                if let Some(Object::Reference(id)) = cid_font.entries().iter().find_map(|(k, v)| {
-                    if k == "W" {
-                        Some(v.clone())
-                    } else {
-                        None
-                    }
-                }) {
+                if let Some(Object::Reference(id)) = cid_font
+                    .entries()
+                    .iter()
+                    .find_map(|(k, v)| if k == "W" { Some(v.clone()) } else { None })
+                {
                     let resolved = reader.resolve(id)?;
                     cid_font.set("W", resolved);
                 }
@@ -2018,11 +2015,11 @@ fn resolve_one_type3_font(
             Some((_, other)) => Some(other.clone()),
             None => None,
         };
-        if let Some(arr) = diffs {
-            if let Ok(parsed) = crate::reader::encoding::parse_encoding_differences(&arr) {
-                for ov in parsed.overrides {
-                    encoding.insert(ov.code, ov.glyph_name);
-                }
+        if let Some(arr) = diffs
+            && let Ok(parsed) = crate::reader::encoding::parse_encoding_differences(&arr)
+        {
+            for ov in parsed.overrides {
+                encoding.insert(ov.code, ov.glyph_name);
             }
         }
     }
@@ -2079,10 +2076,9 @@ fn resolve_one_type3_font(
         }
         if let Some(group) =
             parse_glyph_description(reader, &content_bytes, glyph_resources.as_ref(), depth)?
+            && !group.children.is_empty()
         {
-            if !group.children.is_empty() {
-                glyphs.insert(glyph_name.clone(), group);
-            }
+            glyphs.insert(glyph_name.clone(), group);
         }
     }
     if glyphs.is_empty() {
@@ -2585,7 +2581,7 @@ fn resolve_image_xobjects(
             _ => None,
         };
         if let Some(alpha) = alpha_plane {
-            for (px, a) in rgba.chunks_exact_mut(4).zip(alpha) {
+            for (px, a) in rgba.as_chunks_mut::<4>().0.iter_mut().zip(alpha) {
                 px[3] = ((px[3] as u16 * a as u16) / 255) as u8;
             }
         }
@@ -2727,7 +2723,7 @@ fn resolve_explicit_mask(
                 return Ok(ResolvedMask::None);
             }
             let mut ranges = Vec::with_capacity(n_comps);
-            for pair in items.chunks_exact(2) {
+            for pair in items.as_chunks::<2>().0 {
                 let (Object::Integer(lo), Object::Integer(hi)) = (&pair[0], &pair[1]) else {
                     return Ok(ResolvedMask::None);
                 };
@@ -3051,20 +3047,19 @@ fn resolve_soft_masks(
                 .find(|(k, _)| k == "BC")
                 .and_then(|(_, v)| number_array(v))
                 .and_then(|comps| backdrop_color(&comps));
-            if let Some(color) = bc {
-                if (color.r, color.g, color.b) != (0, 0, 0) {
-                    if let Some(bbox) = form_bbox_clip(&stream.dict) {
-                        mask.children.insert(
-                            0,
-                            Node::Path(PathNode {
-                                path: bbox,
-                                fill: Some(Paint::Solid(color)),
-                                stroke: None,
-                                fill_rule: FillRule::NonZero,
-                            }),
-                        );
-                    }
-                }
+            if let Some(color) = bc
+                && (color.r, color.g, color.b) != (0, 0, 0)
+                && let Some(bbox) = form_bbox_clip(&stream.dict)
+            {
+                mask.children.insert(
+                    0,
+                    Node::Path(PathNode {
+                        path: bbox,
+                        fill: Some(Paint::Solid(color)),
+                        stroke: None,
+                        fill_rule: FillRule::NonZero,
+                    }),
+                );
             }
         }
         out.insert(name.clone(), ResolvedSoftMask { kind, mask });
@@ -3129,10 +3124,10 @@ fn resolve_xobject_forms(
         if let Some(id) = form_id {
             visited.remove(&id);
         }
-        if let Some(g) = group {
-            if !g.children.is_empty() {
-                out.insert(name.clone(), g);
-            }
+        if let Some(g) = group
+            && !g.children.is_empty()
+        {
+            out.insert(name.clone(), g);
         }
     }
     if out.is_empty() {
@@ -4052,7 +4047,7 @@ fn apply_filter(name: &str, data: &[u8], parms: Option<&Dict>) -> Result<Vec<u8>
 /// (§7.4.4.4 Table 8 / Table 10). When `/Predictor` is absent or `1`
 /// the bytes pass through unchanged.
 fn apply_predictor_post(data: Vec<u8>, parms: Option<&Dict>) -> Result<Vec<u8>, PdfError> {
-    use crate::reader::filters::{apply_predictor, PredictorParams};
+    use crate::reader::filters::{PredictorParams, apply_predictor};
     let Some(parms) = parms else {
         return Ok(data);
     };
@@ -4181,7 +4176,9 @@ fn decode_text(v: &Object) -> Option<String> {
             // back to a Rust String.
             if b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF {
                 let utf16: Vec<u16> = b[2..]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_be_bytes([c[0], c[1]]))
                     .collect();
                 Some(String::from_utf16_lossy(&utf16))

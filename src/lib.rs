@@ -71,50 +71,48 @@ pub mod writer;
 mod zlib;
 
 pub use acroform::{
-    write_pdf_with_form, FieldJustification, FormField, FormFieldCheckbox, FormFieldChoice,
-    FormFieldRadioGroup, FormFieldSignature, FormFieldText, RadioOption,
+    FieldJustification, FormField, FormFieldCheckbox, FormFieldChoice, FormFieldRadioGroup,
+    FormFieldSignature, FormFieldText, RadioOption, write_pdf_with_form,
 };
 pub use annotations::{
-    write_pdf_with_annotations, Annotation, AnnotationKind as WriterAnnotationKind, CaretSymbol,
-    FixedPrintSpec, FreeTextQuadding, SoundEncoding,
+    Annotation, AnnotationKind as WriterAnnotationKind, CaretSymbol, FixedPrintSpec,
+    FreeTextQuadding, SoundEncoding, write_pdf_with_annotations,
 };
 pub use attachments::{
-    write_pdf_with_annotations_and_attachments, write_pdf_with_attachments, AfRelationship,
-    Attachment,
+    AfRelationship, Attachment, write_pdf_with_annotations_and_attachments,
+    write_pdf_with_attachments,
 };
 pub use error::PdfError;
 pub use outline::{LinkAnnotationSpec, LinkTarget, OutlineDestination, OutlineSpec};
 pub use pubsec::{
-    open_with_certificate, open_with_certificate_and_trust_store,
-    open_with_certificate_and_trust_store_with_permissions, open_with_certificate_with_permissions,
     CertRef, KariRecipient, PubSecCfGroup, PubSecCredential, PubSecEncoderConfig,
     PubSecEncryptionState, PubSecKariConfig, PubSecMatch, PubSecMultiCfConfig, PubSecRecipient,
-    PubSecSubFilter, TrustStore,
+    PubSecSubFilter, TrustStore, open_with_certificate, open_with_certificate_and_trust_store,
+    open_with_certificate_and_trust_store_with_permissions, open_with_certificate_with_permissions,
 };
 pub use reader::doc_timestamps as read_pdf_doc_timestamps;
 pub use reader::{
-    actions as read_pdf_actions, annotations as read_pdf_annotations,
-    attachments as read_pdf_attachments, extract_text as extract_pdf_text,
-    extract_text_marked as extract_pdf_text_marked, image_xobjects as read_pdf_image_xobjects,
-    inline_images as read_pdf_inline_images, links as read_pdf_links, outline as read_pdf_outline,
-    parse_linearization_dict, pdfa_signals as read_pdf_pdfa_signals,
-    read_in_logical_order as read_pdf_in_logical_order, read_pdf_to_scene,
-    read_pdf_to_scene_with_certificate, read_pdf_to_scene_with_certificate_and_trust_store,
-    read_pdf_to_scene_with_password, signatures as read_pdf_signatures,
-    signed_bytes as pdf_signed_bytes, verify_hierarchy as verify_pdf_hierarchy, ActionKind,
-    ActionTrigger, AnnotationAppearance, AnnotationKind, ColorSpace, FixedPrint, HierarchyIssue,
-    HierarchyReport, InlineImageFilter, IssueSeverity, LayoutMode, LinearizationParams,
-    MarkedTextRun, MovieActivation, OutlineNode, PdfACatalogSignals, PdfAConformance, PdfAction,
-    PdfAnnotation, PdfAttachment, PdfDocTimestamp, PdfImageXObject, PdfInlineImage, PdfLink,
-    PdfLinkTarget, PdfMarkedTextExtraction, PdfOutline, PdfSignature, PdfTextExtraction,
-    ReadingOrderText, SoftMaskImage, TextMarkupVariant, TextRenderMode, TextRun, ThreeDActivation,
-    ThreeDViewSelector, XmpPacket,
+    ActionKind, ActionTrigger, AnnotationAppearance, AnnotationKind, ColorSpace, FixedPrint,
+    HierarchyIssue, HierarchyReport, InlineImageFilter, IssueSeverity, LayoutMode,
+    LinearizationParams, MarkedTextRun, MovieActivation, OutlineNode, PdfACatalogSignals,
+    PdfAConformance, PdfAction, PdfAnnotation, PdfAttachment, PdfDocTimestamp, PdfImageXObject,
+    PdfInlineImage, PdfLink, PdfLinkTarget, PdfMarkedTextExtraction, PdfOutline, PdfSignature,
+    PdfTextExtraction, ReadingOrderText, SoftMaskImage, TextMarkupVariant, TextRenderMode, TextRun,
+    ThreeDActivation, ThreeDViewSelector, XmpPacket, actions as read_pdf_actions,
+    annotations as read_pdf_annotations, attachments as read_pdf_attachments,
+    extract_text as extract_pdf_text, extract_text_marked as extract_pdf_text_marked,
+    image_xobjects as read_pdf_image_xobjects, inline_images as read_pdf_inline_images,
+    links as read_pdf_links, outline as read_pdf_outline, parse_linearization_dict,
+    pdfa_signals as read_pdf_pdfa_signals, read_in_logical_order as read_pdf_in_logical_order,
+    read_pdf_to_scene, read_pdf_to_scene_with_certificate,
+    read_pdf_to_scene_with_certificate_and_trust_store, read_pdf_to_scene_with_password,
+    signatures as read_pdf_signatures, signed_bytes as pdf_signed_bytes,
+    verify_hierarchy as verify_pdf_hierarchy,
 };
 pub use sig::{
-    add_document_timestamp, build_tst_info, pkcs7_wrap_signed_data, sign_pdf_from_scene,
-    wrap_tst_in_signed_data, EcdsaP256Sha256Signer, MessageImprint, MockTsaSigner,
-    RsaPkcs1v15Sha256Signer, SigWriter, Signer, SignerIdentity, SigningAlgorithm, TsaSigner,
-    OID_CT_TST_INFO,
+    EcdsaP256Sha256Signer, MessageImprint, MockTsaSigner, OID_CT_TST_INFO, RsaPkcs1v15Sha256Signer,
+    SigWriter, Signer, SignerIdentity, SigningAlgorithm, TsaSigner, add_document_timestamp,
+    build_tst_info, pkcs7_wrap_signed_data, sign_pdf_from_scene, wrap_tst_in_signed_data,
 };
 pub use writer::{
     write_pdf, write_pdf_from_scene, write_pdf_from_scene_encrypted,

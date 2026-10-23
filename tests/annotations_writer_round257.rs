@@ -17,8 +17,8 @@ use oxideav_core::vector::{
 };
 use oxideav_pdf::reader::DocumentReader;
 use oxideav_pdf::{
-    read_pdf_annotations, write_pdf_with_annotations, Annotation, AnnotationKind,
-    WriterAnnotationKind,
+    Annotation, AnnotationKind, WriterAnnotationKind, read_pdf_annotations,
+    write_pdf_with_annotations,
 };
 use oxideav_scene::{Page, Scene};
 

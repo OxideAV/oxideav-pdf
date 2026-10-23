@@ -23,11 +23,11 @@ use crate::decrypt::{CryptMethod, StandardHandler};
 use crate::error::PdfError;
 use crate::objects::{Dict, Object};
 
-use super::cms_build::{
-    build_envelope_aes128, build_envelope_aes256, build_envelope_rc4, rsa_pkcs1_encrypt,
-    RecipientIdRef, RecipientPlain,
-};
 use super::PubSecSubFilter;
+use super::cms_build::{
+    RecipientIdRef, RecipientPlain, build_envelope_aes128, build_envelope_aes256,
+    build_envelope_rc4, rsa_pkcs1_encrypt,
+};
 
 /// Recipient identification + public key for an emitted public-key
 /// envelope. Either form of RFC 5652 §6.2.1 RecipientIdentifier is
@@ -591,7 +591,7 @@ fn build_multi_cf_encrypt_dict(
         _ => {
             return Err(PdfError::other(
                 "PDF pubsec multi-CF: only s5 SubFilters supported",
-            ))
+            ));
         }
     };
     let cf_length_bytes = (key_length_bits / 8) as i64;
@@ -1169,8 +1169,8 @@ impl PubSecEncryptionState {
 mod tests {
     use super::super::open_with_certificate;
     use super::*;
-    use crate::pubsec::x509::Certificate;
     use crate::pubsec::PubSecCredential;
+    use crate::pubsec::x509::Certificate;
 
     fn keypair() -> (rsa::RsaPrivateKey, rsa::RsaPublicKey) {
         let mut rng = rsa::rand_core::OsRng;

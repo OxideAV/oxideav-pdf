@@ -265,7 +265,13 @@ fn ghostscript_agrees_with_color_key_image_decode() {
         None
     }
     let img = find_image(root).expect("spliced image");
-    let px: Vec<&[u8]> = img.frame.planes[0].data.chunks_exact(4).collect();
+    let px: Vec<&[u8]> = img.frame.planes[0]
+        .data
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| c.as_slice())
+        .collect();
     assert_eq!(px[0], &[255, 0, 0, 255]);
     assert_eq!(px[1][3], 0, "green colour-key masked in crate decode");
     assert_eq!(px[2], &[0, 0, 255, 255]);

@@ -14,7 +14,7 @@
 //! the title (string-decryption) and the content stream's path
 //! commands (stream-decryption).
 
-use oxideav_pdf::decrypt::{md5, rc4, StandardHandler};
+use oxideav_pdf::decrypt::{StandardHandler, md5, rc4};
 use oxideav_pdf::read_pdf_to_scene_with_password;
 
 // ───────── PDF fixture builder ─────────

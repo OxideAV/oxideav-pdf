@@ -35,10 +35,10 @@ use std::collections::HashMap;
 
 use crate::error::PdfError;
 use crate::objects::{Object, Stream};
-use crate::reader::document::{decode_stream, DocumentReader};
+use crate::reader::document::{DocumentReader, decode_stream};
 use crate::reader::text::{
-    bytes_to_u32, peek_keyword, read_hex_string_payload, skip_token, skip_ws_and_comments,
-    CodespaceRange,
+    CodespaceRange, bytes_to_u32, peek_keyword, read_hex_string_payload, skip_token,
+    skip_ws_and_comments,
 };
 
 /// One `<lo> <hi> cid` mapping from a `begincidrange` (or

@@ -96,8 +96,8 @@ use crate::error::PdfError;
 use crate::objects::{Dict, Object};
 use crate::reader::image_decode::{decode_image_to_rgba, decode_stencil_coverage};
 use crate::reader::inline_images::{
-    find_inline_image_ei, parse_one_inline_image_full, InlineColorSpace, InlineImageFilter,
-    ParsedInlineImage, PdfInlineImage,
+    InlineColorSpace, InlineImageFilter, ParsedInlineImage, PdfInlineImage, find_inline_image_ei,
+    parse_one_inline_image_full,
 };
 
 /// Parse a content-stream byte sequence into a single [`Group`]
@@ -2272,11 +2272,7 @@ fn exec_ps_op(op: PsOp, stack: &mut Vec<PsValue>) -> Result<(), ()> {
                 }
             } else {
                 let s = (-shift) as u32;
-                if s >= 32 {
-                    0
-                } else {
-                    v >> s
-                }
+                if s >= 32 { 0 } else { v >> s }
             };
             push(stack, PsValue::Num(r as f32))
         }
@@ -3481,11 +3477,11 @@ impl<'a> State<'a> {
                     _ => None,
                 };
                 self.operands.clear();
-                if let (Some(name), Some(ext_gstate)) = (name, self.ext_gstate) {
-                    if let Some(dict) = lookup_dict(ext_gstate, &name) {
-                        self.apply_ext_gstate(dict);
-                        self.apply_soft_mask_entry(&name, dict);
-                    }
+                if let (Some(name), Some(ext_gstate)) = (name, self.ext_gstate)
+                    && let Some(dict) = lookup_dict(ext_gstate, &name)
+                {
+                    self.apply_ext_gstate(dict);
+                    self.apply_soft_mask_entry(&name, dict);
                 }
             }
 
@@ -4118,7 +4114,7 @@ impl<'a> State<'a> {
                                 Some(Paint::Solid(c)) => *c,
                                 _ => Rgba::opaque(0, 0, 0),
                             };
-                            for px in data.chunks_exact_mut(4) {
+                            for px in data.as_chunks_mut::<4>().0 {
                                 px[0] = fill.r;
                                 px[1] = fill.g;
                                 px[2] = fill.b;
@@ -4147,29 +4143,29 @@ impl<'a> State<'a> {
                         self.operands.clear();
                         return Ok(());
                     }
-                    if let Some(form) = self.xobject_forms.and_then(|m| m.get(&name)) {
-                        if !form.children.is_empty() {
-                            let mut group = form.clone();
-                            // §11.6.6 — a *transparency-group* XObject
-                            // composites into its parent as a unit, so
-                            // the current nonstroking alpha constant
-                            // applies to the group's results
-                            // (§11.6.4.4), not to each object inside
-                            // it. (The group's own content already
-                            // parsed with fresh state — blend Normal,
-                            // alphas 1.0, soft mask None — per the
-                            // §11.6.6 initialisation rule, so nothing
-                            // is applied twice.) An ordinary form gets
-                            // no grouping behaviour.
-                            if self.fill_alpha < 1.0
-                                && self
-                                    .transparency_groups
-                                    .is_some_and(|set| set.contains(&name))
-                            {
-                                group.opacity *= self.fill_alpha;
-                            }
-                            self.push_painted(Node::Group(group));
+                    if let Some(form) = self.xobject_forms.and_then(|m| m.get(&name))
+                        && !form.children.is_empty()
+                    {
+                        let mut group = form.clone();
+                        // §11.6.6 — a *transparency-group* XObject
+                        // composites into its parent as a unit, so
+                        // the current nonstroking alpha constant
+                        // applies to the group's results
+                        // (§11.6.4.4), not to each object inside
+                        // it. (The group's own content already
+                        // parsed with fresh state — blend Normal,
+                        // alphas 1.0, soft mask None — per the
+                        // §11.6.6 initialisation rule, so nothing
+                        // is applied twice.) An ordinary form gets
+                        // no grouping behaviour.
+                        if self.fill_alpha < 1.0
+                            && self
+                                .transparency_groups
+                                .is_some_and(|set| set.contains(&name))
+                        {
+                            group.opacity *= self.fill_alpha;
                         }
+                        self.push_painted(Node::Group(group));
                     }
                 }
                 self.operands.clear();
@@ -4226,19 +4222,18 @@ impl<'a> State<'a> {
                 // to the `ContentShading` event rather than synthesising a
                 // page-sized fill. Type 1 (function-based) and mesh
                 // shadings have no `Paint` analogue and stay event-only.
-                if let Some(clip_path) = &clip {
-                    if let Some(paint) = gradient
+                if let Some(clip_path) = &clip
+                    && let Some(paint) = gradient
                         .as_ref()
                         .and_then(|g| gradient_to_paint(g, Transform2D::identity()))
-                    {
-                        let node = Node::Path(PathNode {
-                            path: clip_path.clone(),
-                            fill: Some(apply_alpha(paint, self.fill_alpha)),
-                            stroke: None,
-                            fill_rule: FillRule::NonZero,
-                        });
-                        self.push_painted(node);
-                    }
+                {
+                    let node = Node::Path(PathNode {
+                        path: clip_path.clone(),
+                        fill: Some(apply_alpha(paint, self.fill_alpha)),
+                        stroke: None,
+                        fill_rule: FillRule::NonZero,
+                    });
+                    self.push_painted(node);
                 }
                 self.shadings.push(ContentShading {
                     name,
@@ -4787,25 +4782,24 @@ impl<'a> State<'a> {
                 .encoding
                 .get(&b)
                 .and_then(|n| font.glyphs.get(n).map(|g| (n, g)))
+                && !glyph.children.is_empty()
             {
-                if !glyph.children.is_empty() {
-                    // group transform = Tm ∘ text_state ∘ FontMatrix
-                    let outer = compose(tm, text_state);
-                    let g_xform = compose(outer, font.font_matrix);
-                    let mut children = glyph.children.clone();
-                    // §9.6.5 — a `d1` shape-only glyph takes the current
-                    // fill colour, not its own; recolour its paints.
-                    if font.shape_only.contains(glyph_name) {
-                        for child in &mut children {
-                            recolor_node(child, fill_color);
-                        }
+                // group transform = Tm ∘ text_state ∘ FontMatrix
+                let outer = compose(tm, text_state);
+                let g_xform = compose(outer, font.font_matrix);
+                let mut children = glyph.children.clone();
+                // §9.6.5 — a `d1` shape-only glyph takes the current
+                // fill colour, not its own; recolour its paints.
+                if font.shape_only.contains(glyph_name) {
+                    for child in &mut children {
+                        recolor_node(child, fill_color);
                     }
-                    nodes.push(Node::Group(Group {
-                        transform: g_xform,
-                        children,
-                        ..Group::default()
-                    }));
                 }
+                nodes.push(Node::Group(Group {
+                    transform: g_xform,
+                    children,
+                    ..Group::default()
+                }));
             }
             // Advance the local running matrix by this glyph's
             // displacement (§9.4.4) so the next glyph in the string paints
@@ -5045,7 +5039,7 @@ impl<'a> State<'a> {
                 Paint::Solid(rgb_from_cmyk(comps[0], comps[1], comps[2], comps[3]))
             }
             ColorSpaceKind::Indexed { base, hival, table } => {
-                return indexed_color(base, *hival, table, comps[0])
+                return indexed_color(base, *hival, table, comps[0]);
             }
             ColorSpaceKind::Separation {
                 alt,
@@ -5756,7 +5750,7 @@ impl<'a> BitReader<'a> {
     /// Advance to the next byte boundary (each mesh element — vertex or
     /// patch — is byte-aligned, §8.7.4.5.5).
     fn align_byte(&mut self) {
-        if self.bit_pos % 8 != 0 {
+        if !self.bit_pos.is_multiple_of(8) {
             self.bit_pos = self.bit_pos.div_ceil(8) * 8;
         }
     }
@@ -6364,11 +6358,7 @@ impl MeshEvaluator<'_> {
                 None => break,
             };
             let new_pts = if f == 0 {
-                if tensor {
-                    16
-                } else {
-                    12
-                }
+                if tensor { 16 } else { 12 }
             } else if tensor {
                 12
             } else {
@@ -7482,10 +7472,10 @@ fn read_array(input: &[u8], start: usize) -> Result<(usize, Vec<ArrayElem>), Pdf
                 NumScan::Slow(next) => {
                     // Tolerant: a number `str::parse` rejects is
                     // dropped, matching the historical policy.
-                    if let Ok(s) = str::from_utf8(&input[nstart..next]) {
-                        if let Ok(f) = s.parse::<f32>() {
-                            items.push(ArrayElem::Number(f));
-                        }
+                    if let Ok(s) = str::from_utf8(&input[nstart..next])
+                        && let Ok(f) = s.parse::<f32>()
+                    {
+                        items.push(ArrayElem::Number(f));
                     }
                     end = next;
                 }
@@ -10232,8 +10222,8 @@ mod tests {
     fn mesh_type6_coons_single_patch() {
         let mut w = BitWriter::new();
         w.write(0, 8); // edge flag f=0
-                       // 12 boundary points. Lay out a unit square traced in the
-                       // Coons order (p00 p01 p02 p03 p13 p23 p33 p32 p31 p30 p20 p10).
+        // 12 boundary points. Lay out a unit square traced in the
+        // Coons order (p00 p01 p02 p03 p13 p23 p33 p32 p31 p30 p20 p10).
         let pts: [(u64, u64); 12] = [
             (0, 0),     // p00
             (0, 85),    // p01
@@ -10310,9 +10300,9 @@ mod tests {
     fn mesh_type7_tensor_single_patch() {
         let mut w = BitWriter::new();
         w.write(0, 8); // f=0
-                       // 16 points in tensor stream order; we only check the four
-                       // corners land at the right (col,row) slots.
-                       // Order: p00 p01 p02 p03 p13 p23 p33 p32 p31 p30 p20 p10 p11 p12 p22 p21
+        // 16 points in tensor stream order; we only check the four
+        // corners land at the right (col,row) slots.
+        // Order: p00 p01 p02 p03 p13 p23 p33 p32 p31 p30 p20 p10 p11 p12 p22 p21
         let pts: [(u64, u64); 16] = [
             (0, 0),     // p00
             (0, 85),    // p01
@@ -10435,7 +10425,7 @@ mod tests {
         // own p00 p01 p02 p03 (§8.7.4.5.8 Table 86 f=1 geometry).
         assert_eq!(b.control_points[0][0], a.control_points[0][3]); // B.p00 = A.p03
         assert_eq!(b.control_points[0][3], a.control_points[3][3]); // B.p03 = A.p33
-                                                                    // Patch B inherits c1=c2prev (green), c2=c3prev (blue).
+        // Patch B inherits c1=c2prev (green), c2=c3prev (blue).
         assert_eq!(
             (
                 b.corner_colors[0].r,

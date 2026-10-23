@@ -369,10 +369,10 @@ pub fn optional_content(
         };
         // Best-effort: skip dicts that aren't /Type /OCG.
         let kind = dict_name(&group_dict, "Type");
-        if let Some(k) = kind.as_deref() {
-            if k != "OCG" {
-                continue;
-            }
+        if let Some(k) = kind.as_deref()
+            && k != "OCG"
+        {
+            continue;
         }
         let name = dict_text(&group_dict, "Name").unwrap_or_default();
         let intents = decode_intent_array(reader, &group_dict)?;
@@ -438,10 +438,10 @@ pub fn parse_membership(
     dict: &Dict,
 ) -> Result<Option<OcMembership>, PdfError> {
     let kind = dict_name(dict, "Type");
-    if let Some(k) = kind.as_deref() {
-        if k != "OCMD" {
-            return Ok(None);
-        }
+    if let Some(k) = kind.as_deref()
+        && k != "OCMD"
+    {
+        return Ok(None);
     }
     let mut groups: Vec<ObjectId> = Vec::new();
     if let Some(o) = dict
@@ -670,11 +670,10 @@ fn decode_usage(
         .iter()
         .find(|(k, _)| k == "Language")
         .map(|(_, v)| v.clone())
+        && let Object::Dict(d) = reader.deref(o)?
     {
-        if let Object::Dict(d) = reader.deref(o)? {
-            out.language = dict_text(&d, "Lang");
-            out.language_preferred = dict_name(&d, "Preferred").map(|n| n == "ON");
-        }
+        out.language = dict_text(&d, "Lang");
+        out.language_preferred = dict_name(&d, "Preferred").map(|n| n == "ON");
     }
     // /Zoom { /min n, /max n }
     if let Some(o) = usage_dict
@@ -682,19 +681,18 @@ fn decode_usage(
         .iter()
         .find(|(k, _)| k == "Zoom")
         .map(|(_, v)| v.clone())
+        && let Object::Dict(d) = reader.deref(o)?
     {
-        if let Object::Dict(d) = reader.deref(o)? {
-            out.zoom_min = d
-                .entries()
-                .iter()
-                .find(|(k, _)| k == "min")
-                .and_then(|(_, v)| number_to_f64(v));
-            out.zoom_max = d
-                .entries()
-                .iter()
-                .find(|(k, _)| k == "max")
-                .and_then(|(_, v)| number_to_f64(v));
-        }
+        out.zoom_min = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "min")
+            .and_then(|(_, v)| number_to_f64(v));
+        out.zoom_max = d
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "max")
+            .and_then(|(_, v)| number_to_f64(v));
     }
     // /Print { /Subtype, /PrintState }
     if let Some(o) = usage_dict
@@ -702,11 +700,10 @@ fn decode_usage(
         .iter()
         .find(|(k, _)| k == "Print")
         .map(|(_, v)| v.clone())
+        && let Object::Dict(d) = reader.deref(o)?
     {
-        if let Object::Dict(d) = reader.deref(o)? {
-            out.print_subtype = dict_name(&d, "Subtype");
-            out.print_state = dict_name(&d, "PrintState").map(|n| n == "ON");
-        }
+        out.print_subtype = dict_name(&d, "Subtype");
+        out.print_state = dict_name(&d, "PrintState").map(|n| n == "ON");
     }
     // /View { /ViewState }
     if let Some(o) = usage_dict
@@ -714,10 +711,9 @@ fn decode_usage(
         .iter()
         .find(|(k, _)| k == "View")
         .map(|(_, v)| v.clone())
+        && let Object::Dict(d) = reader.deref(o)?
     {
-        if let Object::Dict(d) = reader.deref(o)? {
-            out.view_state = dict_name(&d, "ViewState").map(|n| n == "ON");
-        }
+        out.view_state = dict_name(&d, "ViewState").map(|n| n == "ON");
     }
     // /Export { /ExportState }
     if let Some(o) = usage_dict
@@ -725,10 +721,9 @@ fn decode_usage(
         .iter()
         .find(|(k, _)| k == "Export")
         .map(|(_, v)| v.clone())
+        && let Object::Dict(d) = reader.deref(o)?
     {
-        if let Object::Dict(d) = reader.deref(o)? {
-            out.export_state = dict_name(&d, "ExportState").map(|n| n == "ON");
-        }
+        out.export_state = dict_name(&d, "ExportState").map(|n| n == "ON");
     }
     // /PageElement { /Subtype HF|FG|BG|L }
     if let Some(o) = usage_dict
@@ -736,10 +731,9 @@ fn decode_usage(
         .iter()
         .find(|(k, _)| k == "PageElement")
         .map(|(_, v)| v.clone())
+        && let Object::Dict(d) = reader.deref(o)?
     {
-        if let Object::Dict(d) = reader.deref(o)? {
-            out.page_element_subtype = dict_name(&d, "Subtype");
-        }
+        out.page_element_subtype = dict_name(&d, "Subtype");
     }
     Ok(Some(out))
 }
@@ -938,7 +932,9 @@ fn dict_text(d: &Dict, key: &str) -> Option<String> {
 fn decode_text_string(b: &[u8]) -> String {
     if b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF {
         let utf16: Vec<u16> = b[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect();
         String::from_utf16_lossy(&utf16)

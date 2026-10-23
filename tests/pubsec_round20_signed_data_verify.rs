@@ -20,13 +20,13 @@
 //! third-party CMS / OpenSSL source consulted.
 
 use oxideav_pdf::pubsec::der;
-use oxideav_pdf::pubsec::signed_data::{parse_signed_data, SignerIdentifier};
+use oxideav_pdf::pubsec::signed_data::{SignerIdentifier, parse_signed_data};
 use oxideav_pdf::pubsec::verify::{
+    AttachedContent, HashAlg, OID_ATTR_MESSAGE_DIGEST, OID_EC_PUBLIC_KEY, OID_ECDSA_WITH_SHA256,
+    OID_ECDSA_WITH_SHA384, OID_ECDSA_WITH_SHA512, OID_NAMED_CURVE_P256, OID_NAMED_CURVE_P384,
+    OID_NAMED_CURVE_P521, OID_RSA_ENCRYPTION, OID_RSA_PSS, OID_SHA256, OID_SHA384, OID_SHA512,
     build_message_digest_attribute_der, implicit_signed_attrs_tlv, pack_signed_attrs_implicit,
-    rsa_pubkey_to_pkcs1_der, signed_attrs_to_be_signed, verify_signature, AttachedContent, HashAlg,
-    OID_ATTR_MESSAGE_DIGEST, OID_ECDSA_WITH_SHA256, OID_ECDSA_WITH_SHA384, OID_ECDSA_WITH_SHA512,
-    OID_EC_PUBLIC_KEY, OID_NAMED_CURVE_P256, OID_NAMED_CURVE_P384, OID_NAMED_CURVE_P521,
-    OID_RSA_ENCRYPTION, OID_RSA_PSS, OID_SHA256, OID_SHA384, OID_SHA512,
+    rsa_pubkey_to_pkcs1_der, signed_attrs_to_be_signed, verify_signature,
 };
 use oxideav_pdf::pubsec::x509::Certificate;
 

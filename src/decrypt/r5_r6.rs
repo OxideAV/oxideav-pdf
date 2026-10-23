@@ -55,7 +55,7 @@
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
 use crate::decrypt::{
-    aes256_ecb_decrypt_block, constant_time_eq, CryptMethod, EncryptParams, StandardHandler,
+    CryptMethod, EncryptParams, StandardHandler, aes256_ecb_decrypt_block, constant_time_eq,
 };
 use crate::error::PdfError;
 
@@ -235,7 +235,7 @@ fn unwrap_file_key(int_key: &[u8], wrapped: &[u8]) -> Result<Vec<u8>, PdfError> 
     let cipher = aes::Aes256::new(int_key.into());
     let mut prev = [0u8; 16];
     let mut out = vec![0u8; 32];
-    for (i, chunk) in wrapped.chunks_exact(16).enumerate() {
+    for (i, chunk) in wrapped.as_chunks::<16>().0.iter().enumerate() {
         let mut ga = *GenericArray::from_slice(chunk);
         cipher.decrypt_block(&mut ga);
         for j in 0..16 {
@@ -263,7 +263,7 @@ fn build_handler(p: &EncryptParams, file_key: Vec<u8>) -> Result<StandardHandler
         other => {
             return Err(PdfError::other(format!(
                 "PDF decrypt: V=5 requires AESV3 crypt method (got {other:?})"
-            )))
+            )));
         }
     };
     Ok(StandardHandler {
@@ -381,7 +381,7 @@ fn algorithm_2b(seed: &[u8], password: &[u8], aux: &[u8]) -> Vec<u8> {
         let cipher = aes::Aes128::new((&key_bytes).into());
         let mut prev: [u8; 16] = iv_bytes;
         let mut e = vec![0u8; k1.len()];
-        for (i, chunk) in k1.chunks_exact(16).enumerate() {
+        for (i, chunk) in k1.as_chunks::<16>().0.iter().enumerate() {
             let mut block = [0u8; 16];
             for j in 0..16 {
                 block[j] = chunk[j] ^ prev[j];
@@ -570,7 +570,7 @@ fn aes256_cbc_encrypt_no_padding(key: &[u8], data: &[u8]) -> Vec<u8> {
     let cipher = aes::Aes256::new(key.into());
     let mut prev = [0u8; 16];
     let mut out = vec![0u8; data.len()];
-    for (i, chunk) in data.chunks_exact(16).enumerate() {
+    for (i, chunk) in data.as_chunks::<16>().0.iter().enumerate() {
         let mut block = [0u8; 16];
         for j in 0..16 {
             block[j] = chunk[j] ^ prev[j];

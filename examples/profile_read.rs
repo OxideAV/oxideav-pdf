@@ -79,7 +79,7 @@ fn dense_frame(w: f32, h: f32, segments: usize, rng: &mut u32) -> VectorFrame {
         }
     }
     p.commands.push(PathCommand::Close);
-    let fill = if segments % 2 == 0 {
+    let fill = if segments.is_multiple_of(2) {
         Paint::Solid(Rgba::opaque(
             (xorshift32(rng) & 0xFF) as u8,
             (xorshift32(rng) & 0xFF) as u8,

@@ -15,7 +15,7 @@
 //! (replacement text), §8.9.7 (inline images). Staged PDF bytes are
 //! hand-assembled here; no third-party PDF library was consulted.
 
-use oxideav_pdf::reader::{assemble_text, reorder_bidi_line, DocumentReader, TextRun};
+use oxideav_pdf::reader::{DocumentReader, TextRun, assemble_text, reorder_bidi_line};
 
 /// Assemble a one-page PDF. `fonts` are `(resource name, font object
 /// body)` pairs; each body may reference `{tu}` for a ToUnicode

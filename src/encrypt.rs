@@ -29,8 +29,8 @@
 //! since they were already needed for the round-5 fixture builder; the
 //! V≤4 entries (Algorithms 3, 4, 5) live in this module.
 
-use crate::decrypt::r5_r6::{algorithm_10, algorithm_8, algorithm_9};
-use crate::decrypt::{md5, rc4, CryptMethod, StandardHandler};
+use crate::decrypt::r5_r6::{algorithm_8, algorithm_9, algorithm_10};
+use crate::decrypt::{CryptMethod, StandardHandler, md5, rc4};
 use crate::error::PdfError;
 use crate::objects::{Dict, Object};
 
@@ -240,7 +240,7 @@ impl EncryptionState {
             )));
         }
         if config.revision <= 4
-            && (config.length_bits % 8 != 0 || !(40..=128).contains(&config.length_bits))
+            && (!config.length_bits.is_multiple_of(8) || !(40..=128).contains(&config.length_bits))
         {
             return Err(PdfError::other(format!(
                 "PDF encrypt: V≤4 requires Length∈[40..=128] (mult of 8); got {}",
@@ -511,7 +511,7 @@ fn default_file_key_v5_for_password() -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decrypt::{open_with_password, CryptMethod};
+    use crate::decrypt::{CryptMethod, open_with_password};
 
     #[test]
     fn algorithm_3_with_empty_owner_password_falls_back_to_user() {

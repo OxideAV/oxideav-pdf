@@ -51,8 +51,8 @@ use crate::error::PdfError;
 
 use super::cms::{IssuerAndSerial, OID_SIGNED_DATA};
 use super::der::{
-    maybe_read_context, read_context, read_expected, read_integer_bytes, read_integer_u64,
-    read_octet_string, read_oid, read_sequence, read_set, read_tlv, tag, Class,
+    Class, maybe_read_context, read_context, read_expected, read_integer_bytes, read_integer_u64,
+    read_octet_string, read_oid, read_sequence, read_set, read_tlv, tag,
 };
 
 /// `SignerIdentifier` (RFC 5652 §5.3) — the CHOICE that picks between
@@ -513,7 +513,7 @@ mod tests {
         let payload = b"OXIDEAV-attached-econtent-bytes";
         let eci_body = {
             let mut b = der::write_oid(&[1u64, 2, 840, 113549, 1, 7, 1]); // id-data
-                                                                          // [0] EXPLICIT OCTET STRING
+            // [0] EXPLICIT OCTET STRING
             let octet = der::write_octet_string(payload);
             b.extend_from_slice(&der::write_context_constructed(0, &octet));
             b
@@ -596,7 +596,7 @@ mod tests {
 
         // SignerInfo
         let mut si_body = der::write_integer_u64(3); // v3
-                                                     // [0] IMPLICIT SubjectKeyIdentifier (OCTET STRING) — primitive context-specific.
+        // [0] IMPLICIT SubjectKeyIdentifier (OCTET STRING) — primitive context-specific.
         si_body.extend_from_slice(&der::write_context_primitive(0, &signer_ski));
         let da_alg = {
             let mut b = der::write_oid(&digest_oid);

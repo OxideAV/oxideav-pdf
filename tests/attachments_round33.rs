@@ -18,7 +18,7 @@ use oxideav_core::vector::{
     FillRule, Group, Node, Paint, Path, PathCommand, PathNode, Point, Rgba, VectorFrame,
 };
 use oxideav_pdf::reader::DocumentReader;
-use oxideav_pdf::{read_pdf_attachments, write_pdf_with_attachments, Attachment};
+use oxideav_pdf::{Attachment, read_pdf_attachments, write_pdf_with_attachments};
 use oxideav_scene::{Page, Scene};
 
 fn mk_page(w: f32, h: f32) -> Page {
@@ -165,9 +165,11 @@ fn empty_attachments_list_emits_no_names_entry() {
 fn file_attachment_annotation_lands_on_correct_page() {
     let scene = two_page_scene();
     let payload = b"x".to_vec();
-    let attachments = vec![Attachment::new("marker.bin", payload)
-        .with_mime_type("application/octet-stream")
-        .with_annotation(1, [50.0, 50.0, 70.0, 70.0])];
+    let attachments = vec![
+        Attachment::new("marker.bin", payload)
+            .with_mime_type("application/octet-stream")
+            .with_annotation(1, [50.0, 50.0, 70.0, 70.0]),
+    ];
     let pdf = write_pdf_with_attachments(&scene, &attachments).expect("write");
     // Quick string-grep heuristic: the on-wire bytes contain the
     // FileAttachment subtype.

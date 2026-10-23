@@ -15,8 +15,8 @@ use oxideav_pdf::pubsec::der;
 use oxideav_pdf::pubsec::kari::KariCurve;
 use oxideav_pdf::pubsec::x509::Certificate;
 use oxideav_pdf::{
-    read_pdf_to_scene_with_certificate, write_pdf_from_scene_pubsec_kari, KariRecipient,
-    PubSecCredential, PubSecKariConfig,
+    KariRecipient, PubSecCredential, PubSecKariConfig, read_pdf_to_scene_with_certificate,
+    write_pdf_from_scene_pubsec_kari,
 };
 use oxideav_scene::{Page, Scene};
 
@@ -62,8 +62,8 @@ fn small_scene(title: &str) -> Scene {
 
 /// P-256 keypair from a deterministic 32-byte scalar.
 fn p256_keypair(scalar: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
     use p256::SecretKey;
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
     let sk = SecretKey::from_slice(scalar).expect("scalar valid");
     let pub_sec1 = sk.public_key().to_encoded_point(false).as_bytes().to_vec();
     (scalar.to_vec(), pub_sec1)
@@ -71,8 +71,8 @@ fn p256_keypair(scalar: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
 
 /// P-384 keypair from a deterministic 48-byte scalar.
 fn p384_keypair(scalar: &[u8; 48]) -> (Vec<u8>, Vec<u8>) {
-    use p384::elliptic_curve::sec1::ToEncodedPoint;
     use p384::SecretKey;
+    use p384::elliptic_curve::sec1::ToEncodedPoint;
     let sk = SecretKey::from_slice(scalar).expect("scalar valid");
     let pub_sec1 = sk.public_key().to_encoded_point(false).as_bytes().to_vec();
     (scalar.to_vec(), pub_sec1)

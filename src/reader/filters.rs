@@ -131,7 +131,7 @@ pub fn ascii_hex_decode(input: &[u8]) -> Result<Vec<u8>, PdfError> {
             _ => {
                 return Err(PdfError::other(format!(
                     "PDF filter: ASCIIHex illegal byte {b:#x}"
-                )))
+                )));
             }
         };
         match high.take() {
@@ -185,7 +185,7 @@ pub fn run_length_decode(input: &[u8]) -> Result<Vec<u8>, PdfError> {
             }
             let byte = input[i];
             i += 1;
-            out.extend(std::iter::repeat(byte).take(count));
+            out.extend(std::iter::repeat_n(byte, count));
         }
     }
     Ok(out)
@@ -302,12 +302,12 @@ pub fn lzw_decode_with_early_change(input: &[u8], early_change: bool) -> Result<
         // Append a new table entry: previous sequence + first byte of
         // the current entry. The very first code after a clear has no
         // previous, so it creates no entry.
-        if let Some(prev) = previous.as_ref() {
-            if next_code <= 4095 {
-                let mut new_entry = prev.clone();
-                new_entry.push(entry[0]);
-                table.push(new_entry);
-            }
+        if let Some(prev) = previous.as_ref()
+            && next_code <= 4095
+        {
+            let mut new_entry = prev.clone();
+            new_entry.push(entry[0]);
+            table.push(new_entry);
         }
         previous = Some(entry);
 
@@ -430,7 +430,7 @@ fn tiff_predictor_2(
     params: &PredictorParams,
     row_bytes: usize,
 ) -> Result<Vec<u8>, PdfError> {
-    if data.len() % row_bytes != 0 {
+    if !data.len().is_multiple_of(row_bytes) {
         return Err(PdfError::other(format!(
             "PDF filter: TIFF predictor row width {row_bytes} does not divide data length {}",
             data.len()
@@ -496,7 +496,7 @@ fn tiff_predictor_2(
 /// `bpp` is the byte distance to the "left"/"upper-left" neighbours.
 fn png_predictor(data: &[u8], bpp: usize, row_bytes: usize) -> Result<Vec<u8>, PdfError> {
     let stride = row_bytes + 1;
-    if data.len() % stride != 0 {
+    if !data.len().is_multiple_of(stride) {
         return Err(PdfError::other(format!(
             "PDF filter: PNG predictor row stride {stride} does not divide data length {}",
             data.len()
@@ -531,7 +531,7 @@ fn png_predictor(data: &[u8], bpp: usize, row_bytes: usize) -> Result<Vec<u8>, P
                 other => {
                     return Err(PdfError::other(format!(
                         "PDF filter: PNG predictor row tag {other} unknown (0..=4)"
-                    )))
+                    )));
                 }
             };
             out[dst_start + i] = recon;

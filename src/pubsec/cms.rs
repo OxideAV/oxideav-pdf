@@ -29,8 +29,8 @@
 use crate::error::PdfError;
 
 use super::der::{
-    maybe_read_context, read_context, read_expected, read_integer_bytes, read_integer_u64,
-    read_octet_string, read_oid, read_sequence, read_set, Class,
+    Class, maybe_read_context, read_context, read_expected, read_integer_bytes, read_integer_u64,
+    read_octet_string, read_oid, read_sequence, read_set,
 };
 
 /// OID 1.2.840.113549.1.7.3 — id-envelopedData.
@@ -1018,7 +1018,7 @@ fn decode_content_alg(oid: &[u64], params: &[u8]) -> Result<ContentEncryption, P
                 _ => {
                     return Err(PdfError::other(format!(
                         "CMS: RC2 rc2ParameterVersion {vers_u64} out of range (RFC 2268 §6)"
-                    )))
+                    )));
                 }
             };
             cursor = after;
@@ -1064,7 +1064,7 @@ fn decode_content_alg(oid: &[u64], params: &[u8]) -> Result<ContentEncryption, P
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pubsec::cms_build::{build_envelope_aes256, RecipientPlain};
+    use crate::pubsec::cms_build::{RecipientPlain, build_envelope_aes256};
 
     #[test]
     fn parse_handcrafted_aes256_envelope() {

@@ -17,7 +17,7 @@
 
 use oxideav_pdf::objects::{Object, ObjectId};
 use oxideav_pdf::reader::{
-    name_tree_entries, name_tree_lookup, number_tree_entries, DocumentReader,
+    DocumentReader, name_tree_entries, name_tree_lookup, number_tree_entries,
 };
 
 /// Assemble a classic-xref PDF from `(object_number, body)` pairs.
@@ -147,7 +147,7 @@ fn attachments_still_walk_after_shared_tree_refactor() {
     // guard the writer → reader attachment round-trip end-to-end.
     use oxideav_core::time::TimeBase;
     use oxideav_core::vector::{Group, VectorFrame};
-    use oxideav_pdf::{read_pdf_attachments, write_pdf_with_attachments, Attachment};
+    use oxideav_pdf::{Attachment, read_pdf_attachments, write_pdf_with_attachments};
     use oxideav_scene::{Page, Scene};
 
     let mut page = Page::new(200.0, 200.0);

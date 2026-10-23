@@ -15,8 +15,8 @@ use oxideav_core::vector::{
 };
 use oxideav_pdf::reader::DocumentReader;
 use oxideav_pdf::{
-    read_pdf_annotations, read_pdf_to_scene, write_pdf_with_annotations, Annotation,
-    WriterAnnotationKind,
+    Annotation, WriterAnnotationKind, read_pdf_annotations, read_pdf_to_scene,
+    write_pdf_with_annotations,
 };
 use oxideav_scene::{Page, Scene};
 
@@ -475,9 +475,10 @@ fn squiggly_appearance_zigzags_along_quad_bottom() {
         .find(|pts| pts.first() == Some(&(10.0, 50.0)) && pts.len() > 20)
         .expect("sawtooth path");
     assert!(saw.iter().any(|&(_, y)| (y - 51.0).abs() < 1e-3));
-    assert!(saw
-        .iter()
-        .all(|&(_, y)| (50.0 - 1e-3..=51.0 + 1e-3).contains(&y)));
+    assert!(
+        saw.iter()
+            .all(|&(_, y)| (50.0 - 1e-3..=51.0 + 1e-3).contains(&y))
+    );
 }
 
 #[test]

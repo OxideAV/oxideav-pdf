@@ -57,51 +57,49 @@ pub mod xmp;
 #[doc(hidden)]
 pub mod xref;
 
-pub use actions::{actions, ActionKind, ActionTrigger, PdfAction};
+pub use actions::{ActionKind, ActionTrigger, PdfAction, actions};
 pub use annotation::{
-    annotations, AnnotationAppearance, AnnotationKind, FixedPrint, MovieActivation, PdfAnnotation,
-    TextMarkupVariant, ThreeDActivation, ThreeDViewSelector,
+    AnnotationAppearance, AnnotationKind, FixedPrint, MovieActivation, PdfAnnotation,
+    TextMarkupVariant, ThreeDActivation, ThreeDViewSelector, annotations,
 };
-pub use attachments::{attachments, PdfAttachment};
+pub use attachments::{PdfAttachment, attachments};
 pub use content::{
-    parse_content_stream, parse_content_stream_full, parse_content_stream_full_with_color_space,
-    parse_content_stream_full_with_properties, parse_content_stream_full_with_shading,
-    parse_content_stream_full_with_soft_masks, parse_content_stream_with_resources,
     ContentInlineImage, ContentMarkedContent, ContentShading, ContentTextShow, MarkedContentOp,
     MeshPatch, MeshShading, MeshTriangle, MeshVertex, ParsedContent, ResolvedImageXObject,
-    ResolvedSoftMask, ShadingGradient, TextShowOp,
+    ResolvedSoftMask, ShadingGradient, TextShowOp, parse_content_stream, parse_content_stream_full,
+    parse_content_stream_full_with_color_space, parse_content_stream_full_with_properties,
+    parse_content_stream_full_with_shading, parse_content_stream_full_with_soft_masks,
+    parse_content_stream_with_resources,
 };
 pub use document::{
-    read_pdf_to_scene, read_pdf_to_scene_with_certificate,
+    DocumentReader, read_pdf_to_scene, read_pdf_to_scene_with_certificate,
     read_pdf_to_scene_with_certificate_and_trust_store, read_pdf_to_scene_with_password,
-    DocumentReader,
 };
 pub use encoding::{
-    apply_encoding_differences, parse_encoding_differences, BaseEncoding, EncodingDifferences,
-    EncodingMap, EncodingOverride,
+    BaseEncoding, EncodingDifferences, EncodingMap, EncodingOverride, apply_encoding_differences,
+    parse_encoding_differences,
 };
-pub use hierarchy::{verify_hierarchy, HierarchyIssue, HierarchyReport, IssueSeverity};
-pub use images::{image_xobjects, ColorSpace, PdfImageXObject, SoftMaskImage};
-pub use inline_images::{inline_images, InlineImageFilter, PdfInlineImage};
-pub use layout::{read_in_logical_order, LayoutMode, ReadingOrderText};
-pub use linearize::{parse_linearization_dict, LinearizationParams};
-pub use link::{links, PdfLink, PdfLinkTarget};
-pub use named_dest::{named_destinations, resolve_named_destination, NamedDestination};
+pub use hierarchy::{HierarchyIssue, HierarchyReport, IssueSeverity, verify_hierarchy};
+pub use images::{ColorSpace, PdfImageXObject, SoftMaskImage, image_xobjects};
+pub use inline_images::{InlineImageFilter, PdfInlineImage, inline_images};
+pub use layout::{LayoutMode, ReadingOrderText, read_in_logical_order};
+pub use linearize::{LinearizationParams, parse_linearization_dict};
+pub use link::{PdfLink, PdfLinkTarget, links};
+pub use named_dest::{NamedDestination, named_destinations, resolve_named_destination};
 pub use nametree::{decode_key_text, name_tree_entries, name_tree_lookup, number_tree_entries};
 pub use ocg::{
-    optional_content, parse_membership, OcBaseState, OcConfig, OcListMode, OcMembership,
-    OcOrderItem, OcUsage, OcVisibilityExpression, OcVisibilityPolicy, OptionalContent,
-    OptionalContentGroup,
+    OcBaseState, OcConfig, OcListMode, OcMembership, OcOrderItem, OcUsage, OcVisibilityExpression,
+    OcVisibilityPolicy, OptionalContent, OptionalContentGroup, optional_content, parse_membership,
 };
-pub use outline::{outline, OutlineNode, PdfOutline};
+pub use outline::{OutlineNode, PdfOutline, outline};
 pub use page_labels::{
-    page_label_map, page_label_ranges, page_labels, PageLabelRange, PageLabelStyle,
+    PageLabelRange, PageLabelStyle, page_label_map, page_label_ranges, page_labels,
 };
-pub use pdfa::{pdfa_signals, PdfACatalogSignals, PdfAConformance};
-pub use sig::{doc_timestamps, signatures, signed_bytes, PdfDocTimestamp, PdfSignature};
+pub use pdfa::{PdfACatalogSignals, PdfAConformance, pdfa_signals};
+pub use sig::{PdfDocTimestamp, PdfSignature, doc_timestamps, signatures, signed_bytes};
 pub use text::{
-    assemble_text, extract_text, extract_text_marked, reorder_bidi_line, MarkedTextRun,
-    PdfMarkedTextExtraction, PdfTextExtraction, TextRenderMode, TextRun, WORD_GAP_EM,
+    MarkedTextRun, PdfMarkedTextExtraction, PdfTextExtraction, TextRenderMode, TextRun,
+    WORD_GAP_EM, assemble_text, extract_text, extract_text_marked, reorder_bidi_line,
 };
-pub use threads::{threads, PdfBead, PdfThread};
+pub use threads::{PdfBead, PdfThread, threads};
 pub use xmp::XmpPacket;

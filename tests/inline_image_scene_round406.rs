@@ -73,7 +73,9 @@ fn spliced_images(pdf: &[u8]) -> Vec<ImageRef> {
 fn pixels(img: &ImageRef) -> Vec<[u8; 4]> {
     img.frame.planes[0]
         .data
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| [c[0], c[1], c[2], c[3]])
         .collect()
 }

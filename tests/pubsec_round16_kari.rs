@@ -16,8 +16,8 @@ use oxideav_pdf::pubsec::der;
 use oxideav_pdf::pubsec::kari::KariCurve;
 use oxideav_pdf::pubsec::x509::Certificate;
 use oxideav_pdf::{
-    read_pdf_to_scene_with_certificate, write_pdf_from_scene_pubsec_kari, KariRecipient,
-    PubSecCredential, PubSecKariConfig,
+    KariRecipient, PubSecCredential, PubSecKariConfig, read_pdf_to_scene_with_certificate,
+    write_pdf_from_scene_pubsec_kari,
 };
 use oxideav_scene::{Page, Scene};
 
@@ -65,8 +65,8 @@ fn small_scene(title: &str) -> Scene {
 /// pinned to 0x00 so the scalar stays below the curve order n.
 fn p521_keypair(mut scalar: [u8; 66]) -> (Vec<u8>, Vec<u8>) {
     scalar[0] = 0x00;
-    use p521::elliptic_curve::sec1::ToEncodedPoint;
     use p521::SecretKey;
+    use p521::elliptic_curve::sec1::ToEncodedPoint;
     let sk = SecretKey::from_slice(&scalar).expect("scalar valid");
     let pub_sec1 = sk.public_key().to_encoded_point(false).as_bytes().to_vec();
     (scalar.to_vec(), pub_sec1)

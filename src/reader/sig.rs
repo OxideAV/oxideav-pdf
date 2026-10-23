@@ -45,7 +45,7 @@
 use crate::error::PdfError;
 use crate::objects::{Dict, Object, ObjectId};
 use crate::pubsec::der;
-use crate::pubsec::signed_data::{parse_signed_data, SignedData};
+use crate::pubsec::signed_data::{SignedData, parse_signed_data};
 use crate::reader::document::DocumentReader;
 
 /// One PDF `/Sig` form field's signature dictionary, fully parsed and
@@ -465,7 +465,9 @@ fn text_value(o: &Option<Object>) -> Option<String> {
         Object::HexString(b) => {
             if b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF {
                 let utf16: Vec<u16> = b[2..]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_be_bytes([c[0], c[1]]))
                     .collect();
                 Some(String::from_utf16_lossy(&utf16))

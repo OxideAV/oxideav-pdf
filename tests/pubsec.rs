@@ -23,12 +23,12 @@
 //! No external library code is consulted — RFC 5652 + RFC 5280 +
 //! ISO 32000-1 §7.6.4 only.
 
-use oxideav_pdf::decrypt::{md5, rc4, CryptMethod, StandardHandler};
+use oxideav_pdf::decrypt::{CryptMethod, StandardHandler, md5, rc4};
 use oxideav_pdf::pubsec::{
+    PubSecCredential,
     cms::{OID_AES128_CBC, OID_AES256_CBC, OID_DATA, OID_ENVELOPED_DATA, OID_RSA_ENCRYPTION},
     der,
     x509::Certificate,
-    PubSecCredential,
 };
 use oxideav_pdf::read_pdf_to_scene_with_certificate;
 
@@ -521,10 +521,10 @@ fn wrong_certificate_serial_returns_error() {
 
 /// Build a one-page Scene the writer entry point can serialise.
 fn one_page_scene(title: &str) -> oxideav_scene::Scene {
+    use oxideav_core::TimeBase;
     use oxideav_core::vector::{
         FillRule, Group, Node, Paint, Path, PathCommand, PathNode, Point, Rgba, VectorFrame,
     };
-    use oxideav_core::TimeBase;
     use oxideav_scene::{Metadata, Page, Scene};
     let mut p = Path::new();
     p.commands.push(PathCommand::MoveTo(Point::new(10.0, 10.0)));
@@ -730,8 +730,8 @@ fn open_unencrypted_pdf_via_certificate_works() {
     // accepting any password on an unencrypted PDF). Use the
     // round-1 writer to produce a known-good PDF — far more robust
     // than hand-writing the xref offsets.
-    use oxideav_core::vector::{FillRule, Group, Node, Paint, Path, PathNode, Rgba, VectorFrame};
     use oxideav_core::TimeBase;
+    use oxideav_core::vector::{FillRule, Group, Node, Paint, Path, PathNode, Rgba, VectorFrame};
     let mut p = Path::new();
     p.move_to(oxideav_core::vector::Point::new(10.0, 10.0))
         .line_to(oxideav_core::vector::Point::new(110.0, 10.0))

@@ -29,7 +29,7 @@
 
 use std::fmt::Write as _;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use oxideav_pdf::reader::content::parse_content_stream;
 

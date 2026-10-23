@@ -20,7 +20,7 @@ use crate::error::PdfError;
 use crate::objects::{Dict, Object, ObjectId};
 use crate::outline::OutlineDestination;
 use crate::reader::document::DocumentReader;
-use crate::reader::named_dest::{named_dest_map, ResolvedNamedDest};
+use crate::reader::named_dest::{ResolvedNamedDest, named_dest_map};
 use crate::reader::nametree::decode_key_text;
 use crate::reader::outline::build_page_index_map;
 

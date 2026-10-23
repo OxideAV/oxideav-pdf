@@ -1117,11 +1117,7 @@ fn decode_annotation(
                             }
                         }
                     }
-                    if ok {
-                        Some(out)
-                    } else {
-                        None
-                    }
+                    if ok { Some(out) } else { None }
                 }
                 _ => None,
             };
@@ -1460,23 +1456,23 @@ fn decode_fixed_print(o: &Object) -> Option<FixedPrint> {
         return None;
     };
     let mut out = FixedPrint::default();
-    if let Some(Object::Array(items)) = find_entry(d, "Matrix") {
-        if items.len() == 6 {
-            let mut tmp = [0f32; 6];
-            let mut ok = true;
-            for (i, it) in items.iter().enumerate() {
-                match it {
-                    Object::Real(f) => tmp[i] = *f as f32,
-                    Object::Integer(n) => tmp[i] = *n as f32,
-                    _ => {
-                        ok = false;
-                        break;
-                    }
+    if let Some(Object::Array(items)) = find_entry(d, "Matrix")
+        && items.len() == 6
+    {
+        let mut tmp = [0f32; 6];
+        let mut ok = true;
+        for (i, it) in items.iter().enumerate() {
+            match it {
+                Object::Real(f) => tmp[i] = *f as f32,
+                Object::Integer(n) => tmp[i] = *n as f32,
+                _ => {
+                    ok = false;
+                    break;
                 }
             }
-            if ok {
-                out.matrix = tmp;
-            }
+        }
+        if ok {
+            out.matrix = tmp;
         }
     }
     if let Some(v) = decode_real(find_entry(d, "H")) {
@@ -1554,7 +1550,9 @@ fn decode_text_string(o: Option<&Object>) -> Option<String> {
         Object::HexString(b) => {
             if b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF {
                 let utf16: Vec<u16> = b[2..]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_be_bytes([c[0], c[1]]))
                     .collect();
                 Some(String::from_utf16_lossy(&utf16))
@@ -1584,7 +1582,9 @@ fn decode_field_value(o: Option<&Object>) -> Option<String> {
 fn decode_pdf_string_bytes(b: &[u8]) -> String {
     if b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF {
         let utf16: Vec<u16> = b[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect();
         String::from_utf16_lossy(&utf16)

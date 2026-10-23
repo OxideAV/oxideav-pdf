@@ -14,7 +14,7 @@
 //! `/Title` is a known string. The test asserts the reader recovers
 //! the title (string-decryption) and the content-stream operators.
 
-use oxideav_pdf::decrypt::r5_r6::{algorithm_10, algorithm_8, algorithm_9};
+use oxideav_pdf::decrypt::r5_r6::{algorithm_8, algorithm_9, algorithm_10};
 use oxideav_pdf::decrypt::{CryptMethod, StandardHandler};
 use oxideav_pdf::read_pdf_to_scene_with_password;
 

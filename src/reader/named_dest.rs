@@ -92,12 +92,12 @@ pub fn resolve_named_destination(
 ) -> Result<Option<OutlineDestination>, PdfError> {
     let page_index_map = build_page_index_map(reader)?;
     // 1. /Names → /Dests name tree.
-    if let Some(tree_root) = names_dests_root(reader)? {
-        if let Some(value) = name_tree_lookup(reader, &tree_root, name)? {
-            let (dest, _raw) = decode_target(reader, value, &page_index_map)?;
-            if dest.is_some() {
-                return Ok(dest);
-            }
+    if let Some(tree_root) = names_dests_root(reader)?
+        && let Some(value) = name_tree_lookup(reader, &tree_root, name)?
+    {
+        let (dest, _raw) = decode_target(reader, value, &page_index_map)?;
+        if dest.is_some() {
+            return Ok(dest);
         }
     }
     // 2. Catalogue /Dests dictionary (PDF 1.1 — keys are Names).

@@ -12,7 +12,7 @@
 
 use oxideav_pdf::pubsec::der;
 use oxideav_pdf::pubsec::signed_data::{
-    parse_signed_data, SignedData, SignerIdentifier, SignerInfo,
+    SignedData, SignerIdentifier, SignerInfo, parse_signed_data,
 };
 
 /// Build a self-contained ContentInfo wrapping a SignedData with a

@@ -35,7 +35,7 @@ use oxideav_scene::Scene;
 use crate::error::PdfError;
 use crate::info::{build_info_dict, has_metadata};
 use crate::objects::{Dict, Document, Object, ObjectId};
-use crate::page::{build_pages, PageInput};
+use crate::page::{PageInput, build_pages};
 use crate::resources::ResourceCollector;
 use crate::sig::Signer;
 use crate::writer::render_frame_for_linearize as render_frame;

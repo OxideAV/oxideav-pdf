@@ -43,7 +43,7 @@ use crate::error::PdfError;
 use crate::objects::{Dict, Object, ObjectId};
 use crate::outline::OutlineDestination;
 use crate::reader::document::DocumentReader;
-use crate::reader::named_dest::{named_dest_map, ResolvedNamedDest};
+use crate::reader::named_dest::{ResolvedNamedDest, named_dest_map};
 use crate::reader::nametree::decode_key_text;
 
 /// The raw-name → resolved-destination lookaside built once per walk
@@ -344,20 +344,19 @@ fn decode_dest_or_action(
                 adict.entries().iter().find(|(k, _)| k == "S").map(|(_, v)| v),
                 Some(Object::Name(s)) if s == "GoTo"
             );
-            if is_goto {
-                if let Some(d) = adict
+            if is_goto
+                && let Some(d) = adict
                     .entries()
                     .iter()
                     .find(|(k, _)| k == "D")
                     .map(|(_, v)| v.clone())
-                {
-                    return Ok(decode_dest_value(
-                        reader,
-                        d,
-                        page_index_map,
-                        Some(named_dests),
-                    ));
-                }
+            {
+                return Ok(decode_dest_value(
+                    reader,
+                    d,
+                    page_index_map,
+                    Some(named_dests),
+                ));
             }
             // /S /URI — surface the URI text in raw_dest.
             let is_uri = matches!(
@@ -619,7 +618,9 @@ fn decode_text(o: Option<&Object>) -> Option<String> {
         Object::HexString(b) => {
             if b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF {
                 let utf16: Vec<u16> = b[2..]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_be_bytes([c[0], c[1]]))
                     .collect();
                 Some(String::from_utf16_lossy(&utf16))

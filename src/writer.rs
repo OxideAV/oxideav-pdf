@@ -25,11 +25,11 @@ use crate::error::PdfError;
 use crate::info::{build_info_dict, has_metadata};
 use crate::objects::{Dict, Document, Object, ObjectId, Stream};
 use crate::operators::{
-    concat_matrix, emit_clip_marker, emit_path, paint, restore, save, set_ext_gstate,
-    set_fill_paint, set_stroke_style, OpBuf, PaintMode,
+    OpBuf, PaintMode, concat_matrix, emit_clip_marker, emit_path, paint, restore, save,
+    set_ext_gstate, set_fill_paint, set_stroke_style,
 };
 use crate::outline::{LinkAnnotationSpec, LinkTarget, OutlineDestination, OutlineSpec};
-use crate::page::{build_page, build_pages, PageInput};
+use crate::page::{PageInput, build_page, build_pages};
 use crate::reader::xref::{find_startxref_offset, parse_xref};
 use crate::resources::ResourceCollector;
 
@@ -333,15 +333,15 @@ pub fn write_pdf_from_scene_with_outlines_and_links(
                 link.source_page_index, n_pages
             )));
         }
-        if let LinkTarget::Internal(dest) = &link.target {
-            if dest.page_index() >= n_pages {
-                return Err(PdfError::other(format!(
-                    "write_pdf_from_scene_with_outlines: link annotation destination page_index {} \
+        if let LinkTarget::Internal(dest) = &link.target
+            && dest.page_index() >= n_pages
+        {
+            return Err(PdfError::other(format!(
+                "write_pdf_from_scene_with_outlines: link annotation destination page_index {} \
                      out of range (scene has {} page(s))",
-                    dest.page_index(),
-                    n_pages
-                )));
-            }
+                dest.page_index(),
+                n_pages
+            )));
         }
     }
 
@@ -827,7 +827,7 @@ pub fn write_pdf_incremental_update(
         _ => {
             return Err(PdfError::other(
                 "write_pdf_incremental_update: previous catalog missing /Pages reference",
-            ))
+            ));
         }
     };
     let pages_tree = reader.resolve(pages_tree_id)?;

@@ -13,16 +13,16 @@
 //! Provenance: ISO 32000-1 §7.6.4.2 + §7.6.5.4 (per-CF recipients);
 //! RFC 5652 §6.2.2 (KARI). No external library code consulted.
 
-use oxideav_pdf::pubsec::cms::{parse_envelope, RecipientInfoVariant};
+use oxideav_pdf::pubsec::cms::{RecipientInfoVariant, parse_envelope};
 use oxideav_pdf::pubsec::cms_build::{
-    build_envelope_aes256, build_envelope_kari_aes256, KariRecipientIdRef, KariRecipientPlain,
-    OriginatorIdRef, RecipientPlain,
+    KariRecipientIdRef, KariRecipientPlain, OriginatorIdRef, RecipientPlain, build_envelope_aes256,
+    build_envelope_kari_aes256,
 };
 use oxideav_pdf::pubsec::{der, x509::Certificate};
 use oxideav_pdf::{
+    PubSecCfGroup, PubSecCredential, PubSecMultiCfConfig, PubSecRecipient, PubSecSubFilter,
     open_with_certificate_with_permissions, read_pdf_to_scene_with_certificate,
-    write_pdf_from_scene_pubsec_multi_cf, PubSecCfGroup, PubSecCredential, PubSecMultiCfConfig,
-    PubSecRecipient, PubSecSubFilter,
+    write_pdf_from_scene_pubsec_multi_cf,
 };
 
 fn rsa_keypair() -> (rsa::RsaPrivateKey, rsa::RsaPublicKey) {
@@ -33,10 +33,10 @@ fn rsa_keypair() -> (rsa::RsaPrivateKey, rsa::RsaPublicKey) {
 }
 
 fn one_page_scene(title: &str) -> oxideav_scene::Scene {
+    use oxideav_core::TimeBase;
     use oxideav_core::vector::{
         FillRule, Group, Node, Paint, Path, PathCommand, PathNode, Point, Rgba, VectorFrame,
     };
-    use oxideav_core::TimeBase;
     use oxideav_scene::{Metadata, Page, Scene};
     let mut p = Path::new();
     p.commands.push(PathCommand::MoveTo(Point::new(10.0, 10.0)));

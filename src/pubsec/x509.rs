@@ -33,7 +33,7 @@
 
 use crate::error::PdfError;
 
-use super::der::{maybe_read_context, read_integer_bytes, read_sequence, read_tlv, tag, Class};
+use super::der::{Class, maybe_read_context, read_integer_bytes, read_sequence, read_tlv, tag};
 
 /// The fields a CMS recipient slot needs to match against a user's
 /// certificate. Stored exactly as DER bytes so equality is a memcmp.
@@ -244,7 +244,7 @@ fn parse_time(data: &[u8]) -> Result<(Vec<u8>, &[u8]), PdfError> {
         other => {
             return Err(PdfError::other(format!(
                 "X.509 Time: unexpected tag {other} (expected 23 UTCTime or 24 GeneralizedTime)"
-            )))
+            )));
         }
     };
     Ok((normalised, rest))

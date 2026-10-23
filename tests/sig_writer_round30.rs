@@ -15,14 +15,14 @@ use oxideav_core::vector::{
 use oxideav_pdf::pubsec::der;
 use oxideav_pdf::pubsec::signed_data::SignerIdentifier;
 use oxideav_pdf::pubsec::verify::{
-    rsa_pubkey_to_pkcs1_der, verify_signature, AttachedContent, OID_EC_PUBLIC_KEY,
-    OID_NAMED_CURVE_P256, OID_RSA_ENCRYPTION,
+    AttachedContent, OID_EC_PUBLIC_KEY, OID_NAMED_CURVE_P256, OID_RSA_ENCRYPTION,
+    rsa_pubkey_to_pkcs1_der, verify_signature,
 };
 use oxideav_pdf::pubsec::x509::Certificate;
 use oxideav_pdf::reader::DocumentReader;
 use oxideav_pdf::{
-    pdf_signed_bytes, sign_pdf_from_scene, EcdsaP256Sha256Signer, RsaPkcs1v15Sha256Signer,
-    SignerIdentity,
+    EcdsaP256Sha256Signer, RsaPkcs1v15Sha256Signer, SignerIdentity, pdf_signed_bytes,
+    sign_pdf_from_scene,
 };
 use oxideav_scene::{Page, Scene};
 

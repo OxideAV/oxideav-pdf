@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use super::x509::{time_within, Certificate};
+use super::x509::{Certificate, time_within};
 
 /// CHOICE tag for one entry in a [`TrustStore`]. Mirrors the two
 /// long-term-cert forms of `OriginatorIdentifierOrKey`'s CHOICE
@@ -160,10 +160,10 @@ impl TrustStore {
                     if entry_ski.as_slice() != ski {
                         continue;
                     }
-                    if let Some((nb, na)) = cert.validity() {
-                        if time_within(inst, nb, na) {
-                            return Some(cert);
-                        }
+                    if let Some((nb, na)) = cert.validity()
+                        && time_within(inst, nb, na)
+                    {
+                        return Some(cert);
                     }
                 }
                 // No cert under this SKI had a window containing the
@@ -231,9 +231,11 @@ mod tests {
         let cert = synth_cert(b"O=B", &[0x05], Some(b"FakeSPKI".to_vec()));
         store.insert(CertRef::SubjectKeyIdentifier(ski.clone()), cert);
         assert!(store.lookup(&CertRef::SubjectKeyIdentifier(ski)).is_some());
-        assert!(store
-            .lookup(&CertRef::SubjectKeyIdentifier(vec![0; 20]))
-            .is_none());
+        assert!(
+            store
+                .lookup(&CertRef::SubjectKeyIdentifier(vec![0; 20]))
+                .is_none()
+        );
     }
 
     #[test]
@@ -243,12 +245,14 @@ mod tests {
         let cert = synth_cert(b"O=C", &[0x07], Some(pubkey.to_vec()));
         let ski = cert.subject_key_identifier().expect("SKI");
         store.insert_certificate(cert.clone());
-        assert!(store
-            .lookup(&CertRef::IssuerAndSerial {
-                issuer_der: cert.issuer_der.clone(),
-                serial: cert.serial.clone(),
-            })
-            .is_some());
+        assert!(
+            store
+                .lookup(&CertRef::IssuerAndSerial {
+                    issuer_der: cert.issuer_der.clone(),
+                    serial: cert.serial.clone(),
+                })
+                .is_some()
+        );
         assert!(store.lookup(&CertRef::SubjectKeyIdentifier(ski)).is_some());
         assert_eq!(store.len(), 2);
     }
@@ -258,12 +262,14 @@ mod tests {
         let mut store = TrustStore::new();
         let cert = synth_cert(b"O=D", &[0x09], None);
         store.insert_certificate(cert.clone());
-        assert!(store
-            .lookup(&CertRef::IssuerAndSerial {
-                issuer_der: cert.issuer_der,
-                serial: cert.serial,
-            })
-            .is_some());
+        assert!(
+            store
+                .lookup(&CertRef::IssuerAndSerial {
+                    issuer_der: cert.issuer_der,
+                    serial: cert.serial,
+                })
+                .is_some()
+        );
         assert_eq!(store.len(), 1);
     }
 
@@ -324,9 +330,11 @@ mod tests {
         assert_eq!(hit_b.serial, vec![0x02]);
 
         // Instant in 2026 (outside both windows) → None.
-        assert!(store
-            .find_with_temporal_validity(&ski, Some(b"20260601000000Z"))
-            .is_none());
+        assert!(
+            store
+                .find_with_temporal_validity(&ski, Some(b"20260601000000Z"))
+                .is_none()
+        );
 
         // No instant → fall-through to lookup (last-writer-wins =
         // cert_b for the single-entry by_ski path).

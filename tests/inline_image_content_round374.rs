@@ -11,7 +11,7 @@
 
 use oxideav_core::vector::{Group, Node};
 use oxideav_pdf::reader::content::{
-    parse_content_stream, parse_content_stream_full, ContentInlineImage,
+    ContentInlineImage, parse_content_stream, parse_content_stream_full,
 };
 use oxideav_pdf::reader::inline_images::InlineImageFilter;
 

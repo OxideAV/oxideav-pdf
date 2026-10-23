@@ -30,8 +30,8 @@
 use oxideav_core::vector::{LineCap, LineJoin, Node, Paint};
 use oxideav_pdf::objects::{Dict, Object};
 use oxideav_pdf::read_pdf_to_scene;
-use oxideav_pdf::reader::content::parse_content_stream_with_resources;
 use oxideav_pdf::reader::DocumentReader;
+use oxideav_pdf::reader::content::parse_content_stream_with_resources;
 
 /// Build the same `/Resources /ExtGState` + `gs`-using PDF that lives
 /// at `tests/fixtures/gs_ext_gstate.pdf`. Kept byte-stable so the

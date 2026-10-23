@@ -10,13 +10,13 @@ use oxideav_core::vector::{
     FillRule, Group, Node, Paint, Path, PathCommand, PathNode, Point, Rgba, VectorFrame,
 };
 use oxideav_pdf::reader::{
+    DocumentReader,
     hierarchy::IssueSeverity,
     pdfa::{PdfACatalogSignals, PdfAConformance},
-    DocumentReader,
 };
 use oxideav_pdf::{
-    parse_linearization_dict, verify_pdf_hierarchy, write_pdf_from_scene,
-    write_pdf_from_scene_linearized, write_pdf_from_scene_with_xmp, XmpPacket,
+    XmpPacket, parse_linearization_dict, verify_pdf_hierarchy, write_pdf_from_scene,
+    write_pdf_from_scene_linearized, write_pdf_from_scene_with_xmp,
 };
 use oxideav_scene::{Page, Scene};
 
@@ -279,10 +279,11 @@ fn pdfa_conformance_xmp_b_claim_flags_missing_output_intents() {
     assert!(conf.is_declared());
     assert_eq!(conf.declared, Some((2u8, "B".into())));
     assert!(conf.claim_inconsistent, "missing /OutputIntents must flag");
-    assert!(conf
-        .inconsistencies
-        .iter()
-        .any(|s| s.contains("OutputIntents")));
+    assert!(
+        conf.inconsistencies
+            .iter()
+            .any(|s| s.contains("OutputIntents"))
+    );
     assert_eq!(conf.designator().as_deref(), Some("2B"));
 }
 
@@ -305,14 +306,16 @@ fn pdfa_conformance_synthetic_a_level_lacks_structtreeroot() {
     let conf = PdfAConformance::from_signals_and_xmp(&sig, Some(&xmp));
     assert!(conf.claim_inconsistent);
     assert!(!conf.structurally_sound);
-    assert!(conf
-        .inconsistencies
-        .iter()
-        .any(|s| s.contains("StructTreeRoot")));
-    assert!(conf
-        .inconsistencies
-        .iter()
-        .any(|s| s.contains("Marked is not true")));
+    assert!(
+        conf.inconsistencies
+            .iter()
+            .any(|s| s.contains("StructTreeRoot"))
+    );
+    assert!(
+        conf.inconsistencies
+            .iter()
+            .any(|s| s.contains("Marked is not true"))
+    );
 }
 
 #[test]

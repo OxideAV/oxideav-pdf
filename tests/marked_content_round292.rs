@@ -15,7 +15,7 @@
 //! in the page's `/Resources /Properties` subdictionary.
 
 use oxideav_pdf::objects::{Dict, Object};
-use oxideav_pdf::reader::content::{parse_content_stream_full_with_properties, MarkedContentOp};
+use oxideav_pdf::reader::content::{MarkedContentOp, parse_content_stream_full_with_properties};
 
 fn parse(
     input: &[u8],

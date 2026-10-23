@@ -26,7 +26,7 @@ use oxideav_core::vector::{
     FillRule, Group, Node, Paint, Path, PathCommand, PathNode, Point, Rgba, VectorFrame,
 };
 use oxideav_pdf::reader::DocumentReader;
-use oxideav_pdf::{read_pdf_attachments, write_pdf_with_attachments, AfRelationship, Attachment};
+use oxideav_pdf::{AfRelationship, Attachment, read_pdf_attachments, write_pdf_with_attachments};
 use oxideav_scene::{Page, Scene};
 
 fn mk_page(w: f32, h: f32) -> Page {
@@ -95,9 +95,11 @@ fn write_temp_pdf(pdf: &[u8], stem: &str) -> std::path::PathBuf {
 #[test]
 fn filespec_carries_afrelationship_name_when_set() {
     let scene = two_page_scene();
-    let attachments = vec![Attachment::new("invoice.xml", b"<x/>".to_vec())
-        .with_mime_type("application/xml")
-        .with_af_relationship(AfRelationship::Source)];
+    let attachments = vec![
+        Attachment::new("invoice.xml", b"<x/>".to_vec())
+            .with_mime_type("application/xml")
+            .with_af_relationship(AfRelationship::Source),
+    ];
     let pdf = write_pdf_with_attachments(&scene, &attachments).expect("write");
     let s = String::from_utf8_lossy(&pdf);
     assert!(
@@ -151,10 +153,12 @@ fn catalog_af_array_populated_for_associated_attachments() {
 #[test]
 fn page_af_array_populated_when_annotation_and_relationship_both_set() {
     let scene = two_page_scene();
-    let attachments = vec![Attachment::new("data.csv", b"a,b\n".to_vec())
-        .with_mime_type("text/csv")
-        .with_af_relationship(AfRelationship::Data)
-        .with_annotation(1, [50.0, 50.0, 70.0, 70.0])];
+    let attachments = vec![
+        Attachment::new("data.csv", b"a,b\n".to_vec())
+            .with_mime_type("text/csv")
+            .with_af_relationship(AfRelationship::Data)
+            .with_annotation(1, [50.0, 50.0, 70.0, 70.0]),
+    ];
     let pdf = write_pdf_with_attachments(&scene, &attachments).expect("write");
     let s = String::from_utf8_lossy(&pdf);
 
@@ -189,9 +193,11 @@ fn writer_preserves_round33_shape_when_no_relationship_set() {
     // must NOT emit /AFRelationship or /AF anywhere — that protects the
     // round-33 byte shape from regressing.
     let scene = two_page_scene();
-    let attachments = vec![Attachment::new("notes.txt", b"hi".to_vec())
-        .with_mime_type("text/plain")
-        .with_annotation(0, [10.0, 10.0, 30.0, 30.0])];
+    let attachments = vec![
+        Attachment::new("notes.txt", b"hi".to_vec())
+            .with_mime_type("text/plain")
+            .with_annotation(0, [10.0, 10.0, 30.0, 30.0]),
+    ];
     let pdf = write_pdf_with_attachments(&scene, &attachments).expect("write");
     let s = String::from_utf8_lossy(&pdf);
     assert!(

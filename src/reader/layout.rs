@@ -45,7 +45,7 @@ use std::collections::{HashMap, HashSet};
 use crate::error::PdfError;
 use crate::objects::{Object, ObjectId};
 use crate::reader::document::DocumentReader;
-use crate::reader::text::{extract_text, extract_text_marked, TextRun};
+use crate::reader::text::{TextRun, extract_text, extract_text_marked};
 
 // ────────────────────────── public surface ──────────────────────────
 
@@ -244,10 +244,10 @@ fn visit_k(
     match kid {
         Object::Integer(mcid) => {
             // Bare-integer MCID into ctx.cur_page.
-            if let (Some(pg), Ok(mcid_u)) = (ctx.cur_page, u32::try_from(mcid)) {
-                if let Some(runs) = ctx.buckets.get(&(pg, mcid_u)) {
-                    ctx.out.extend(runs.iter().cloned());
-                }
+            if let (Some(pg), Ok(mcid_u)) = (ctx.cur_page, u32::try_from(mcid))
+                && let Some(runs) = ctx.buckets.get(&(pg, mcid_u))
+            {
+                ctx.out.extend(runs.iter().cloned());
             }
             Ok(())
         }
@@ -301,10 +301,10 @@ fn visit_k(
                             Object::Integer(n) => u32::try_from(*n).ok(),
                             _ => None,
                         });
-                    if let (Some(pg), Some(mcid)) = (pg, mcid) {
-                        if let Some(runs) = ctx.buckets.get(&(pg, mcid)) {
-                            ctx.out.extend(runs.iter().cloned());
-                        }
+                    if let (Some(pg), Some(mcid)) = (pg, mcid)
+                        && let Some(runs) = ctx.buckets.get(&(pg, mcid))
+                    {
+                        ctx.out.extend(runs.iter().cloned());
                     }
                     Ok(())
                 }

@@ -15,8 +15,8 @@
 //! and is saved / restored by `q`/`Q`). No third-party PDF library was
 //! consulted.
 
-use oxideav_pdf::reader::DocumentReader;
 use oxideav_pdf::TextRenderMode;
+use oxideav_pdf::reader::DocumentReader;
 
 /// Build a minimal single-page PDF whose page content stream is
 /// `content` and whose `/Resources /Font /F0` is a stock Helvetica

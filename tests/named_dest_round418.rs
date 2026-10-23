@@ -15,10 +15,10 @@
 
 use std::process::{Command, Stdio};
 
-use oxideav_pdf::reader::{
-    links, named_destinations, outline, resolve_named_destination, DocumentReader, PdfLinkTarget,
-};
 use oxideav_pdf::OutlineDestination;
+use oxideav_pdf::reader::{
+    DocumentReader, PdfLinkTarget, links, named_destinations, outline, resolve_named_destination,
+};
 
 /// Assemble a classic-xref PDF from `(object_number, body)` pairs.
 fn build_pdf(objects: &[(u32, &str)]) -> Vec<u8> {
@@ -204,9 +204,11 @@ fn document_without_named_dests_is_unaffected() {
         (5, "<< /Title (Top) /Parent 4 0 R /Dest [3 0 R /Fit] >>"),
     ]);
     let mut reader = DocumentReader::open(&pdf).expect("open");
-    assert!(named_destinations(&mut reader)
-        .expect("named_destinations")
-        .is_empty());
+    assert!(
+        named_destinations(&mut reader)
+            .expect("named_destinations")
+            .is_empty()
+    );
     let tree = outline(&mut reader).expect("outline").expect("present");
     assert_eq!(
         tree.roots[0].destination,

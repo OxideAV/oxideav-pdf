@@ -955,7 +955,7 @@ fn fill_standard(m: &mut EncodingMap) {
     m.set_char(0x27, '\u{2019}'); // quoteright
     m.set_char(0x60, '\u{2018}'); // quoteleft
     m.set_char(0x22, '"'); // quotedbl
-                           // Upper bytes — the "Standard Latin" extras.
+    // Upper bytes — the "Standard Latin" extras.
     let upper: &[(u8, char)] = &[
         (0xA1, '\u{00A1}'),
         (0xA2, '\u{00A2}'),
@@ -1379,7 +1379,7 @@ mod tests {
         };
         let out = apply_encoding_differences(&base, &diffs);
         assert_eq!(out.decode(&[0x41]), "\u{03A9}"); // Greek capital Omega
-                                                     // Sibling codes unchanged.
+        // Sibling codes unchanged.
         assert_eq!(out.decode(&[0x42]), "B");
     }
 

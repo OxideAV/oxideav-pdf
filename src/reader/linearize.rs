@@ -502,9 +502,11 @@ mod tests {
     #[test]
     fn empty_input_returns_none() {
         assert!(LinearizationParams::parse(b"").expect("parse").is_none());
-        assert!(LinearizationParams::parse(b"%PDF-1.7\n%%EOF\n")
-            .expect("parse")
-            .is_none());
+        assert!(
+            LinearizationParams::parse(b"%PDF-1.7\n%%EOF\n")
+                .expect("parse")
+                .is_none()
+        );
     }
 
     #[test]

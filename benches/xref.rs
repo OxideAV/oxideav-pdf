@@ -26,7 +26,7 @@
 //! Run with:
 //!     cargo bench -p oxideav-pdf --bench xref
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 use oxideav_core::time::TimeBase;
 use oxideav_core::vector::{

@@ -20,7 +20,7 @@
 //! same shape as `tests/annotations_round197.rs`).
 
 use oxideav_pdf::reader::DocumentReader;
-use oxideav_pdf::{read_pdf_annotations, AnnotationKind, FixedPrint};
+use oxideav_pdf::{AnnotationKind, FixedPrint, read_pdf_annotations};
 
 /// Minimal one-page PDF with the supplied per-page annotation dicts
 /// spliced into the page's `/Annots` array. Object numbering:

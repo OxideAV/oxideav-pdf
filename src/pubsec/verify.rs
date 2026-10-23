@@ -75,13 +75,13 @@
 
 use rsa::pkcs1v15::Pkcs1v15Sign;
 use rsa::pss::Pss;
-use rsa::{traits::SignatureScheme, RsaPublicKey};
+use rsa::{RsaPublicKey, traits::SignatureScheme};
 use sha1::Sha1;
 use sha2::{Sha256, Sha384, Sha512};
 
 use crate::error::PdfError;
 
-use super::der::{read_octet_string, read_oid, write_set, write_tlv, Class};
+use super::der::{Class, read_octet_string, read_oid, write_set, write_tlv};
 use super::signed_data::{Attribute, SignedData, SignerIdentifier, SignerInfo};
 use super::x509::Certificate;
 
@@ -318,10 +318,10 @@ pub fn resolve_signer_cert<'a>(
                 }
             }
             SignerIdentifier::SubjectKeyIdentifier(ski) => {
-                if let Some(cert_ski) = cert.subject_key_identifier() {
-                    if &cert_ski == ski {
-                        return Some(cert);
-                    }
+                if let Some(cert_ski) = cert.subject_key_identifier()
+                    && &cert_ski == ski
+                {
+                    return Some(cert);
                 }
             }
         }
@@ -359,10 +359,10 @@ pub fn message_digest_attr(attrs: &[Attribute]) -> Option<Vec<u8>> {
         if a.oid == OID_ATTR_MESSAGE_DIGEST {
             // Each attrValue is an OCTET STRING TLV — pull the bytes
             // out of the first value.
-            if let Some(v) = a.values.first() {
-                if let Ok((bytes, _)) = read_octet_string(v) {
-                    return Some(bytes.to_vec());
-                }
+            if let Some(v) = a.values.first()
+                && let Ok((bytes, _)) = read_octet_string(v)
+            {
+                return Some(bytes.to_vec());
             }
         }
     }

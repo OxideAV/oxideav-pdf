@@ -68,10 +68,10 @@ use oxideav_pdf::reader::content::parse_content_stream;
 use oxideav_pdf::reader::inline_images::extract_inline_images_from_stream;
 use oxideav_pdf::reader::linearize::parse_linearization_dict;
 use oxideav_pdf::reader::{
-    actions, annotations, attachments, doc_timestamps, extract_text, image_xobjects,
-    inline_images, links, named_destinations, optional_content, outline, page_label_ranges,
-    page_labels, pdfa_signals, read_in_logical_order, signatures, threads, verify_hierarchy,
-    DocumentReader,
+    DocumentReader, actions, annotations, attachments, doc_timestamps, extract_text,
+    image_xobjects, inline_images, links, named_destinations, optional_content, outline,
+    page_label_ranges, page_labels, pdfa_signals, read_in_logical_order, signatures, threads,
+    verify_hierarchy,
 };
 
 fuzz_target!(|data: &[u8]| {

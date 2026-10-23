@@ -21,9 +21,9 @@ use oxideav_core::vector::{
 };
 use oxideav_pdf::reader::DocumentReader;
 use oxideav_pdf::{
-    read_pdf_links, read_pdf_outline, read_pdf_to_scene, write_pdf_from_scene,
-    write_pdf_from_scene_with_outlines, write_pdf_from_scene_with_outlines_and_links,
-    LinkAnnotationSpec, LinkTarget, OutlineDestination, OutlineSpec, PdfLinkTarget,
+    LinkAnnotationSpec, LinkTarget, OutlineDestination, OutlineSpec, PdfLinkTarget, read_pdf_links,
+    read_pdf_outline, read_pdf_to_scene, write_pdf_from_scene, write_pdf_from_scene_with_outlines,
+    write_pdf_from_scene_with_outlines_and_links,
 };
 use oxideav_scene::{Page, Scene};
 

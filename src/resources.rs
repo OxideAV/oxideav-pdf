@@ -18,8 +18,8 @@
 //! `/Resources` dictionary entries (`/ExtGState`, `/Pattern`,
 //! `/XObject`) in one pass.
 
-use oxideav_core::vector::{GradientStop, LinearGradient, MaskKind, RadialGradient, SpreadMethod};
 use oxideav_core::VideoFrame;
+use oxideav_core::vector::{GradientStop, LinearGradient, MaskKind, RadialGradient, SpreadMethod};
 
 use crate::objects::{Dict, Document, Object, ObjectId, Stream};
 

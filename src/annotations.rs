@@ -136,12 +136,12 @@
 use oxideav_scene::Scene;
 
 use crate::attachments::{
-    emit_embedded_file_stream, emit_embedded_files_name_tree, emit_filespec_dict, Attachment,
+    Attachment, emit_embedded_file_stream, emit_embedded_files_name_tree, emit_filespec_dict,
 };
 use crate::error::PdfError;
 use crate::info::{build_info_dict, has_metadata};
 use crate::objects::{Dict, Document, Object, ObjectId};
-use crate::page::{build_pages, PageInput};
+use crate::page::{PageInput, build_pages};
 use crate::resources::ResourceCollector;
 use crate::writer::render_frame_for_linearize as render_frame;
 
@@ -1030,31 +1030,31 @@ fn validate_annotations(annotations: &[Annotation], n_pages: usize) -> Result<()
             AnnotationKind::Watermark {
                 fixed_print: Some(fp),
             } => {
-                if let Some(m) = fp.matrix {
-                    if m.iter().any(|v| !v.is_finite()) {
-                        return Err(PdfError::other(format!(
-                            "write_pdf_with_annotations: annotation #{i} /Watermark \
+                if let Some(m) = fp.matrix
+                    && m.iter().any(|v| !v.is_finite())
+                {
+                    return Err(PdfError::other(format!(
+                        "write_pdf_with_annotations: annotation #{i} /Watermark \
                              /FixedPrint /Matrix entries must all be finite (got {m:?})",
-                        )));
-                    }
+                    )));
                 }
-                if let Some(h) = fp.h {
-                    if !h.is_finite() || h < 0.0 {
-                        return Err(PdfError::other(format!(
-                            "write_pdf_with_annotations: annotation #{i} /Watermark \
+                if let Some(h) = fp.h
+                    && (!h.is_finite() || h < 0.0)
+                {
+                    return Err(PdfError::other(format!(
+                        "write_pdf_with_annotations: annotation #{i} /Watermark \
                              /FixedPrint /H must be a finite non-negative number \
                              (got {h}) — §12.5.6.22 Table 191 negative-values warning",
-                        )));
-                    }
+                    )));
                 }
-                if let Some(v) = fp.v {
-                    if !v.is_finite() || v < 0.0 {
-                        return Err(PdfError::other(format!(
-                            "write_pdf_with_annotations: annotation #{i} /Watermark \
+                if let Some(v) = fp.v
+                    && (!v.is_finite() || v < 0.0)
+                {
+                    return Err(PdfError::other(format!(
+                        "write_pdf_with_annotations: annotation #{i} /Watermark \
                              /FixedPrint /V must be a finite non-negative number \
                              (got {v}) — §12.5.6.22 Table 191 negative-values warning",
-                        )));
-                    }
+                    )));
                 }
             }
             // §12.5.6.20 Table 362 — /MN is a PDF Name. §7.3.5 requires
@@ -1264,7 +1264,7 @@ fn build_normal_appearance(annot: &Annotation) -> Option<Vec<u8>> {
                 }
                 any = true;
                 ops.push_str(&format!("{} {} m\n", fr(stroke[0]), fr(stroke[1])));
-                for xy in stroke.chunks_exact(2).skip(1) {
+                for xy in stroke.as_chunks::<2>().0.iter().skip(1) {
                     ops.push_str(&format!("{} {} l\n", fr(xy[0]), fr(xy[1])));
                 }
             }
@@ -1318,7 +1318,7 @@ fn build_normal_appearance(annot: &Annotation) -> Option<Vec<u8>> {
                 return None;
             }
             ops.push_str(&format!("{} {} m\n", fr(vertices[0]), fr(vertices[1])));
-            for xy in vertices.chunks_exact(2).skip(1) {
+            for xy in vertices.as_chunks::<2>().0.iter().skip(1) {
                 ops.push_str(&format!("{} {} l\n", fr(xy[0]), fr(xy[1])));
             }
             if closed {
@@ -2697,14 +2697,16 @@ mod tests {
         };
         assert_eq!(items.len(), 6);
         // /H + /V emitted as reals.
-        assert!(fp
-            .entries()
-            .iter()
-            .any(|(k, v)| k == "H" && matches!(v, Object::Real(r) if (*r - 0.5).abs() < 1e-6)));
-        assert!(fp
-            .entries()
-            .iter()
-            .any(|(k, v)| k == "V" && matches!(v, Object::Real(r) if (*r - 0.25).abs() < 1e-6)));
+        assert!(
+            fp.entries()
+                .iter()
+                .any(|(k, v)| k == "H" && matches!(v, Object::Real(r) if (*r - 0.5).abs() < 1e-6))
+        );
+        assert!(
+            fp.entries()
+                .iter()
+                .any(|(k, v)| k == "V" && matches!(v, Object::Real(r) if (*r - 0.25).abs() < 1e-6))
+        );
     }
 
     #[test]
@@ -2737,10 +2739,11 @@ mod tests {
             panic!("/FixedPrint should be an inline dict, got {fp_obj:?}");
         };
         assert_eq!(fp.entries().len(), 1);
-        assert!(fp
-            .entries()
-            .iter()
-            .all(|(k, _)| !matches!(k.as_str(), "Matrix" | "H" | "V")));
+        assert!(
+            fp.entries()
+                .iter()
+                .all(|(k, _)| !matches!(k.as_str(), "Matrix" | "H" | "V"))
+        );
     }
 
     #[test]

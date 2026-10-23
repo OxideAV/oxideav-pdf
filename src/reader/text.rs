@@ -44,9 +44,9 @@ use std::str;
 use crate::error::PdfError;
 use crate::objects::{Dict, Object, ObjectId};
 use crate::reader::cid_cmap::CidCMap;
-use crate::reader::document::{decode_stream, DocumentReader};
+use crate::reader::document::{DocumentReader, decode_stream};
 use crate::reader::encoding::{
-    apply_encoding_differences, parse_encoding_differences, BaseEncoding, EncodingMap,
+    BaseEncoding, EncodingMap, apply_encoding_differences, parse_encoding_differences,
 };
 
 // ────────────────────────── public surface ──────────────────────────
@@ -355,10 +355,10 @@ pub fn assemble_text(runs: &[TextRun]) -> String {
     let mut lines: Vec<Vec<&TextRun>> = Vec::new();
     let mut cur: Vec<&TextRun> = Vec::new();
     for run in runs.iter().filter(|r| !r.text.is_empty()) {
-        if let Some(prev) = cur.last() {
-            if starts_new_line(prev, run) {
-                lines.push(std::mem::take(&mut cur));
-            }
+        if let Some(prev) = cur.last()
+            && starts_new_line(prev, run)
+        {
+            lines.push(std::mem::take(&mut cur));
         }
         cur.push(run);
     }
@@ -506,11 +506,7 @@ fn letter_spacing_estimate(singles: &[bool], gaps: &[f32], em: f32) -> f32 {
             best = Some(best.map_or(*g, |b: f32| b.min(*g)));
         }
     }
-    if count >= 2 {
-        best.unwrap_or(0.0)
-    } else {
-        0.0
-    }
+    if count >= 2 { best.unwrap_or(0.0) } else { 0.0 }
 }
 
 /// Whether a character belongs to a right-to-left script block
@@ -1134,11 +1130,11 @@ fn build_cid_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvanc
         Some(Object::Name(name)) if name == "Identity-V" => wmode = 1,
         Some(Object::Name(_)) => {}
         Some(obj) => {
-            if let Ok(Object::Stream(stream)) = reader.deref(obj) {
-                if let Ok(cm) = CidCMap::from_stream(reader, &stream, 0) {
-                    wmode = cm.wmode;
-                    cmap = Some(Box::new(cm));
-                }
+            if let Ok(Object::Stream(stream)) = reader.deref(obj)
+                && let Ok(cm) = CidCMap::from_stream(reader, &stream, 0)
+            {
+                wmode = cm.wmode;
+                cmap = Some(Box::new(cm));
             }
         }
         None => {}
@@ -1559,12 +1555,12 @@ impl FontDecoder {
                     return Ok(FontDecoder::IdentityNoCMap);
                 }
                 Some(obj) => {
-                    if let Ok(Object::Stream(stream)) = reader.deref(obj) {
-                        if let Ok(cmap) = CidCMap::from_stream(reader, &stream, 0) {
-                            return Ok(FontDecoder::CidEncoding {
-                                cmap: Box::new(cmap),
-                            });
-                        }
+                    if let Ok(Object::Stream(stream)) = reader.deref(obj)
+                        && let Ok(cmap) = CidCMap::from_stream(reader, &stream, 0)
+                    {
+                        return Ok(FontDecoder::CidEncoding {
+                            cmap: Box::new(cmap),
+                        });
                     }
                     return Ok(FontDecoder::IdentityNoCMap);
                 }
@@ -1910,13 +1906,12 @@ fn parse_type1_cleartext_encoding(program: &[u8]) -> Option<EncodingMap> {
                 while k < after.len() && !is_ws(after[k]) && !is_delim(after[k]) {
                     k += 1;
                 }
-                if let (Some(code), Ok(name)) = (code, str::from_utf8(&after[name_start..k])) {
-                    if code < 256 {
-                        if let Some(text) = crate::reader::encoding::glyph_name_to_unicode(name) {
-                            map.set_string(code as u8, text.as_ref());
-                            any = true;
-                        }
-                    }
+                if let (Some(code), Ok(name)) = (code, str::from_utf8(&after[name_start..k]))
+                    && code < 256
+                    && let Some(text) = crate::reader::encoding::glyph_name_to_unicode(name)
+                {
+                    map.set_string(code as u8, text.as_ref());
+                    any = true;
                 }
                 pos = k;
             }
@@ -2249,10 +2244,10 @@ fn parse_bfrange(bytes: &[u8], mut i: usize, cm: &mut CMap) -> Result<usize, Pdf
                 for k in 0..count {
                     let cid = lo.saturating_add(k);
                     cm.table.insert(cid, chars.iter().collect::<String>());
-                    if let Some(last) = chars.last_mut() {
-                        if let Some(next) = char::from_u32(*last as u32 + 1) {
-                            *last = next;
-                        }
+                    if let Some(last) = chars.last_mut()
+                        && let Some(next) = char::from_u32(*last as u32 + 1)
+                    {
+                        *last = next;
                     }
                 }
             }
@@ -2293,7 +2288,7 @@ pub(crate) fn read_hex_string_payload(
         nibbles.push(0);
     }
     let mut out = Vec::with_capacity(nibbles.len() / 2);
-    for pair in nibbles.chunks_exact(2) {
+    for pair in nibbles.as_chunks::<2>().0 {
         out.push((pair[0] << 4) | pair[1]);
     }
     Ok((out, i))
@@ -2315,7 +2310,7 @@ fn utf16be_to_string(b: &[u8]) -> String {
         return String::from(b[0] as char);
     }
     let mut units: Vec<u16> = Vec::with_capacity(b.len() / 2);
-    for chunk in b.chunks_exact(2) {
+    for chunk in b.as_chunks::<2>().0 {
         units.push(u16::from_be_bytes([chunk[0], chunk[1]]));
     }
     String::from_utf16_lossy(&units)
@@ -3523,7 +3518,9 @@ fn scan_inline_props(bytes: &[u8]) -> (Option<u32>, Option<String>) {
 fn decode_text_string_bytes(b: &[u8]) -> String {
     if b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF {
         let utf16: Vec<u16> = b[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect();
         String::from_utf16_lossy(&utf16)
@@ -3664,10 +3661,10 @@ fn read_tj_array(input: &[u8], start: usize) -> Result<(usize, Vec<TJItem>), Pdf
                 }
                 end += 1;
             }
-            if let Ok(s) = str::from_utf8(&input[i..end]) {
-                if let Ok(f) = s.parse::<f32>() {
-                    items.push(TJItem::Kern(f));
-                }
+            if let Ok(s) = str::from_utf8(&input[i..end])
+                && let Ok(f) = s.parse::<f32>()
+            {
+                items.push(TJItem::Kern(f));
             }
             i = end;
             continue;

@@ -19,7 +19,7 @@
 //!   scaling;
 //! * x stays constant down the column.
 
-use oxideav_pdf::reader::{extract_text, DocumentReader};
+use oxideav_pdf::reader::{DocumentReader, extract_text};
 
 /// Assemble a classic-xref PDF from `(object_number, body)` pairs.
 fn build_pdf(objects: &[(u32, Vec<u8>)]) -> Vec<u8> {

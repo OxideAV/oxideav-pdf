@@ -5,7 +5,7 @@
 //! bead's `/N` refers back to the first) plus a titled `/I` info
 //! dictionary, and a malformed thread whose ring never closes.
 
-use oxideav_pdf::reader::{threads, DocumentReader};
+use oxideav_pdf::reader::{DocumentReader, threads};
 
 /// Assemble a classic-xref PDF from `(object_number, body)` pairs.
 fn build_pdf(objects: &[(u32, &str)]) -> Vec<u8> {

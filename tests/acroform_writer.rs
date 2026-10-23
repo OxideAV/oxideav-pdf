@@ -12,14 +12,14 @@ use oxideav_core::vector::{
 };
 use oxideav_pdf::pubsec::der;
 use oxideav_pdf::pubsec::verify::{
-    rsa_pubkey_to_pkcs1_der, verify_signature, AttachedContent, OID_RSA_ENCRYPTION,
+    AttachedContent, OID_RSA_ENCRYPTION, rsa_pubkey_to_pkcs1_der, verify_signature,
 };
 use oxideav_pdf::pubsec::x509::Certificate;
 use oxideav_pdf::reader::DocumentReader;
 use oxideav_pdf::{
-    pdf_signed_bytes, write_pdf_with_form, AnnotationKind, FieldJustification, FormField,
-    FormFieldCheckbox, FormFieldChoice, FormFieldRadioGroup, FormFieldSignature, FormFieldText,
-    RadioOption, RsaPkcs1v15Sha256Signer, SignerIdentity,
+    AnnotationKind, FieldJustification, FormField, FormFieldCheckbox, FormFieldChoice,
+    FormFieldRadioGroup, FormFieldSignature, FormFieldText, RadioOption, RsaPkcs1v15Sha256Signer,
+    SignerIdentity, pdf_signed_bytes, write_pdf_with_form,
 };
 use oxideav_scene::{Page, Scene};
 

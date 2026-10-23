@@ -22,7 +22,7 @@ use oxideav_core::vector::{
     FillRule, Group, Node, Paint, Path, PathCommand, PathNode, Point, Rgba, VectorFrame,
 };
 use oxideav_pdf::encrypt::EncryptionConfig;
-use oxideav_pdf::{read_pdf_to_scene_with_password, write_pdf_from_scene_encrypted, PdfError};
+use oxideav_pdf::{PdfError, read_pdf_to_scene_with_password, write_pdf_from_scene_encrypted};
 use oxideav_scene::{Metadata, Page, Scene};
 
 /// Build a minimal one-page scene with the provided title in /Info.

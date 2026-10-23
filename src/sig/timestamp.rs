@@ -59,14 +59,14 @@ use crate::error::PdfError;
 use crate::objects::Object;
 use crate::pubsec::cms::OID_SIGNED_DATA;
 use crate::pubsec::der::{
-    write_context_constructed, write_integer_bytes, write_integer_u64, write_null,
-    write_octet_string, write_oid, write_sequence, write_set, write_tlv, Class,
+    Class, write_context_constructed, write_integer_bytes, write_integer_u64, write_null,
+    write_octet_string, write_oid, write_sequence, write_set, write_tlv,
 };
 use crate::pubsec::verify::{
-    build_message_digest_attribute_der, implicit_signed_attrs_tlv, pack_signed_attrs_implicit,
-    signed_attrs_to_be_signed, HashAlg, OID_RSA_ENCRYPTION, OID_SHA256,
+    HashAlg, OID_RSA_ENCRYPTION, OID_SHA256, build_message_digest_attribute_der,
+    implicit_signed_attrs_tlv, pack_signed_attrs_implicit, signed_attrs_to_be_signed,
 };
-use crate::sig::writer::{build_content_type_attribute_der, SignerIdentity};
+use crate::sig::writer::{SignerIdentity, build_content_type_attribute_der};
 
 // ---------------------------------------------------------------------
 // OIDs

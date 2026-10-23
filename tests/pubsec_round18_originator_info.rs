@@ -10,9 +10,9 @@
 //! Provenance: RFC 5652 §10.2.1 (`OriginatorInfo`) + §10.2.2
 //! (`CertificateChoices`) + RFC 5280 §5 (`CertificateList` for CRLs).
 
-use oxideav_pdf::pubsec::cms::{parse_envelope, OriginatorInfo};
+use oxideav_pdf::pubsec::cms::{OriginatorInfo, parse_envelope};
 use oxideav_pdf::pubsec::cms_build::{
-    build_envelope_aes256, build_envelope_aes256_with_originator_info, RecipientPlain,
+    RecipientPlain, build_envelope_aes256, build_envelope_aes256_with_originator_info,
 };
 use oxideav_pdf::pubsec::der;
 use oxideav_pdf::pubsec::x509::Certificate;

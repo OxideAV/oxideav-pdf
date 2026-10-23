@@ -928,14 +928,18 @@ fn decode_js_bytes(b: &[u8]) -> String {
     }
     if b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF {
         let utf16: Vec<u16> = b[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect();
         return String::from_utf16_lossy(&utf16);
     }
     if b.len() >= 2 && b[0] == 0xFF && b[1] == 0xFE {
         let utf16: Vec<u16> = b[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         return String::from_utf16_lossy(&utf16);
@@ -1064,7 +1068,9 @@ fn decode_text_obj(obj: &Object) -> Option<String> {
         Object::HexString(b) => {
             if b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF {
                 let utf16: Vec<u16> = b[2..]
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_be_bytes([c[0], c[1]]))
                     .collect();
                 Some(String::from_utf16_lossy(&utf16))

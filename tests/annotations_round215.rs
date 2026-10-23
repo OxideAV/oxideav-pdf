@@ -22,7 +22,7 @@
 //! `tests/annotations_round204.rs` / `tests/annotations_round209.rs`).
 
 use oxideav_pdf::reader::DocumentReader;
-use oxideav_pdf::{read_pdf_annotations, AnnotationKind};
+use oxideav_pdf::{AnnotationKind, read_pdf_annotations};
 
 /// Helper — open the synthesised PDF and walk its annotations.
 fn read_annots(pdf: &[u8]) -> Vec<oxideav_pdf::PdfAnnotation> {

@@ -304,10 +304,11 @@ mod tests {
         assert!(c.is_declared());
         assert!(c.claim_inconsistent);
         assert!(!c.structurally_sound);
-        assert!(c
-            .inconsistencies
-            .iter()
-            .any(|m| m.contains("OutputIntents")));
+        assert!(
+            c.inconsistencies
+                .iter()
+                .any(|m| m.contains("OutputIntents"))
+        );
     }
 
     #[test]
@@ -326,14 +327,16 @@ mod tests {
         };
         let c = PdfAConformance::from_signals_and_xmp(&sig, Some(&xmp));
         assert!(c.claim_inconsistent);
-        assert!(c
-            .inconsistencies
-            .iter()
-            .any(|m| m.contains("Marked is not true")));
-        assert!(c
-            .inconsistencies
-            .iter()
-            .any(|m| m.contains("StructTreeRoot is absent")));
+        assert!(
+            c.inconsistencies
+                .iter()
+                .any(|m| m.contains("Marked is not true"))
+        );
+        assert!(
+            c.inconsistencies
+                .iter()
+                .any(|m| m.contains("StructTreeRoot is absent"))
+        );
     }
 
     #[test]

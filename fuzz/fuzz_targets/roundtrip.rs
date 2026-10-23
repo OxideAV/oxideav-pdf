@@ -264,7 +264,10 @@ fuzz_target!(|data: &[u8]| {
     let mut pages = Vec::with_capacity(page_count);
     for _ in 0..page_count {
         let f = build_frame(&mut c);
-        let mut page = Page::new(f.width.max(1.0).min(14400.0), f.height.max(1.0).min(14400.0));
+        let mut page = Page::new(
+            f.width.max(1.0).min(14400.0),
+            f.height.max(1.0).min(14400.0),
+        );
         page.content = f;
         pages.push(page);
     }

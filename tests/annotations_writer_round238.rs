@@ -18,8 +18,8 @@ use oxideav_core::vector::{
 };
 use oxideav_pdf::reader::DocumentReader;
 use oxideav_pdf::{
-    read_pdf_annotations, read_pdf_attachments, write_pdf_with_annotations, Annotation,
-    AnnotationKind, WriterAnnotationKind,
+    Annotation, AnnotationKind, WriterAnnotationKind, read_pdf_annotations, read_pdf_attachments,
+    write_pdf_with_annotations,
 };
 use oxideav_scene::{Page, Scene};
 
@@ -164,7 +164,7 @@ fn file_attachment_utf16_name_with_mime_roundtrips() {
         b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01".to_vec();
     // Pad with a repeating pattern that compresses well so the
     // FlateDecode branch is taken.
-    payload.extend(std::iter::repeat(0xAB).take(256));
+    payload.extend(std::iter::repeat_n(0xAB, 256));
     let annot = default_annot(
         [50.0, 50.0, 70.0, 70.0],
         WriterAnnotationKind::FileAttachment {

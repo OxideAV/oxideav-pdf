@@ -12,10 +12,10 @@
 //! `read_pdf_to_scene` reproduces a `Node::SoftMask` with the same
 //! kind, mask geometry, and content.
 
+use oxideav_core::TimeBase;
 use oxideav_core::vector::{
     FillRule, Group, MaskKind, Node, Paint, Path, PathNode, Point, Rgba, VectorFrame,
 };
-use oxideav_core::TimeBase;
 use oxideav_pdf::{read_pdf_to_scene, write_pdf};
 
 fn rect_path(x0: f32, y0: f32, x1: f32, y1: f32) -> Path {

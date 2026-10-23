@@ -15,7 +15,7 @@
 //! exactly one U+FFFD marker (CIDs index glyphs, not characters — no
 //! Unicode source exists), pinning segmentation.
 
-use oxideav_pdf::reader::{extract_text, DocumentReader};
+use oxideav_pdf::reader::{DocumentReader, extract_text};
 
 /// Assemble a classic-xref PDF from `(object_number, body)` pairs
 /// (bodies may contain binary stream payloads).

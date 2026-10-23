@@ -236,7 +236,7 @@ impl<'a> Parser<'a> {
             // EOF after the int — not a ref.
             return Ok(Object::Integer(n));
         };
-        let TokenKind::Integer(gen) = t2.kind else {
+        let TokenKind::Integer(r#gen) = t2.kind else {
             // Not int int — restore and emit Integer.
             self.peeked = Some(t2);
             // (saved positions don't need restoring — peeked covers
@@ -260,14 +260,14 @@ impl<'a> Parser<'a> {
             self.peeked = saved_peeked;
             return Ok(Object::Integer(n));
         };
-        if n < 1 || n > u32::MAX as i64 || gen < 0 || gen > u16::MAX as i64 {
+        if n < 1 || n > u32::MAX as i64 || r#gen < 0 || r#gen > u16::MAX as i64 {
             return Err(PdfError::other(format!(
                 "PDF parser: indirect ref out of range `{n} {gen} R`"
             )));
         }
         Ok(Object::Reference(ObjectId {
             number: n as u32,
-            generation: gen as u16,
+            generation: r#gen as u16,
         }))
     }
 
@@ -354,84 +354,81 @@ impl<'a> Parser<'a> {
         // Check whether this dict is a stream header — `stream` keyword
         // immediately follows (after optional whitespace).
         let after = self.peek()?.cloned();
-        if let Some(t) = after {
-            if let TokenKind::Keyword(b"stream") = t.kind {
-                // Consume the `stream` keyword.
-                let _ = self.next()?;
-                // Per §7.3.8.1, the stream data starts immediately
-                // after the EOL marker that follows the `stream`
-                // keyword. The marker is CRLF or just LF.
-                let raw = self.lex.input();
-                let mut data_start = t.end;
-                if data_start < raw.len() && raw[data_start] == b'\r' {
-                    data_start += 1;
-                }
-                if data_start < raw.len() && raw[data_start] == b'\n' {
-                    data_start += 1;
-                }
-                // /Length is required per §7.3.8.2 — use it to find
-                // the body's end. ISO 32000-1 §7.3.10 Example 3
-                // makes indirect /Length normative on stream objects
-                // (`<< /Length 8 0 R >>` for one-pass writers). When a
-                // resolver is supplied (the top-level
-                // `DocumentReader::resolve` path), call it to fetch the
-                // referenced integer; when no resolver is supplied
-                // (the xref-stream parsing path, where the xref isn't
-                // yet built) the indirect form is rejected.
-                let length_obj = dict.entries().iter().find_map(|(k, v)| {
-                    if k == "Length" {
-                        Some(v.clone())
-                    } else {
-                        None
-                    }
-                });
-                let len: usize = match length_obj {
-                    Some(Object::Integer(n)) if n >= 0 => n as usize,
-                    Some(Object::Reference(id)) => {
-                        let resolved = resolver.resolve_length(id)?;
-                        if resolved < 0 {
-                            return Err(PdfError::other(format!(
-                                "PDF parser: indirect /Length {id:?} resolved to \
-                                 negative integer {resolved}"
-                            )));
-                        }
-                        // Patch the dict so downstream consumers (e.g.
-                        // `decode_stream`, encryption length tracking)
-                        // see the resolved direct integer rather than
-                        // the now-stale `Reference`.
-                        dict.set("Length", Object::Integer(resolved));
-                        resolved as usize
-                    }
-                    Some(other) => {
+        if let Some(t) = after
+            && let TokenKind::Keyword(b"stream") = t.kind
+        {
+            // Consume the `stream` keyword.
+            let _ = self.next()?;
+            // Per §7.3.8.1, the stream data starts immediately
+            // after the EOL marker that follows the `stream`
+            // keyword. The marker is CRLF or just LF.
+            let raw = self.lex.input();
+            let mut data_start = t.end;
+            if data_start < raw.len() && raw[data_start] == b'\r' {
+                data_start += 1;
+            }
+            if data_start < raw.len() && raw[data_start] == b'\n' {
+                data_start += 1;
+            }
+            // /Length is required per §7.3.8.2 — use it to find
+            // the body's end. ISO 32000-1 §7.3.10 Example 3
+            // makes indirect /Length normative on stream objects
+            // (`<< /Length 8 0 R >>` for one-pass writers). When a
+            // resolver is supplied (the top-level
+            // `DocumentReader::resolve` path), call it to fetch the
+            // referenced integer; when no resolver is supplied
+            // (the xref-stream parsing path, where the xref isn't
+            // yet built) the indirect form is rejected.
+            let length_obj = dict
+                .entries()
+                .iter()
+                .find_map(|(k, v)| if k == "Length" { Some(v.clone()) } else { None });
+            let len: usize = match length_obj {
+                Some(Object::Integer(n)) if n >= 0 => n as usize,
+                Some(Object::Reference(id)) => {
+                    let resolved = resolver.resolve_length(id)?;
+                    if resolved < 0 {
                         return Err(PdfError::other(format!(
-                            "PDF parser: stream /Length must be a non-negative integer (got {other:?})"
+                            "PDF parser: indirect /Length {id:?} resolved to \
+                                 negative integer {resolved}"
                         )));
                     }
-                    None => {
-                        return Err(PdfError::other(
-                            "PDF parser: stream object missing required /Length entry",
-                        ));
-                    }
-                };
-                let data_end = data_start.saturating_add(len).min(raw.len());
-                let data = self.lex.slice(data_start, data_end).to_vec();
-                // Skip the body + the EOL before `endstream` + the
-                // `endstream` keyword itself.
-                self.lex.seek(data_end);
-                self.peeked = None;
-                // Drop any whitespace + EOL between the data and
-                // `endstream`.
-                let endstream = self
-                    .next()?
-                    .ok_or_else(|| PdfError::other("PDF parser: stream missing `endstream`"))?;
-                let TokenKind::Keyword(b"endstream") = endstream.kind else {
+                    // Patch the dict so downstream consumers (e.g.
+                    // `decode_stream`, encryption length tracking)
+                    // see the resolved direct integer rather than
+                    // the now-stale `Reference`.
+                    dict.set("Length", Object::Integer(resolved));
+                    resolved as usize
+                }
+                Some(other) => {
                     return Err(PdfError::other(format!(
-                        "PDF parser: expected `endstream` after stream body at byte {} (got {:?})",
-                        endstream.start, endstream.kind
+                        "PDF parser: stream /Length must be a non-negative integer (got {other:?})"
                     )));
-                };
-                return Ok(Object::Stream(Stream::new(dict, data)));
-            }
+                }
+                None => {
+                    return Err(PdfError::other(
+                        "PDF parser: stream object missing required /Length entry",
+                    ));
+                }
+            };
+            let data_end = data_start.saturating_add(len).min(raw.len());
+            let data = self.lex.slice(data_start, data_end).to_vec();
+            // Skip the body + the EOL before `endstream` + the
+            // `endstream` keyword itself.
+            self.lex.seek(data_end);
+            self.peeked = None;
+            // Drop any whitespace + EOL between the data and
+            // `endstream`.
+            let endstream = self
+                .next()?
+                .ok_or_else(|| PdfError::other("PDF parser: stream missing `endstream`"))?;
+            let TokenKind::Keyword(b"endstream") = endstream.kind else {
+                return Err(PdfError::other(format!(
+                    "PDF parser: expected `endstream` after stream body at byte {} (got {:?})",
+                    endstream.start, endstream.kind
+                )));
+            };
+            return Ok(Object::Stream(Stream::new(dict, data)));
         }
         Ok(Object::Dict(dict))
     }
@@ -455,7 +452,7 @@ impl<'a> Parser<'a> {
         resolver: &mut dyn LengthResolver,
     ) -> Result<(ObjectId, Object), PdfError> {
         let n = self.expect_integer("indirect-object number")?;
-        let gen = self.expect_integer("indirect-object generation")?;
+        let r#gen = self.expect_integer("indirect-object generation")?;
         let obj_kw = self
             .next()?
             .ok_or_else(|| PdfError::other("PDF parser: unexpected EOF before `obj` keyword"))?;
@@ -477,7 +474,7 @@ impl<'a> Parser<'a> {
                 endobj.start, endobj.kind
             )));
         };
-        if n < 1 || n > u32::MAX as i64 || !(0..=u16::MAX as i64).contains(&gen) {
+        if n < 1 || n > u32::MAX as i64 || !(0..=u16::MAX as i64).contains(&r#gen) {
             return Err(PdfError::other(format!(
                 "PDF parser: indirect-object id `{n} {gen}` out of range"
             )));
@@ -485,7 +482,7 @@ impl<'a> Parser<'a> {
         Ok((
             ObjectId {
                 number: n as u32,
-                generation: gen as u16,
+                generation: r#gen as u16,
             },
             body,
         ))

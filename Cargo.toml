@@ -1,8 +1,8 @@
 [package]
 name = "oxideav-pdf"
 version = "0.2.1"
-edition = "2021"
-rust-version = "1.80"
+edition = "2024"
+rust-version = "1.95"
 license = "MIT"
 authors = ["Mark Karpeles"]
 description = "Pure-Rust PDF writer for the oxideav framework — vector-stays-vector path"

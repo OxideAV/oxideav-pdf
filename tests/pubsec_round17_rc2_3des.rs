@@ -13,9 +13,9 @@
 //!
 //! Provenance: RFC 5652 §6 + §12.4 + RFC 3217 + RFC 3370 + RFC 2268 only.
 
-use oxideav_pdf::pubsec::cms::{parse_envelope, ContentEncryption, RecipientInfoVariant};
+use oxideav_pdf::pubsec::cms::{ContentEncryption, RecipientInfoVariant, parse_envelope};
 use oxideav_pdf::pubsec::cms_build::{
-    build_envelope_des_ede3_cbc, build_envelope_rc2_cbc, rsa_pkcs1_encrypt, RecipientPlain,
+    RecipientPlain, build_envelope_des_ede3_cbc, build_envelope_rc2_cbc, rsa_pkcs1_encrypt,
 };
 use oxideav_pdf::pubsec::der;
 
@@ -62,7 +62,7 @@ fn rc2_cbc_envelope_decrypts_round_trip() {
     // End-to-end: build envelope → decrypt with the matching recipient
     // RSA key → assert plaintext recovery.
     use oxideav_pdf::objects::{Dict, Object};
-    use oxideav_pdf::pubsec::{open_with_certificate, PubSecCredential};
+    use oxideav_pdf::pubsec::{PubSecCredential, open_with_certificate};
     let (priv_key, pub_key) = rsa_keypair();
     let issuer_der = der::write_sequence(b"O=RC2 round-17 RT");
     let serial = vec![0x55];
@@ -120,7 +120,7 @@ fn rc2_cbc_envelope_decrypts_round_trip() {
 fn rc2_with_eff_key_64_bits_decrypts() {
     // RFC 2268 §6: effective-key 64 bits → version byte 120.
     use oxideav_pdf::objects::{Dict, Object};
-    use oxideav_pdf::pubsec::{open_with_certificate, PubSecCredential};
+    use oxideav_pdf::pubsec::{PubSecCredential, open_with_certificate};
     let (priv_key, pub_key) = rsa_keypair();
     let issuer_der = der::write_sequence(b"O=RC2 64-bit");
     let serial = vec![0x40];
@@ -204,7 +204,7 @@ fn des_ede3_cbc_envelope_parses_with_correct_iv() {
 #[test]
 fn des_ede3_cbc_envelope_decrypts_round_trip() {
     use oxideav_pdf::objects::{Dict, Object};
-    use oxideav_pdf::pubsec::{open_with_certificate, PubSecCredential};
+    use oxideav_pdf::pubsec::{PubSecCredential, open_with_certificate};
     let (priv_key, pub_key) = rsa_keypair();
     let issuer_der = der::write_sequence(b"O=3DES round-17 RT");
     let serial = vec![0x37];

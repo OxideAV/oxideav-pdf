@@ -22,7 +22,7 @@
 //! update section pointing at a cross-reference stream that surfaces
 //! an object stream's entries).
 
-use oxideav_pdf::reader::xref::{parse_xref, XrefEntry};
+use oxideav_pdf::reader::xref::{XrefEntry, parse_xref};
 
 /// Build the same hybrid-reference PDF that lives under
 /// `tests/fixtures/hybrid_xrefstm.pdf`. Kept in sync byte-for-byte so

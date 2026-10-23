@@ -9,17 +9,17 @@
 //! Provenance: ISO 32000-1 §7.6.4 + ISO 32000-2 §7.6.5 + RFC 5652
 //! §6.2.2 + RFC 5753 §7.1 + RFC 3394 only.
 
-use oxideav_pdf::decrypt::{md5, CryptMethod, StandardHandler};
+use oxideav_pdf::decrypt::{CryptMethod, StandardHandler, md5};
 use oxideav_pdf::pubsec::cms_build::{
-    build_envelope_kari_aes256, KariRecipientIdRef, KariRecipientPlain, OriginatorIdRef,
+    KariRecipientIdRef, KariRecipientPlain, OriginatorIdRef, build_envelope_kari_aes256,
 };
 use oxideav_pdf::pubsec::der;
 use oxideav_pdf::pubsec::kari::{
-    wrap_cek_for_p256_recipient, WrapAlgorithm, OID_DH_SINGLE_PASS_STDDH_SHA256_KDF,
-    OID_EC_PUBLIC_KEY, OID_SECP256R1,
+    OID_DH_SINGLE_PASS_STDDH_SHA256_KDF, OID_EC_PUBLIC_KEY, OID_SECP256R1, WrapAlgorithm,
+    wrap_cek_for_p256_recipient,
 };
 use oxideav_pdf::pubsec::x509::Certificate;
-use oxideav_pdf::{read_pdf_to_scene_with_certificate, PubSecCredential};
+use oxideav_pdf::{PubSecCredential, read_pdf_to_scene_with_certificate};
 
 /// AES-256 CBC encrypt + PKCS#7 pad — used to build the per-object
 /// content stream whose key is the SHA-256-derived file key.
@@ -65,8 +65,8 @@ fn derive_file_key_sha256(seed: &[u8], envelopes: &[Vec<u8>], n: usize) -> Vec<u
 /// Generate a deterministic test P-256 keypair from a 32-byte seed
 /// scalar. Returns `(scalar_bytes, sec1_uncompressed_point_bytes)`.
 fn p256_keypair_from(scalar: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
     use p256::SecretKey;
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
     let sk = SecretKey::from_slice(scalar).expect("scalar valid");
     let point = sk.public_key().to_encoded_point(false).as_bytes().to_vec();
     (scalar.to_vec(), point)

@@ -24,7 +24,7 @@
 //!   marks the page and 1 leaves it unchanged; `Decode [1 0]` reverses
 //!   the meanings.
 
-use super::content::{rgba_from_components, ColorSpaceKind};
+use super::content::{ColorSpaceKind, rgba_from_components};
 
 /// Widths §8.9.5.1 Table 89 permits for `BitsPerComponent`.
 fn valid_bpc(bpc: u32) -> bool {
@@ -166,10 +166,11 @@ pub(crate) fn decode_image_to_rgba(
             if let Some(lut) = &lut {
                 let code = read_code(row, x, bpc);
                 let mut px = lut[code as usize];
-                if let Some(key) = key {
-                    if key[0].0 <= code && code <= key[0].1 {
-                        px[3] = 0;
-                    }
+                if let Some(key) = key
+                    && key[0].0 <= code
+                    && code <= key[0].1
+                {
+                    px[3] = 0;
                 }
                 rgba.extend_from_slice(&px);
                 continue;
@@ -241,7 +242,7 @@ pub(crate) fn decode_gray_plane(
         decode,
         None,
     )?;
-    Some(rgba.chunks_exact(4).map(|px| px[0]).collect())
+    Some(rgba.as_chunks::<4>().0.iter().map(|px| px[0]).collect())
 }
 
 /// Nearest-neighbour resample of a per-pixel plane from `sw × sh` to

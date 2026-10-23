@@ -32,8 +32,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_pdf::reader::filters::{
-    apply_predictor, ascii85_decode, ascii_hex_decode, flate_decompress, lzw_decode,
-    lzw_decode_with_early_change, run_length_decode, PredictorParams,
+    PredictorParams, apply_predictor, ascii_hex_decode, ascii85_decode, flate_decompress,
+    lzw_decode, lzw_decode_with_early_change, run_length_decode,
 };
 
 fuzz_target!(|data: &[u8]| {

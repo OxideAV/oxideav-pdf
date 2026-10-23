@@ -88,8 +88,8 @@ fn parse_objstm_self_container_no_stack_overflow() {
 #[test]
 fn extraction_surfaces_no_stack_overflow_on_pages_cycle() {
     use oxideav_pdf::reader::{
-        extract_text, image_xobjects, links, named_destinations, outline, page_labels,
-        DocumentReader,
+        DocumentReader, extract_text, image_xobjects, links, named_destinations, outline,
+        page_labels,
     };
     let bytes = include_bytes!("fixtures/fuzz_parse_extraction_pages_cycle.bin");
     let _ = read_pdf_to_scene(bytes);
@@ -122,7 +122,7 @@ fn extraction_surfaces_no_stack_overflow_on_pages_cycle() {
 #[test]
 fn parse_outline_first_self_cycle_no_stack_overflow() {
     use oxideav_pdf::reader::{
-        extract_text, named_destinations, outline, page_labels, DocumentReader,
+        DocumentReader, extract_text, named_destinations, outline, page_labels,
     };
     let bytes = include_bytes!("fixtures/fuzz_parse_outline_first_cycle.bin");
     // Pre-fix this aborts via stack overflow; post-fix every call
@@ -156,7 +156,7 @@ fn parse_outline_first_self_cycle_no_stack_overflow() {
 /// `timeout-4ef63c68…`-class input.
 #[test]
 fn parse_tounicode_bfrange_span_terminates() {
-    use oxideav_pdf::reader::{extract_text, DocumentReader};
+    use oxideav_pdf::reader::{DocumentReader, extract_text};
     let bytes = include_bytes!("fixtures/fuzz_parse_tounicode_bfrange_span.bin");
     // The whole point is that this *returns promptly*: pre-fix it spins
     // for minutes, post-fix it completes in milliseconds. Guard with a

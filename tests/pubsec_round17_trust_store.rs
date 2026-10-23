@@ -14,16 +14,16 @@
 
 use oxideav_pdf::decrypt::{CryptMethod, StandardHandler};
 use oxideav_pdf::pubsec::cms_build::{
-    build_envelope_kari_aes256, KariRecipientIdRef, KariRecipientPlain, OriginatorIdRef,
+    KariRecipientIdRef, KariRecipientPlain, OriginatorIdRef, build_envelope_kari_aes256,
 };
 use oxideav_pdf::pubsec::der;
 use oxideav_pdf::pubsec::kari::{
-    wrap_cek_for_p256_recipient, KariCurve, WrapAlgorithm, OID_DH_SINGLE_PASS_STDDH_SHA256_KDF,
+    KariCurve, OID_DH_SINGLE_PASS_STDDH_SHA256_KDF, WrapAlgorithm, wrap_cek_for_p256_recipient,
 };
 use oxideav_pdf::pubsec::x509::Certificate;
 use oxideav_pdf::{
-    read_pdf_to_scene_with_certificate, read_pdf_to_scene_with_certificate_and_trust_store,
-    CertRef, PubSecCredential, TrustStore,
+    CertRef, PubSecCredential, TrustStore, read_pdf_to_scene_with_certificate,
+    read_pdf_to_scene_with_certificate_and_trust_store,
 };
 
 /// AES-256 CBC encrypt + PKCS#7 pad — used to build the per-object
@@ -64,8 +64,8 @@ fn derive_file_key_sha256(seed: &[u8], envelopes: &[Vec<u8>], n: usize) -> Vec<u
 }
 
 fn p256_keypair_from(scalar: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
     use p256::SecretKey;
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
     let sk = SecretKey::from_slice(scalar).expect("scalar valid");
     let point = sk.public_key().to_encoded_point(false).as_bytes().to_vec();
     (scalar.to_vec(), point)

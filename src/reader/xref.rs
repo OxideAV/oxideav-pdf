@@ -550,7 +550,9 @@ fn parse_xref_stream_at(input: &[u8], xref_pos: usize) -> Result<XrefTable, PdfE
                 ));
             }
             items
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|chunk| {
                     let (Object::Integer(s), Object::Integer(c)) = (&chunk[0], &chunk[1]) else {
                         return Err(PdfError::other(
@@ -753,7 +755,7 @@ fn apply_predictor(raw: &[u8], dict: &Dict, entry_width: usize) -> Result<Vec<u8
     }
     // PNG predictors store one tag byte per row + `columns` data bytes.
     let row_size = columns + 1;
-    if raw.len() % row_size != 0 {
+    if !raw.len().is_multiple_of(row_size) {
         return Err(PdfError::other(format!(
             "PDF reader: predictor row size {row_size} doesn't divide raw len {}",
             raw.len()

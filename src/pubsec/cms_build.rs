@@ -770,7 +770,7 @@ fn build_kari(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pubsec::cms::{parse_envelope, RecipientInfoVariant};
+    use crate::pubsec::cms::{RecipientInfoVariant, parse_envelope};
 
     /// Round-trip: build a single-recipient KARI envelope by hand,
     /// parse it back, assert structural fields match.

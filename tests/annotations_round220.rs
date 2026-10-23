@@ -15,7 +15,7 @@
 //!   PDF 1.7 `/TB` and `/NP` flags.
 
 use oxideav_pdf::reader::DocumentReader;
-use oxideav_pdf::{read_pdf_annotations, AnnotationKind, ThreeDActivation, ThreeDViewSelector};
+use oxideav_pdf::{AnnotationKind, ThreeDActivation, ThreeDViewSelector, read_pdf_annotations};
 
 fn read_annots(pdf: &[u8]) -> Vec<oxideav_pdf::PdfAnnotation> {
     let mut r = DocumentReader::open(pdf).unwrap();

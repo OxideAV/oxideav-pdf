@@ -11,8 +11,8 @@
 
 use oxideav_pdf::reader::DocumentReader;
 use oxideav_pdf::{
-    read_pdf_annotations, AnnotationKind, OutlineDestination, PdfLinkTarget, TextMarkupVariant,
-    XmpPacket,
+    AnnotationKind, OutlineDestination, PdfLinkTarget, TextMarkupVariant, XmpPacket,
+    read_pdf_annotations,
 };
 
 /// Build a minimal one-page PDF with the supplied per-page annotation
@@ -398,7 +398,7 @@ fn one_page_scene() -> oxideav_scene::Scene {
 #[test]
 fn writer_link_annotations_round_trip_through_unified_reader() {
     use oxideav_pdf::{
-        write_pdf_from_scene_with_outlines_and_links, LinkAnnotationSpec, LinkTarget,
+        LinkAnnotationSpec, LinkTarget, write_pdf_from_scene_with_outlines_and_links,
     };
     let scene = one_page_scene();
     let links = vec![LinkAnnotationSpec {

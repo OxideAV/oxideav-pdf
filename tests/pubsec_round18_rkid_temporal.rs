@@ -19,13 +19,13 @@
 //!
 //! Provenance: RFC 5652 §6.2.2 + RFC 5280 §4.1.2.5 (Validity) only.
 
-use oxideav_pdf::pubsec::cms::{parse_envelope, KeyAgreeRecipientId, RecipientInfoVariant};
+use oxideav_pdf::TrustStore;
+use oxideav_pdf::pubsec::cms::{KeyAgreeRecipientId, RecipientInfoVariant, parse_envelope};
 use oxideav_pdf::pubsec::cms_build::{
-    build_envelope_kari_aes256, KariRecipientIdRef, KariRecipientPlain, OriginatorIdRef,
+    KariRecipientIdRef, KariRecipientPlain, OriginatorIdRef, build_envelope_kari_aes256,
 };
 use oxideav_pdf::pubsec::der;
 use oxideav_pdf::pubsec::x509::Certificate;
-use oxideav_pdf::TrustStore;
 
 /// Build a minimal KARI envelope whose single recipient slot carries
 /// an RKID with the supplied SKI + optional `date` + optional `other`.

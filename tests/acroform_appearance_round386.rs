@@ -16,8 +16,8 @@ use oxideav_core::vector::{
 };
 use oxideav_pdf::reader::DocumentReader;
 use oxideav_pdf::{
-    read_pdf_annotations, read_pdf_to_scene, write_pdf_with_form, FormField, FormFieldCheckbox,
-    FormFieldRadioGroup, RadioOption,
+    FormField, FormFieldCheckbox, FormFieldRadioGroup, RadioOption, read_pdf_annotations,
+    read_pdf_to_scene, write_pdf_with_form,
 };
 use oxideav_scene::{Page, Scene};
 

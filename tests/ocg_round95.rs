@@ -24,10 +24,10 @@
 //! reference bytes — no qpdf / pdfium / mupdf source consulted.
 
 use oxideav_pdf::objects::ObjectId;
+use oxideav_pdf::reader::DocumentReader;
 use oxideav_pdf::reader::ocg::{
     OcBaseState, OcMembership, OcOrderItem, OcVisibilityExpression, OcVisibilityPolicy,
 };
-use oxideav_pdf::reader::DocumentReader;
 use std::io::Write as _;
 
 /// Build a minimal PDF whose catalog carries a populated `/OCProperties`

@@ -8,7 +8,7 @@
 
 use std::process::{Command, Stdio};
 
-use oxideav_pdf::reader::{page_label_ranges, page_labels, DocumentReader, PageLabelStyle};
+use oxideav_pdf::reader::{DocumentReader, PageLabelStyle, page_label_ranges, page_labels};
 
 /// Assemble a classic-xref PDF from `(object_number, body)` pairs.
 fn build_pdf(objects: &[(u32, String)]) -> Vec<u8> {
@@ -138,9 +138,11 @@ fn no_page_labels_entry_returns_none() {
     ]);
     let mut reader = DocumentReader::open(&pdf).expect("open");
     assert!(page_labels(&mut reader).expect("page_labels").is_none());
-    assert!(page_label_ranges(&mut reader)
-        .expect("page_label_ranges")
-        .is_none());
+    assert!(
+        page_label_ranges(&mut reader)
+            .expect("page_label_ranges")
+            .is_none()
+    );
 }
 
 #[test]

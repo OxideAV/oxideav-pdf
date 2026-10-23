@@ -15,13 +15,13 @@
 use oxideav_pdf::pubsec::der;
 use oxideav_pdf::pubsec::signed_data::SignerIdentifier;
 use oxideav_pdf::pubsec::verify::{
-    build_message_digest_attribute_der, implicit_signed_attrs_tlv, pack_signed_attrs_implicit,
-    rsa_pubkey_to_pkcs1_der, signed_attrs_to_be_signed, verify_signature, AttachedContent, HashAlg,
-    OID_RSA_ENCRYPTION, OID_SHA256,
+    AttachedContent, HashAlg, OID_RSA_ENCRYPTION, OID_SHA256, build_message_digest_attribute_der,
+    implicit_signed_attrs_tlv, pack_signed_attrs_implicit, rsa_pubkey_to_pkcs1_der,
+    signed_attrs_to_be_signed, verify_signature,
 };
 use oxideav_pdf::pubsec::x509::Certificate;
 use oxideav_pdf::reader::DocumentReader;
-use oxideav_pdf::{pdf_signed_bytes, PdfSignature};
+use oxideav_pdf::{PdfSignature, pdf_signed_bytes};
 
 // -------------------------------------------------------------------
 // Minimal-PDF fixture builder

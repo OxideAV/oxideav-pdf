@@ -24,11 +24,11 @@ use oxideav_core::vector::{
     FillRule, Group, Node, Paint, Path, PathCommand, PathNode, Point, Rgba, VectorFrame,
 };
 use oxideav_pdf::pubsec::der;
-use oxideav_pdf::pubsec::verify::{rsa_pubkey_to_pkcs1_der, HashAlg, OID_RSA_ENCRYPTION};
+use oxideav_pdf::pubsec::verify::{HashAlg, OID_RSA_ENCRYPTION, rsa_pubkey_to_pkcs1_der};
 use oxideav_pdf::reader::DocumentReader;
 use oxideav_pdf::{
-    add_document_timestamp, sign_pdf_from_scene, MockTsaSigner, RsaPkcs1v15Sha256Signer,
-    SignerIdentity,
+    MockTsaSigner, RsaPkcs1v15Sha256Signer, SignerIdentity, add_document_timestamp,
+    sign_pdf_from_scene,
 };
 use oxideav_scene::{Page, Scene};
 
@@ -235,7 +235,7 @@ fn document_timestamp_appends_revision_and_roundtrips_through_reader() {
 /// that algorithm); panics on any structural mismatch so test failures
 /// are loud.
 fn extract_message_imprint_hash_sha256(tst: &[u8]) -> Option<Vec<u8>> {
-    use oxideav_pdf::pubsec::der::{read_expected, read_oid, read_sequence, Class};
+    use oxideav_pdf::pubsec::der::{Class, read_expected, read_oid, read_sequence};
 
     // Outer ContentInfo SEQUENCE { contentType=id-signedData, [0] EXPLICIT SignedData }.
     let (body, _) = read_sequence(tst).ok()?;
@@ -265,7 +265,7 @@ fn extract_message_imprint_hash_sha256(tst: &[u8]) -> Option<Vec<u8>> {
     let (tst_body, _) = read_sequence(oct.body).ok()?;
     let (_, rest) = oxideav_pdf::pubsec::der::read_tlv(tst_body).ok()?; // version
     let (_, rest) = oxideav_pdf::pubsec::der::read_tlv(rest).ok()?; // policy OID
-                                                                    // messageImprint SEQUENCE { hashAlgorithm, hashedMessage }.
+    // messageImprint SEQUENCE { hashAlgorithm, hashedMessage }.
     let (mi_body, _) = read_sequence(rest).ok()?;
     let (alg_body, mi_rest) = read_sequence(mi_body).ok()?;
     let (alg_oid, _) = read_oid(alg_body).ok()?;

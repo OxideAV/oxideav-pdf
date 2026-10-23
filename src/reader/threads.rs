@@ -96,12 +96,12 @@ fn read_thread(
     let mut result = PdfThread::default();
 
     // /I — thread information dictionary (document-info syntax).
-    if let Some(info_obj) = dict_get(thread, "I") {
-        if let Ok(Object::Dict(info)) = reader.deref(info_obj) {
-            result.title = text_entry(&info, "Title");
-            result.author = text_entry(&info, "Author");
-            result.subject = text_entry(&info, "Subject");
-        }
+    if let Some(info_obj) = dict_get(thread, "I")
+        && let Ok(Object::Dict(info)) = reader.deref(info_obj)
+    {
+        result.title = text_entry(&info, "Title");
+        result.author = text_entry(&info, "Author");
+        result.subject = text_entry(&info, "Subject");
     }
 
     // /F — first bead; unroll the circular /N ring.

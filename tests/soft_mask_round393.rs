@@ -175,10 +175,10 @@ fn luminosity_smask_wraps_masked_fill() {
             return Some(g);
         }
         for c in &g.children {
-            if let Node::Group(gg) = c {
-                if let Some(found) = find_matrix_group(gg) {
-                    return Some(found);
-                }
+            if let Node::Group(gg) = c
+                && let Some(found) = find_matrix_group(gg)
+            {
+                return Some(found);
             }
         }
         None

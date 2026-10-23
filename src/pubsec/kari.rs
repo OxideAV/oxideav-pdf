@@ -547,7 +547,7 @@ pub fn build_ecc_cms_shared_info(
     entity_u_info: Option<&[u8]>,
     key_bit_length: u32,
 ) -> Vec<u8> {
-    use super::der::{write_context_constructed, write_octet_string, write_tlv, Class};
+    use super::der::{Class, write_context_constructed, write_octet_string, write_tlv};
     // keyInfo AlgorithmIdentifier — wrap OID + (no parameters per RFC
     // 3394 / RFC 5649 OID list; the AlgorithmIdentifier carries the
     // OID alone).
@@ -829,7 +829,7 @@ fn originator_point_from_cert(
 fn ecdh_z(curve: KariCurve, scalar: &[u8], originator_point: &[u8]) -> Result<Vec<u8>, PdfError> {
     match curve {
         KariCurve::P256 => {
-            use p256::{ecdh::diffie_hellman, PublicKey, SecretKey};
+            use p256::{PublicKey, SecretKey, ecdh::diffie_hellman};
             let secret = SecretKey::from_slice(scalar).map_err(|e| {
                 PdfError::other(format!(
                     "PDF pubsec KARI: invalid P-256 private scalar: {e}"
@@ -844,7 +844,7 @@ fn ecdh_z(curve: KariCurve, scalar: &[u8], originator_point: &[u8]) -> Result<Ve
             Ok(shared.raw_secret_bytes().to_vec())
         }
         KariCurve::P384 => {
-            use p384::{ecdh::diffie_hellman, PublicKey, SecretKey};
+            use p384::{PublicKey, SecretKey, ecdh::diffie_hellman};
             let secret = SecretKey::from_slice(scalar).map_err(|e| {
                 PdfError::other(format!(
                     "PDF pubsec KARI: invalid P-384 private scalar: {e}"
@@ -859,7 +859,7 @@ fn ecdh_z(curve: KariCurve, scalar: &[u8], originator_point: &[u8]) -> Result<Ve
             Ok(shared.raw_secret_bytes().to_vec())
         }
         KariCurve::P521 => {
-            use p521::{ecdh::diffie_hellman, PublicKey, SecretKey};
+            use p521::{PublicKey, SecretKey, ecdh::diffie_hellman};
             let secret = SecretKey::from_slice(scalar).map_err(|e| {
                 PdfError::other(format!(
                     "PDF pubsec KARI: invalid P-521 private scalar: {e}"
@@ -1094,10 +1094,10 @@ pub fn match_kari_slot<'a>(
                 }
             }
             KeyAgreeRecipientId::RecipientKeyIdentifier { ski, .. } => {
-                if let Some(our) = our_ski.as_ref() {
-                    if ski == our {
-                        return Some(slot);
-                    }
+                if let Some(our) = our_ski.as_ref()
+                    && ski == our
+                {
+                    return Some(slot);
                 }
             }
         }
@@ -1197,7 +1197,7 @@ pub fn wrap_cek_for_recipient_with_kdf(
     let (originator_pub, z) = match curve {
         KariCurve::P256 => {
             use p256::elliptic_curve::sec1::ToEncodedPoint;
-            use p256::{ecdh::diffie_hellman, PublicKey, SecretKey};
+            use p256::{PublicKey, SecretKey, ecdh::diffie_hellman};
             let secret = SecretKey::from_slice(ephemeral_scalar).map_err(|e| {
                 PdfError::other(format!("PDF pubsec KARI build: bad P-256 ephemeral: {e}"))
             })?;
@@ -1217,7 +1217,7 @@ pub fn wrap_cek_for_recipient_with_kdf(
         }
         KariCurve::P384 => {
             use p384::elliptic_curve::sec1::ToEncodedPoint;
-            use p384::{ecdh::diffie_hellman, PublicKey, SecretKey};
+            use p384::{PublicKey, SecretKey, ecdh::diffie_hellman};
             let secret = SecretKey::from_slice(ephemeral_scalar).map_err(|e| {
                 PdfError::other(format!("PDF pubsec KARI build: bad P-384 ephemeral: {e}"))
             })?;
@@ -1237,7 +1237,7 @@ pub fn wrap_cek_for_recipient_with_kdf(
         }
         KariCurve::P521 => {
             use p521::elliptic_curve::sec1::ToEncodedPoint;
-            use p521::{ecdh::diffie_hellman, PublicKey, SecretKey};
+            use p521::{PublicKey, SecretKey, ecdh::diffie_hellman};
             let secret = SecretKey::from_slice(ephemeral_scalar).map_err(|e| {
                 PdfError::other(format!("PDF pubsec KARI build: bad P-521 ephemeral: {e}"))
             })?;
@@ -1431,8 +1431,8 @@ mod tests {
     /// unwrap it on the recipient side and assert byte equality.
     #[test]
     fn p256_aes256_wrap_unwrap_round_trip() {
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
         use p256::SecretKey;
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
         // Deterministic test scalars (each is a valid non-zero P-256
         // scalar — well within the curve order).
         let ephemeral_scalar = [
@@ -1489,8 +1489,8 @@ mod tests {
     /// AES-128-WRAP variant of the round-trip. Same setup, smaller KEK.
     #[test]
     fn p256_aes128_wrap_unwrap_round_trip() {
-        use p256::elliptic_curve::sec1::ToEncodedPoint;
         use p256::SecretKey;
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
         let ephemeral_scalar = [0x77u8; 32];
         let recipient_scalar = [0x55u8; 32];
         let recipient_secret = SecretKey::from_slice(&recipient_scalar).unwrap();
@@ -1569,8 +1569,8 @@ mod tests {
     /// (round-15 P-384 path).
     #[test]
     fn p384_aes256_wrap_unwrap_round_trip() {
-        use p384::elliptic_curve::sec1::ToEncodedPoint;
         use p384::SecretKey;
+        use p384::elliptic_curve::sec1::ToEncodedPoint;
         // 48-byte deterministic scalars for P-384.
         let ephemeral_scalar = [0x42u8; 48];
         let recipient_scalar = [0x77u8; 48];
@@ -1788,8 +1788,8 @@ mod tests {
     /// round trip.
     #[test]
     fn p521_aes256_wrap_unwrap_round_trip() {
-        use p521::elliptic_curve::sec1::ToEncodedPoint;
         use p521::SecretKey;
+        use p521::elliptic_curve::sec1::ToEncodedPoint;
         // 66-byte deterministic scalars for P-521. The first byte
         // carries only 1 bit of the 521-bit field, so we lead with
         // 0x00 to keep the scalar comfortably below the curve order n

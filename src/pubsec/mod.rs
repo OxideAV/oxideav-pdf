@@ -264,19 +264,20 @@ impl PubSecSubFilter {
                 .find(|(kk, _)| kk == k)
                 .map(|(_, v)| v.clone())
         };
-        let sub =
-            match lookup("SubFilter") {
-                Some(Object::Name(n)) => n,
-                _ => return Err(PdfError::other(
+        let sub = match lookup("SubFilter") {
+            Some(Object::Name(n)) => n,
+            _ => {
+                return Err(PdfError::other(
                     "PDF pubsec: /Encrypt missing /SubFilter (required for public-key handlers)",
-                )),
-            };
+                ));
+            }
+        };
         let v = match lookup("V") {
             Some(Object::Integer(n)) => n,
             _ => {
                 return Err(PdfError::other(
                     "PDF pubsec: /Encrypt missing /V (required)",
-                ))
+                ));
             }
         };
         match (sub.as_str(), v) {
@@ -692,11 +693,11 @@ fn collect_recipient_arrays(encrypt: &Dict) -> Result<Vec<RecipientCandidate>, P
         // Move the StmF entry to the front so its candidate is tried
         // first — round-10 single-CF callers rely on the StmF being
         // the "default" recipient set.
-        if let Some(name) = stmf_name.as_ref() {
-            if let Some(pos) = entries.iter().position(|(k, _)| k == name) {
-                let entry = entries.remove(pos);
-                entries.insert(0, entry);
-            }
+        if let Some(name) = stmf_name.as_ref()
+            && let Some(pos) = entries.iter().position(|(k, _)| k == name)
+        {
+            let entry = entries.remove(pos);
+            entries.insert(0, entry);
         }
         for (name, entry) in &entries {
             let Object::Dict(filter) = entry else {
@@ -943,7 +944,7 @@ where
 {
     use aes::cipher::{BlockDecryptMut, KeyIvInit};
     type Dec<C> = cbc::Decryptor<C>;
-    if ct.len() % 16 != 0 {
+    if !ct.len().is_multiple_of(16) {
         return Err(PdfError::other(format!(
             "PDF pubsec: AES-CBC ciphertext {} not block-aligned",
             ct.len()
@@ -974,7 +975,7 @@ fn rc2_cbc_decrypt(
 ) -> Result<Vec<u8>, PdfError> {
     use cbc::cipher::{BlockDecryptMut, InnerIvInit};
     use rc2::Rc2;
-    if ct.len() % 8 != 0 {
+    if !ct.len().is_multiple_of(8) {
         return Err(PdfError::other(format!(
             "PDF pubsec: RC2-CBC ciphertext {} not block-aligned (8-byte blocks)",
             ct.len()
@@ -1010,7 +1011,7 @@ fn rc2_cbc_decrypt(
 fn des_ede3_cbc_decrypt(cek: &[u8], iv: &[u8; 8], ct: &[u8]) -> Result<Vec<u8>, PdfError> {
     use cbc::cipher::{BlockDecryptMut, KeyIvInit};
     use des::TdesEde3;
-    if ct.len() % 8 != 0 {
+    if !ct.len().is_multiple_of(8) {
         return Err(PdfError::other(format!(
             "PDF pubsec: 3DES-CBC ciphertext {} not block-aligned (8-byte blocks)",
             ct.len()
@@ -1068,8 +1069,8 @@ fn derive_file_key(
 #[cfg(test)]
 mod tests {
     use super::cms_build::{
-        build_envelope_aes128, build_envelope_aes256, build_envelope_rc4, rsa_pkcs1_encrypt,
-        RecipientPlain,
+        RecipientPlain, build_envelope_aes128, build_envelope_aes256, build_envelope_rc4,
+        rsa_pkcs1_encrypt,
     };
     use super::*;
     use crate::objects::Dict;
