@@ -138,7 +138,15 @@ fn rise_saved_and_restored_by_q_capital_q() {
     assert_eq!(runs[0].text_rise, 0.0);
     assert_eq!(runs[1].text_rise, 7.0);
     assert_eq!(runs[2].text_rise, 0.0, "q/Q restored the baseline rise");
-    assert_eq!(runs[2].position, (50.0, 700.0));
+    // `Q` restores the text matrix saved at `q`, so `after` starts
+    // where `before` ended: 50 + the Helvetica advance of "before"
+    // (556+556+278+556+333+556 = 2835 thousandths × 12 pt).
+    assert!(
+        (runs[2].position.0 - 84.02).abs() < 0.01,
+        "{:?}",
+        runs[2].position
+    );
+    assert_eq!(runs[2].position.1, 700.0);
 }
 
 #[test]

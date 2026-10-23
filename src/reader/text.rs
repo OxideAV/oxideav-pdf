@@ -62,6 +62,7 @@ use crate::reader::encoding::{
 /// physical size should multiply by the CTM extracted from the
 /// reader's group walker.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct TextRun {
     /// Decoded Unicode payload — the result of mapping every encoded
     /// byte / CID through the font's `/ToUnicode` CMap (or the
@@ -101,6 +102,95 @@ pub struct TextRun {
     /// a run as super/subscript without reverse-engineering the offset
     /// from the position delta.
     pub text_rise: f32,
+    /// The text matrix `Tm` (`[a b c d e f]`, ISO 32000-1 §9.4.2) in
+    /// force when the show fired — before the run's own advance and
+    /// without the rise folded in. Its first column `(a, b)` is the
+    /// baseline direction and `hypot(a, b) × font_size` the rendered
+    /// em; [`Self::end`] maps the run's advance through it. Identity
+    /// for a run assembled by hand.
+    pub text_matrix: [f32; 6],
+    /// The §9.4.4 displacement `(tx, ty)` the run's glyphs produced,
+    /// in unscaled text-space units (glyph advances × `Tfs`, plus
+    /// `Tc` / `Tw` / `TJ` kerns, × `Th` horizontally). `ty` is non-zero
+    /// only in vertical writing mode. `(0, 0)` when the font declared
+    /// no metrics, so [`Self::end`] then coincides with the origin.
+    pub advance: (f32, f32),
+}
+
+impl TextRun {
+    /// A run with the text-state defaults (`Fill`, no rise, identity
+    /// text matrix, no advance). Builders set the rest with the
+    /// `with_*` methods.
+    pub fn new(
+        text: impl Into<String>,
+        position: (f32, f32),
+        font_name: impl Into<String>,
+        font_size: f32,
+    ) -> Self {
+        Self {
+            text: text.into(),
+            position,
+            font_name: font_name.into(),
+            font_size,
+            render_mode: TextRenderMode::Fill,
+            text_rise: 0.0,
+            text_matrix: identity(),
+            advance: (0.0, 0.0),
+        }
+    }
+
+    /// Set the text rendering mode.
+    pub fn with_render_mode(mut self, mode: TextRenderMode) -> Self {
+        self.render_mode = mode;
+        self
+    }
+
+    /// Set the text rise.
+    pub fn with_text_rise(mut self, rise: f32) -> Self {
+        self.text_rise = rise;
+        self
+    }
+
+    /// Set the text matrix in force at the show.
+    pub fn with_text_matrix(mut self, tm: [f32; 6]) -> Self {
+        self.text_matrix = tm;
+        self
+    }
+
+    /// Set the run's unscaled text-space advance.
+    pub fn with_advance(mut self, advance: (f32, f32)) -> Self {
+        self.advance = advance;
+        self
+    }
+
+    /// The point in user space where the run's glyphs end — the origin
+    /// the next show on the same line starts from — on the same
+    /// (rise-adjusted) baseline as [`Self::position`].
+    pub fn end(&self) -> (f32, f32) {
+        let m = self.text_matrix;
+        let (tx, ty) = self.advance;
+        let (x, y) = self.position;
+        (x + m[0] * tx + m[2] * ty, y + m[1] * tx + m[3] * ty)
+    }
+
+    /// The rendered em of the run: `font_size` scaled by the text
+    /// matrix's horizontal basis. `font_size` alone when the matrix
+    /// is degenerate.
+    pub fn em(&self) -> f32 {
+        let m = self.text_matrix;
+        let s = (m[0] * m[0] + m[1] * m[1]).sqrt();
+        if s > 0.0 && s.is_finite() {
+            self.font_size * s
+        } else {
+            self.font_size
+        }
+    }
+
+    /// Writing direction: `true` when the run advanced vertically
+    /// (a `WMode 1` font) rather than along the baseline.
+    pub fn is_vertical(&self) -> bool {
+        self.advance.0 == 0.0 && self.advance.1 != 0.0
+    }
 }
 
 /// Text rendering mode — the integer argument to the `Tr` operator
@@ -209,12 +299,371 @@ impl PdfTextExtraction {
     /// blob (e.g. keyword search). A real layout engine would walk the
     /// individual runs + positions to reconstruct lines / paragraphs.
     pub fn flat_text(&self) -> String {
-        self.runs
-            .iter()
-            .map(|r| r.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" ")
+        assemble_text(&self.runs)
     }
+
+    /// The runs assembled into lines — see [`assemble_text`] for the
+    /// word-gap and line-break rules.
+    pub fn lines(&self) -> Vec<String> {
+        assemble_text(&self.runs)
+            .split('\n')
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+/// Assemble text runs into words and lines from their geometry.
+///
+/// Producers lay text down in very different granularities: one show
+/// per word with the inter-word gap as a `TJ` kern or a `Td` move
+/// (pdfTeX), one show per word plus a separate space glyph (cairo), or
+/// one show per glyph with a `Td` between every pair (Skia, many
+/// browser print paths). Joining runs with a fixed separator therefore
+/// either glues words together or spaces every letter out. This pass
+/// instead walks the runs in the given order and decides each boundary
+/// from the geometry the walker recorded on the runs:
+///
+/// * **Line break** — the next run's baseline (its origin projected on
+///   the perpendicular of the previous run's baseline direction) moves
+///   by more than half the larger em, or the run starts more than half
+///   an em *behind* the previous run's end on the same baseline (a new
+///   line or column that happens to share the baseline).
+/// * **Word break** — on the same line, the gap between the previous
+///   run's [`TextRun::end`] and the next run's origin is at least
+///   [`WORD_GAP_EM`] of the smaller em plus the line's letter spacing.
+///   Glyph-level kerns stay below that; a space advance (0.2–0.35 em
+///   in text faces, 0.17 em for TeX's most-shrunk interword glue)
+///   lands above it. The letter spacing is measured on the line
+///   itself when it is laid down glyph by glyph (see
+///   [`letter_spacing_estimate`]), so tracked headings keep their
+///   words. A literal space glyph on either side of the boundary is
+///   kept as is, never doubled.
+/// * **Otherwise** the runs are glued, so per-glyph shows rebuild
+///   their word.
+///
+/// A line whose letters are mostly right-to-left script is painted in
+/// visual order (leftmost glyph first); it is reversed back into
+/// logical order, see [`reorder_bidi_line`].
+///
+/// Runs whose text is empty contribute nothing but do not move the
+/// previous run's end. Vertical-writing runs use the perpendicular
+/// axis as their line axis. The thresholds are extraction heuristics
+/// — the spec defines the geometry, not a word-break rule — and are
+/// shared with the `TJ` in-run kern rule ([`TextWalker::WORD_BREAK_GAP`]).
+pub fn assemble_text(runs: &[TextRun]) -> String {
+    // 1. Group into lines.
+    let mut lines: Vec<Vec<&TextRun>> = Vec::new();
+    let mut cur: Vec<&TextRun> = Vec::new();
+    for run in runs.iter().filter(|r| !r.text.is_empty()) {
+        if let Some(prev) = cur.last() {
+            if starts_new_line(prev, run) {
+                lines.push(std::mem::take(&mut cur));
+            }
+        }
+        cur.push(run);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    // 2. Words within each line.
+    let mut out = String::new();
+    for (li, line) in lines.iter().enumerate() {
+        if li > 0 {
+            out.push('\n');
+        }
+        let gaps: Vec<(f32, f32)> = line.windows(2).map(|w| run_gap(w[0], w[1])).collect();
+        let singles: Vec<bool> = line.iter().map(|r| is_single_glyph(&r.text)).collect();
+        // Letter spacing in user units: the estimate works in em
+        // fractions of each pair's smaller font, so normalise the gaps.
+        let rel: Vec<f32> = gaps
+            .iter()
+            .map(|(g, em)| if *em > 0.0 { g / em } else { 0.0 })
+            .collect();
+        let ls_em = letter_spacing_estimate(&singles, &rel, 1.0);
+        let mut text = String::new();
+        for (i, run) in line.iter().enumerate() {
+            if i > 0 {
+                let (gap, em) = gaps[i - 1];
+                if gap >= (WORD_GAP_EM + ls_em) * em
+                    && !text.ends_with(char::is_whitespace)
+                    && !run.text.starts_with(char::is_whitespace)
+                {
+                    text.push(' ');
+                }
+            }
+            text.push_str(&run.text);
+        }
+        while text.ends_with(' ') {
+            text.pop();
+        }
+        out.push_str(&reorder_bidi_line(&text));
+    }
+    out
+}
+
+/// Minimum same-line gap, as a fraction of the smaller run's em, that
+/// [`assemble_text`] reads as an inter-word space (before the line's
+/// letter spacing is added).
+pub const WORD_GAP_EM: f32 = 0.15;
+
+/// Baseline offset, as a fraction of the larger em, beyond which two
+/// runs are on different lines.
+const LINE_SHIFT_EM: f32 = 0.5;
+
+/// Backtrack along the baseline, as a fraction of the larger em,
+/// beyond which a run on the same baseline starts a new line.
+const BACKTRACK_EM: f32 = 0.5;
+
+/// Largest gap, in em, that can still be letter spacing rather than a
+/// word gap.
+const MAX_LETTER_SPACING_EM: f32 = 0.3;
+
+/// Unit baseline direction and its perpendicular for a run, from the
+/// text matrix (the vertical-writing axis for a `WMode 1` run).
+fn run_axes(r: &TextRun) -> ((f32, f32), (f32, f32)) {
+    let m = r.text_matrix;
+    let (ax, ay) = if r.is_vertical() {
+        // Vertical runs advance along -y of text space.
+        (-m[2], -m[3])
+    } else {
+        (m[0], m[1])
+    };
+    let len = (ax * ax + ay * ay).sqrt();
+    let u = if len > 0.0 && len.is_finite() {
+        (ax / len, ay / len)
+    } else {
+        (1.0, 0.0)
+    };
+    (u, (-u.1, u.0))
+}
+
+fn dot(a: (f32, f32), b: (f32, f32)) -> f32 {
+    a.0 * b.0 + a.1 * b.1
+}
+
+fn em_pair(p: &TextRun, r: &TextRun) -> (f32, f32) {
+    let em_p = p.em().abs();
+    let em_r = r.em().abs();
+    let big = em_p.max(em_r).max(1e-3);
+    let small = if em_p > 0.0 && em_r > 0.0 {
+        em_p.min(em_r)
+    } else {
+        big
+    };
+    (big, small)
+}
+
+/// Whether `r` starts a new line after `p`: a baseline shift, or a
+/// backtrack along the baseline past `p`'s end.
+fn starts_new_line(p: &TextRun, r: &TextRun) -> bool {
+    let (u, v) = run_axes(p);
+    let (em_big, _) = em_pair(p, r);
+    let across = dot(r.position, v) - dot(p.position, v);
+    if across.abs() > LINE_SHIFT_EM * em_big {
+        return true;
+    }
+    let gap = dot(r.position, u) - dot(p.end(), u);
+    gap < -BACKTRACK_EM * em_big
+}
+
+/// Gap along the baseline from `p`'s end to `r`'s origin (user units,
+/// rightward positive) and the pair's smaller em.
+fn run_gap(p: &TextRun, r: &TextRun) -> (f32, f32) {
+    let (u, _) = run_axes(p);
+    let (_, em_small) = em_pair(p, r);
+    (dot(r.position, u) - dot(p.end(), u), em_small)
+}
+
+/// One letter or digit's worth of text: a single alphanumeric
+/// character. Punctuation does not count (a comma is followed by a
+/// word gap, not by letter spacing), nor does a ligature that decoded
+/// to several characters.
+fn is_single_glyph(text: &str) -> bool {
+    let mut chars = text.chars();
+    matches!((chars.next(), chars.next()), (Some(c), None) if c.is_alphanumeric())
+}
+
+/// Letter spacing of a line laid down glyph by glyph.
+///
+/// `singles[i]` says whether piece `i` is one glyph, `gaps[i]` is the
+/// gap between pieces `i` and `i + 1` in units where `em` is one em.
+/// When at least half of the pieces are single glyphs and two or more
+/// positive gaps between adjacent single glyphs stay under
+/// [`MAX_LETTER_SPACING_EM`], the smallest of those is the tracking
+/// every glyph received and a word gap is that much wider than usual.
+/// Per-word layouts and kerned `TJ` arrays yield `0`.
+fn letter_spacing_estimate(singles: &[bool], gaps: &[f32], em: f32) -> f32 {
+    let n = singles.len();
+    if n < 3 || singles.iter().filter(|s| **s).count() * 2 < n {
+        return 0.0;
+    }
+    let cap = MAX_LETTER_SPACING_EM * em;
+    let mut best: Option<f32> = None;
+    let mut count = 0usize;
+    for (i, g) in gaps.iter().enumerate() {
+        if singles[i] && singles.get(i + 1).copied().unwrap_or(false) && *g > 0.0 && *g <= cap {
+            count += 1;
+            best = Some(best.map_or(*g, |b: f32| b.min(*g)));
+        }
+    }
+    if count >= 2 {
+        best.unwrap_or(0.0)
+    } else {
+        0.0
+    }
+}
+
+/// Whether a character belongs to a right-to-left script block
+/// (Hebrew, Arabic, Syriac, Thaana, NKo, Samaritan, Mandaic, Arabic
+/// Extended / Presentation Forms).
+fn is_rtl_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x1_0800..=0x1_0FFF | 0x1_E800..=0x1_EFFF
+    )
+}
+
+/// Combining mark that stays attached to the preceding base character
+/// when a run is reversed (Hebrew points, Arabic harakat, general
+/// combining diacriticals, variation selectors).
+fn is_combining_mark(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x0300..=0x036F
+            | 0x0483..=0x0489
+            | 0x0591..=0x05BD
+            | 0x05BF
+            | 0x05C1..=0x05C2
+            | 0x05C4..=0x05C5
+            | 0x05C7
+            | 0x0610..=0x061A
+            | 0x064B..=0x065F
+            | 0x0670
+            | 0x06D6..=0x06DC
+            | 0x06DF..=0x06E4
+            | 0x06E7..=0x06E8
+            | 0x06EA..=0x06ED
+            | 0x0711
+            | 0x0730..=0x074A
+            | 0x07A6..=0x07B0
+            | 0x07EB..=0x07F3
+            | 0x0816..=0x082D
+            | 0x08D3..=0x08FF
+            | 0x200C..=0x200D
+            | 0xFE00..=0xFE0F
+    )
+}
+
+fn mirror_bracket(c: char) -> char {
+    match c {
+        '(' => ')',
+        ')' => '(',
+        '[' => ']',
+        ']' => '[',
+        '{' => '}',
+        '}' => '{',
+        '<' => '>',
+        '>' => '<',
+        '«' => '»',
+        '»' => '«',
+        '‹' => '›',
+        '›' => '‹',
+        other => other,
+    }
+}
+
+/// Reverse a visual-order span into logical order: grapheme-wise (a
+/// combining mark follows its base, a lam-alef ligature that one glyph
+/// decoded to stays lam-then-alef), mirroring paired brackets.
+fn reverse_visual(span: &str) -> String {
+    let mut clusters: Vec<String> = Vec::new();
+    for c in span.chars() {
+        let lam_alef =
+            matches!(c, 'ا' | 'أ' | 'إ' | 'آ') && clusters.last().is_some_and(|l| l == "ل");
+        if (is_combining_mark(c) || lam_alef) && !clusters.is_empty() {
+            clusters.last_mut().unwrap().push(c);
+        } else {
+            clusters.push(mirror_bracket(c).to_string());
+        }
+    }
+    clusters.iter().rev().flat_map(|s| s.chars()).collect()
+}
+
+/// Put a line painted in visual order back into logical order.
+///
+/// Right-to-left text is drawn leftmost glyph first, so the extracted
+/// characters come out reversed. When right-to-left letters outnumber
+/// left-to-right letters the whole line is reversed (its punctuation
+/// and digits were positioned for a right-to-left paragraph); in a
+/// left-to-right line only the maximal spans of right-to-left letters,
+/// with the neutrals between them, are reversed. Digit runs inside a
+/// reversed span are flipped back so numbers keep their order.
+pub fn reorder_bidi_line(line: &str) -> String {
+    let rtl = line.chars().filter(|c| is_rtl_char(*c)).count();
+    if rtl == 0 {
+        return line.to_owned();
+    }
+    let ltr = line
+        .chars()
+        .filter(|c| c.is_alphabetic() && !is_rtl_char(*c) && !is_combining_mark(*c))
+        .count();
+    let restore_digits = |s: String| -> String {
+        // Digits inside a reversed span were reversed too; flip each
+        // maximal digit run back.
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i].is_ascii_digit() {
+                let mut j = i;
+                while j < chars.len()
+                    && (chars[j].is_ascii_digit()
+                        || (chars[j] == '.' || chars[j] == ',')
+                            && j + 1 < chars.len()
+                            && chars[j + 1].is_ascii_digit())
+                {
+                    j += 1;
+                }
+                out.extend(chars[i..j].iter().rev());
+                i = j;
+            } else {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+        out
+    };
+    if rtl > ltr {
+        return restore_digits(reverse_visual(line));
+    }
+    // Mixed line: reverse each maximal RTL span (letters plus the
+    // neutrals strictly between them).
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if !is_rtl_char(chars[i]) {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // Extend to the last RTL letter reachable through neutrals.
+        let mut end = i + 1;
+        let mut last_rtl = i;
+        while end < chars.len() {
+            let c = chars[end];
+            if is_rtl_char(c) || is_combining_mark(c) {
+                last_rtl = end;
+            } else if c.is_alphabetic() {
+                break;
+            }
+            end += 1;
+        }
+        let span: String = chars[i..=last_rtl].iter().collect();
+        out.push_str(&restore_digits(reverse_visual(&span)));
+        i = last_rtl + 1;
+    }
+    out
 }
 
 impl<'a> DocumentReader<'a> {
@@ -437,6 +886,16 @@ enum FontAdvance {
     },
     /// Composite font (§9.7.4.3) — see [`CidAdvance`].
     Cid(Box<CidAdvance>),
+    /// A standard-14 face without `/Widths` (§9.6.2.2 lets a producer
+    /// omit them): widths from the built-in AFM tables, looked up by
+    /// the glyph's Unicode text under the font's encoding, or by code
+    /// under the face's own built-in encoding when no `/Encoding`
+    /// applies or the text is unknown to the table.
+    Std14 {
+        metrics: &'static crate::reader::std14_metrics::Std14Metrics,
+        encoding: Option<Box<EncodingMap>>,
+        missing: f32,
+    },
     /// No resolvable widths — every glyph advances 0 (prior behaviour).
     None,
 }
@@ -508,6 +967,25 @@ impl FontAdvance {
                 }
                 cid.default
             }
+            FontAdvance::Std14 {
+                metrics,
+                encoding,
+                missing,
+            } => {
+                let Ok(code) = u8::try_from(code) else {
+                    return *missing;
+                };
+                let by_text = encoding.as_ref().and_then(|enc| {
+                    let t = enc.lookup(code);
+                    (!t.is_empty())
+                        .then(|| metrics.width_by_unicode(t))
+                        .flatten()
+                });
+                by_text
+                    .or_else(|| metrics.width_by_code(code))
+                    .map(f32::from)
+                    .unwrap_or(*missing)
+            }
             FontAdvance::None => 0.0,
         }
     }
@@ -564,9 +1042,6 @@ fn build_font_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvan
         Some(Object::Array(items)) => items.iter().map(|o| obj_as_f32(o).unwrap_or(0.0)).collect(),
         _ => Vec::new(),
     };
-    if widths.is_empty() {
-        return FontAdvance::None;
-    }
     // /MissingWidth lives in the /FontDescriptor (§9.8.1 Table 122).
     let descr = font
         .entries()
@@ -586,6 +1061,34 @@ fn build_font_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvan
             .unwrap_or(0.0),
         _ => 0.0,
     };
+    if widths.is_empty() {
+        // §9.6.2.2: the standard 14 fonts may omit /Widths — take the
+        // AFM metrics, keyed through whatever encoding the dict sets.
+        let base_font = font
+            .entries()
+            .iter()
+            .find_map(|(k, v)| match (k.as_str(), v) {
+                ("BaseFont", Object::Name(s)) => Some(s.as_str()),
+                _ => None,
+            });
+        if let Some(metrics) = base_font.and_then(crate::reader::std14_metrics::resolve) {
+            let encoding = match FontDecoder::simple_from_encoding(
+                reader,
+                font,
+                subtype.unwrap_or("Type1"),
+                None,
+            ) {
+                Ok(FontDecoder::SimpleMap(m)) => Some(m),
+                _ => None,
+            };
+            return FontAdvance::Std14 {
+                metrics,
+                encoding,
+                missing,
+            };
+        }
+        return FontAdvance::None;
+    }
     // §9.6.5: a Type 3 font's /Widths are in glyph space and scaled to
     // text space by the /FontMatrix horizontal component. Type1 /
     // TrueType widths are already in thousandths of text space.
@@ -905,7 +1408,9 @@ fn extract_page(
         return Ok(());
     };
     let mut walker = TextWalker::new(fonts, advances);
-    walker.parse(&content_bytes)?;
+    // A malformed page keeps the runs it produced up to the fault;
+    // the rest of the document still extracts.
+    let _ = walker.parse(&content_bytes);
     out.runs.extend(walker.into_runs());
     Ok(())
 }
@@ -921,7 +1426,7 @@ fn extract_page_marked(
     };
     let mut walker = TextWalker::new(fonts, advances);
     walker.track_mcid = true;
-    walker.parse(&content_bytes)?;
+    let _ = walker.parse(&content_bytes);
     let runs = walker.into_runs_with_mcid();
     for (run, mcid) in runs {
         out.runs.push(MarkedTextRun {
@@ -978,6 +1483,17 @@ enum FontDecoder {
     /// Boxed because the 256-entry table dwarfs the other variants
     /// and `clippy::large_enum_variant` flags the unboxed form.
     SimpleMap(Box<EncodingMap>),
+    /// Simple font (Type1 / TrueType / Type3) with a `/ToUnicode`
+    /// CMap. A simple font's codes are single bytes whatever the
+    /// CMap's `codespacerange` claims (InDesign writes `<0000>
+    /// <FFFF>` over one-byte `bfchar` sources), so every byte is
+    /// looked up on its own; a byte the CMap leaves out falls back to
+    /// the font's encoding (§9.10.2's second method) rather than
+    /// U+FFFD.
+    SimpleToUnicode {
+        map: CMap,
+        fallback: Option<Box<EncodingMap>>,
+    },
     /// No discernible encoding — fall back to Latin-1 byte → code
     /// point (identity for ASCII; reasonable for CP1252 punctuation).
     Latin1,
@@ -985,6 +1501,15 @@ enum FontDecoder {
 
 impl FontDecoder {
     fn from_dict(reader: &mut DocumentReader<'_>, font: &Dict) -> Result<FontDecoder, PdfError> {
+        let subtype = font
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Subtype")
+            .and_then(|(_, v)| match v {
+                Object::Name(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .unwrap_or("");
         // 1. /ToUnicode wins regardless of the /Subtype — even simple
         // fonts may carry one (PDF/UA mandates it for text extraction).
         let to_unicode = font
@@ -1001,20 +1526,19 @@ impl FontDecoder {
                 let bytes = decode_stream(&s)?;
                 let map = CMap::parse(&bytes)?;
                 let cid_width = map.byte_width;
-                return Ok(FontDecoder::ToUnicode { map, cid_width });
+                if subtype == "Type0" {
+                    return Ok(FontDecoder::ToUnicode { map, cid_width });
+                }
+                let builtin = embedded_type1_encoding(reader, font);
+                let fallback = match Self::simple_from_encoding(reader, font, subtype, builtin)? {
+                    FontDecoder::SimpleMap(m) => Some(m),
+                    _ => None,
+                };
+                return Ok(FontDecoder::SimpleToUnicode { map, fallback });
             }
         }
 
         // 2. Composite font (Type0) without /ToUnicode — Identity-H/V.
-        let subtype = font
-            .entries()
-            .iter()
-            .find(|(k, _)| k == "Subtype")
-            .and_then(|(_, v)| match v {
-                Object::Name(s) => Some(s.as_str()),
-                _ => None,
-            })
-            .unwrap_or("");
         if subtype == "Type0" {
             // /Encoding is one of (§9.7.6.1 Table 121): the
             // Identity-H / Identity-V predefined names, another
@@ -1047,13 +1571,49 @@ impl FontDecoder {
                 None => return Ok(FontDecoder::IdentityNoCMap),
             }
         }
+        let builtin = embedded_type1_encoding(reader, font);
+        Self::simple_from_encoding(reader, font, subtype, builtin)
+    }
 
-        // 3. Simple font with named /Encoding.
+    /// The simple-font decoder from `/Encoding` (§9.6.6) over the
+    /// font's built-in encoding: `embedded` is the one read out of an
+    /// embedded Type 1 program when there is one.
+    fn simple_from_encoding(
+        reader: &mut DocumentReader<'_>,
+        font: &Dict,
+        subtype: &str,
+        embedded: Option<EncodingMap>,
+    ) -> Result<FontDecoder, PdfError> {
+        // The built-in encoding of a standard-14 Symbol / ZapfDingbats
+        // face is its own set (Annex D.5 / D.6), not StandardEncoding;
+        // it is the base when no /Encoding or no /BaseEncoding says
+        // otherwise.
+        let builtin = font
+            .entries()
+            .iter()
+            .find_map(|(k, v)| match (k.as_str(), v) {
+                ("BaseFont", Object::Name(s)) => crate::reader::std14_metrics::resolve(s),
+                _ => None,
+            })
+            .filter(|m| m.is_symbolic())
+            .map(|m| {
+                if m.name == "Symbol" {
+                    BaseEncoding::Symbol
+                } else {
+                    BaseEncoding::ZapfDingbats
+                }
+            });
+        // 3. Simple font with named /Encoding. The entry is often an
+        // indirect reference to the encoding dict (pdfTeX, Ghostscript).
         let enc = font
             .entries()
             .iter()
             .find(|(k, _)| k == "Encoding")
             .map(|(_, v)| v.clone());
+        let enc = match enc {
+            Some(Object::Reference(id)) => reader.resolve(id).ok(),
+            other => other,
+        };
         if let Some(Object::Name(name)) = enc {
             if let Some(base) = BaseEncoding::from_name(name.as_str()) {
                 return Ok(FontDecoder::SimpleMap(Box::new(EncodingMap::from_base(
@@ -1085,15 +1645,20 @@ impl FontDecoder {
                 });
             let base_map = match base_name.as_deref().and_then(BaseEncoding::from_name) {
                 Some(b) => EncodingMap::from_base(b),
-                None => {
-                    // No (recognised) /BaseEncoding — pick a sensible
-                    // default per the font subtype.
-                    let default = match subtype {
-                        "TrueType" => BaseEncoding::WinAnsi,
-                        _ => BaseEncoding::Standard,
-                    };
-                    EncodingMap::from_base(default)
-                }
+                None => match embedded {
+                    // §9.6.6.1: without /BaseEncoding the differences
+                    // apply over the font's built-in encoding.
+                    Some(m) => m,
+                    None => {
+                        // The built-in encoding when it is a known
+                        // one, else a sensible default per subtype.
+                        let default = builtin.unwrap_or(match subtype {
+                            "TrueType" => BaseEncoding::WinAnsi,
+                            _ => BaseEncoding::Standard,
+                        });
+                        EncodingMap::from_base(default)
+                    }
+                },
             };
             // Overlay /Differences if present.
             let diffs_obj = enc_d
@@ -1101,6 +1666,10 @@ impl FontDecoder {
                 .iter()
                 .find(|(k, _)| k == "Differences")
                 .map(|(_, v)| v.clone());
+            let diffs_obj = match diffs_obj {
+                Some(Object::Reference(id)) => reader.resolve(id).ok(),
+                other => other,
+            };
             let final_map = match diffs_obj {
                 Some(arr @ Object::Array(_)) => {
                     let diffs = parse_encoding_differences(&arr)?;
@@ -1110,9 +1679,16 @@ impl FontDecoder {
             };
             return Ok(FontDecoder::SimpleMap(Box::new(final_map)));
         }
-        // Default for Type1 / Type3 with no /Encoding is
-        // StandardEncoding (§9.6.6.1). TrueType with no /Encoding is
+        // Default for Type1 / Type3 with no /Encoding is the font's
+        // built-in encoding — StandardEncoding for the Latin faces
+        // (§9.6.6.1). TrueType with no /Encoding is
         // implementation-dependent — use WinAnsi.
+        if let Some(m) = embedded {
+            return Ok(FontDecoder::SimpleMap(Box::new(m)));
+        }
+        if let Some(b) = builtin {
+            return Ok(FontDecoder::SimpleMap(Box::new(EncodingMap::from_base(b))));
+        }
         let default = match subtype {
             "TrueType" => BaseEncoding::WinAnsi,
             "Type1" | "Type3" | "MMType1" => BaseEncoding::Standard,
@@ -1138,9 +1714,25 @@ impl FontDecoder {
                 // mixed-width CMaps (1-byte ASCII passthrough alongside
                 // a 2-byte CJK territory) decode correctly.
                 if !map.codespaces.is_empty() {
+                    // An invalid code (§9.7.6.3) consumes the length
+                    // of the shortest codespace its first byte
+                    // partially matches; producers write `<0002>
+                    // <3a2f>` meaning the linear CID range, which the
+                    // byte-wise rule rejects for most codes, and this
+                    // rule still steps them two bytes at a time. With
+                    // no partial match either, a CMap whose codespaces
+                    // all share one width still steps by that width
+                    // (a ToUnicode codespace only has to settle the
+                    // code length).
+                    let uniform = map.uniform_codespace_width();
                     let mut i = 0;
                     while i < bytes.len() {
-                        if let Some(w) = map.match_codespace_width(&bytes[i..]) {
+                        let matched = map
+                            .match_codespace_width(&bytes[i..])
+                            .or_else(|| map.partial_match_width(bytes[i]))
+                            .or(uniform)
+                            .filter(|w| i + w <= bytes.len());
+                        if let Some(w) = matched {
                             let cid = bytes_to_u32(&bytes[i..i + w]);
                             if let Some(s) = map.lookup(cid) {
                                 out.push_str(s);
@@ -1215,9 +1807,131 @@ impl FontDecoder {
                 out
             }
             FontDecoder::SimpleMap(map) => map.decode(bytes),
+            FontDecoder::SimpleToUnicode { map, fallback } => {
+                let mut out = String::new();
+                for &b in bytes {
+                    if let Some(s) = map.lookup(b as u32) {
+                        out.push_str(s);
+                    } else if let Some(enc) = fallback {
+                        let s = enc.lookup(b);
+                        if s.is_empty() {
+                            out.push(b as char);
+                        } else {
+                            out.push_str(s);
+                        }
+                    } else {
+                        out.push(b as char);
+                    }
+                }
+                out
+            }
             FontDecoder::Latin1 => bytes.iter().map(|&b| b as char).collect(),
         }
     }
+}
+
+// ────────────────────────── embedded Type 1 encoding ──────────────────────────
+
+/// The built-in encoding of an embedded Type 1 font program
+/// (`/FontFile`, §9.9 Table 126): the `/Encoding` entry of the
+/// cleartext portion — either `StandardEncoding` or an array filled
+/// by `dup <code> /<glyph> put` lines. `None` when the font is not an
+/// embedded Type 1 or its program carries no readable encoding.
+fn embedded_type1_encoding(reader: &mut DocumentReader<'_>, font: &Dict) -> Option<EncodingMap> {
+    let descr = font
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "FontDescriptor")
+        .map(|(_, v)| v.clone())?;
+    let Ok(Object::Dict(descr)) = reader.deref(descr) else {
+        return None;
+    };
+    let file = descr
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "FontFile")
+        .map(|(_, v)| v.clone())?;
+    let Ok(Object::Stream(stream)) = reader.deref(file) else {
+        return None;
+    };
+    let bytes = decode_stream(&stream).ok()?;
+    parse_type1_cleartext_encoding(&bytes)
+}
+
+/// Parse the `/Encoding` of a Type 1 program's cleartext (everything
+/// before `eexec`): `StandardEncoding`, or `256 array` followed by
+/// one `dup <code> /<name> put` per assigned slot up to the closing
+/// `readonly def` / `def`.
+fn parse_type1_cleartext_encoding(program: &[u8]) -> Option<EncodingMap> {
+    let clear_end = find_bytes(program, b"eexec").unwrap_or(program.len());
+    let clear = &program[..clear_end];
+    let enc_at = find_bytes(clear, b"/Encoding")?;
+    let after = &clear[enc_at + "/Encoding".len()..];
+    let mut i = 0;
+    while i < after.len() && is_ws(after[i]) {
+        i += 1;
+    }
+    if after[i..].starts_with(b"StandardEncoding") {
+        return Some(EncodingMap::from_base(BaseEncoding::Standard));
+    }
+    let mut map = EncodingMap::new();
+    let mut any = false;
+    let mut pos = i;
+    while pos < after.len() {
+        // Next token.
+        while pos < after.len() && is_ws(after[pos]) {
+            pos += 1;
+        }
+        let start = pos;
+        while pos < after.len() && !is_ws(after[pos]) {
+            pos += 1;
+        }
+        let tok = &after[start..pos];
+        if tok.is_empty() {
+            break;
+        }
+        if tok == b"dup" {
+            while pos < after.len() && is_ws(after[pos]) {
+                pos += 1;
+            }
+            let num_start = pos;
+            while pos < after.len() && after[pos].is_ascii_digit() {
+                pos += 1;
+            }
+            let code = str::from_utf8(&after[num_start..pos])
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok());
+            while pos < after.len() && is_ws(after[pos]) {
+                pos += 1;
+            }
+            if pos < after.len() && after[pos] == b'/' {
+                let name_start = pos + 1;
+                let mut k = name_start;
+                while k < after.len() && !is_ws(after[k]) && !is_delim(after[k]) {
+                    k += 1;
+                }
+                if let (Some(code), Ok(name)) = (code, str::from_utf8(&after[name_start..k])) {
+                    if code < 256 {
+                        if let Some(text) = crate::reader::encoding::glyph_name_to_unicode(name) {
+                            map.set_string(code as u8, text.as_ref());
+                            any = true;
+                        }
+                    }
+                }
+                pos = k;
+            }
+        } else if (tok == b"def" || tok == b"readonly") && any {
+            break;
+        }
+    }
+    any.then_some(map)
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 // ────────────────────────── CMap parser ──────────────────────────
@@ -1350,6 +2064,26 @@ impl CMap {
     /// that lists `<00><7F>` (1 byte) before `<8140><FCFC>` (2 bytes)
     /// picks 1 byte for `0x41` and 2 bytes for `0x81 0x40`, matching
     /// what the §9.10.3 decoder is required to do.
+    /// §9.7.6.3: the length of the shortest codespace whose first-byte
+    /// bounds admit `first` — how many bytes an invalid code starting
+    /// with that byte consumes.
+    fn partial_match_width(&self, first: u8) -> Option<usize> {
+        self.codespaces
+            .iter()
+            .filter(|cs| !cs.lo.is_empty() && cs.lo[0] <= first && first <= cs.hi[0])
+            .map(CodespaceRange::width)
+            .min()
+    }
+
+    /// The single byte width every declared codespace shares, if so.
+    fn uniform_codespace_width(&self) -> Option<usize> {
+        let w = self.codespaces.first()?.width();
+        self.codespaces
+            .iter()
+            .all(|cs| cs.width() == w)
+            .then_some(w)
+    }
+
     fn match_codespace_width(&self, bytes: &[u8]) -> Option<usize> {
         for cs in &self.codespaces {
             if cs.matches(bytes) {
@@ -1781,6 +2515,10 @@ struct TextWalker {
     /// Horizontal scaling `Th` (§9.3.4) as a fraction (`scale ÷ 100`).
     /// Scales the §9.4.4 horizontal advance. Default 1.0.
     horiz_scale: f32,
+    /// Displacement accumulated by the current show operator
+    /// (unscaled text space); reset before each show, stored on the
+    /// run afterwards as [`TextRun::advance`].
+    run_advance: (f32, f32),
     /// Saved text states — one entry per `q`. We don't push the whole
     /// graphics state (paint, transform, etc.) since the path walker
     /// already covers those; just the text-relevant slots.
@@ -1796,6 +2534,9 @@ struct TextWalker {
     /// property dict has no MCID, and for `BMC` blocks). The top of
     /// the stack is what `emit_show` stamps into `run_mcids`.
     mcid_stack: Vec<Option<u32>>,
+    /// One frame per open `BDC` / `BMC` (always maintained, unlike
+    /// `mcid_stack`): `Some` when the block declared `/ActualText`.
+    actual_stack: Vec<Option<ActualSpan>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1810,7 +2551,20 @@ enum TextOperand {
     /// has no MCID slot). Used by `BDC` to push a marked-content frame.
     Dict {
         mcid: Option<u32>,
+        /// `/ActualText` (§14.9.4) scanned out of the dict, decoded
+        /// from PDFDocEncoding / UTF-16BE.
+        actual_text: Option<String>,
     },
+}
+
+/// One open marked-content frame's replacement text: the `/ActualText`
+/// a `BDC` declared (§14.9.4) and the index of the run that carries
+/// it once the first show inside the span fired. Later shows in the
+/// same span add no run; they extend that run's advance.
+#[derive(Clone, Debug)]
+struct ActualSpan {
+    text: String,
+    run: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -1858,9 +2612,11 @@ impl TextWalker {
             char_spacing: 0.0,
             word_spacing: 0.0,
             horiz_scale: 1.0,
+            run_advance: (0.0, 0.0),
             saved: Vec::new(),
             track_mcid: false,
             mcid_stack: Vec::new(),
+            actual_stack: Vec::new(),
         }
     }
 
@@ -1907,19 +2663,31 @@ impl TextWalker {
                 let start = i;
                 let mut depth = 1u32;
                 i += 2;
-                while i + 1 < input.len() && depth > 0 {
-                    if input[i] == b'<' && input[i + 1] == b'<' {
+                while i < input.len() && depth > 0 {
+                    if input[i] == b'<' && input.get(i + 1) == Some(&b'<') {
                         depth += 1;
                         i += 2;
-                    } else if input[i] == b'>' && input[i + 1] == b'>' {
+                    } else if input[i] == b'>' && input.get(i + 1) == Some(&b'>') {
                         depth -= 1;
                         i += 2;
+                    } else if input[i] == b'(' {
+                        // A string value: its bytes never open or
+                        // close a nesting level.
+                        i = read_literal_string(input, i)
+                            .map(|(e, _)| e)
+                            .unwrap_or(input.len());
+                    } else if input[i] == b'<' {
+                        // Hex string: `<FEFF00AD>>>` ends the string
+                        // first, then the dict.
+                        i = read_hex_string_payload(input, i)
+                            .map(|(_, e)| e)
+                            .unwrap_or(input.len());
                     } else {
                         i += 1;
                     }
                 }
-                let mcid = scan_inline_mcid(&input[start..i]);
-                self.operands.push(TextOperand::Dict { mcid });
+                let (mcid, actual_text) = scan_inline_props(&input[start..i]);
+                self.operands.push(TextOperand::Dict { mcid, actual_text });
                 continue;
             }
             if b == b'[' {
@@ -1977,6 +2745,14 @@ impl TextWalker {
             let kw_end = scan_kw_end(input, i);
             if kw_end == i {
                 i += 1;
+                continue;
+            }
+            if &input[i..kw_end] == b"BI" {
+                // Inline image (§8.9.7): the payload between `ID` and
+                // `EI` is arbitrary bytes — a `(` in it would otherwise
+                // be read as a string running to the end of the stream.
+                i = skip_inline_image(input, kw_end);
+                self.operands.clear();
                 continue;
             }
             self.dispatch(&input[i..kw_end])?;
@@ -2154,8 +2930,15 @@ impl TextWalker {
             // Marked-content operators (ISO 32000-1 §14.6).
             b"BDC" => {
                 // tag properties BDC. Pop properties, then tag.
+                let mut actual_text = None;
                 let mcid = match self.operands.pop() {
-                    Some(TextOperand::Dict { mcid }) => mcid,
+                    Some(TextOperand::Dict {
+                        mcid,
+                        actual_text: at,
+                    }) => {
+                        actual_text = at;
+                        mcid
+                    }
                     Some(TextOperand::Name(_)) => {
                         // /Properties resource ref — round-29 doesn't
                         // resolve indirect property dicts (the writer
@@ -2173,6 +2956,8 @@ impl TextWalker {
                 if self.track_mcid {
                     self.mcid_stack.push(mcid);
                 }
+                self.actual_stack
+                    .push(actual_text.map(|text| ActualSpan { text, run: None }));
                 self.operands.clear();
             }
             b"BMC" => {
@@ -2181,12 +2966,14 @@ impl TextWalker {
                 if self.track_mcid {
                     self.mcid_stack.push(None);
                 }
+                self.actual_stack.push(None);
                 self.operands.clear();
             }
             b"EMC" => {
                 if self.track_mcid {
                     self.mcid_stack.pop();
                 }
+                self.actual_stack.pop();
                 self.operands.clear();
             }
             b"MP" => {
@@ -2282,10 +3069,12 @@ impl TextWalker {
             return;
         }
         let text = self.decode_bytes(bytes);
-        self.push_run(text);
+        let span_run = self.begin_span_run(|| text);
         // §9.4.4 — advance Tm past the shown glyphs so a following show
         // on the same line starts at the correct origin.
+        self.run_advance = (0.0, 0.0);
         self.advance_bytes(bytes);
+        self.end_span_run(span_run);
         self.operands.clear();
     }
 
@@ -2311,23 +3100,35 @@ impl TextWalker {
             self.operands.clear();
             return;
         }
-        let mut text = String::new();
-        // Pending rightward gap (in thousandths of an em) accumulated by
-        // numeric elements since the last string element. Applied as a
-        // word break only when the next string element arrives, so a
-        // trailing adjustment doesn't append a dangling space.
+        // Kerns ahead of the first string move the origin the first
+        // glyph is drawn at (pdfTeX opens a new font's array with the
+        // interword gap: `/F45 Tf [-724(Bold)…]TJ`); apply them before
+        // the run is recorded so its position — and the gap the line
+        // assembler measures from the previous run — is the glyph's.
+        let first_str = arr
+            .iter()
+            .position(|it| matches!(it, TJItem::Str(_)))
+            .unwrap_or(arr.len());
+        for item in &arr[..first_str] {
+            if let TJItem::Kern(adj) = item {
+                self.advance_kern(*adj);
+            }
+        }
+        let arr = &arr[first_str..];
+        // Decode every string once; the gaps between consecutive
+        // strings (thousandths of an em, rightward positive) feed the
+        // letter-spacing estimate and the word-break rule.
+        let mut pieces: Vec<String> = Vec::new();
+        let mut gaps: Vec<f32> = Vec::new();
         let mut pending_gap = 0.0f32;
         for item in arr {
             match item {
                 TJItem::Str(b) => {
-                    if pending_gap >= Self::WORD_BREAK_GAP
-                        && !text.is_empty()
-                        && !text.ends_with(' ')
-                    {
-                        text.push(' ');
+                    if !pieces.is_empty() {
+                        gaps.push(pending_gap);
                     }
                     pending_gap = 0.0;
-                    text.push_str(&self.decode_bytes(b));
+                    pieces.push(self.decode_bytes(b));
                 }
                 // Numeric adjustment: subtracted from the horizontal
                 // coordinate, so negate to get the rightward gap. Positive
@@ -2336,17 +3137,86 @@ impl TextWalker {
                 TJItem::Kern(adj) => pending_gap += -adj,
             }
         }
+        let ls = letter_spacing_estimate(
+            pieces
+                .iter()
+                .map(|t| is_single_glyph(t))
+                .collect::<Vec<_>>()
+                .as_slice(),
+            &gaps,
+            1000.0,
+        );
+        let mut text = String::new();
+        for (i, piece) in pieces.iter().enumerate() {
+            if i > 0
+                && gaps[i - 1] >= Self::WORD_BREAK_GAP + ls
+                && !text.is_empty()
+                && !text.ends_with(' ')
+            {
+                text.push(' ');
+            }
+            text.push_str(piece);
+        }
         // Record the run at the array's start origin, then advance Tm
         // through every element (glyph widths + per-element kerns,
         // §9.4.3 / §9.4.4) so a following show is correctly positioned.
-        self.push_run(text);
+        let span_run = self.begin_span_run(|| text);
+        self.run_advance = (0.0, 0.0);
         for item in arr {
             match item {
                 TJItem::Str(b) => self.advance_bytes(b),
                 TJItem::Kern(adj) => self.advance_kern(*adj),
             }
         }
+        self.end_span_run(span_run);
         self.operands.clear();
+    }
+
+    /// Start the run for a show: outside an `/ActualText` span the
+    /// decoded `text` becomes a new run; inside one, the span's
+    /// replacement text is the run — pushed on the span's first show,
+    /// reused (and extended by [`Self::end_span_run`]) on later ones.
+    /// Returns the index of a span run to extend, if any.
+    fn begin_span_run(&mut self, text: impl FnOnce() -> String) -> Option<usize> {
+        let span = self.actual_stack.iter_mut().rev().find_map(|f| f.as_mut());
+        match span {
+            None => {
+                self.push_run(text());
+                None
+            }
+            Some(span) => match span.run {
+                Some(idx) => Some(idx),
+                None => {
+                    let replacement = span.text.clone();
+                    let idx = self.runs.len();
+                    span.run = Some(idx);
+                    self.push_run(replacement);
+                    None
+                }
+            },
+        }
+    }
+
+    /// Close the show begun by [`Self::begin_span_run`]: store the
+    /// accumulated advance on a fresh run, or move an existing span
+    /// run's end to the current text origin.
+    fn end_span_run(&mut self, span_run: Option<usize>) {
+        match span_run {
+            None => self.finish_run_advance(),
+            Some(idx) => {
+                self.run_advance = (0.0, 0.0);
+                let tm = self.tm;
+                if let Some(run) = self.runs.get_mut(idx) {
+                    let m = run.text_matrix;
+                    let (dx, dy) = (tm[4] - m[4], tm[5] - m[5]);
+                    let det = m[0] * m[3] - m[1] * m[2];
+                    if det.abs() > 1e-9 {
+                        run.advance =
+                            ((dx * m[3] - dy * m[2]) / det, (dy * m[0] - dx * m[1]) / det);
+                    }
+                }
+            }
+        }
     }
 
     /// Append a decoded run at the current text position + font, stamping
@@ -2368,6 +3238,8 @@ impl TextWalker {
             font_size: self.cur_size,
             render_mode: self.render_mode,
             text_rise: rise,
+            text_matrix: self.tm,
+            advance: (0.0, 0.0),
         });
         // Stamp the current MCID (top of stack) onto the run.
         let cur_mcid = self.mcid_stack.last().copied().unwrap_or(None);
@@ -2473,6 +3345,7 @@ impl TextWalker {
     fn translate_tm(&mut self, tx: f32) {
         let translate = [1.0, 0.0, 0.0, 1.0, tx, 0.0];
         self.tm = mul(translate, self.tm);
+        self.run_advance.0 += tx;
     }
 
     /// Translate `Tm` by `(0, ty)` in text space — the §9.4.4
@@ -2480,19 +3353,44 @@ impl TextWalker {
     fn translate_tm_v(&mut self, ty: f32) {
         let translate = [1.0, 0.0, 0.0, 1.0, 0.0, ty];
         self.tm = mul(translate, self.tm);
+        self.run_advance.1 += ty;
+    }
+
+    /// Store the displacement accumulated since the last `push_run` on
+    /// that run.
+    fn finish_run_advance(&mut self) {
+        if let Some(run) = self.runs.last_mut() {
+            run.advance = self.run_advance;
+        }
+        self.run_advance = (0.0, 0.0);
     }
 
     /// Minimum rightward `TJ` gap, in thousandths of an em, that the
     /// text extractor treats as an inter-word space rather than
-    /// intra-word kerning. 0.25 em (= 250) is comfortably above the
-    /// ISO 32000-1 Figure 46 kerns (−120 / −95) yet below a real space
-    /// advance (~0.25–0.35 em for most fonts), so word boundaries that a
+    /// intra-word kerning — [`WORD_GAP_EM`] in thousandths. 0.15 em is
+    /// above the ISO 32000-1 Figure 46 kerns (−120 / −95) and below
+    /// the narrowest real space advance (TeX's fully shrunk interword
+    /// glue is ~0.17 em in Times, 0.22 em in Computer Modern; text
+    /// faces place a space at 0.2–0.35 em), so word boundaries a
     /// producer encoded purely as a `TJ` displacement are recovered
-    /// without false-splitting tightly-kerned text.
-    const WORD_BREAK_GAP: f32 = 250.0;
+    /// without false-splitting kerned text.
+    const WORD_BREAK_GAP: f32 = WORD_GAP_EM * 1000.0;
 }
 
 // ────────────────────────── helpers ──────────────────────────
+
+/// Skip a `BI … ID … EI` inline image whose `BI` keyword ended at
+/// `after_bi`; returns the offset just past `EI` (or the end of the
+/// stream when no delimited `EI` follows).
+fn skip_inline_image(input: &[u8], after_bi: usize) -> usize {
+    use crate::reader::inline_images::{find_inline_image_ei, parse_one_inline_image};
+    match parse_one_inline_image(input, after_bi) {
+        Ok((_, resume)) => resume,
+        Err(_) => find_inline_image_ei(input, after_bi)
+            .map(|ei| ei + 2)
+            .unwrap_or(input.len()),
+    }
+}
 
 fn identity() -> [f32; 6] {
     [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
@@ -2528,12 +3426,15 @@ fn scan_kw_end(input: &[u8], start: usize) -> usize {
 }
 
 /// Best-effort scan of a top-level inline-dict slice (`<<...>>`) for
-/// `/MCID <integer>`. We only care about the MCID at the dict's top
-/// level — nested dicts are skipped wholesale. Whitespace tolerant;
-/// returns `None` if no `/MCID` key is present.
-fn scan_inline_mcid(bytes: &[u8]) -> Option<u32> {
+/// `/MCID <integer>` and `/ActualText <string>` (§14.9.4). Only the
+/// dict's top level is read — nested dicts are skipped wholesale, and
+/// string values are stepped over as strings so their bytes can't
+/// open or close a nesting level. Whitespace tolerant.
+fn scan_inline_props(bytes: &[u8]) -> (Option<u32>, Option<String>) {
+    let mut mcid = None;
+    let mut actual = None;
     if bytes.len() < 4 || &bytes[..2] != b"<<" {
-        return None;
+        return (mcid, actual);
     }
     let body = &bytes[2..bytes.len().saturating_sub(2)];
     let mut i = 0;
@@ -2554,6 +3455,20 @@ fn scan_inline_mcid(bytes: &[u8]) -> Option<u32> {
             i += 2;
             continue;
         }
+        if b == b'(' {
+            i = match read_literal_string(body, i) {
+                Ok((end, _)) => end,
+                Err(_) => body.len(),
+            };
+            continue;
+        }
+        if b == b'<' {
+            i = match read_hex_string_payload(body, i) {
+                Ok((_, end)) => end,
+                Err(_) => body.len(),
+            };
+            continue;
+        }
         if depth > 0 {
             // Inside a nested dict — skip.
             i += 1;
@@ -2567,29 +3482,56 @@ fn scan_inline_mcid(bytes: &[u8]) -> Option<u32> {
             }
             let name = &body[i + 1..end];
             i = end;
+            while i < body.len() && is_ws(body[i]) {
+                i += 1;
+            }
             if name == b"MCID" {
-                // Skip ws.
-                while i < body.len() && is_ws(body[i]) {
-                    i += 1;
-                }
-                // Read integer.
                 let mut e = i;
                 while e < body.len() && (body[e].is_ascii_digit() || body[e] == b'-') {
                     e += 1;
                 }
-                if e == i {
-                    return None;
+                if e > i {
+                    mcid = std::str::from_utf8(&body[i..e])
+                        .ok()
+                        .and_then(|s| s.parse::<u32>().ok());
                 }
-                let s = std::str::from_utf8(&body[i..e]).ok()?;
-                return s.parse::<u32>().ok();
+                i = e;
+            } else if name == b"ActualText" {
+                let payload = match body.get(i) {
+                    Some(b'(') => read_literal_string(body, i).ok(),
+                    Some(b'<') => read_hex_string_payload(body, i)
+                        .ok()
+                        .map(|(v, end)| (end, v)),
+                    _ => None,
+                };
+                if let Some((end, raw)) = payload {
+                    actual = Some(decode_text_string_bytes(&raw));
+                    i = end;
+                }
             }
-            // Else: skip the value that follows.
             continue;
         }
         // Skip any other top-level token.
         i += 1;
     }
-    None
+    (mcid, actual)
+}
+
+/// PDF text string (§7.9.2.2): UTF-16BE behind a `FE FF` byte-order
+/// mark, UTF-8 behind the `EF BB BF` mark, else PDFDocEncoding, which
+/// coincides with Latin-1 for the characters that matter here.
+fn decode_text_string_bytes(b: &[u8]) -> String {
+    if b.len() >= 2 && b[0] == 0xFE && b[1] == 0xFF {
+        let utf16: Vec<u16> = b[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&utf16)
+    } else if b.len() >= 3 && b[..3] == [0xEF, 0xBB, 0xBF] {
+        String::from_utf8_lossy(&b[3..]).into_owned()
+    } else {
+        b.iter().map(|&c| c as char).collect()
+    }
 }
 
 fn read_literal_string(input: &[u8], start: usize) -> Result<(usize, Vec<u8>), PdfError> {
@@ -2796,22 +3738,8 @@ mod tests {
     fn flat_text_joins_runs_with_spaces() {
         let pe = PdfTextExtraction {
             runs: vec![
-                TextRun {
-                    text: "Hello".into(),
-                    position: (0.0, 0.0),
-                    font_name: "F0".into(),
-                    font_size: 12.0,
-                    render_mode: TextRenderMode::Fill,
-                    text_rise: 0.0,
-                },
-                TextRun {
-                    text: "World".into(),
-                    position: (40.0, 0.0),
-                    font_name: "F0".into(),
-                    font_size: 12.0,
-                    render_mode: TextRenderMode::Fill,
-                    text_rise: 0.0,
-                },
+                TextRun::new("Hello", (0.0, 0.0), "F0", 12.0).with_advance((30.0, 0.0)),
+                TextRun::new("World", (40.0, 0.0), "F0", 12.0).with_advance((30.0, 0.0)),
             ],
         };
         assert_eq!(pe.flat_text(), "Hello World");

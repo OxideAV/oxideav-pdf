@@ -49,6 +49,7 @@ pub mod page_labels;
 pub mod parse;
 pub mod pdfa;
 pub mod sig;
+pub(crate) mod std14_metrics;
 pub mod text;
 pub mod threads;
 pub mod xmp;
@@ -99,8 +100,8 @@ pub use page_labels::{
 pub use pdfa::{pdfa_signals, PdfACatalogSignals, PdfAConformance};
 pub use sig::{doc_timestamps, signatures, signed_bytes, PdfDocTimestamp, PdfSignature};
 pub use text::{
-    extract_text, extract_text_marked, MarkedTextRun, PdfMarkedTextExtraction, PdfTextExtraction,
-    TextRenderMode, TextRun,
+    assemble_text, extract_text, extract_text_marked, reorder_bidi_line, MarkedTextRun,
+    PdfMarkedTextExtraction, PdfTextExtraction, TextRenderMode, TextRun, WORD_GAP_EM,
 };
 pub use threads::{threads, PdfBead, PdfThread};
 pub use xmp::XmpPacket;

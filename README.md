@@ -183,16 +183,27 @@ for an end-to-end verify.
 [`DocumentReader::open`] gives access to a family of extraction walkers:
 
 - **Text extraction** — `text_extraction()` emits one `TextRun` per
-  `Tj` / `TJ` / `'` / `"` show with text-matrix origin, font + size, and
-  Unicode mapping via `/ToUnicode` CMap (mixed-width codespaces honoured)
-  or simple-font encoding (`WinAnsi` / `MacRoman` / `/Differences` over
-  the Adobe Glyph List, including `uniXXXX` / `uXXXXXXXX` escapes). `TJ`
-  word-break gaps are recovered, and each run carries its text render
-  mode (`Tr` — including the invisible OCR layer) and text rise (`Ts`).
+  `Tj` / `TJ` / `'` / `"` show with text-matrix origin, the text matrix
+  and advance (`end()` / `em()`), font + size, and Unicode mapping via
+  `/ToUnicode` CMap (mixed-width codespaces honoured; a simple font's
+  codes stay one byte whatever the CMap's codespace claims) or
+  simple-font encoding (`WinAnsi` / `MacRoman` / `/Differences` over
+  the Adobe Glyph List, including `uniXXXX` / `uXXXXXXXX` escapes; an
+  embedded Type 1 program's own encoding; Symbol / ZapfDingbats
+  built-ins). `/ActualText` spans (§14.9.4) replace the glyphs they
+  wrap. `flat_text()` / `lines()` assemble words and lines from the
+  runs' geometry — one show per word, per word plus a space glyph, or
+  per glyph (pdfTeX, cairo, Skia / Chrome) all rebuild the same text;
+  letter-spaced lines keep their words, right-to-left lines painted in
+  visual order come back in logical order. Each run carries its text
+  render mode (`Tr` — including the invisible OCR layer) and text rise
+  (`Ts`). `cargo run --example pdf2text -- file.pdf [--runs]` prints
+  the flat text or the runs.
   Consecutive shows on one line advance the text origin per §9.4.4
   (`tx = ((w0 − Tj/1000)·Tfs + Tc + Tw)·Th`) using per-glyph `/Widths`
-  (simple) or `/W` / `/DW` (Type0) metrics, so runs without an
-  explicit `Td` / `Tm` still get distinct positions. Type 3 font widths
+  (simple), `/W` / `/DW` (Type0), or the standard-14 AFM metrics when
+  a core font omits `/Widths` (§9.6.2.2), so runs without an explicit
+  `Td` / `Tm` still get distinct positions. Type 3 font widths
   are scaled into text space by the font's `/FontMatrix` (§9.6.5), not
   the 1/1000 Type1 convention. A Type 0 font whose `/Encoding` is an
   **embedded CMap stream** (§9.7.5.3) segments show operands at the

@@ -162,19 +162,19 @@ endbfchar
 endcmap
 ";
     // Input bytes: 0x81 0x39 0x81 0x40
-    //   Position 0: 0x81 — 1-byte width attempted, no 1-byte
-    //               codespace declared, so try 2-byte: 0x81 0x39 — low
-    //               byte 0x39 < 0x40 → out of [0x40..=0xFC] component
-    //               bound → no match → emit U+FFFD, advance 1.
-    //   Position 1: 0x39 — out (no codespace covers it) → emit
-    //               U+FFFD, advance 1.
+    //   Position 0: 0x81 0x39 — low byte 0x39 < 0x40 → out of the
+    //               [0x40..=0xFC] component bound → invalid code. Its
+    //               first byte 0x81 partially matches the 2-byte
+    //               codespace, so per §9.7.6.3 the invalid code
+    //               consumes that codespace's length: emit U+FFFD,
+    //               advance 2.
     //   Position 2: 0x81 0x40 — in 2-byte codespace, maps to U+4E00.
-    // Result: "\u{FFFD}\u{FFFD}\u{4E00}".
+    // Result: "\u{FFFD}\u{4E00}".
     let content = b"BT /F0 14 Tf 50 700 Td <81398140> Tj ET";
     let pdf = build_pdf_with_cmap(content, cmap);
 
     let mut reader = DocumentReader::open(&pdf).expect("open");
     let runs = reader.text_extraction().expect("extract").runs;
     assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0].text, "\u{FFFD}\u{FFFD}\u{4E00}");
+    assert_eq!(runs[0].text, "\u{FFFD}\u{4E00}");
 }

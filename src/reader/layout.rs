@@ -75,11 +75,7 @@ impl ReadingOrderText {
     /// reading-order analogue of
     /// [`crate::reader::PdfTextExtraction::flat_text`].
     pub fn flat_text(&self) -> String {
-        self.runs
-            .iter()
-            .map(|r| r.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" ")
+        crate::reader::text::assemble_text(&self.runs)
     }
 }
 
@@ -337,22 +333,8 @@ mod tests {
         let r = ReadingOrderText {
             mode: LayoutMode::Tagged,
             runs: vec![
-                TextRun {
-                    text: "Hello".into(),
-                    position: (0.0, 0.0),
-                    font_name: "F0".into(),
-                    font_size: 12.0,
-                    render_mode: crate::reader::text::TextRenderMode::Fill,
-                    text_rise: 0.0,
-                },
-                TextRun {
-                    text: "World".into(),
-                    position: (40.0, 0.0),
-                    font_name: "F0".into(),
-                    font_size: 12.0,
-                    render_mode: crate::reader::text::TextRenderMode::Fill,
-                    text_rise: 0.0,
-                },
+                TextRun::new("Hello", (0.0, 0.0), "F0", 12.0).with_advance((30.0, 0.0)),
+                TextRun::new("World", (40.0, 0.0), "F0", 12.0).with_advance((30.0, 0.0)),
             ],
         };
         assert_eq!(r.flat_text(), "Hello World");

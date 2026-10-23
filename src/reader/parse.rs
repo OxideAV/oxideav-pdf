@@ -187,9 +187,14 @@ impl<'a> Parser<'a> {
         match tok.kind {
             TokenKind::Integer(n) => self.maybe_indirect_ref(n, tok.end),
             TokenKind::Real(f) => Ok(Object::Real(f)),
-            TokenKind::Name(bytes) => Ok(Object::Name(String::from_utf8(bytes).map_err(|_| {
-                PdfError::other(format!("PDF parser: non-UTF-8 name at byte {}", tok.start))
-            })?)),
+            // A name is a byte sequence (§7.3.5); producers write
+            // raw high bytes in them (8-bit font / resource names), so
+            // one that is not UTF-8 is read as Latin-1 rather than
+            // refused.
+            TokenKind::Name(bytes) => Ok(Object::Name(match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(e) => e.into_bytes().iter().map(|&b| b as char).collect(),
+            })),
             TokenKind::LiteralString(bytes) => Ok(Object::LiteralString(bytes)),
             TokenKind::HexString(bytes) => Ok(Object::HexString(bytes)),
             TokenKind::ArrayStart => self.parse_array(resolver),

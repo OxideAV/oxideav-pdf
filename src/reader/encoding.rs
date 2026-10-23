@@ -678,6 +678,16 @@ const AGL_SUBSET: &[(&str, &str)] = &[
     ("existential", "\u{2203}"),
     // ── Ligatures ──
     ("fi", "fi"),
+    // TeX font ligatures and dotless i (AGL v2.0 names outside the
+    // staged subset; the spellings are the AGL's).
+    ("ff", "ff"),
+    ("ffi", "ffi"),
+    ("ffl", "ffl"),
+    ("dotlessi", "\u{0131}"),
+    ("Eng", "\u{014A}"),
+    ("eng", "\u{014B}"),
+    ("IJ", "\u{0132}"),
+    ("ij", "\u{0133}"),
     ("fl", "fl"),
     // ── Bullets / shapes ──
     ("filledbox", "\u{25A0}"),
