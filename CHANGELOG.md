@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/OxideAV/oxideav-pdf/compare/v0.2.0...v0.2.1) - 2026-10-23
+
+### Other
+
+- assemble words and lines from run geometry — pdfTeX, cairo and Skia layouts extract the same text; ActualText, standard-14 metrics, Type 1 built-in encodings, indirect /Encoding, inline-image skip
+- re-lock compcol at the 0.6.9 loop-guard line
+- structure-aware campaign — bfrange DoS fix, flate bomb cap, +2 targets
+- bound /First recursion — fix stack-overflow on self-referential outline item
+- vertical writing mode advances (sections 9.7.4.3 + 9.4.4 W2/DW2, vertical TJ kerns)
+- section 12.4.3 article threads (bead rings, info dicts, page mapping)
+- document the round-418 navigation + embedded-CMap reader surfaces
+- drive round-418 extraction surfaces; guard three page walkers against /Pages self-cycles
+- Type 0 embedded-CMap /Encoding drives segmentation, CID widths, and extraction
+- parse embedded CID CMap streams (sections 9.7.5.3-9.7.6.3 code-to-CID machinery)
+- section 12.4.2 page labels (ranges + per-page label synthesis)
+- resolve \xc2\xa712.3.2.3 named destinations across outline + link surfaces
+- shared \xc2\xa77.9.6/\xc2\xa77.9.7 name/number-tree walkers with Limits-guided lookup
+- doc(hidden) the internal public surface so semver tooling tracks only the documented API
+- drop a tool-attribution aside from the number-serialization comment
+- generalize two module-doc provenance notes to name no external tools
+- rewrite the PS-calculator keyword branch with the ? operator
+- scrub implementation-naming prose from the image walker module docs
+- Lab range-scaled Decode default + DeviceN Type-4 tint image coverage
+- document the §8.9 image-decode subsystem (sample model, masking, inline splicing)
+- image-decode robustness smoke + Ghostscript pixel validation + fuzz corpus seeds
+- splice inline images into the Scene (§8.9.7)
+- decode the full §8.9.5.2 image sample model + §8.9.6 masking on the scene splice
+- image-XObject scene splicing + soft-mask image surfaces
+- splice decodable Image XObjects into the Scene with /SMask alpha (§8.9.5 + §11.6.5.3)
+- document the §11.6 transparency subsystem
+- surface /SMask soft-mask images on image_xobjects() (§11.6.5.3)
+- emit Node::SoftMask as an /SMask luminosity/alpha soft mask (§11.6.4.3 + §11.6.6)
+- composite transparency-group XObjects as a unit on Do (§11.6.6)
+- pour the /BC backdrop under luminosity soft masks (§11.6.5.2 + §11.5.3)
+- paint /SMask soft masks into the Scene as Node::SoftMask (§11.6.4.3 + §11.6.5.2)
+- save/restore the graphics state across q/Q (§8.4.4)
+- add CI / crates.io / docs.rs / MIT-license badges
+
 ### Other
 
 - text extraction: **words and lines are assembled from geometry** (§9.4.4 + §9.10). `TextRun` gains `text_matrix` and `advance` (with `end()` / `em()` / `is_vertical()`, a `new()` + `with_*` builder, and `#[non_exhaustive]`); `flat_text()` and the new `lines()` / `assemble_text` walk the runs and decide each boundary from the gap between a run's end and the next run's origin — glue, a space at ≥ 0.15 em plus the line's measured letter spacing, a line break on a baseline shift or a backtrack — so one show per word (pdfTeX, the gap a `TJ` kern or a `Td`), one show per word plus a space glyph (cairo), and one show per glyph with a `Td` between (Skia / Chrome print) all extract as the same text instead of glued words or spaced-out letters. A `TJ` array's leading kern moves the run origin; the in-array word-break threshold is the same 0.15 em and adapts to letter-spaced glyph strings. Right-to-left lines painted in visual order are reversed into logical order (`reorder_bidi_line`: whole line when right-to-left letters dominate, else each span; combining marks and lam-alef stay attached, brackets mirror, digit runs keep their order)
