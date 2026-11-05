@@ -183,7 +183,8 @@ for an end-to-end verify.
 [`DocumentReader::open`] gives access to a family of extraction walkers:
 
 - **Text extraction** — `text_extraction()` emits one `TextRun` per
-  `Tj` / `TJ` / `'` / `"` show with text-matrix origin, the text matrix
+  `Tj` / `TJ` / `'` / `"` show with its user-space origin, the text
+  matrix through the CTM (`cm`, `q` / `Q`, form matrices)
   and advance (`end()` / `em()`), font + size, and Unicode mapping via
   `/ToUnicode` CMap (mixed-width codespaces honoured; a simple font's
   codes stay one byte whatever the CMap's codespace claims) or
@@ -208,7 +209,11 @@ for an end-to-end verify.
   wrap. `flat_text()` / `lines()` assemble words and lines from the
   runs' geometry — one show per word, per word plus a space glyph, or
   per glyph (pdfTeX, cairo, Skia / Chrome) all rebuild the same text;
-  letter-spaced lines keep their words, right-to-left lines painted in
+  letter-spaced lines keep their words (tracking is inferred only when
+  the typical glyph gap is open, so justified glyph-by-glyph lines keep
+  their word gaps), a spacing accent drawn over the next letter
+  composes with it (`J¨urgen` → `Jürgen`), overprinted fake-bold text
+  comes out once, right-to-left lines painted in
   visual order come back in logical order. Each run carries its text
   render mode (`Tr` — including the invisible OCR layer) and text rise
   (`Ts`). `cargo run --example pdf2text -- file.pdf [--runs]` prints

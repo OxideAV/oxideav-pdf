@@ -708,3 +708,92 @@ fn tj_word_gaps_with_tiny_letter_kerns() {
     );
     assert_eq!(text_of(&pdf), "this layer is specified. In some cases,");
 }
+
+#[test]
+fn runs_placed_by_cm_keep_user_space_geometry() {
+    // Each show sits at the text-space origin and is placed by its own
+    // `cm` (a pattern some producers write for every word); the run
+    // geometry goes through the CTM, so the words assemble on one line
+    // with their real gaps. Courier: 600/1000 em per glyph at 10 pt.
+    let pdf = page_doc(
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>",
+        b"q 1 0 0 1 72 700 cm BT /F0 10 Tf (Blu) Tj ET Q \
+          q 1 0 0 1 90 700 cm BT /F0 10 Tf (-ray) Tj ET Q \
+          q 1 0 0 1 117 700 cm BT /F0 10 Tf (Disc) Tj ET Q",
+        Vec::new(),
+    );
+    let mut reader = DocumentReader::open(&pdf).expect("open");
+    let ex = reader.text_extraction().expect("extract");
+    assert_eq!(ex.runs[1].position, (90.0, 700.0));
+    assert_eq!(ex.flat_text(), "Blu-ray Disc");
+}
+
+#[test]
+fn form_matrix_scales_into_user_space() {
+    // A form drawn through `/Matrix [2 0 0 2 0 0]` and a `cm`
+    // translation: its run reports the composed origin and em.
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F0 5 0 R >> /XObject << /Fm0 6 0 R >> >> \
+              /Contents 4 0 R >>"
+                .to_vec(),
+        ),
+        (4, stream_body("", b"q 1 0 0 1 100 200 cm /Fm0 Do Q")),
+        (
+            5,
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ),
+        (
+            6,
+            stream_body(
+                "/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Matrix [2 0 0 2 0 0]",
+                b"BT /F0 10 Tf 5 7 Td (Big) Tj ET",
+            ),
+        ),
+    ];
+    let pdf = build_pdf(&objects);
+    let mut reader = DocumentReader::open(&pdf).expect("open");
+    let ex = reader.text_extraction().expect("extract");
+    assert_eq!(ex.runs[0].text, "Big");
+    assert_eq!(ex.runs[0].position, (110.0, 214.0));
+    assert!((ex.runs[0].em() - 20.0).abs() < 1e-4);
+}
+
+#[test]
+fn spacing_accent_over_the_next_letter_composes() {
+    // TeX's `J\"urgen`: "J", then the dieresis accent glyph, then the
+    // text backed up under it — the AGL's `udieresis` is the letter.
+    let pdf = page_doc(
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>",
+        b"BT /F0 10 Tf 1 0 0 1 72 700 Tm (J) Tj 1 0 0 1 78.5 700.05 Tm <A8> Tj \
+          1 0 0 1 78 700 Tm (urgen) Tj ET",
+        Vec::new(),
+    );
+    let mut reader = DocumentReader::open(&pdf).expect("open");
+    assert_eq!(
+        reader.text_extraction().expect("extract").flat_text(),
+        "Jürgen"
+    );
+}
+
+#[test]
+fn overprinted_fake_bold_extracts_once() {
+    // Every show drawn twice 0.2 pt apart (a fake-bold rendering), and
+    // a whole line redrawn: one copy of each.
+    let pdf = page_doc(
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>",
+        b"BT /F0 10 Tf 1 0 0 1 72 700 Tm (32,) Tj 1 0 0 1 72.2 700 Tm (32,) Tj \
+          1 0 0 1 96 700 Tm (31) Tj 1 0 0 1 96.2 700 Tm (31) Tj \
+          1 0 0 1 72 680 Tm (bold line) Tj 1 0 0 1 72.2 680 Tm (bold line) Tj ET",
+        Vec::new(),
+    );
+    let mut reader = DocumentReader::open(&pdf).expect("open");
+    assert_eq!(
+        reader.text_extraction().expect("extract").flat_text(),
+        "32, 31\nbold line"
+    );
+}

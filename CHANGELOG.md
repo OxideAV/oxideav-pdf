@@ -37,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   streams; `/Resources` inherited from a `/Pages` ancestor; a font
   whose encoding resources fail to parse no longer drops the page.
 - R=6 `/O` / `/U` strings zero-padded past 48 bytes are accepted.
+- Text runs report user-space geometry: `position` and `text_matrix`
+  now go through the CTM (`cm`, `q` / `Q`, Form XObject `/Matrix`), so
+  producers that place every word with its own `cm` assemble into
+  lines and words instead of piling up at the text-space origin.
+- A spacing accent drawn over the following letter (TeX's `\"u`)
+  composes with it through the AGL's accented-letter names
+  (`J¨urgen` → `Jürgen`).
+- Overprinted text (a fake bold drawing each show, or a whole line,
+  twice a hair apart) is extracted once.
 - Word assembly no longer mistakes the word gaps of a glyph-by-glyph
   justified line (or a `TJ` array with tiny letter kerns) for letter
   spacing: tracking is only inferred when the typical gap between

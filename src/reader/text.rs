@@ -56,14 +56,11 @@ use crate::reader::font_program::{
 
 /// One contiguous text-show output by the content-stream walker.
 ///
-/// Position is the text-space origin of the run at the moment the show
-/// operator fired (text-matrix `e` / `f`). Font size carries the `Tf`
-/// argument verbatim — note that PDF text-space is multiplied by the
-/// CTM scaling, so the rendered glyph size on paper is `font_size *
-/// CTM_scale`. Round-22 callers that only need the raw `Tf` value
-/// (e.g. for keyword search) can ignore the CTM; renderers that want
-/// physical size should multiply by the CTM extracted from the
-/// reader's group walker.
+/// Position is the user-space origin of the run at the moment the show
+/// operator fired: the text-matrix origin mapped through the CTM
+/// (`cm`, `q` / `Q`, Form XObject matrices). Font size carries the `Tf`
+/// argument verbatim; the rendered em on the page is [`TextRun::em`]
+/// (`font_size` scaled by the user-space text matrix).
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct TextRun {
@@ -72,7 +69,7 @@ pub struct TextRun {
     /// identity / WinAnsi fallbacks documented above).
     pub text: String,
     /// `(x, y)` in PDF user space — the origin at which the run's
-    /// glyphs begin. This is the text-matrix origin adjusted by the
+    /// glyphs begin, through the CTM. This is the text-matrix origin adjusted by the
     /// text rise `Ts` (ISO 32000-1 §9.4.4): per the text-rendering
     /// matrix the rise translates the rendering origin by `Trise`
     /// along the text matrix's vertical basis, so a `4 Ts` superscript
@@ -106,8 +103,10 @@ pub struct TextRun {
     /// from the position delta.
     pub text_rise: f32,
     /// The text matrix `Tm` (`[a b c d e f]`, ISO 32000-1 §9.4.2) in
-    /// force when the show fired — before the run's own advance and
-    /// without the rise folded in. Its first column `(a, b)` is the
+    /// force when the show fired, mapped to user space through the
+    /// CTM (`Tm × CTM`, §8.3.4 — `cm`, `q` / `Q` and Form XObject
+    /// matrices) — before the run's own advance and without the rise
+    /// folded in. Its first column `(a, b)` is the
     /// baseline direction and `hypot(a, b) × font_size` the rendered
     /// em; [`Self::end`] maps the run's advance through it. Identity
     /// for a run assembled by hand.
@@ -358,15 +357,20 @@ pub fn assemble_text(runs: &[TextRun]) -> String {
     let mut lines: Vec<Vec<&TextRun>> = Vec::new();
     let mut cur: Vec<&TextRun> = Vec::new();
     for run in runs.iter().filter(|r| !r.text.is_empty()) {
+        // Overprinting (a "fake bold" drawing every show twice a hair
+        // apart) paints one text: keep the first copy.
+        if cur.last().is_some_and(|prev| is_overprint(prev, run)) {
+            continue;
+        }
         if let Some(prev) = cur.last()
             && starts_new_line(prev, run)
         {
-            lines.push(std::mem::take(&mut cur));
+            push_line(&mut lines, std::mem::take(&mut cur));
         }
         cur.push(run);
     }
     if !cur.is_empty() {
-        lines.push(cur);
+        push_line(&mut lines, cur);
     }
     // 2. Words within each line.
     let mut out = String::new();
@@ -384,8 +388,11 @@ pub fn assemble_text(runs: &[TextRun]) -> String {
             .collect();
         let ls_em = letter_spacing_estimate(&singles, &rel, 1.0);
         let mut text = String::new();
+        // A spacing accent drawn over the following glyph (TeX's
+        // `\"u`: the accent, then the letter backed up under it).
+        let mut pending_accent: Option<&'static str> = None;
         for (i, run) in line.iter().enumerate() {
-            if i > 0 {
+            if i > 0 && pending_accent.is_none() {
                 let (gap, em) = gaps[i - 1];
                 if gap >= (WORD_GAP_EM + ls_em) * em
                     && !text.ends_with(char::is_whitespace)
@@ -394,7 +401,23 @@ pub fn assemble_text(runs: &[TextRun]) -> String {
                     text.push(' ');
                 }
             }
-            text.push_str(&run.text);
+            if let Some(accent) = spacing_accent_name(&run.text)
+                && let Some(next) = line.get(i + 1)
+                && gaps[i].0 < 0.0
+                && composed_accent(&next.text, accent).is_some()
+            {
+                pending_accent = Some(accent);
+                continue;
+            }
+            match pending_accent.take() {
+                Some(accent) => {
+                    if let Some((composed, rest)) = composed_accent(&run.text, accent) {
+                        text.push_str(&composed);
+                        text.push_str(rest);
+                    }
+                }
+                None => text.push_str(&run.text),
+            }
         }
         while text.ends_with(' ') {
             text.pop();
@@ -402,6 +425,72 @@ pub fn assemble_text(runs: &[TextRun]) -> String {
         out.push_str(&reorder_bidi_line(&text));
     }
     out
+}
+
+/// Distance, as a fraction of the larger em, within which the same
+/// text drawn twice is one overprinted text.
+const OVERPRINT_EM: f32 = 0.1;
+
+/// True when `r` repeats `p`'s text at (nearly) the same origin.
+fn is_overprint(p: &TextRun, r: &TextRun) -> bool {
+    let (em_big, _) = em_pair(p, r);
+    p.text == r.text
+        && (p.position.0 - r.position.0).abs() <= OVERPRINT_EM * em_big
+        && (p.position.1 - r.position.1).abs() <= OVERPRINT_EM * em_big
+}
+
+/// Append a line unless it overprints the previous one run for run.
+fn push_line<'a>(lines: &mut Vec<Vec<&'a TextRun>>, line: Vec<&'a TextRun>) {
+    if let Some(prev) = lines.last()
+        && prev.len() == line.len()
+        && prev.iter().zip(&line).all(|(p, r)| is_overprint(p, r))
+    {
+        return;
+    }
+    lines.push(line);
+}
+
+/// The AGL name of a run that is one spacing accent glyph.
+fn spacing_accent_name(text: &str) -> Option<&'static str> {
+    let mut chars = text.chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else {
+        return None;
+    };
+    Some(match c {
+        '\u{60}' => "grave",
+        '\u{B4}' => "acute",
+        '\u{2C6}' => "circumflex",
+        '\u{2DC}' => "tilde",
+        '\u{AF}' => "macron",
+        '\u{2D8}' => "breve",
+        '\u{2D9}' => "dotaccent",
+        '\u{A8}' => "dieresis",
+        '\u{2DA}' => "ring",
+        '\u{B8}' => "cedilla",
+        '\u{2DD}' => "hungarumlaut",
+        '\u{2DB}' => "ogonek",
+        '\u{2C7}' => "caron",
+        _ => return None,
+    })
+}
+
+/// `text`'s first letter with `accent` composed onto it — the Adobe
+/// Glyph List names accented letters as base + accent (`u` +
+/// `dieresis` = `udieresis`) — and the rest of `text`; `None` when the
+/// AGL has no such letter.
+fn composed_accent<'a>(text: &'a str, accent: &str) -> Option<(String, &'a str)> {
+    let mut chars = text.char_indices();
+    let (_, base) = chars.next()?;
+    let rest = chars.next().map_or("", |(i, _)| &text[i..]);
+    let base = match base {
+        '\u{131}' => 'i',
+        '\u{237}' => 'j',
+        c if c.is_ascii_alphabetic() => c,
+        _ => return None,
+    };
+    let name = format!("{base}{accent}");
+    let composed = crate::reader::agl::lookup(&name)?;
+    Some((composed.to_owned(), rest))
 }
 
 /// Minimum same-line gap, as a fraction of the smaller run's em, that
@@ -466,6 +555,12 @@ fn starts_new_line(p: &TextRun, r: &TextRun) -> bool {
         return true;
     }
     let gap = dot(r.position, u) - dot(p.end(), u);
+    // A spacing accent is followed by the letter it sits on, backed up
+    // by up to the accent's own width.
+    if spacing_accent_name(&p.text).is_some() {
+        let width = dot(p.end(), u) - dot(p.position, u);
+        return gap < -(width + BACKTRACK_EM * em_big);
+    }
     gap < -BACKTRACK_EM * em_big
 }
 
@@ -1369,6 +1464,8 @@ struct Scope {
 #[derive(Debug)]
 struct FormXObject {
     content: Vec<u8>,
+    /// `/Matrix` (Table 95, default identity).
+    matrix: [f32; 6],
     scope: Option<Scope>,
 }
 
@@ -1441,7 +1538,24 @@ fn load_scope(
                 .cloned()
                 .map(|r| load_scope(reader, r, cache, depth + 1, visited, budget));
             visited.remove(&id.number);
-            forms.insert(name.clone(), Rc::new(FormXObject { content, scope }));
+            let matrix = match dict_get(&stream.dict, "Matrix") {
+                Some(Object::Array(items)) if items.len() == 6 => {
+                    let mut m = identity();
+                    for (slot, item) in m.iter_mut().zip(items) {
+                        *slot = obj_as_f32(item).unwrap_or(*slot);
+                    }
+                    m
+                }
+                _ => identity(),
+            };
+            forms.insert(
+                name.clone(),
+                Rc::new(FormXObject {
+                    content,
+                    matrix,
+                    scope,
+                }),
+            );
         }
     }
     Scope {
@@ -2720,6 +2834,9 @@ struct TextWalker {
     forms: Rc<HashMap<String, Rc<FormXObject>>>,
     /// Nesting of `Do`-invoked forms being walked.
     form_depth: u32,
+    /// Current transformation matrix (§8.3.4): `cm`, `q` / `Q` and
+    /// form matrices; runs report user-space geometry through it.
+    ctm: [f32; 6],
     runs: Vec<TextRun>,
     /// Parallel to `runs`: the MCID in scope at the moment of each
     /// emit. Populated even when `track_mcid` is false (it's free —
@@ -2834,6 +2951,7 @@ enum TJItem {
 
 #[derive(Clone, Debug)]
 struct SavedTextState {
+    ctm: [f32; 6],
     font: String,
     size: f32,
     tm: [f32; 6],
@@ -2853,6 +2971,7 @@ impl TextWalker {
             advances: scope.advances,
             forms: scope.forms,
             form_depth: 0,
+            ctm: identity(),
             runs: Vec::new(),
             run_mcids: Vec::new(),
             operands: Vec::new(),
@@ -3020,6 +3139,7 @@ impl TextWalker {
         match op {
             b"q" => {
                 self.saved.push(SavedTextState {
+                    ctm: self.ctm,
                     font: self.cur_font.clone(),
                     size: self.cur_size,
                     tm: self.tm,
@@ -3035,6 +3155,7 @@ impl TextWalker {
             }
             b"Q" => {
                 if let Some(s) = self.saved.pop() {
+                    self.ctm = s.ctm;
                     self.cur_font = s.font;
                     self.cur_size = s.size;
                     self.tm = s.tm;
@@ -3045,6 +3166,13 @@ impl TextWalker {
                     self.char_spacing = s.char_spacing;
                     self.word_spacing = s.word_spacing;
                     self.horiz_scale = s.horiz_scale;
+                }
+                self.operands.clear();
+            }
+            b"cm" => {
+                // a b c d e f cm — CTM' = M × CTM (§8.4.4).
+                if let Some(m) = self.take_n(6) {
+                    self.ctm = mul(m, self.ctm);
                 }
                 self.operands.clear();
             }
@@ -3321,6 +3449,8 @@ impl TextWalker {
             return;
         }
         let _ = self.dispatch(b"q");
+        // §8.10.1: the form matrix is concatenated with the CTM.
+        self.ctm = mul(form.matrix, self.ctm);
         let in_text = self.in_text;
         let outer = form.scope.as_ref().map(|scope| {
             (
@@ -3497,7 +3627,7 @@ impl TextWalker {
             None => self.finish_run_advance(),
             Some(idx) => {
                 self.run_advance = (0.0, 0.0);
-                let tm = self.tm;
+                let tm = self.user_tm();
                 if let Some(run) = self.runs.get_mut(idx) {
                     let m = run.text_matrix;
                     let (dx, dy) = (tm[4] - m[4], tm[5] - m[5]);
@@ -3511,6 +3641,11 @@ impl TextWalker {
         }
     }
 
+    /// The text matrix mapped to user space: `Tm × CTM`.
+    fn user_tm(&self) -> [f32; 6] {
+        mul(self.tm, self.ctm)
+    }
+
     /// Append a decoded run at the current text position + font, stamping
     /// the in-scope MCID.
     fn push_run(&mut self, text: String) {
@@ -3520,9 +3655,12 @@ impl TextWalker {
         // `(e, f)`; adding the rise along `Tm`'s vertical basis gives
         // `(c·Trise + e, d·Trise + f)`. For the common axis-aligned
         // `Tm` (`c == 0`, `d == 1`) this is simply `(e, f + Trise)`.
+        // Both map on to user space through the CTM (§8.3.4), so runs
+        // placed by `cm` rather than `Tm` keep their geometry.
         let rise = self.text_rise;
-        let x = self.tm[2] * rise + self.tm[4];
-        let y = self.tm[3] * rise + self.tm[5];
+        let m = self.user_tm();
+        let x = m[2] * rise + m[4];
+        let y = m[3] * rise + m[5];
         self.runs.push(TextRun {
             text,
             position: (x, y),
@@ -3530,7 +3668,7 @@ impl TextWalker {
             font_size: self.cur_size,
             render_mode: self.render_mode,
             text_rise: rise,
-            text_matrix: self.tm,
+            text_matrix: m,
             advance: (0.0, 0.0),
         });
         // Stamp the current MCID (top of stack) onto the run.
