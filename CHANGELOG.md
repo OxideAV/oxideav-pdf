@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cjk-cmaps` feature; `-V` CMaps set vertical writing mode.
 - The full Adobe Glyph List (AGL §2 suffix / ligature-component rules)
   and the full Annex D.5 Symbol encoding.
+- Text extraction walks Form XObjects painted with `Do` (§8.10) under
+  their own `/Resources` (or the invoker's), nesting and cycles
+  bounded; font decoders are cached per document.
 
 ### Changed
 
@@ -34,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   streams; `/Resources` inherited from a `/Pages` ancestor; a font
   whose encoding resources fail to parse no longer drops the page.
 - R=6 `/O` / `/U` strings zero-padded past 48 bytes are accepted.
+- Word assembly no longer mistakes the word gaps of a glyph-by-glyph
+  justified line (or a `TJ` array with tiny letter kerns) for letter
+  spacing: tracking is only inferred when the typical gap between
+  single glyphs is open.
 
 ## [0.2.1](https://github.com/OxideAV/oxideav-pdf/compare/v0.2.0...v0.2.1) - 2026-10-23
 

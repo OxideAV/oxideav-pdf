@@ -621,3 +621,90 @@ fn type3_blank_glyph_reads_as_space() {
     );
     assert_eq!(text_of(&pdf), " \u{FFFD}");
 }
+
+#[test]
+fn form_xobject_text_with_own_and_inherited_resources() {
+    // The page paints form /Fm0 (own /Resources naming /F1) which
+    // paints form /Fm1 (no /Resources — uses its invoker's, §7.8.3)
+    // and itself again (a cycle, ignored).
+    let objects: Vec<(u32, Vec<u8>)> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F0 5 0 R >> /XObject << /Fm0 6 0 R >> >> \
+              /Contents 4 0 R >>"
+                .to_vec(),
+        ),
+        (
+            4,
+            stream_body("", b"BT /F0 12 Tf 72 700 Td (Page) Tj ET /Fm0 Do"),
+        ),
+        (
+            5,
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        ),
+        (
+            6,
+            stream_body(
+                "/Type /XObject /Subtype /Form /BBox [0 0 612 792] \
+                 /Resources << /Font << /F1 5 0 R >> /XObject << /Fm1 7 0 R /Fm0 6 0 R >> >>",
+                b"BT /F1 12 Tf 72 600 Td (Form) Tj ET /Fm1 Do /Fm0 Do",
+            ),
+        ),
+        (
+            7,
+            stream_body(
+                "/Type /XObject /Subtype /Form /BBox [0 0 612 792]",
+                b"BT /F1 12 Tf 72 500 Td (Nested) Tj ET",
+            ),
+        ),
+    ];
+    let pdf = build_pdf(&objects);
+    let mut reader = DocumentReader::open(&pdf).expect("open");
+    let ex = extract_text(&mut reader).expect("extract");
+    let texts: Vec<&str> = ex.runs.iter().map(|r| r.text.as_str()).collect();
+    assert_eq!(texts, ["Page", "Form", "Nested"]);
+}
+
+// ───────────────────────── word assembly ─────────────────────────
+
+#[test]
+fn justified_glyph_by_glyph_line_keeps_its_word_gaps() {
+    // One show per glyph, glyphs abutting inside words and 0.26 em
+    // apart between them (a justified line without space glyphs):
+    // the word gaps are not letter spacing.
+    let mut content = b"BT /F0 10 Tf ".to_vec();
+    let mut x = 72.0f32;
+    for word in ["The", "JPEG", "Committee"] {
+        for c in word.chars() {
+            content.extend(format!("1 0 0 1 {x:.2} 700 Tm ({c}) Tj ").as_bytes());
+            x += 6.0;
+        }
+        x += 2.6;
+    }
+    content.extend(b"ET");
+    let pdf = page_doc(
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>",
+        &content,
+        Vec::new(),
+    );
+    let mut reader = DocumentReader::open(&pdf).expect("open");
+    let text = reader.text_extraction().expect("extract").flat_text();
+    assert_eq!(text, "The JPEG Committee");
+}
+
+#[test]
+fn tj_word_gaps_with_tiny_letter_kerns() {
+    // Word gaps of ~250/1000 em next to ±1..4 letter kerns: the word
+    // gaps are not the tracking (half the single-glyph pairs are word
+    // gaps here).
+    let pdf = page_doc(
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>",
+        b"BT /F0 12 Tf 72 700 Td [(this)-246(layer)-245(i)1(s)-246(s)4(pec)-6(i)1(fied.)\
+          -490(I)-3(n)-248(s)4(ome)-251(c)4(ases)-6(,)]TJ ET",
+        Vec::new(),
+    );
+    assert_eq!(text_of(&pdf), "this layer is specified. In some cases,");
+}

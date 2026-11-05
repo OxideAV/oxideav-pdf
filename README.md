@@ -201,7 +201,10 @@ for an end-to-end verify.
   map CIDs through `CIDToGIDMap` / the CFF charset to the program's
   glyphs, or through the Adobe-Japan1 / GB1 / CNS1 / Korea1 / KR
   collection named by `/CIDSystemInfo`; a `/ToUnicode` that leaves
-  codes out falls back to the same sources. `/ActualText` spans (§14.9.4) replace the glyphs they
+  codes out falls back to the same sources. Text inside **Form
+  XObjects** (`Do`, §8.10 — watermarks, headers, imported pages) is
+  extracted with the form's own resources, nested forms included;
+  fonts load once per document. `/ActualText` spans (§14.9.4) replace the glyphs they
   wrap. `flat_text()` / `lines()` assemble words and lines from the
   runs' geometry — one show per word, per word plus a space glyph, or
   per glyph (pdfTeX, cairo, Skia / Chrome) all rebuild the same text;

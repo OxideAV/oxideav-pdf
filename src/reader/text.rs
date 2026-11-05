@@ -39,6 +39,7 @@
 //! PDF library was consulted.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::str;
 
 use crate::error::PdfError;
@@ -489,27 +490,44 @@ fn is_single_glyph(text: &str) -> bool {
 ///
 /// `singles[i]` says whether piece `i` is one glyph, `gaps[i]` is the
 /// gap between pieces `i` and `i + 1` in units where `em` is one em.
-/// When at least half of the pieces are single glyphs and two or more
-/// positive gaps between adjacent single glyphs stay under
-/// [`MAX_LETTER_SPACING_EM`], the smallest of those is the tracking
-/// every glyph received and a word gap is that much wider than usual.
-/// Per-word layouts and kerned `TJ` arrays yield `0`.
+/// When at least half of the pieces are single glyphs, the typical
+/// (lower-median) gap between adjacent single glyphs is past rounding
+/// noise — tracking widens *every* glyph pair, where a glyph-by-glyph
+/// justified line only opens its word gaps — and two or more of those
+/// gaps are positive and under [`MAX_LETTER_SPACING_EM`], the smallest
+/// of them is the tracking every glyph received and a word gap is that
+/// much wider than usual. Per-word layouts and kerned `TJ` arrays
+/// yield `0`.
 fn letter_spacing_estimate(singles: &[bool], gaps: &[f32], em: f32) -> f32 {
     let n = singles.len();
     if n < 3 || singles.iter().filter(|s| **s).count() * 2 < n {
         return 0.0;
     }
     let cap = MAX_LETTER_SPACING_EM * em;
-    let mut best: Option<f32> = None;
-    let mut count = 0usize;
-    for (i, g) in gaps.iter().enumerate() {
-        if singles[i] && singles.get(i + 1).copied().unwrap_or(false) && *g > 0.0 && *g <= cap {
-            count += 1;
-            best = Some(best.map_or(*g, |b: f32| b.min(*g)));
-        }
+    let noise = LETTER_SPACING_NOISE_EM * em;
+    let mut pair_gaps: Vec<f32> = gaps
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| singles[*i] && singles.get(i + 1).copied().unwrap_or(false))
+        .map(|(_, g)| *g)
+        .collect();
+    pair_gaps.sort_by(f32::total_cmp);
+    let Some(&typical) = pair_gaps.get(pair_gaps.len().saturating_sub(1) / 2) else {
+        return 0.0;
+    };
+    if typical <= noise {
+        return 0.0;
     }
-    if count >= 2 { best.unwrap_or(0.0) } else { 0.0 }
+    let tracked: Vec<f32> = pair_gaps
+        .into_iter()
+        .filter(|g| *g > noise && *g <= cap)
+        .collect();
+    if tracked.len() >= 2 { tracked[0] } else { 0.0 }
 }
+
+/// Gap, in em, below which a positive gap between glyphs is position
+/// rounding rather than tracking.
+const LETTER_SPACING_NOISE_EM: f32 = 0.02;
 
 /// Whether a character belongs to a right-to-left script block
 /// (Hebrew, Arabic, Syriac, Thaana, NKo, Samaritan, Mandaic, Arabic
@@ -692,8 +710,9 @@ impl<'a> DocumentReader<'a> {
 pub fn extract_text(reader: &mut DocumentReader<'_>) -> Result<PdfTextExtraction, PdfError> {
     let leaves = collect_page_leaves(reader)?;
     let mut out = PdfTextExtraction::default();
+    let mut cache = FontCache::new();
     for leaf in leaves {
-        extract_page(reader, leaf, &mut out)?;
+        extract_page(reader, leaf, &mut out, &mut cache)?;
     }
     Ok(out)
 }
@@ -708,8 +727,9 @@ pub fn extract_text_marked(
 ) -> Result<PdfMarkedTextExtraction, PdfError> {
     let leaves = collect_page_leaves(reader)?;
     let mut out = PdfMarkedTextExtraction::default();
+    let mut cache = FontCache::new();
     for (page_index, leaf) in leaves.into_iter().enumerate() {
-        extract_page_marked(reader, leaf, page_index as u32, &mut out)?;
+        extract_page_marked(reader, leaf, page_index as u32, &mut out, &mut cache)?;
     }
     Ok(out)
 }
@@ -1291,54 +1311,25 @@ type PageAdvances = HashMap<String, FontAdvance>;
 fn load_page_for_text(
     reader: &mut DocumentReader<'_>,
     page_id: ObjectId,
-) -> Result<Option<(PageFonts, PageAdvances, Vec<u8>)>, PdfError> {
+    cache: &mut FontCache,
+) -> Result<Option<(Scope, Vec<u8>)>, PdfError> {
     let page_obj = reader.resolve(page_id)?;
     let Object::Dict(page_dict) = page_obj else {
         return Ok(None);
     };
-
-    // Resolve the page's /Resources /Font subdict — each entry maps a
-    // resource name (`F0`) to a font dictionary. /Resources may be
-    // inherited from a /Pages ancestor (§7.7.3.4).
-    let resources = inherited_page_attr(reader, &page_dict, "Resources");
-    let resources = match resources {
-        Some(Object::Reference(id)) => reader.resolve(id)?,
-        Some(other) => other,
-        None => return Ok(None),
+    // /Resources may be inherited from a /Pages ancestor (§7.7.3.4).
+    let Some(resources) = inherited_page_attr(reader, &page_dict, "Resources") else {
+        return Ok(None);
     };
-    let mut fonts: HashMap<String, FontDecoder> = HashMap::new();
-    let mut advances: HashMap<String, FontAdvance> = HashMap::new();
-    if let Object::Dict(rdict) = resources {
-        let font_dict = rdict
-            .entries()
-            .iter()
-            .find(|(k, _)| k == "Font")
-            .map(|(_, v)| v.clone());
-        if let Some(font_obj) = font_dict {
-            let font_obj = match font_obj {
-                Object::Reference(id) => reader.resolve(id)?,
-                other => other,
-            };
-            if let Object::Dict(fd) = font_obj {
-                for (name, val) in fd.entries() {
-                    let resolved = match val {
-                        Object::Reference(id) => reader.resolve(*id)?,
-                        other => other.clone(),
-                    };
-                    if let Object::Dict(font_d) = resolved {
-                        // A font whose encoding resources fail to parse
-                        // still shows its bytes (Latin-1) rather than
-                        // dropping the whole page.
-                        let decoder =
-                            FontDecoder::from_dict(reader, &font_d).unwrap_or(FontDecoder::Latin1);
-                        fonts.insert(name.clone(), decoder);
-                        let advance = build_font_advance(reader, &font_d);
-                        advances.insert(name.clone(), advance);
-                    }
-                }
-            }
-        }
-    }
+    let mut budget = MAX_FORMS_PER_PAGE;
+    let scope = load_scope(
+        reader,
+        resources,
+        cache,
+        0,
+        &mut HashSet::new(),
+        &mut budget,
+    );
 
     // Concatenate /Contents.
     let contents_obj = page_dict
@@ -1350,7 +1341,114 @@ fn load_page_for_text(
         return Ok(None);
     };
 
-    Ok(Some((fonts, advances, content_bytes)))
+    Ok(Some((scope, content_bytes)))
+}
+
+/// Decoders and advances of fonts already loaded in this document,
+/// keyed by the font dictionary's object — a font shared by many
+/// pages (or forms) parses its encoding and program once.
+type FontCache = HashMap<ObjectId, (FontDecoder, FontAdvance)>;
+
+/// Bound on Form XObjects prepared for one page (nesting included).
+const MAX_FORMS_PER_PAGE: usize = 256;
+/// Bound on Form XObject nesting (§8.10).
+const MAX_FORM_DEPTH: u32 = 8;
+
+/// One resource scope (§7.8.3): the fonts and Form XObjects a content
+/// stream can name.
+#[derive(Clone, Debug, Default)]
+struct Scope {
+    fonts: Rc<PageFonts>,
+    advances: Rc<PageAdvances>,
+    forms: Rc<HashMap<String, Rc<FormXObject>>>,
+}
+
+/// A Form XObject (§8.10) prepared for text extraction: its content
+/// and, when it carries one, its own resource scope (a form without
+/// `/Resources` uses its invoker's, §7.8.3).
+#[derive(Debug)]
+struct FormXObject {
+    content: Vec<u8>,
+    scope: Option<Scope>,
+}
+
+fn load_scope(
+    reader: &mut DocumentReader<'_>,
+    resources: Object,
+    cache: &mut FontCache,
+    depth: u32,
+    visited: &mut HashSet<u32>,
+    budget: &mut usize,
+) -> Scope {
+    let Ok(Object::Dict(rdict)) = reader.deref(resources) else {
+        return Scope::default();
+    };
+    let mut fonts: PageFonts = HashMap::new();
+    let mut advances: PageAdvances = HashMap::new();
+    if let Some(fd) = resolve_dict(reader, &rdict, "Font") {
+        for (name, val) in fd.entries() {
+            let id = match val {
+                Object::Reference(id) => Some(*id),
+                _ => None,
+            };
+            if let Some((d, a)) = id.and_then(|id| cache.get(&id)) {
+                fonts.insert(name.clone(), d.clone());
+                advances.insert(name.clone(), a.clone());
+                continue;
+            }
+            let Ok(Object::Dict(font_d)) = reader.deref(val.clone()) else {
+                continue;
+            };
+            // A font whose encoding resources fail to parse still
+            // shows its bytes (Latin-1) rather than dropping the page.
+            let decoder = FontDecoder::from_dict(reader, &font_d).unwrap_or(FontDecoder::Latin1);
+            let advance = build_font_advance(reader, &font_d);
+            if let Some(id) = id {
+                cache.insert(id, (decoder.clone(), advance.clone()));
+            }
+            fonts.insert(name.clone(), decoder);
+            advances.insert(name.clone(), advance);
+        }
+    }
+    let mut forms = HashMap::new();
+    if depth < MAX_FORM_DEPTH
+        && let Some(xd) = resolve_dict(reader, &rdict, "XObject")
+    {
+        for (name, val) in xd.entries() {
+            if *budget == 0 {
+                break;
+            }
+            // Each form object is prepared once per chain (a form
+            // naming itself, directly or not, stops there).
+            let Object::Reference(id) = val else {
+                continue;
+            };
+            if visited.contains(&id.number) {
+                continue;
+            }
+            let Ok(Object::Stream(stream)) = reader.resolve(*id) else {
+                continue;
+            };
+            if !matches!(dict_get(&stream.dict, "Subtype"), Some(Object::Name(n)) if n == "Form") {
+                continue;
+            }
+            let Ok(content) = decode_stream(&stream) else {
+                continue;
+            };
+            *budget -= 1;
+            visited.insert(id.number);
+            let scope = dict_get(&stream.dict, "Resources")
+                .cloned()
+                .map(|r| load_scope(reader, r, cache, depth + 1, visited, budget));
+            visited.remove(&id.number);
+            forms.insert(name.clone(), Rc::new(FormXObject { content, scope }));
+        }
+    }
+    Scope {
+        fonts: Rc::new(fonts),
+        advances: Rc::new(advances),
+        forms: Rc::new(forms),
+    }
 }
 
 /// The page's `/Contents` (§7.7.3.3 Table 31): one stream, or an array
@@ -1407,11 +1505,12 @@ fn extract_page(
     reader: &mut DocumentReader<'_>,
     page_id: ObjectId,
     out: &mut PdfTextExtraction,
+    cache: &mut FontCache,
 ) -> Result<(), PdfError> {
-    let Some((fonts, advances, content_bytes)) = load_page_for_text(reader, page_id)? else {
+    let Some((scope, content_bytes)) = load_page_for_text(reader, page_id, cache)? else {
         return Ok(());
     };
-    let mut walker = TextWalker::new(fonts, advances);
+    let mut walker = TextWalker::new(scope);
     // A malformed page keeps the runs it produced up to the fault;
     // the rest of the document still extracts.
     let _ = walker.parse(&content_bytes);
@@ -1424,11 +1523,12 @@ fn extract_page_marked(
     page_id: ObjectId,
     page_index: u32,
     out: &mut PdfMarkedTextExtraction,
+    cache: &mut FontCache,
 ) -> Result<(), PdfError> {
-    let Some((fonts, advances, content_bytes)) = load_page_for_text(reader, page_id)? else {
+    let Some((scope, content_bytes)) = load_page_for_text(reader, page_id, cache)? else {
         return Ok(());
     };
-    let mut walker = TextWalker::new(fonts, advances);
+    let mut walker = TextWalker::new(scope);
     walker.track_mcid = true;
     let _ = walker.parse(&content_bytes);
     let runs = walker.into_runs_with_mcid();
@@ -2612,10 +2712,14 @@ pub(crate) fn skip_token(bytes: &[u8], i: usize) -> usize {
 /// inside a `BT` / `ET` block. We accumulate the current text-matrix +
 /// font + size and emit one [`TextRun`] per show.
 struct TextWalker {
-    fonts: HashMap<String, FontDecoder>,
+    fonts: Rc<PageFonts>,
     /// Per-font horizontal advance metrics (§9.4.4), keyed like
     /// `fonts`. Drives the post-show text-matrix advance.
-    advances: HashMap<String, FontAdvance>,
+    advances: Rc<PageAdvances>,
+    /// Form XObjects the current scope can paint with `Do` (§8.10).
+    forms: Rc<HashMap<String, Rc<FormXObject>>>,
+    /// Nesting of `Do`-invoked forms being walked.
+    form_depth: u32,
     runs: Vec<TextRun>,
     /// Parallel to `runs`: the MCID in scope at the moment of each
     /// emit. Populated even when `track_mcid` is false (it's free —
@@ -2743,10 +2847,12 @@ struct SavedTextState {
 }
 
 impl TextWalker {
-    fn new(fonts: HashMap<String, FontDecoder>, advances: HashMap<String, FontAdvance>) -> Self {
+    fn new(scope: Scope) -> Self {
         Self {
-            fonts,
-            advances,
+            fonts: scope.fonts,
+            advances: scope.advances,
+            forms: scope.forms,
+            form_depth: 0,
             runs: Vec::new(),
             run_mcids: Vec::new(),
             operands: Vec::new(),
@@ -2941,6 +3047,11 @@ impl TextWalker {
                     self.horiz_scale = s.horiz_scale;
                 }
                 self.operands.clear();
+            }
+            b"Do" => {
+                let name = self.pop_name().unwrap_or_default();
+                self.operands.clear();
+                self.paint_form(&name);
             }
             b"BT" => {
                 self.in_text = true;
@@ -3197,6 +3308,38 @@ impl TextWalker {
             }
         }
         Some(nums)
+    }
+
+    /// Walk a Form XObject's content (§8.10.1): its graphics state is
+    /// saved and restored around it, and its own `/Resources` (when it
+    /// has them) are the scope its operators name.
+    fn paint_form(&mut self, name: &str) {
+        let Some(form) = self.forms.get(name).cloned() else {
+            return;
+        };
+        if self.form_depth >= MAX_FORM_DEPTH {
+            return;
+        }
+        let _ = self.dispatch(b"q");
+        let in_text = self.in_text;
+        let outer = form.scope.as_ref().map(|scope| {
+            (
+                std::mem::replace(&mut self.fonts, scope.fonts.clone()),
+                std::mem::replace(&mut self.advances, scope.advances.clone()),
+                std::mem::replace(&mut self.forms, scope.forms.clone()),
+            )
+        });
+        self.form_depth += 1;
+        let _ = self.parse(&form.content);
+        self.form_depth -= 1;
+        if let Some((fonts, advances, forms)) = outer {
+            self.fonts = fonts;
+            self.advances = advances;
+            self.forms = forms;
+        }
+        self.operands.clear();
+        self.in_text = in_text;
+        let _ = self.dispatch(b"Q");
     }
 
     /// Decode a single show-operand byte string through the current

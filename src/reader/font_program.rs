@@ -22,6 +22,7 @@
 //! glyph, then its text as above.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::objects::{Dict, Object};
 use crate::reader::cff::CffFont;
@@ -313,7 +314,7 @@ pub(crate) struct CidText {
     /// Adobe collection index (from `/CIDSystemInfo`, the CFF `ROS`
     /// or a predefined CMap).
     collection: Option<usize>,
-    font: Option<EmbeddedFont>,
+    font: Option<Rc<EmbeddedFont>>,
     cid_to_gid: CidToGid,
     /// The program's glyphs are the authority (TrueType CIDFonts,
     /// name-keyed CFF): a CIDSystemInfo collection is only a fallback
@@ -380,7 +381,7 @@ impl CidText {
                 prefer_font = true;
             }
         }
-        let font = font.filter(EmbeddedFont::has_text_source);
+        let font = font.filter(EmbeddedFont::has_text_source).map(Rc::new);
         CidText {
             collection,
             font,
