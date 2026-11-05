@@ -310,6 +310,15 @@ fn parse_encrypt_dict(d: &crate::objects::Dict) -> Result<EncryptParams, PdfErro
     };
     let o_expected = if r >= 5 { 48 } else { 32 };
     let u_expected = if r >= 5 { 48 } else { 32 };
+    // R=5 / R=6 algorithms (ISO 32000-2 §7.6.4.3.3–4) read only the
+    // 32-byte hash and the two 8-byte salts — bytes 0..48. Writers that
+    // zero-pad the strings out to 127 bytes still carry them in that
+    // prefix, so a longer V=5 string is cut to its meaningful 48 bytes.
+    let (mut o, mut u) = (o, u);
+    if r >= 5 {
+        o.truncate(o_expected);
+        u.truncate(u_expected);
+    }
     if o.len() != o_expected {
         return Err(PdfError::other(format!(
             "PDF decrypt: /O must be {o_expected} bytes for R={r} (got {})",

@@ -20,15 +20,20 @@
 //! [`Transform2D`]: oxideav_core::vector::Transform2D
 
 pub mod actions;
+pub(crate) mod agl;
 pub mod annotation;
 pub mod attachments;
+pub(crate) mod cff;
 pub(crate) mod cid_cmap;
+pub(crate) mod cjk;
 pub mod content;
 pub mod document;
 pub mod encoding;
 // Internal: stream-filter implementations behind `decode_stream` (exposed for tests).
 #[doc(hidden)]
 pub mod filters;
+pub(crate) mod font_program;
+pub(crate) mod font_tables;
 pub mod hierarchy;
 pub(crate) mod image_decode;
 pub mod images;
@@ -48,6 +53,7 @@ pub mod page_labels;
 #[doc(hidden)]
 pub mod parse;
 pub mod pdfa;
+pub(crate) mod sfnt;
 pub mod sig;
 pub(crate) mod std14_metrics;
 pub mod text;

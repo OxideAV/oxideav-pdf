@@ -40,6 +40,18 @@ fn aes256_encrypt(file_key: &[u8; 32], data: &[u8]) -> Vec<u8> {
 /// Build a minimal V=5 encrypted PDF. Returns the bytes; the caller's
 /// supplied user password decrypts them.
 fn build_v5_pdf(user_pw: &[u8], owner_pw: &[u8], revision: u8, title: &str) -> Vec<u8> {
+    build_v5_pdf_padded(user_pw, owner_pw, revision, title, 0)
+}
+
+/// [`build_v5_pdf`] with `/O` and `/U` zero-padded by `pad` bytes past
+/// their 48 (as some writers emit them, out to 127 bytes).
+fn build_v5_pdf_padded(
+    user_pw: &[u8],
+    owner_pw: &[u8],
+    revision: u8,
+    title: &str,
+    pad: usize,
+) -> Vec<u8> {
     // Permission bits: print + copy denied (any value works).
     let p = -3904i32;
     let file_id = b"OXIDEAV-V5-FIXTURE-ID-0123456789".to_vec();
@@ -112,11 +124,11 @@ fn build_v5_pdf(user_pw: &[u8], owner_pw: &[u8], revision: u8, title: &str) -> V
     enc_obj.push_str(" /StmF /StdCF /StrF /StdCF");
     enc_obj.push_str(" /O <");
     bytes.extend_from_slice(enc_obj.as_bytes());
-    for b in &o {
+    for b in o.iter().chain(std::iter::repeat_n(&0u8, pad)) {
         bytes.extend_from_slice(format!("{:02X}", b).as_bytes());
     }
     bytes.extend_from_slice(b"> /U <");
-    for b in &u {
+    for b in u.iter().chain(std::iter::repeat_n(&0u8, pad)) {
         bytes.extend_from_slice(format!("{:02X}", b).as_bytes());
     }
     bytes.extend_from_slice(b"> /OE <");
@@ -247,4 +259,14 @@ fn aes256_r5_long_password_truncated_to_127() {
     let pdf = build_v5_pdf(&pwd, b"admin", 5, "Long pw");
     let scene = read_pdf_to_scene_with_password(&pdf, &pwd).expect("long pwd");
     assert_eq!(scene.metadata.title.as_deref(), Some("Long pw"));
+}
+
+#[test]
+fn aes256_r6_accepts_o_and_u_padded_to_127_bytes() {
+    // ISO 32000-2 Table 21 sizes /O and /U at 48 bytes for R=6; the
+    // algorithms read only that prefix, so 127-byte zero-padded
+    // strings still open.
+    let pdf = build_v5_pdf_padded(b"pw", b"owner", 6, "Padded", 79);
+    let scene = read_pdf_to_scene_with_password(&pdf, b"pw").expect("padded /O and /U decode");
+    assert_eq!(scene.metadata.title.as_deref(), Some("Padded"));
 }

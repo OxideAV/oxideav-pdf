@@ -43,10 +43,12 @@ use std::str;
 
 use crate::error::PdfError;
 use crate::objects::{Dict, Object, ObjectId};
-use crate::reader::cid_cmap::CidCMap;
 use crate::reader::document::{DocumentReader, decode_stream};
 use crate::reader::encoding::{
-    BaseEncoding, EncodingMap, apply_encoding_differences, parse_encoding_differences,
+    BaseEncoding, EncodingMap, apply_encoding_differences_with, parse_encoding_differences,
+};
+use crate::reader::font_program::{
+    CidText, CompositeEncoding, EmbeddedFont, dict_get, resolve_dict,
 };
 
 // ────────────────────────── public surface ──────────────────────────
@@ -740,21 +742,7 @@ pub fn concatenate_page_contents(
         .iter()
         .find(|(k, _)| k == "Contents")
         .map(|(_, v)| v.clone());
-    let bytes = match contents_obj {
-        Some(Object::Reference(id)) => extract_stream_data(reader, id)?,
-        Some(Object::Array(items)) => {
-            let mut all = Vec::new();
-            for item in items {
-                if let Object::Reference(id) = item {
-                    all.extend_from_slice(&extract_stream_data(reader, id)?);
-                    all.push(b'\n');
-                }
-            }
-            all
-        }
-        _ => return Ok(None),
-    };
-    Ok(Some(bytes))
+    Ok(contents_bytes(reader, contents_obj))
 }
 
 pub(crate) fn collect_page_leaves(
@@ -912,8 +900,9 @@ struct CidAdvance {
     default: f32,
     /// `/W` runs — `(start_cid, per-CID widths)`.
     ranges: Vec<(i64, Vec<f32>)>,
-    /// Embedded `/Encoding` CMap (§9.7.5.3), when present.
-    cmap: Option<Box<CidCMap>>,
+    /// The `/Encoding` CMap — embedded (§9.7.5.3) or predefined
+    /// (§9.7.5.2) — that splits codes and yields CIDs.
+    encoding: CompositeEncoding,
     /// Writing mode: 0 horizontal, 1 vertical (§9.7.5 `WMode` — from
     /// the `Identity-V` name or the embedded CMap's `/WMode`).
     wmode: u8,
@@ -1073,6 +1062,7 @@ fn build_font_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvan
                 font,
                 subtype.unwrap_or("Type1"),
                 None,
+                None,
             ) {
                 Ok(FontDecoder::SimpleMap(m)) => Some(m),
                 _ => None,
@@ -1112,33 +1102,13 @@ fn build_font_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvan
 /// Resolve a Type0 font's descendant CIDFont advance metrics
 /// (§9.7.4.3): `/DW` default + `/W` per-CID runs.
 fn build_cid_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvance {
-    // §9.7.5.3 — an /Encoding that is an embedded CMap stream drives
-    // both code segmentation and the code → CID mapping ahead of the
-    // /W width lookup. A Name (Identity-H / Identity-V, or a
-    // predefined CMap this crate has no data tables for) leaves the
-    // Identity two-bytes-per-code behaviour. The writing mode
-    // (§9.7.5 WMode) comes from the Identity-V name or the embedded
-    // CMap's /WMode and selects the §9.4.4 ty displacement path.
-    let enc_obj = font
-        .entries()
-        .iter()
-        .find(|(k, _)| k == "Encoding")
-        .map(|(_, v)| v.clone());
-    let mut wmode = 0u8;
-    let mut cmap: Option<Box<CidCMap>> = None;
-    match enc_obj {
-        Some(Object::Name(name)) if name == "Identity-V" => wmode = 1,
-        Some(Object::Name(_)) => {}
-        Some(obj) => {
-            if let Ok(Object::Stream(stream)) = reader.deref(obj)
-                && let Ok(cm) = CidCMap::from_stream(reader, &stream, 0)
-            {
-                wmode = cm.wmode;
-                cmap = Some(Box::new(cm));
-            }
-        }
-        None => {}
-    }
+    // The /Encoding CMap — embedded (§9.7.5.3) or predefined
+    // (§9.7.5.2, Identity and the CJK CMaps) — drives both code
+    // segmentation and the code → CID mapping ahead of the /W width
+    // lookup. Its writing mode (§9.7.5 WMode: a `-V` name or the
+    // embedded CMap's /WMode) selects the §9.4.4 ty displacement path.
+    let encoding = CompositeEncoding::from_type0(reader, font);
+    let wmode = encoding.wmode();
     let desc_obj = font
         .entries()
         .iter()
@@ -1162,7 +1132,7 @@ fn build_cid_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvanc
         return FontAdvance::Cid(Box::new(CidAdvance {
             default: 1000.0,
             ranges: Vec::new(),
-            cmap,
+            encoding,
             wmode,
             v_default: -1000.0,
             v_ranges: Vec::new(),
@@ -1215,7 +1185,7 @@ fn build_cid_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvanc
     FontAdvance::Cid(Box::new(CidAdvance {
         default,
         ranges,
-        cmap,
+        encoding,
         wmode,
         v_default,
         v_ranges,
@@ -1328,14 +1298,9 @@ fn load_page_for_text(
     };
 
     // Resolve the page's /Resources /Font subdict — each entry maps a
-    // resource name (`F0`) to a font dictionary. Inheritance from
-    // /Pages parents is round-22 deferred; the writer always attaches
-    // /Resources directly to the leaf page.
-    let resources = page_dict
-        .entries()
-        .iter()
-        .find(|(k, _)| k == "Resources")
-        .map(|(_, v)| v.clone());
+    // resource name (`F0`) to a font dictionary. /Resources may be
+    // inherited from a /Pages ancestor (§7.7.3.4).
+    let resources = inherited_page_attr(reader, &page_dict, "Resources");
     let resources = match resources {
         Some(Object::Reference(id)) => reader.resolve(id)?,
         Some(other) => other,
@@ -1361,7 +1326,11 @@ fn load_page_for_text(
                         other => other.clone(),
                     };
                     if let Object::Dict(font_d) = resolved {
-                        let decoder = FontDecoder::from_dict(reader, &font_d)?;
+                        // A font whose encoding resources fail to parse
+                        // still shows its bytes (Latin-1) rather than
+                        // dropping the whole page.
+                        let decoder =
+                            FontDecoder::from_dict(reader, &font_d).unwrap_or(FontDecoder::Latin1);
                         fonts.insert(name.clone(), decoder);
                         let advance = build_font_advance(reader, &font_d);
                         advances.insert(name.clone(), advance);
@@ -1377,22 +1346,61 @@ fn load_page_for_text(
         .iter()
         .find(|(k, _)| k == "Contents")
         .map(|(_, v)| v.clone());
-    let content_bytes = match contents_obj {
-        Some(Object::Reference(id)) => extract_stream_data(reader, id)?,
-        Some(Object::Array(items)) => {
-            let mut all = Vec::new();
-            for item in items {
-                if let Object::Reference(id) = item {
-                    all.extend_from_slice(&extract_stream_data(reader, id)?);
-                    all.push(b'\n');
-                }
-            }
-            all
-        }
-        _ => return Ok(None),
+    let Some(content_bytes) = contents_bytes(reader, contents_obj) else {
+        return Ok(None);
     };
 
     Ok(Some((fonts, advances, content_bytes)))
+}
+
+/// The page's `/Contents` (§7.7.3.3 Table 31): one stream, or an array
+/// of streams concatenated as if they were one — either may sit
+/// behind an indirect reference (an indirect *array* of stream
+/// references is common in Distiller output). A stream that fails to
+/// resolve or decode is skipped rather than failing the page.
+fn contents_bytes(reader: &mut DocumentReader<'_>, contents: Option<Object>) -> Option<Vec<u8>> {
+    let contents = match contents? {
+        Object::Reference(id) => reader.resolve(id).ok()?,
+        other => other,
+    };
+    match contents {
+        Object::Stream(s) => decode_stream(&s).ok(),
+        Object::Array(items) => {
+            let mut all = Vec::new();
+            for item in items {
+                if let Ok(Object::Stream(s)) = reader.deref(item)
+                    && let Ok(bytes) = decode_stream(&s)
+                {
+                    all.extend_from_slice(&bytes);
+                    all.push(b'\n');
+                }
+            }
+            Some(all)
+        }
+        _ => None,
+    }
+}
+
+/// A page attribute that §7.7.3.4 lets a page inherit from its
+/// `/Pages` ancestors (`/Resources`, `/MediaBox`, …): the nearest
+/// definition walking `/Parent` links, bounded against cycles.
+fn inherited_page_attr(reader: &mut DocumentReader<'_>, page: &Dict, key: &str) -> Option<Object> {
+    let mut node = page.clone();
+    for _ in 0..64 {
+        if let Some((_, v)) = node.entries().iter().find(|(k, _)| k == key) {
+            return Some(v.clone());
+        }
+        let parent = node
+            .entries()
+            .iter()
+            .find(|(k, _)| k == "Parent")
+            .map(|(_, v)| v.clone())?;
+        match reader.deref(parent).ok()? {
+            Object::Dict(d) => node = d,
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn extract_page(
@@ -1435,16 +1443,6 @@ fn extract_page_marked(
     Ok(())
 }
 
-fn extract_stream_data(reader: &mut DocumentReader<'_>, id: ObjectId) -> Result<Vec<u8>, PdfError> {
-    let obj = reader.resolve(id)?;
-    let Object::Stream(s) = obj else {
-        return Err(PdfError::other(format!(
-            "PDF text extraction: object {id:?} expected to be a Stream"
-        )));
-    };
-    decode_stream(&s)
-}
-
 // ────────────────────────── font decoder ──────────────────────────
 
 /// Per-font byte-to-Unicode decoder. The variant is picked at
@@ -1455,19 +1453,21 @@ enum FontDecoder {
     /// `/ToUnicode` CMap supplied — every show operand is split into
     /// 2-byte CIDs (or 1-byte codes for simple fonts whose CMap also
     /// uses the 2-byte path) and looked up.
-    ToUnicode { map: CMap, cid_width: u8 },
-    /// Identity-H / Identity-V without /ToUnicode — interpret each
-    /// 2-byte CID as the equivalent BMP code point.
-    IdentityNoCMap,
-    /// Type 0 font whose `/Encoding` is an **embedded CMap stream**
-    /// (§9.7.5.3) and which carries no `/ToUnicode`. The code → CID
-    /// mapping is known, but a CID indexes a glyph collection, not a
-    /// character — there is no Unicode source — so each shown code
-    /// emits U+FFFD as an explicit lossy marker while segmentation
-    /// (and therefore glyph counts and §9.4.4 advances) follows the
-    /// CMap's codespace widths. Supply a `/ToUnicode` CMap for real
-    /// text recovery (§9.10.2's first method).
-    CidEncoding { cmap: Box<CidCMap> },
+    ///
+    /// A code the CMap leaves out falls back to `fallback` — the
+    /// composite font's own CID → Unicode sources — before U+FFFD.
+    ToUnicode {
+        map: CMap,
+        cid_width: u8,
+        fallback: Option<Box<CompositeText>>,
+    },
+    /// Type 0 font without `/ToUnicode` (§9.10.2's third method): the
+    /// `/Encoding` CMap — embedded (§9.7.5.3) or predefined
+    /// (§9.7.5.2, the CJK ones from [`crate::reader::cjk`]) — splits
+    /// codes and yields CIDs; a `Uni…` CMap's codes are Unicode
+    /// themselves; otherwise the CID's text comes from the Adobe
+    /// collection or the embedded program ([`CidText`]).
+    Composite(Box<CompositeText>),
     /// Simple font (Type1 / TrueType / Type3) with a resolved
     /// 256-entry byte → Unicode table. Captures every variant of
     /// ISO 32000-1 §9.6.6.1 — named base encodings, encoding-dict
@@ -1493,6 +1493,57 @@ enum FontDecoder {
     /// No discernible encoding — fall back to Latin-1 byte → code
     /// point (identity for ASCII; reasonable for CP1252 punctuation).
     Latin1,
+}
+
+/// A composite font's code → text pipeline without a `/ToUnicode`.
+#[derive(Clone, Debug)]
+struct CompositeText {
+    encoding: CompositeEncoding,
+    cids: CidText,
+}
+
+impl CompositeText {
+    fn from_type0(reader: &mut DocumentReader<'_>, font: &Dict) -> CompositeText {
+        let encoding = CompositeEncoding::from_type0(reader, font);
+        let cids = CidText::from_type0(reader, font, encoding.collection());
+        CompositeText { encoding, cids }
+    }
+
+    /// Text of one code's CID, or `None` when no source knows it.
+    fn cid_text(&self, cid: u32, identity_fallback: bool) -> Option<String> {
+        if let Some(t) = self.cids.text(cid) {
+            return Some(t);
+        }
+        if !identity_fallback {
+            return None;
+        }
+        // Nothing knows the CID: an Identity font's CID is taken as
+        // the BMP code point (the long-standing fallback, right for
+        // producers that number glyphs by Unicode).
+        if self.encoding.is_identity() {
+            return char::from_u32(cid).map(String::from);
+        }
+        None
+    }
+
+    /// Decode a show operand. `identity_fallback` lets an Identity
+    /// font fall back to CID-as-code-point for CIDs nothing maps.
+    fn decode(&self, bytes: &[u8], identity_fallback: bool) -> String {
+        let mut out = String::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            let (consumed, cid, direct) = self.encoding.next(&bytes[i..]);
+            if self.encoding.is_identity() && i + consumed > bytes.len() {
+                break;
+            }
+            match direct.or_else(|| self.cid_text(cid, identity_fallback)) {
+                Some(t) => out.push_str(&t),
+                None => out.push('\u{FFFD}'),
+            }
+            i += consumed;
+        }
+        out
+    }
 }
 
 impl FontDecoder {
@@ -1523,10 +1574,23 @@ impl FontDecoder {
                 let map = CMap::parse(&bytes)?;
                 let cid_width = map.byte_width;
                 if subtype == "Type0" {
-                    return Ok(FontDecoder::ToUnicode { map, cid_width });
+                    let composite = CompositeText::from_type0(reader, font);
+                    let fallback = composite.cids.is_available().then(|| Box::new(composite));
+                    return Ok(FontDecoder::ToUnicode {
+                        map,
+                        cid_width,
+                        fallback,
+                    });
                 }
-                let builtin = embedded_type1_encoding(reader, font);
-                let fallback = match Self::simple_from_encoding(reader, font, subtype, builtin)? {
+                let program = font_program(reader, font);
+                let builtin = builtin_encoding(reader, font, program.as_ref());
+                let fallback = match Self::simple_from_encoding(
+                    reader,
+                    font,
+                    subtype,
+                    builtin,
+                    program.as_ref(),
+                )? {
                     FontDecoder::SimpleMap(m) => Some(m),
                     _ => None,
                 };
@@ -1534,41 +1598,21 @@ impl FontDecoder {
             }
         }
 
-        // 2. Composite font (Type0) without /ToUnicode — Identity-H/V.
+        // 2. Composite font (Type0) without /ToUnicode.
         if subtype == "Type0" {
-            // /Encoding is one of (§9.7.6.1 Table 121): the
-            // Identity-H / Identity-V predefined names, another
-            // predefined CMap name, or an embedded CMap stream
-            // (§9.7.5.3).
-            let enc = font
-                .entries()
-                .iter()
-                .find(|(k, _)| k == "Encoding")
-                .map(|(_, v)| v.clone());
-            match enc {
-                Some(Object::Name(_)) => {
-                    // Identity-H / Identity-V decode as CID = code.
-                    // The other predefined CMap names index Adobe
-                    // character collections whose data tables ISO
-                    // 32000 does not carry — Identity is the safest
-                    // in-spec fallback for those too.
-                    return Ok(FontDecoder::IdentityNoCMap);
-                }
-                Some(obj) => {
-                    if let Ok(Object::Stream(stream)) = reader.deref(obj)
-                        && let Ok(cmap) = CidCMap::from_stream(reader, &stream, 0)
-                    {
-                        return Ok(FontDecoder::CidEncoding {
-                            cmap: Box::new(cmap),
-                        });
-                    }
-                    return Ok(FontDecoder::IdentityNoCMap);
-                }
-                None => return Ok(FontDecoder::IdentityNoCMap),
-            }
+            return Ok(FontDecoder::Composite(Box::new(CompositeText::from_type0(
+                reader, font,
+            ))));
         }
-        let builtin = embedded_type1_encoding(reader, font);
-        Self::simple_from_encoding(reader, font, subtype, builtin)
+        let program = font_program(reader, font);
+        let builtin = builtin_encoding(reader, font, program.as_ref());
+        let decoder = Self::simple_from_encoding(reader, font, subtype, builtin, program.as_ref())?;
+        Ok(overlay_symbolic_truetype(
+            reader,
+            font,
+            program.as_ref(),
+            decoder,
+        ))
     }
 
     /// The simple-font decoder from `/Encoding` (§9.6.6) over the
@@ -1579,6 +1623,7 @@ impl FontDecoder {
         font: &Dict,
         subtype: &str,
         embedded: Option<EncodingMap>,
+        program: Option<&EmbeddedFont>,
     ) -> Result<FontDecoder, PdfError> {
         // The built-in encoding of a standard-14 Symbol / ZapfDingbats
         // face is its own set (Annex D.5 / D.6), not StandardEncoding;
@@ -1669,7 +1714,22 @@ impl FontDecoder {
             let final_map = match diffs_obj {
                 Some(arr @ Object::Array(_)) => {
                     let diffs = parse_encoding_differences(&arr)?;
-                    apply_encoding_differences(&base_map, &diffs)
+                    // A Type 3 glyph whose procedure paints nothing is
+                    // a space whatever its name (cairo names them
+                    // `/0`).
+                    let blank3 = if subtype == "Type3" {
+                        type3_blank_glyphs(reader, font, &diffs)
+                    } else {
+                        HashSet::new()
+                    };
+                    // A name the AGL does not know may still name a
+                    // glyph of the embedded program (`/G12`, `/g250`)
+                    // whose cmap gives its text.
+                    apply_encoding_differences_with(&base_map, &diffs, |name| {
+                        program
+                            .and_then(|p| p.name_text(name))
+                            .or_else(|| blank3.contains(name).then(|| " ".to_owned()))
+                    })
                 }
                 _ => base_map,
             };
@@ -1698,7 +1758,21 @@ impl FontDecoder {
     /// Decode a `Tj` / `TJ` operand byte-string into Unicode.
     fn decode(&self, bytes: &[u8]) -> String {
         match self {
-            FontDecoder::ToUnicode { map, cid_width } => {
+            FontDecoder::ToUnicode {
+                map,
+                cid_width,
+                fallback,
+            } => {
+                let miss = |out: &mut String, code: &[u8]| {
+                    let text = fallback
+                        .as_ref()
+                        .map(|f| f.decode(code, false))
+                        .filter(|t| !t.is_empty() && !t.contains('\u{FFFD}'));
+                    match text {
+                        Some(t) => out.push_str(&t),
+                        None => out.push('\u{FFFD}'),
+                    }
+                };
                 let mut out = String::new();
                 // When the CMap declared `codespacerange` entries, walk
                 // bytes left-to-right per Adobe Tech Note #5411 §2 +
@@ -1733,7 +1807,7 @@ impl FontDecoder {
                             if let Some(s) = map.lookup(cid) {
                                 out.push_str(s);
                             } else {
-                                out.push('\u{FFFD}');
+                                miss(&mut out, &bytes[i..i + w]);
                             }
                             i += w;
                         } else {
@@ -1768,40 +1842,15 @@ impl FontDecoder {
                     if let Some(s) = map.lookup(cid) {
                         out.push_str(s);
                     } else {
-                        // Unmapped CID — emit U+FFFD as a marker so
-                        // callers know decoding was lossy at that
-                        // offset.
-                        out.push('\u{FFFD}');
+                        // Unmapped CID — the font's own sources, else
+                        // U+FFFD as a marker that decoding was lossy.
+                        miss(&mut out, &bytes[i..i + w]);
                     }
                     i += w;
                 }
                 out
             }
-            FontDecoder::IdentityNoCMap => {
-                // 2-byte CID → BMP code point.
-                let mut out = String::new();
-                let mut i = 0;
-                while i + 2 <= bytes.len() {
-                    let cp = ((bytes[i] as u32) << 8) | (bytes[i + 1] as u32);
-                    if let Some(c) = char::from_u32(cp) {
-                        out.push(c);
-                    }
-                    i += 2;
-                }
-                out
-            }
-            FontDecoder::CidEncoding { cmap } => {
-                // Correct segmentation, no Unicode source: one
-                // U+FFFD marker per §9.7.6.2-extracted code.
-                let mut out = String::new();
-                let mut i = 0;
-                while i < bytes.len() {
-                    let (consumed, _code) = cmap.next_code(&bytes[i..]);
-                    out.push('\u{FFFD}');
-                    i += consumed.max(1);
-                }
-                out
-            }
+            FontDecoder::Composite(c) => c.decode(bytes, true),
             FontDecoder::SimpleMap(map) => map.decode(bytes),
             FontDecoder::SimpleToUnicode { map, fallback } => {
                 let mut out = String::new();
@@ -1824,6 +1873,111 @@ impl FontDecoder {
             FontDecoder::Latin1 => bytes.iter().map(|&b| b as char).collect(),
         }
     }
+}
+
+// ────────────────────────── embedded programs ──────────────────────────
+
+/// The program embedded behind a simple font's `/FontDescriptor`.
+fn font_program(reader: &mut DocumentReader<'_>, font: &Dict) -> Option<EmbeddedFont> {
+    let descriptor = resolve_dict(reader, font, "FontDescriptor")?;
+    EmbeddedFont::load(reader, &descriptor)
+}
+
+/// A simple font's built-in encoding (§9.6.6.2): a Type 1 program's
+/// cleartext `/Encoding`, else a CFF program's encoding (TN #5176
+/// §12).
+fn builtin_encoding(
+    reader: &mut DocumentReader<'_>,
+    font: &Dict,
+    program: Option<&EmbeddedFont>,
+) -> Option<EncodingMap> {
+    embedded_type1_encoding(reader, font).or_else(|| program?.cff_builtin_encoding())
+}
+
+/// §9.6.6.4: a TrueType font that is symbolic (`/Flags` bit 3) or has
+/// no `/Encoding` selects glyphs through its `(3,0)` / `(1,0)`
+/// subtable by the raw code; where the selected glyph has a known
+/// text (Unicode cmap or `post` name) it overrides the name-based
+/// table, which stays the fallback for the rest.
+fn overlay_symbolic_truetype(
+    reader: &mut DocumentReader<'_>,
+    font: &Dict,
+    program: Option<&EmbeddedFont>,
+    decoder: FontDecoder,
+) -> FontDecoder {
+    let Some(program) = program.filter(|p| p.is_truetype()) else {
+        return decoder;
+    };
+    let symbolic = resolve_dict(reader, font, "FontDescriptor")
+        .and_then(|d| match dict_get(&d, "Flags") {
+            Some(Object::Integer(f)) => Some(f & 4 != 0),
+            _ => None,
+        })
+        .unwrap_or(false);
+    if !symbolic && dict_get(font, "Encoding").is_some() {
+        return decoder;
+    }
+    let mut map = match decoder {
+        FontDecoder::SimpleMap(m) => *m,
+        FontDecoder::Latin1 => {
+            let mut m = EncodingMap::new();
+            for b in 0..=255u8 {
+                m.set_char(b, b as char);
+            }
+            m
+        }
+        other => return other,
+    };
+    for code in 0..=255u8 {
+        if let Some(text) = program.symbolic_code_text(code) {
+            map.set_string(code, &text);
+        }
+    }
+    FontDecoder::SimpleMap(Box::new(map))
+}
+
+/// The `/Differences` names of a Type 3 font that the AGL does not map
+/// and whose `/CharProcs` procedure paints nothing: no path-painting,
+/// shading, XObject, inline-image or text-showing operator follows the
+/// `d0` / `d1` width declaration (§9.6.5, §8.5.3).
+fn type3_blank_glyphs(
+    reader: &mut DocumentReader<'_>,
+    font: &Dict,
+    diffs: &crate::reader::encoding::EncodingDifferences,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Some(procs) = resolve_dict(reader, font, "CharProcs") else {
+        return out;
+    };
+    for ov in &diffs.overrides {
+        let name = ov.glyph_name.as_str();
+        if out.contains(name) || crate::reader::encoding::glyph_name_to_unicode(name).is_some() {
+            continue;
+        }
+        let Some(obj) = dict_get(&procs, name).cloned() else {
+            continue;
+        };
+        if let Ok(Object::Stream(s)) = reader.deref(obj)
+            && let Ok(body) = decode_stream(&s)
+            && !paints_anything(&body)
+        {
+            out.insert(name.to_owned());
+        }
+    }
+    out
+}
+
+/// True when a content stream holds a painting operator.
+fn paints_anything(content: &[u8]) -> bool {
+    const PAINT: &[&[u8]] = &[
+        b"f", b"F", b"f*", b"S", b"s", b"B", b"B*", b"b", b"b*", b"sh", b"Do", b"BI", b"Tj", b"TJ",
+        b"'", b"\"",
+    ];
+    content
+        .split(|b| is_ws(*b) || is_delim(*b))
+        .any(|tok| PAINT.contains(&tok))
+        || content.contains(&b'\'')
+        || content.contains(&b'"')
 }
 
 // ────────────────────────── embedded Type 1 encoding ──────────────────────────
@@ -3262,48 +3416,35 @@ impl TextWalker {
         let scale = adv.text_scale();
         if let FontAdvance::Cid(cid) = &adv {
             let vertical = cid.wmode == 1;
-            if let Some(cmap) = &cid.cmap {
-                // Embedded-CMap composite (§9.7.6.2): extract codes
-                // at the codespace widths, map each to its CID, then
-                // apply the §9.4.4 displacement. Word spacing applies
-                // only to a *single-byte* code 32 (§9.3.3 — "It shall
-                // not apply to occurrences of the byte value 32 in
-                // multiple-byte codes").
-                let mut i = 0;
-                while i < bytes.len() {
-                    let (consumed, code) = cmap.next_code(&bytes[i..]);
-                    let cid_val = cmap.cid_for_code(code) as i64;
-                    let tw = if consumed == 1 && bytes[i] == 32 {
-                        self.word_spacing
-                    } else {
-                        0.0
-                    };
-                    if vertical {
-                        // §9.4.4: ty = (w1 − Tj/1000)·Tfs + Tc + Tw —
-                        // the horizontal-scaling Th does not apply.
-                        let w1 = cid.vertical(cid_val) * scale;
-                        self.translate_tm_v(w1 * tfs + tc + tw);
-                    } else {
-                        let w0 = adv.width(cid_val) * scale;
-                        self.translate_tm((w0 * tfs + tc + tw) * th);
-                    }
-                    i += consumed.max(1);
+            // Codes at the CMap's codespace widths (§9.7.6.2), each
+            // mapped to its CID for the §9.4.4 displacement. Word
+            // spacing applies only to a *single-byte* code 32 (§9.3.3
+            // — "It shall not apply to occurrences of the byte value 32
+            // in multiple-byte codes").
+            let identity = cid.encoding.is_identity();
+            let mut i = 0;
+            while i < bytes.len() {
+                let (consumed, cid_val, _) = cid.encoding.next(&bytes[i..]);
+                // Identity: a trailing odd byte is no code.
+                if identity && i + consumed > bytes.len() {
+                    break;
                 }
-            } else {
-                // Identity CMap: two bytes per code, CID = code. A
-                // 2-byte code never triggers word spacing (§9.3.3).
-                let mut i = 0;
-                while i + 1 < bytes.len() {
-                    let code = ((bytes[i] as i64) << 8) | bytes[i + 1] as i64;
-                    if vertical {
-                        let w1 = cid.vertical(code) * scale;
-                        self.translate_tm_v(w1 * tfs + tc);
-                    } else {
-                        let w0 = adv.width(code) * scale;
-                        self.translate_tm((w0 * tfs + tc) * th);
-                    }
-                    i += 2;
+                let cid_val = cid_val as i64;
+                let tw = if consumed == 1 && bytes[i] == 32 {
+                    self.word_spacing
+                } else {
+                    0.0
+                };
+                if vertical {
+                    // §9.4.4: ty = (w1 − Tj/1000)·Tfs + Tc + Tw — the
+                    // horizontal-scaling Th does not apply.
+                    let w1 = cid.vertical(cid_val) * scale;
+                    self.translate_tm_v(w1 * tfs + tc + tw);
+                } else {
+                    let w0 = adv.width(cid_val) * scale;
+                    self.translate_tm((w0 * tfs + tc + tw) * th);
                 }
+                i += consumed;
             }
         } else {
             for &b in bytes {
@@ -3857,6 +3998,7 @@ endbfchar
         let decoder = FontDecoder::ToUnicode {
             map: parsed,
             cid_width: 1, // ignored when codespaces are present
+            fallback: None,
         };
         let s = decoder.decode(&[0x41, 0x81, 0x40]);
         assert_eq!(s, "A\u{4E00}");
@@ -3872,6 +4014,7 @@ endbfchar
         let decoder = FontDecoder::ToUnicode {
             map: parsed,
             cid_width: 1,
+            fallback: None,
         };
         let s = decoder.decode(&[0x41, 0x42]);
         assert_eq!(s, "\u{FFFD}\u{FFFD}");
@@ -3894,6 +4037,7 @@ endbfchar
         let decoder = FontDecoder::ToUnicode {
             map: parsed,
             cid_width: 1,
+            fallback: None,
         };
         let s = decoder.decode(&[0xFF, 0x41]);
         assert_eq!(s, "\u{FFFD}A");
@@ -3912,6 +4056,7 @@ endbfchar
         let decoder = FontDecoder::ToUnicode {
             map: parsed,
             cid_width: 2,
+            fallback: None,
         };
         let s = decoder.decode(&[0x00, 0x41, 0x00, 0x42]);
         assert_eq!(s, "Hi");

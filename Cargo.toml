@@ -9,6 +9,7 @@ description = "Pure-Rust PDF writer for the oxideav framework — vector-stays-v
 repository = "https://github.com/OxideAV/oxideav-pdf"
 homepage = "https://github.com/OxideAV/oxideav-pdf"
 readme = "README.md"
+exclude = ["scripts/"]
 keywords = ["multimedia", "pdf", "vector", "writer", "pure-rust"]
 categories = ["multimedia::encoding"]
 
@@ -139,6 +140,16 @@ rc2 = { version = "0.8", default-features = false }
 # per RFC 3211 / RFC 5652 §12.4. PDF 2.0 deprecates 3DES — we accept on
 # decode only. The `cbc` wrapper crate is shared with the AES path.
 des = { version = "0.8", default-features = false }
+
+[features]
+default = ["cjk-cmaps"]
+# Predefined CJK CMaps (ISO 32000-1 §9.7.5.2) and the Adobe-Japan1 /
+# GB1 / CNS1 / Korea1 / KR CID → Unicode tables (§9.10.2) for text
+# extraction from Type 0 fonts without a /ToUnicode CMap. Carries a
+# ~320 KB generated table (src/reader/data/cjk_cmaps.bin) built from
+# Adobe's BSD-3-Clause cmap-resources; disable to drop it, in which case
+# those fonts decode as Identity.
+cjk-cmaps = []
 
 [dev-dependencies]
 # Round 148 (depth-mode benchmarks): Criterion drives the three

@@ -211,6 +211,27 @@ pub fn parse_encoding_differences(arr: &Object) -> Result<EncodingDifferences, P
     Ok(out)
 }
 
+/// [`apply_encoding_differences`] with a second resolver consulted for
+/// names the Adobe Glyph List does not map (an embedded program's
+/// glyph-index names, say).
+pub(crate) fn apply_encoding_differences_with(
+    base: &EncodingMap,
+    differences: &EncodingDifferences,
+    fallback: impl Fn(&str) -> Option<String>,
+) -> EncodingMap {
+    let mut out = base.clone();
+    for ov in &differences.overrides {
+        match glyph_name_to_unicode(&ov.glyph_name) {
+            Some(s) => out.set_string(ov.code, s.as_ref()),
+            None => out.set_string(
+                ov.code,
+                fallback(&ov.glyph_name).as_deref().unwrap_or_default(),
+            ),
+        }
+    }
+    out
+}
+
 /// Overlay `differences` on top of `base`, returning a fresh map. The
 /// base map is left untouched (cheap clone — `String` allocations are
 /// per-entry).
@@ -240,13 +261,14 @@ pub fn apply_encoding_differences(
 /// common case). Returns `None` for unknown names — the caller emits
 /// U+FFFD as a marker.
 ///
-/// The table here is a transcription of the AGL subset under
-/// `docs/document/pdf/agl/subset.txt`. The PDF spec (§D.2 + §9.6.6.1)
-/// defines a fixed Latin repertoire that the four named encodings draw
-/// from; that's what we ship. Extending the table for non-Latin glyphs
-/// (CJK, Cyrillic, Devanagari) is a future-round followup.
+/// Names resolve through a small override table (transcribed from
+/// `docs/document/pdf/agl/subset.txt`: ligatures written out as their
+/// letters) and then the full Adobe Glyph List v2.0
+/// (`docs/text/opentype/spec/agl-glyphlist.txt`, [`super::agl`]),
+/// following the AGL Specification §2 rules: a `.suffix` is dropped
+/// and `_`-joined components map one by one.
 ///
-/// In addition to the static AGL subset, this resolver honours the
+/// In addition to the glyph lists, this resolver honours the
 /// Adobe Glyph List Public Implementation Notes §3 `uniXXXX...` /
 /// `uXXXXXXXX` Unicode-by-name escape forms (round 175). Producers
 /// occasionally emit these escapes directly in a `/Differences` array
@@ -255,24 +277,48 @@ pub fn apply_encoding_differences(
 // Internal: glyph-name lookup plumbing behind the text extractor (exposed for tests).
 #[doc(hidden)]
 pub fn glyph_name_to_unicode(name: &str) -> Option<Cow<'static, str>> {
-    // Special PDF-spec aliases — `.notdef` is rendered as nothing, the
-    // `uniXXXX` / `uXXXXXXXX` forms are Unicode-by-name escapes that the
-    // AGL Public Implementation Notes (§3) mandates we honour first.
+    // `.notdef` is rendered as nothing.
     if name == ".notdef" || name.is_empty() {
         return Some(Cow::Borrowed(""));
     }
-    // Linear scan of the AGL subset first — the AGL alias is preferred
-    // when both forms resolve (a producer that emits `/A` and the
-    // AGL-aliased `/uni0041` should reach the same result, but the
-    // static-table hit avoids an allocation). The table is small enough
-    // that a hash map's setup cost outweighs the savings for the typical
-    // `/Differences` array (≤ 32 entries).
+    if let Some(s) = component_to_unicode(name) {
+        return Some(s);
+    }
+    // AGL Specification §2: drop everything from the first period
+    // (`a.sc`, `one.oldstyle`), split the rest on underscores
+    // (`f_f_i`), map each component and concatenate. A component that
+    // maps to nothing contributes the empty string; a name none of
+    // whose components map is unknown (`None`), so the caller can
+    // choose its own fallback.
+    let base = name.split('.').next().unwrap_or("");
+    if base.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    let mut any = false;
+    for comp in base.split('_') {
+        if let Some(s) = component_to_unicode(comp) {
+            out.push_str(&s);
+            any = true;
+        }
+    }
+    any.then_some(Cow::Owned(out))
+}
+
+/// One AGL §2 component: the shipping overrides (ligatures written
+/// out, Greek Delta / Omega), the full Adobe Glyph List, then the
+/// `uniXXXX` / `uXXXX[XX]` forms.
+fn component_to_unicode(name: &str) -> Option<Cow<'static, str>> {
+    // The overrides first: a static-table hit avoids an allocation
+    // and keeps the extractor's long-standing choices (`fi` → "fi").
     for (n, s) in AGL_SUBSET {
         if *n == name {
             return Some(Cow::Borrowed(*s));
         }
     }
-    // Fall through to the `uniXXXX` / `uXXXXXXXX` decoder.
+    if let Some(s) = crate::reader::agl::lookup(name) {
+        return Some(Cow::Borrowed(s));
+    }
     uni_prefix_decode(name).map(Cow::Owned)
 }
 
@@ -1020,95 +1066,204 @@ fn fill_standard(m: &mut EncodingMap) {
 /// SymbolEncoding — ISO 32000-1 Annex D.5 (Symbol font's built-in
 /// encoding — Greek + math). Sparse; only the spec entries.
 fn fill_symbol(m: &mut EncodingMap) {
-    let table: &[(u8, char)] = &[
-        (0x20, ' '),
-        (0x21, '!'),
-        (0x22, '\u{2200}'), // universal
-        (0x23, '#'),
-        (0x24, '\u{2203}'), // existential
-        (0x25, '%'),
-        (0x26, '&'),
-        (0x27, '\u{220B}'),
-        (0x28, '('),
-        (0x29, ')'),
-        (0x2A, '\u{2217}'),
-        (0x2B, '+'),
-        (0x2C, ','),
-        (0x2D, '\u{2212}'),
-        (0x2E, '.'),
-        (0x2F, '/'),
-        (0x30, '0'),
-        (0x31, '1'),
-        (0x32, '2'),
-        (0x33, '3'),
-        (0x34, '4'),
-        (0x35, '5'),
-        (0x36, '6'),
-        (0x37, '7'),
-        (0x38, '8'),
-        (0x39, '9'),
-        (0x3A, ':'),
-        (0x3B, ';'),
-        (0x3C, '<'),
-        (0x3D, '='),
-        (0x3E, '>'),
-        (0x3F, '?'),
-        (0x40, '\u{2245}'),
-        (0x41, '\u{0391}'),
-        (0x42, '\u{0392}'),
-        (0x43, '\u{03A7}'),
-        (0x44, '\u{0394}'),
-        (0x45, '\u{0395}'),
-        (0x46, '\u{03A6}'),
-        (0x47, '\u{0393}'),
-        (0x48, '\u{0397}'),
-        (0x49, '\u{0399}'),
-        (0x4A, '\u{03D1}'),
-        (0x4B, '\u{039A}'),
-        (0x4C, '\u{039B}'),
-        (0x4D, '\u{039C}'),
-        (0x4E, '\u{039D}'),
-        (0x4F, '\u{039F}'),
-        (0x50, '\u{03A0}'),
-        (0x51, '\u{0398}'),
-        (0x52, '\u{03A1}'),
-        (0x53, '\u{03A3}'),
-        (0x54, '\u{03A4}'),
-        (0x55, '\u{03A5}'),
-        (0x56, '\u{03C2}'),
-        (0x57, '\u{03A9}'),
-        (0x58, '\u{039E}'),
-        (0x59, '\u{03A8}'),
-        (0x5A, '\u{0396}'),
-        (0x61, '\u{03B1}'),
-        (0x62, '\u{03B2}'),
-        (0x63, '\u{03C7}'),
-        (0x64, '\u{03B4}'),
-        (0x65, '\u{03B5}'),
-        (0x66, '\u{03C6}'),
-        (0x67, '\u{03B3}'),
-        (0x68, '\u{03B7}'),
-        (0x69, '\u{03B9}'),
-        (0x6A, '\u{03D5}'),
-        (0x6B, '\u{03BA}'),
-        (0x6C, '\u{03BB}'),
-        (0x6D, '\u{03BC}'),
-        (0x6E, '\u{03BD}'),
-        (0x6F, '\u{03BF}'),
-        (0x70, '\u{03C0}'),
-        (0x71, '\u{03B8}'),
-        (0x72, '\u{03C1}'),
-        (0x73, '\u{03C3}'),
-        (0x74, '\u{03C4}'),
-        (0x75, '\u{03C5}'),
-        (0x76, '\u{03D6}'),
-        (0x77, '\u{03C9}'),
-        (0x78, '\u{03BE}'),
-        (0x79, '\u{03C8}'),
-        (0x7A, '\u{03B6}'),
+    // ISO 32000-1 Annex D.5 "Symbol Set and Encoding": every glyph of
+    // the set with its (octal) code; each name resolves through the
+    // Adobe Glyph List.
+    let table: &[(u8, &str)] = &[
+        (0o040, "space"),
+        (0o041, "exclam"),
+        (0o042, "universal"),
+        (0o043, "numbersign"),
+        (0o044, "existential"),
+        (0o045, "percent"),
+        (0o046, "ampersand"),
+        (0o047, "suchthat"),
+        (0o050, "parenleft"),
+        (0o051, "parenright"),
+        (0o052, "asteriskmath"),
+        (0o053, "plus"),
+        (0o054, "comma"),
+        (0o055, "minus"),
+        (0o056, "period"),
+        (0o057, "slash"),
+        (0o060, "zero"),
+        (0o061, "one"),
+        (0o062, "two"),
+        (0o063, "three"),
+        (0o064, "four"),
+        (0o065, "five"),
+        (0o066, "six"),
+        (0o067, "seven"),
+        (0o070, "eight"),
+        (0o071, "nine"),
+        (0o072, "colon"),
+        (0o073, "semicolon"),
+        (0o074, "less"),
+        (0o075, "equal"),
+        (0o076, "greater"),
+        (0o077, "question"),
+        (0o100, "congruent"),
+        (0o101, "Alpha"),
+        (0o102, "Beta"),
+        (0o103, "Chi"),
+        (0o104, "Delta"),
+        (0o105, "Epsilon"),
+        (0o106, "Phi"),
+        (0o107, "Gamma"),
+        (0o110, "Eta"),
+        (0o111, "Iota"),
+        (0o112, "theta1"),
+        (0o113, "Kappa"),
+        (0o114, "Lambda"),
+        (0o115, "Mu"),
+        (0o116, "Nu"),
+        (0o117, "Omicron"),
+        (0o120, "Pi"),
+        (0o121, "Theta"),
+        (0o122, "Rho"),
+        (0o123, "Sigma"),
+        (0o124, "Tau"),
+        (0o125, "Upsilon"),
+        (0o126, "sigma1"),
+        (0o127, "Omega"),
+        (0o130, "Xi"),
+        (0o131, "Psi"),
+        (0o132, "Zeta"),
+        (0o133, "bracketleft"),
+        (0o134, "therefore"),
+        (0o135, "bracketright"),
+        (0o136, "perpendicular"),
+        (0o137, "underscore"),
+        (0o140, "radicalex"),
+        (0o141, "alpha"),
+        (0o142, "beta"),
+        (0o143, "chi"),
+        (0o144, "delta"),
+        (0o145, "epsilon"),
+        (0o146, "phi"),
+        (0o147, "gamma"),
+        (0o150, "eta"),
+        (0o151, "iota"),
+        (0o152, "phi1"),
+        (0o153, "kappa"),
+        (0o154, "lambda"),
+        (0o155, "mu"),
+        (0o156, "nu"),
+        (0o157, "omicron"),
+        (0o160, "pi"),
+        (0o161, "theta"),
+        (0o162, "rho"),
+        (0o163, "sigma"),
+        (0o164, "tau"),
+        (0o165, "upsilon"),
+        (0o166, "omega1"),
+        (0o167, "omega"),
+        (0o170, "xi"),
+        (0o171, "psi"),
+        (0o172, "zeta"),
+        (0o173, "braceleft"),
+        (0o174, "bar"),
+        (0o175, "braceright"),
+        (0o176, "similar"),
+        (0o240, "Euro"),
+        (0o241, "Upsilon1"),
+        (0o242, "minute"),
+        (0o243, "lessequal"),
+        (0o244, "fraction"),
+        (0o245, "infinity"),
+        (0o246, "florin"),
+        (0o247, "club"),
+        (0o250, "diamond"),
+        (0o251, "heart"),
+        (0o252, "spade"),
+        (0o253, "arrowboth"),
+        (0o254, "arrowleft"),
+        (0o255, "arrowup"),
+        (0o256, "arrowright"),
+        (0o257, "arrowdown"),
+        (0o260, "degree"),
+        (0o261, "plusminus"),
+        (0o262, "second"),
+        (0o263, "greaterequal"),
+        (0o264, "multiply"),
+        (0o265, "proportional"),
+        (0o266, "partialdiff"),
+        (0o267, "bullet"),
+        (0o270, "divide"),
+        (0o271, "notequal"),
+        (0o272, "equivalence"),
+        (0o273, "approxequal"),
+        (0o274, "ellipsis"),
+        (0o275, "arrowvertex"),
+        (0o276, "arrowhorizex"),
+        (0o277, "carriagereturn"),
+        (0o300, "aleph"),
+        (0o301, "Ifraktur"),
+        (0o302, "Rfraktur"),
+        (0o303, "weierstrass"),
+        (0o304, "circlemultiply"),
+        (0o305, "circleplus"),
+        (0o306, "emptyset"),
+        (0o307, "intersection"),
+        (0o310, "union"),
+        (0o311, "propersuperset"),
+        (0o312, "reflexsuperset"),
+        (0o313, "notsubset"),
+        (0o314, "propersubset"),
+        (0o315, "reflexsubset"),
+        (0o316, "element"),
+        (0o317, "notelement"),
+        (0o320, "angle"),
+        (0o321, "gradient"),
+        (0o322, "registerserif"),
+        (0o323, "copyrightserif"),
+        (0o324, "trademarkserif"),
+        (0o325, "product"),
+        (0o326, "radical"),
+        (0o327, "dotmath"),
+        (0o330, "logicalnot"),
+        (0o331, "logicaland"),
+        (0o332, "logicalor"),
+        (0o333, "arrowdblboth"),
+        (0o334, "arrowdblleft"),
+        (0o335, "arrowdblup"),
+        (0o336, "arrowdblright"),
+        (0o337, "arrowdbldown"),
+        (0o340, "lozenge"),
+        (0o341, "angleleft"),
+        (0o342, "registersans"),
+        (0o343, "copyrightsans"),
+        (0o344, "trademarksans"),
+        (0o345, "summation"),
+        (0o346, "parenlefttp"),
+        (0o347, "parenleftex"),
+        (0o350, "parenleftbt"),
+        (0o351, "bracketlefttp"),
+        (0o352, "bracketleftex"),
+        (0o353, "bracketleftbt"),
+        (0o354, "bracelefttp"),
+        (0o355, "braceleftmid"),
+        (0o356, "braceleftbt"),
+        (0o357, "braceex"),
+        (0o361, "angleright"),
+        (0o362, "integral"),
+        (0o363, "integraltp"),
+        (0o364, "integralex"),
+        (0o365, "integralbt"),
+        (0o366, "parenrighttp"),
+        (0o367, "parenrightex"),
+        (0o370, "parenrightbt"),
+        (0o371, "bracketrighttp"),
+        (0o372, "bracketrightex"),
+        (0o373, "bracketrightbt"),
+        (0o374, "bracerighttp"),
+        (0o375, "bracerightmid"),
+        (0o376, "bracerightbt"),
     ];
-    for (b, c) in table {
-        m.set_char(*b, *c);
+    for &(code, name) in table {
+        if let Some(text) = glyph_name_to_unicode(name) {
+            m.set_string(code, &text);
+        }
     }
 }
 

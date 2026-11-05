@@ -188,9 +188,20 @@ for an end-to-end verify.
   `/ToUnicode` CMap (mixed-width codespaces honoured; a simple font's
   codes stay one byte whatever the CMap's codespace claims) or
   simple-font encoding (`WinAnsi` / `MacRoman` / `/Differences` over
-  the Adobe Glyph List, including `uniXXXX` / `uXXXXXXXX` escapes; an
-  embedded Type 1 program's own encoding; Symbol / ZapfDingbats
-  built-ins). `/ActualText` spans (§14.9.4) replace the glyphs they
+  the full Adobe Glyph List with the AGL §2 rules — `.suffix` dropped,
+  `f_f_i` components, `uniXXXX` / `uXXXXXXXX` escapes; the full Annex
+  D.5 Symbol and ZapfDingbats built-ins). Fonts without a `/ToUnicode`
+  read their **embedded programs**: a Type 1 cleartext `/Encoding`, a
+  CFF (`/FontFile3` Type1C or OpenType) built-in encoding and charset
+  (TN #5176), a symbolic TrueType's `(3,0)` / `(1,0)` glyph selection
+  (§9.6.6.4) with the glyph's text from the font's Unicode `cmap` run
+  backwards or its `post` name; glyph-index `/Differences` names
+  (`/G12`, `/g250`) resolve through the program, and a glyph that
+  draws nothing reads as a space. **CIDFonts** without a `/ToUnicode`
+  map CIDs through `CIDToGIDMap` / the CFF charset to the program's
+  glyphs, or through the Adobe-Japan1 / GB1 / CNS1 / Korea1 / KR
+  collection named by `/CIDSystemInfo`; a `/ToUnicode` that leaves
+  codes out falls back to the same sources. `/ActualText` spans (§14.9.4) replace the glyphs they
   wrap. `flat_text()` / `lines()` assemble words and lines from the
   runs' geometry — one show per word, per word plus a space glyph, or
   per glyph (pdfTeX, cairo, Skia / Chrome) all rebuild the same text;
@@ -211,10 +222,13 @@ for an end-to-end verify.
   partial-match and notdef → CID 0 fallbacks) and maps each code to
   its CID before the CID-keyed `/W` width lookup; `/UseCMap`
   inheritance resolves from the Table 120 stream-dictionary entry.
-  (The non-Identity *predefined* CMap names index Adobe character
-  collections whose data tables ISO 32000 doesn't carry — those fall
-  back to Identity.) **Vertical writing mode** (`Identity-V`, or an
-  embedded CMap with `/WMode 1`) advances runs down the column by the
+  The **predefined CJK CMaps** (§9.7.5.2 — `90ms-RKSJ-H`,
+  `GBK-EUC-H`, `B5pc-H`, `KSC-EUC-H`, … all 94 legacy-encoding CMaps
+  of Adobe's cmap-resources, plus every `Uni…-UCS2/UTF8/UTF16/UTF32`
+  CMap) segment, map to CIDs (for widths) and to Unicode (§9.10.2)
+  from a ~320 KB generated table behind the default-on `cjk-cmaps`
+  feature. **Vertical writing mode** (`Identity-V`, a `-V` predefined
+  CMap, or an embedded CMap with `/WMode 1`) advances runs down the column by the
   §9.7.4.3 `/W2` / `/DW2` vertical displacements, `TJ` adjustments
   included, per the §9.4.4 `ty` equation (no `Th`).
 - **Document outline + links** — `outline()` collapses the §12.3.3

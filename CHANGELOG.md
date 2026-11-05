@@ -7,9 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Text extraction for fonts without `/ToUnicode`: CFF (`/FontFile3`
+  Type1C / OpenType) built-in encodings and charsets; TrueType
+  symbolic `(3,0)` / `(1,0)` glyph selection with Unicode-`cmap` and
+  `post`-name text (§9.6.6.4); glyph-index `/Differences` names
+  resolved through the embedded program; blank glyphs read as spaces;
+  CIDFontType2 / CIDFontType0 CIDs through `CIDToGIDMap` / the CFF
+  charset to the program's glyphs; `/ToUnicode` gaps fall back to the
+  same sources.
+- Predefined CJK CMaps (§9.7.5.2) and the Adobe-Japan1 / GB1 / CNS1 /
+  Korea1 / KR CID → Unicode tables (§9.10.2), generated from Adobe's
+  cmap-resources into a compact table behind the new default-on
+  `cjk-cmaps` feature; `-V` CMaps set vertical writing mode.
+- The full Adobe Glyph List (AGL §2 suffix / ligature-component rules)
+  and the full Annex D.5 Symbol encoding.
+
 ### Changed
 
 - edition 2024, MSRV 1.95
+
+### Fixed
+
+- Page `/Contents` given as an indirect reference to an array of
+  streams; `/Resources` inherited from a `/Pages` ancestor; a font
+  whose encoding resources fail to parse no longer drops the page.
+- R=6 `/O` / `/U` strings zero-padded past 48 bytes are accepted.
 
 ## [0.2.1](https://github.com/OxideAV/oxideav-pdf/compare/v0.2.0...v0.2.1) - 2026-10-23
 

@@ -206,6 +206,21 @@ impl CidCMap {
         Ok(cm)
     }
 
+    /// A CMap carrying only codespace ranges — the §9.7.6.2 code
+    /// segmenter for a predefined CMap whose code → CID data lives in
+    /// the generated table of [`crate::reader::cjk`].
+    pub(crate) fn from_codespaces(codespaces: Vec<CodespaceRange>) -> CidCMap {
+        CidCMap {
+            codespaces,
+            ..CidCMap::default()
+        }
+    }
+
+    /// The declared codespace ranges.
+    pub(crate) fn codespaces(&self) -> &[CodespaceRange] {
+        &self.codespaces
+    }
+
     /// The Identity mapping (2-byte codes, CID = code) — the shape of
     /// the predefined Identity-H / Identity-V CMaps, used as a
     /// `/UseCMap` base.
