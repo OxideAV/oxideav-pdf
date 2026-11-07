@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/OxideAV/oxideav-pdf/compare/v0.2.2...v0.3.0) - 2026-11-07
+
+### Other
+
+- API hygiene: non_exhaustive reader output records, constructor-built configs, growable enums
+
 ### Changed
 
 - `#[non_exhaustive]` on the reader output records (`PdfAction`, `PdfAnnotation`, `AnnotationAppearance`, `ThreeDActivation`, `FixedPrint`, `PdfAttachment`, `HierarchyIssue`, `HierarchyReport`, `PdfImageXObject`, `SoftMaskImage`, `PdfInlineImage`, `ReadingOrderText`, `LinearizationParams`, `PdfLink`, `NamedDestination`, the optional-content `OptionalContentGroup` / `OcUsage` / `OcConfig` / `OptionalContent`, `OutlineNode`, `PdfOutline`, `PageLabelRange`, `PdfAConformance`, `PdfDocTimestamp`, `MarkedTextRun`, `PdfTextExtraction`, `PdfMarkedTextExtraction`, `PdfThread`, `PdfBead`, the `reader::content` records, `PubSecMatch`) and on the writer / encryption records that already have constructors (`Attachment`, `OutlineSpec`, `EncryptionConfig`, `EncryptionState`, `PubSecEncoderConfig`, `PubSecEncryptionState`, `PubSecCfGroup`, `PubSecKariConfig`, `KariRecipient`, `PubSecCredential`).
