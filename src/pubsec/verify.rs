@@ -185,6 +185,7 @@ pub const OID_ATTR_CONTENT_TYPE: [u64; 7] = [1, 2, 840, 113549, 1, 9, 3];
 
 /// Identify the hash function the `digestAlgorithm` OID names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HashAlg {
     Sha1,
     Sha256,
@@ -228,6 +229,7 @@ impl HashAlg {
 
 /// Identify the signature scheme the `signatureAlgorithm` OID names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SignatureAlg {
     /// RSA-PKCS#1 v1.5 (RFC 8017 §8.2). The `digestAlgorithm` is supplied
     /// separately via `SignerInfo.digest_algorithm_oid` — the
@@ -266,6 +268,7 @@ impl SignatureAlg {
 
 /// Named-curve identifier extracted from a cert SPKI for ECDSA dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EcCurve {
     P256,
     P384,

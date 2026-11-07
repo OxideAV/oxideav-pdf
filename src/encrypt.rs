@@ -56,6 +56,7 @@ fn pad_password(password: &[u8]) -> [u8; 32] {
 /// IVs / salts to feed into the AES paths so output stays
 /// deterministic for tests.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct EncryptionConfig {
     /// Revision — 2..=6. Implies `length_bits`, `cfm`, and which
     /// algorithm family (V≤4 vs V=5) to use.
@@ -208,6 +209,7 @@ impl EncryptionConfig {
 /// start of [`crate::objects::Document::write_to`] and threaded
 /// through per-object string + stream encryption.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct EncryptionState {
     /// Handler used to encrypt every string + stream.
     pub handler: StandardHandler,

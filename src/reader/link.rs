@@ -30,6 +30,7 @@ type NamedDests = HashMap<Vec<u8>, ResolvedNamedDest>;
 
 /// One Link annotation, ready for a caller to follow.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PdfLink {
     /// 0-based page index — which page in DFS order carries this
     /// annotation in its `/Annots` array.
@@ -45,6 +46,7 @@ pub struct PdfLink {
 
 /// What a [`PdfLink`] points to.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum PdfLinkTarget {
     /// In-document jump.
     Internal(OutlineDestination),

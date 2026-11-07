@@ -67,6 +67,7 @@ use crate::reader::document::DocumentReader;
 /// vanishingly rare with DCTDecode, but we surface the variant so
 /// downstream code can detect + special-case it.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ColorSpace {
     /// `/DeviceRGB` — 3 channels, non-calibrated RGB.
     DeviceRGB,
@@ -122,6 +123,7 @@ impl ColorSpace {
 /// they don't, the PDF dictionary wins for layout and the decoder
 /// re-samples on the way out.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct PdfImageXObject {
     /// Raw JPEG bytes — a self-contained JPEG-1 / JFIF stream ready
     /// to be passed to a JPEG decoder.
@@ -152,6 +154,7 @@ pub struct PdfImageXObject {
 /// Per Table 145 its colour space is required to be `/DeviceGray`, so
 /// the decoded samples are single-component gray values.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct SoftMaskImage {
     /// `/Width` of the mask (Table 145: independent of the parent's
     /// unless `/Matte` is present — both map onto the unit square).

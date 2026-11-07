@@ -39,6 +39,7 @@ use crate::reader::outline::{build_page_index_map, decode_dest_value};
 
 /// One named destination, from either §12.3.2.3 source.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct NamedDestination {
     /// The destination name, decoded for display (UTF-16BE when the
     /// §7.9.2.2 BOM prefix is present, UTF-8-lossy otherwise).

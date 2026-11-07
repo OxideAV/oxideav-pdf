@@ -35,6 +35,7 @@ use crate::reader::document::DocumentReader;
 
 /// Severity tag for [`HierarchyIssue`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IssueSeverity {
     /// Spec violation that breaks rendering — e.g. a `/Pages` tree
     /// with no leaves, or a missing required `/Root` reference.
@@ -47,6 +48,7 @@ pub enum IssueSeverity {
 
 /// One issue surfaced by [`verify_hierarchy`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct HierarchyIssue {
     /// The offending object — `None` for issues that fault the
     /// document as a whole (e.g. "Catalog missing /Pages").
@@ -59,6 +61,7 @@ pub struct HierarchyIssue {
 
 /// Summary report from [`verify_hierarchy`].
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct HierarchyReport {
     /// Number of page leaves the walker found.
     pub page_count: usize,

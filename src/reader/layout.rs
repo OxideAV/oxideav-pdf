@@ -51,6 +51,7 @@ use crate::reader::text::{TextRun, extract_text, extract_text_marked};
 
 /// Which path produced the [`ReadingOrderText`] runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LayoutMode {
     /// The document carries a `/StructTreeRoot` whose `/K` tree was
     /// walked to produce logical reading order. Multi-column / table
@@ -65,6 +66,7 @@ pub enum LayoutMode {
 /// Output of [`read_in_logical_order`]: the run sequence plus the
 /// flag that tells the caller which path produced them.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct ReadingOrderText {
     pub mode: LayoutMode,
     pub runs: Vec<TextRun>,

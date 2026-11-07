@@ -62,6 +62,7 @@ const BYTE_RANGE_PLACEHOLDER: &str = "/ByteRange [         0          0         
 /// can be plumbed through the same trait without touching the writer
 /// surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SigningAlgorithm {
     /// RSA-PKCS#1 v1.5 (RFC 8017 §8.2) over a SHA-256 message digest.
     /// `signatureAlgorithm` OID emitted: `rsaEncryption`

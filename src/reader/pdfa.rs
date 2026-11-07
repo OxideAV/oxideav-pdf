@@ -64,6 +64,7 @@ pub struct PdfACatalogSignals {
 /// Resolved PDF/A conformance picture, combining XMP claims with
 /// catalog signals. See [`PdfAConformance::from_signals_and_xmp`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PdfAConformance {
     /// What the XMP packet declares — `Some((part, conformance))`
     /// when `pdfaid:part` is set; `None` when the document does not

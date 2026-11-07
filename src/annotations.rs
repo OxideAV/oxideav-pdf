@@ -189,6 +189,7 @@ pub struct Annotation {
 /// Stamp) plus three additional ones (Square, Circle, Ink) that
 /// show up in markup-heavy PDFs (review / proof workflows).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum AnnotationKind {
     /// `/Subtype /Text` — sticky-note (§12.5.6.4, Table 172).
     Text {

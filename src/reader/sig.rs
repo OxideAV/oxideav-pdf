@@ -146,6 +146,7 @@ impl PdfSignature {
 /// verification dispatch (cert chain + GenTime ordering) lives in a
 /// follow-up round.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PdfDocTimestamp {
     /// `/ByteRange [a b c d]` — same shape as [`PdfSignature::byte_range`].
     pub byte_range: [i64; 4],

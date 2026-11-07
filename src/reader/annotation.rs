@@ -128,6 +128,7 @@ use crate::reader::outline::build_page_index_map;
 /// The fields are the cross-subtype intersection; per-subtype detail
 /// hangs off [`Self::kind`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PdfAnnotation {
     /// 0-based page index — which page in DFS order carries this
     /// annotation in its `/Annots` array.
@@ -173,6 +174,7 @@ pub struct PdfAnnotation {
 /// union of state names across all three (empty when every present
 /// entry is a single stream).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AnnotationAppearance {
     /// `/N` — normal appearance present (Table 168 requires it, but
     /// the enumeration is tolerant of producers that omit it).
@@ -192,6 +194,7 @@ pub struct AnnotationAppearance {
 /// The `/Subtype` name from §12.5.6 maps to one of these variants;
 /// unknown subtypes fall through to [`Self::Other`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum AnnotationKind {
     /// `/Subtype /Text` — sticky-note (§12.5.6.4 Table 172).
     Text {
@@ -616,6 +619,7 @@ pub enum AnnotationKind {
 /// 298, round 220). Per spec the `/3DV` slot may carry any of four
 /// shapes; this enum is the lossless union of those.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ThreeDViewSelector {
     /// Indirect reference to a 3D view dictionary (§13.6.4).
     View(ObjectId),
@@ -638,6 +642,7 @@ pub enum ThreeDViewSelector {
 /// lossless about presence-vs-default to keep round-trip diagnostics
 /// possible).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ThreeDActivation {
     /// `/A` — activation circumstance: `PO` / `PV` / `XA`. Default
     /// `XA` (the annotation stays inactive until explicit user
@@ -713,6 +718,7 @@ pub enum TextMarkupVariant {
 /// (defaulting to identity per spec), `/H`, and `/V` (each defaulting
 /// to `0.0` per spec).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct FixedPrint {
     /// `/Matrix` — six-number affine transform applied to the
     /// annotation rectangle before rendering. Defaults to the

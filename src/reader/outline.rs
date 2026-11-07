@@ -64,6 +64,7 @@ const MAX_OUTLINE_DEPTH: usize = 64;
 
 /// One node in the parsed outline tree.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct OutlineNode {
     /// `/Title` text (decoded — `LiteralString` PDFDocEncoding or
     /// `HexString` UTF-16BE with BOM).
@@ -118,6 +119,7 @@ impl OutlineNode {
 /// is the value of the outline dict's own `/Count` entry per Table
 /// 152 (when present).
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct PdfOutline {
     pub roots: Vec<OutlineNode>,
     pub count: Option<i64>,

@@ -8,6 +8,7 @@ use std::io;
 
 /// Errors that can arise while building a PDF.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum PdfError {
     /// I/O error while serialising. Currently only produced by the
     /// `Vec<u8>`-backed writer when something pathological happens to

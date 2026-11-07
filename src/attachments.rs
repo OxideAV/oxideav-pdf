@@ -181,6 +181,7 @@ impl AfRelationship {
 /// either is `None`, no annotation is created (the file is still embedded
 /// + reachable via the `/Names → /EmbeddedFiles` name tree).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Attachment {
     /// File name shown to the user (e.g. `"notes.txt"`).
     pub name: String,

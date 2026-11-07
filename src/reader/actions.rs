@@ -62,6 +62,7 @@ use crate::reader::outline::build_page_index_map;
 /// specific page event, an annotation event, a form-field event, or
 /// a name-tree entry — and `kind` records *what* the action does.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PdfAction {
     /// Where in the document this action lives.
     pub trigger: ActionTrigger,
@@ -75,6 +76,7 @@ pub struct PdfAction {
 
 /// Where in the document an action is attached.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ActionTrigger {
     /// `Catalog /OpenAction` — fired when the document is opened
     /// (§7.7.2 Table 28 + §12.6.4 Table 198).
@@ -130,6 +132,7 @@ pub enum ActionTrigger {
 
 /// Typed action payload — Table 198's 18 action types.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ActionKind {
     /// `/S /GoTo` — in-document jump (§12.6.4.2 Table 199). `/D` is
     /// either an explicit `[page-ref mode args …]` array (caller

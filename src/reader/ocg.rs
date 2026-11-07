@@ -115,6 +115,7 @@ impl OcBaseState {
 /// objects are OCGs", which lets callers cross-walk against e.g.
 /// content-stream `/OC /OCx BDC` resource names).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct OptionalContentGroup {
     /// Indirect object id — the OCG dict's `(n 0 obj)` number. Used
     /// by content streams + OCMDs to refer to the group.
@@ -136,6 +137,7 @@ pub struct OptionalContentGroup {
 /// usage-application dictionaries (Table 103) consult for `View` /
 /// `Print` / `Export` state derivation.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct OcUsage {
     /// `/Language /Lang` (§8.11.4.4 — IETF BCP 47 language tag, e.g.
     /// `en-US`, `fr`, `es-MX`).
@@ -168,6 +170,7 @@ pub struct OcUsage {
 /// configurations in `/OCProperties /Configs` are also surfaced
 /// using this same shape.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct OcConfig {
     /// `/Name` — display name for this configuration.
     pub name: Option<String>,
@@ -234,6 +237,7 @@ pub enum OcOrderItem {
 ///
 /// Returned by [`DocumentReader::optional_content`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct OptionalContent {
     /// Every OCG in the document, in `/OCProperties /OCGs` order.
     pub groups: Vec<OptionalContentGroup>,

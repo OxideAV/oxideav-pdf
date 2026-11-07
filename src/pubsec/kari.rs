@@ -228,6 +228,7 @@ impl WrapAlgorithm {
 /// (P-256 → SHA-256, P-384 → SHA-384, P-521 → SHA-512) and configurable
 /// via [`KariKdf`] for X25519 + X448 per RFC 8418 §2.1 + §2.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KariCurve {
     /// NIST P-256 (`secp256r1`) + X9.63-SHA-256 KDF. KEA OID is
     /// [`OID_DH_SINGLE_PASS_STDDH_SHA256_KDF`].
@@ -336,6 +337,7 @@ impl KariCurve {
 ///   KEK length. KEA OIDs sit in the smime-alg arc
 ///   `1.2.840.113549.1.9.16.3.{19,20,21}` (HKDF-SHA-256 / 384 / 512).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KariKdf {
     /// X9.63 KDF with SHA-256 (RFC 5753 §7.1.2 + §7.1.4 secg-scheme).
     /// Default for P-256 + X25519.

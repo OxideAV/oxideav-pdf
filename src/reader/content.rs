@@ -503,6 +503,7 @@ pub fn parse_content_stream_full_with_soft_masks(
 /// stream-order list of text-show events the round-128 walker
 /// surfaces when `/Resources /Font` is plumbed in.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct ParsedContent {
     /// Painted-shapes group — identical to the `Group` returned by
     /// [`parse_content_stream`] / [`parse_content_stream_with_resources`].
@@ -554,6 +555,7 @@ pub struct ParsedContent {
 /// for hex strings — so a consumer that wants byte→Unicode mapping can
 /// route them through whatever decoder its `font_dict` calls for.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ContentTextShow {
     /// Font resource name as named by the most recent `Tf`, with the
     /// leading `/` stripped (e.g. `"F1"`). Empty when the content
@@ -618,6 +620,7 @@ pub enum TextShowOp {
 /// * `clip` — the most recent `W`/`W*`-committed clip path in force,
 ///   or `None`. The image is subject to it (§8.5.4).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ContentInlineImage {
     /// The resolved inline image — dictionary fields (width, height,
     /// colour space, bits-per-component, terminal codec filter,
@@ -655,6 +658,7 @@ pub struct ContentInlineImage {
 ///   shading is subject to this region (§8.7.4.5 "subject to the
 ///   current clipping path").
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ContentShading {
     /// Shading-resource key the `sh` operator named, with the
     /// leading `/` stripped (e.g. `"Sh1"`). Empty when the operator
@@ -821,6 +825,7 @@ pub struct MeshPatch {
 /// entries stay verbatim in `properties` so a downstream consumer can
 /// resolve `/OC`, `/MCID`, `/ActualText`, etc. as it sees fit.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ContentMarkedContent {
     /// Which marked-content operator produced this event.
     pub operator: MarkedContentOp,
@@ -1129,6 +1134,7 @@ struct State<'a> {
 /// default coordinate system (§8.7.2 NOTE 1), and the `/PaintType`
 /// (1 = coloured, 2 = uncoloured stencil).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct TilingPattern {
     /// Cell content stream parsed into a group (its `/Resources` already
     /// resolved). Each tile clones this group under a per-tile transform.
@@ -1167,6 +1173,7 @@ pub struct TilingPattern {
 ///   c) invokes the description with the CTM set to the concatenation
 ///      of `/FontMatrix` and the text space in effect at show time.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Type3Font {
     /// `/FontMatrix` — maps glyph space to text space (§9.2.4). Each
     /// glyph `Group` is painted under `text_render_matrix ∘ FontMatrix`.
@@ -1199,6 +1206,7 @@ pub struct Type3Font {
 /// [`MaskKind::Luminance`], `/Alpha` (§11.5.2, the group's computed
 /// alpha with colours disregarded) becomes [`MaskKind::Alpha`].
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ResolvedSoftMask {
     /// `/S` — the mask-derivation subtype (Table 144).
     pub kind: MaskKind,
@@ -1229,6 +1237,7 @@ pub struct ResolvedSoftMask {
 /// Image-codec payloads (DCTDecode / JPXDecode / …) stay on the
 /// [`crate::reader::images`] passthrough walker.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ResolvedImageXObject {
     /// `/Width` in samples.
     pub width: u32,

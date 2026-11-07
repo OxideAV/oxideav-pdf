@@ -39,6 +39,7 @@
 /// The optional appearance entries `/C` (text colour) and `/F` (style
 /// flags — bold / italic) are deferred to a follow-up round.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct OutlineSpec {
     pub title: String,
     pub destination: OutlineDestination,
@@ -155,6 +156,7 @@ pub struct LinkAnnotationSpec {
 
 /// Where a [`LinkAnnotationSpec`] points.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum LinkTarget {
     /// In-document jump — go-to destination per §12.3.2.
     Internal(OutlineDestination),

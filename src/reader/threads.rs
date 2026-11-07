@@ -26,6 +26,7 @@ use crate::reader::outline::build_page_index_map;
 
 /// One bead on an article thread (Table 161).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct PdfBead {
     /// 0-based index (in `/Pages` DFS order) of the page carrying the
     /// bead — resolved from `/P`. `None` when `/P` is absent or
@@ -37,6 +38,7 @@ pub struct PdfBead {
 
 /// One article thread (Table 160) with its beads in reading order.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct PdfThread {
     /// `/I` `/Title`, when present (document-information syntax,
     /// §14.3.3).

@@ -64,6 +64,7 @@ impl PageLabelStyle {
 /// One labelling range — a `/PageLabels` number-tree entry (Table
 /// 159) with its starting page index.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct PageLabelRange {
     /// Page index (0-based) of the first page in the range — the
     /// number-tree key.

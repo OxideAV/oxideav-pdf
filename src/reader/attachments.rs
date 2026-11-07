@@ -28,6 +28,7 @@ use crate::reader::document::{DocumentReader, decode_stream};
 
 /// One embedded-file attachment surfaced by [`attachments`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PdfAttachment {
     /// File name from `/UF` (UTF-16BE) or `/F` (PDFDocEncoded). The
     /// reader prefers `/UF` when present per §7.11.2 Table 43.

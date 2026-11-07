@@ -48,6 +48,7 @@ use crate::reader::parse::Parser;
 /// match the PDF dict keys exactly; the `linearized` field is the
 /// numeric version (always `1.0` for current Annex F).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct LinearizationParams {
     /// `/Linearized` — the version number (always `1` in published
     /// PDF specs; surfaced as `f64` so the parser tolerates the

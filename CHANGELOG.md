@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `#[non_exhaustive]` on the reader output records (`PdfAction`, `PdfAnnotation`, `AnnotationAppearance`, `ThreeDActivation`, `FixedPrint`, `PdfAttachment`, `HierarchyIssue`, `HierarchyReport`, `PdfImageXObject`, `SoftMaskImage`, `PdfInlineImage`, `ReadingOrderText`, `LinearizationParams`, `PdfLink`, `NamedDestination`, the optional-content `OptionalContentGroup` / `OcUsage` / `OcConfig` / `OptionalContent`, `OutlineNode`, `PdfOutline`, `PageLabelRange`, `PdfAConformance`, `PdfDocTimestamp`, `MarkedTextRun`, `PdfTextExtraction`, `PdfMarkedTextExtraction`, `PdfThread`, `PdfBead`, the `reader::content` records, `PubSecMatch`) and on the writer / encryption records that already have constructors (`Attachment`, `OutlineSpec`, `EncryptionConfig`, `EncryptionState`, `PubSecEncoderConfig`, `PubSecEncryptionState`, `PubSecCfGroup`, `PubSecKariConfig`, `KariRecipient`, `PubSecCredential`).
+- `#[non_exhaustive]` on the growable enums `PdfError`, `ActionTrigger`, `ActionKind`, both `AnnotationKind`s (reader and writer), `ThreeDViewSelector`, `reader::ColorSpace`, `InlineImageFilter`, `LayoutMode`, `IssueSeverity`, `PdfLinkTarget`, `LinkTarget`, `SigningAlgorithm`, `PubSecSubFilter`, `KariCurve`, `KariKdf`, `HashAlg`, `SignatureAlg` and `EcCurve`. Enums whose values ISO 32000 fixes (`Object`, `TextRenderMode`, `PageLabelStyle`, `OutlineDestination`, `AfRelationship`, `SoundEncoding`, `CaretSymbol`, `FreeTextQuadding`, `FieldJustification`, `FormField`, the `Oc*` policy / state / list enums, `BaseEncoding`, `XrefEntry`, `TextShowOp`, `MarkedContentOp`, `CryptMethod`, `CertRef`) stay exhaustive.
+
 ## [0.2.2](https://github.com/OxideAV/oxideav-pdf/compare/v0.2.1...v0.2.2) - 2026-11-05
 
 ### Other

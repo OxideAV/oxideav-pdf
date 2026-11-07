@@ -95,6 +95,7 @@ use crate::reader::text::collect_page_leaves;
 /// dictionary may or may not list a non-codec filter like `/Fl` in the
 /// chain, but those are peeled before the payload reaches the caller).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InlineImageFilter {
     /// No terminal codec filter — payload is raw pixel bytes. Real
     /// PDFs use this most often for small inline images.
@@ -129,6 +130,7 @@ pub enum InlineImageFilter {
 /// duplicate indices (rare but the round-29 marked-text path
 /// already exposes both for the same reason).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PdfInlineImage {
     /// Inline-image payload — after wrapping non-codec filters are
     /// peeled, terminal codec filter (if any) left in place.

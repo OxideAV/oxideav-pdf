@@ -82,6 +82,7 @@ impl PubSecRecipient {
 /// Picks one of the four PDF SubFilters and lists the recipients
 /// that may open the resulting file.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PubSecEncoderConfig {
     /// SubFilter — selects symmetric algorithm + (V, R) pair.
     pub sub_filter: PubSecSubFilter,
@@ -165,6 +166,7 @@ impl PubSecEncoderConfig {
 /// install the handler / encrypt_dict on a `Document` exactly as the
 /// password-based encoder does.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PubSecEncryptionState {
     /// File encryption handler (key + per-object method + revision).
     pub handler: StandardHandler,
@@ -333,6 +335,7 @@ impl PubSecEncryptionState {
 /// `/CF` dict to enumerate distinct CRYPT FILTERS (each with its
 /// own list); see [`PubSecMultiCfConfig`] for the shape.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PubSecCfGroup {
     /// Name under `/CF` — typically a descriptive label like
     /// `OwnerCryptFilter` or `ReadOnlyCryptFilter`. Must match the
@@ -744,6 +747,7 @@ fn build_encrypt_dict(
 /// their public key in the curve's encoded form (SEC1 uncompressed for
 /// P-256 / P-384 / P-521, raw 32-byte u-coordinate for X25519).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct KariRecipient {
     /// Recipient certificate's issuer DER (a SEQUENCE — same shape as
     /// [`super::cms_build::RecipientIdRef::IssuerAndSerial::issuer_der`]).
@@ -991,6 +995,7 @@ impl KariRecipient {
 /// §6.2.2 + RFC 5753 §3.1). All KARIs wrap the same CEK so any
 /// matching recipient recovers the same AES-256 file content.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PubSecKariConfig {
     /// 32-bit signed permissions value (§7.6.3.2 Table 22).
     pub p: i32,

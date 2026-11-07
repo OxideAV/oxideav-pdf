@@ -264,6 +264,7 @@ impl TextRenderMode {
 /// order the StructTreeRoot's `/K` tree dictates (rather than the
 /// raster x/y order [`extract_text`] returns).
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct MarkedTextRun {
     /// The visual text run — same shape as [`TextRun`].
     pub run: TextRun,
@@ -282,6 +283,7 @@ pub struct MarkedTextRun {
 /// All text runs collected from one page (or one whole document — the
 /// caller decides whether to merge across pages).
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct PdfTextExtraction {
     pub runs: Vec<TextRun>,
 }
@@ -291,6 +293,7 @@ pub struct PdfTextExtraction {
 /// are still emitted in raster (content-stream) order — it's the
 /// `mcid` tag that lets the layout pass reorder them.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct PdfMarkedTextExtraction {
     pub runs: Vec<MarkedTextRun>,
 }

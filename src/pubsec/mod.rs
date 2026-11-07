@@ -245,6 +245,7 @@ use crate::objects::{Dict, Object};
 /// declares. Maps to the symmetric algorithm + key length the
 /// resulting `StandardHandler` will use for per-object encryption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PubSecSubFilter {
     /// `adbe.pkcs7.s3` — RC4-40, V=1.
     Pkcs7S3,
@@ -360,6 +361,7 @@ fn stmf_cfm(d: &Dict) -> Option<String> {
 /// X25519 / X448 — round 24). The `from_parsed_ec_p256` /
 /// `with_ec_p256_scalar` round-14 helpers keep working — they default
 /// the curve to [`kari::KariCurve::P256`].
+#[non_exhaustive]
 pub struct PubSecCredential {
     pub(crate) cert: x509::Certificate,
     pub(crate) private_key: Option<rsa::RsaPrivateKey>,
@@ -448,6 +450,7 @@ impl PubSecCredential {
 /// CF-name fields and surfaces only the [`StandardHandler`] for
 /// backwards compatibility with round-10 callers.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PubSecMatch {
     /// File-encryption handler the matched CF derived. Feeds straight
     /// into the per-object decrypt path.
