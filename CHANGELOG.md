@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/OxideAV/oxideav-pdf/compare/v0.2.2...v0.3.0) - 2026-11-15
+
+### Other
+
+- describe the comparison tool of the agreement harness generically
+- text extraction throughput re-measured interleaved (1.4-1.8x), harness agreement table
+- bounded form fan-out (text and scene), indirect /W width lists, leader dots under cancelled Tc, untagged pages in structure order
+- iterate the tensor-patch interior points by slice (clippy 1.100 needless_range_loop)
+- extraction 2.3-2.5x faster — fonts shared by reference and bound on change, in-place matrix operands, exact short-number tokens
+- reading order — structure tree for tagged documents, geometric columns / rows otherwise; hyphen joins, ligatures, artifacts
+- API hygiene: non_exhaustive reader output records, constructor-built configs, growable enums
+
 ### Added
 
 - Reading order. `DocumentReader::text(&TextLayoutOptions)` returns the
