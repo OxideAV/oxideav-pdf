@@ -588,16 +588,18 @@ cargo bench -p oxideav-pdf --bench reader_open
 ### Text extraction throughput
 
 `examples/profile_text.rs` times open → extract → layout on a document
-(`cargo run --release --example profile_text -- file.pdf 7`, medians of
-seven runs on an Apple M-series machine shared with other builds).
-Profiled first: before the changes below, 62 % of the time was the
-content-stream walk (a quarter of it copying the current font's
-metrics at every show), 17 % inflating streams, 8 % layout.
+(`cargo run --release --example profile_text -- file.pdf 7`). Profiled
+first (ISO 32000-2, sampling profiler): 62 % of the time was the
+content-stream walk — a quarter of that copying the current font's
+metrics at every show — 17 % inflating streams, 8 % layout.
+
+Before and after, interleaved on one machine under heavy shared load
+(median of five rounds, each the median of seven runs):
 
 | Document | Pages | Before | After |
 |---|---|---|---|
-| ISO 32000-1:2008 | 756 | 530 ms (1 426 pages/s) | 234 ms (3 225 pages/s) |
-| ISO 32000-2:2020 | 1 003 | 1 012 ms (991 pages/s) | 407 ms (2 463 pages/s) |
+| ISO 32000-1:2008 | 756 | 347 ms (2 180 pages/s) | 250 ms (3 020 pages/s) |
+| ISO 32000-2:2020 | 1 003 | 732 ms (1 370 pages/s) | 417 ms (2 400 pages/s) |
 
 Fonts (decoder and metrics) are parsed once per document and shared by
 reference between pages, forms and the walker, which binds them when
@@ -605,7 +607,30 @@ the font changes instead of looking them up and copying them per show;
 matrix operands are read off the operand stack in place; string
 operands are sized in one allocation; number tokens of up to seven
 digits are converted by one exact division. The extracted runs and
-text are byte-identical before and after on 164 documents.
+text were byte-identical before and after on 164 documents. What is
+left is mostly inflate (about a quarter) and per-show allocation.
+
+### Agreement with a black-box extractor
+
+A scratch harness compares the word sequence of `pdf2text` with that
+of a `pdftotext` executable on 161 documents (two per producer among
+the project's reference PDFs under 1.5 MB), counting the share of the
+reference's words matched in order.
+
+| | Files ≥ 95 % | Files ≥ 90 % | Mean |
+|---|---|---|---|
+| Painting order (before) | 70 | 126 | 0.926 |
+| Geometric reading order | 112 | 141 | 0.951 |
+| Default (structure tree on the 23 tagged files) | 99 | 136 | 0.942 |
+
+The structure order scores lower by construction: it places a page's
+artifacts after its logical content, where the reference keeps them in
+place. The files still under 95 % in geometric order differ mainly in
+tables (rows are kept together here; the reference reads many tables
+column by column), in formula sub- and superscript order, in pages
+where the reference interleaves two columns that are read one after
+the other here, and in glyphs of mathematical fonts whose names no
+staged glyph list maps.
 
 ## Deferred
 
