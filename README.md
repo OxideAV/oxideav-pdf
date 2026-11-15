@@ -613,7 +613,7 @@ left is mostly inflate (about a quarter) and per-show allocation.
 ### Agreement with a black-box extractor
 
 A scratch harness compares the word sequence of `pdf2text` with that
-of a `pdftotext` executable on 161 documents (two per producer among
+of a black-box text extractor on 161 documents (two per producer among
 the project's reference PDFs under 1.5 MB), counting the share of the
 reference's words matched in order.
 
