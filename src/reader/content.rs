@@ -10294,9 +10294,8 @@ mod tests {
         );
         // For a flat unit-square patch, the derived internal points lie
         // inside the unit square (sanity bound).
-        for c in 1..=2 {
-            for rr in 1..=2 {
-                let ip = p.control_points[c][rr];
+        for row in &p.control_points[1..=2] {
+            for ip in &row[1..=2] {
                 assert!(ip.x > -0.5 && ip.x < 1.5, "internal x in range");
                 assert!(ip.y > -0.5 && ip.y < 1.5, "internal y in range");
             }
