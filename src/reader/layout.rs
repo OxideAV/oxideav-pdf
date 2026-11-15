@@ -245,7 +245,8 @@ fn struct_tree_root(reader: &mut DocumentReader<'_>) -> Option<crate::objects::D
 /// them. Text the tree does not reference — artifacts (§14.8.2.2 —
 /// running headers, page numbers; dropped when the options say so)
 /// and unmarked content — is laid out geometrically after the logical
-/// content of its page.
+/// content of its page; a page the tree does not mention keeps its
+/// place in the page sequence.
 pub(crate) fn structure_text(
     reader: &mut DocumentReader<'_>,
     opts: &TextLayoutOptions,
@@ -322,7 +323,24 @@ pub(crate) fn structure_text(
         .enumerate()
         .map(|(gi, (page, _))| (*page, gi))
         .collect();
+    // Pages the tree does not mention at all (a cover, a licence page)
+    // keep their place in the page sequence: each goes ahead of the
+    // first logical content of a later page.
+    let mut untagged_pages: Vec<u32> = loose_pages
+        .iter()
+        .copied()
+        .filter(|page| !last_group.contains_key(page))
+        .collect();
+    untagged_pages.sort_unstable();
+    let mut next_untagged = 0;
     for (gi, (page, runs)) in groups.iter().enumerate() {
+        while untagged_pages
+            .get(next_untagged)
+            .is_some_and(|loose_page| loose_page < page)
+        {
+            flush_loose(untagged_pages[next_untagged], &mut parts);
+            next_untagged += 1;
+        }
         parts.push(layout_page_text(runs, &stream));
         if last_group.get(page) == Some(&gi) {
             flush_loose(*page, &mut parts);

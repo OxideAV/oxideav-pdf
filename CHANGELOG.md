@@ -58,6 +58,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`(Ful)(l) (r)(at)(e)`) are no longer mistaken for tracking.
 - An unassigned control code in a show string (a stray carriage
   return) reads as nothing instead of U+FFFD.
+- Composite-font `/W` / `/W2` arrays whose width lists are indirect
+  objects (`/W [ 0 12 0 R ]`) are read; such fonts used to fall back
+  to the 1000-unit default width, which ran every word of a
+  recognised-text layer over the next.
+- Under a character spacing that the kerns take back between single
+  glyphs, the glyphs of a longer string (leader dots) come out the
+  spacing apart.
+- In structure order, a page the tree does not mention (cover,
+  licence page) keeps its place in the page sequence.
+- Hostile input: forms that paint forms can no longer multiply the
+  work without bound. Text extraction walks at most 64 MiB of form
+  content and 262 144 form invocations per page; the scene reader
+  draws every `Do` splice — form nodes, image pixels, tiling cells,
+  Type 3 glyphs — from a per-page allowance of two million nodes /
+  kibibytes (a 9 KB file nesting seven forms used to run out of time
+  and memory; it now decodes in seconds).
 - A `/ToUnicode` destination of U+0000 (a producer's "no value" for a
   ligature glyph) counts as unmapped, so the font's encoding or
   embedded program supplies the text.

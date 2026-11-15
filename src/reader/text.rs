@@ -1333,7 +1333,7 @@ fn build_cid_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvanc
         other => other,
     };
     let ranges = match w_obj {
-        Some(Object::Array(items)) => parse_w_array(&items),
+        Some(Object::Array(items)) => parse_w_array(&direct_items(reader, items)),
         _ => Vec::new(),
     };
     // §9.7.4.3 vertical metrics: /DW2 [v_y w1y] (default [880 −1000])
@@ -1358,7 +1358,7 @@ fn build_cid_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvanc
         other => other,
     };
     let v_ranges = match w2_obj {
-        Some(Object::Array(items)) => parse_w2_array(&items),
+        Some(Object::Array(items)) => parse_w2_array(&direct_items(reader, items)),
         _ => Vec::new(),
     };
     FontAdvance::Cid(Box::new(CidAdvance {
@@ -1375,6 +1375,24 @@ fn build_cid_advance(reader: &mut DocumentReader<'_>, font: &Dict) -> FontAdvanc
 /// runs. Groups are `c [w1y v1x v1y …]` (numbers in threes — only
 /// the displacement component is kept) or
 /// `cfirst clast w1y v1x v1y`.
+/// The elements of a `/W` / `/W2` array with indirect references
+/// replaced by the objects they name (§7.3.10: any element may be
+/// indirect — some producers write each `c [w …]` width list as an
+/// object of its own). An element that does not resolve is kept as it
+/// is and ends the parse there.
+fn direct_items(reader: &mut DocumentReader<'_>, items: Vec<Object>) -> Vec<Object> {
+    if !items.iter().any(|o| matches!(o, Object::Reference(_))) {
+        return items;
+    }
+    items
+        .into_iter()
+        .map(|item| match item {
+            Object::Reference(id) => reader.resolve(id).unwrap_or(Object::Reference(id)),
+            other => other,
+        })
+        .collect()
+}
+
 fn parse_w2_array(items: &[Object]) -> Vec<(i64, Vec<f32>)> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -1514,6 +1532,13 @@ const MAX_MARKED_DEPTH: usize = 256;
 const MAX_FORMS_PER_PAGE: usize = 256;
 /// Bound on Form XObject nesting (§8.10).
 const MAX_FORM_DEPTH: u32 = 8;
+/// Bound on the form content walked for one page, all invocations
+/// together (64 MiB — far past any page, well short of a fan-out
+/// bomb).
+const MAX_FORM_BYTES_PER_PAGE: usize = 64 << 20;
+/// What one form invocation counts for at least, which caps the
+/// invocations on a page at 262 144.
+const MIN_FORM_COST: usize = 256;
 
 /// One resource scope (§7.8.3): the fonts and Form XObjects a content
 /// stream can name.
@@ -2946,6 +2971,11 @@ struct TextWalker {
     properties: Rc<HashMap<String, MarkedProps>>,
     /// Nesting of `Do`-invoked forms being walked.
     form_depth: u32,
+    /// Form content bytes this page may still walk: forms that invoke
+    /// forms multiply their content (a few kilobytes nested eight deep
+    /// can ask for more work than any page contains), so the total is
+    /// bounded, not only the nesting.
+    form_bytes_left: usize,
     /// Current transformation matrix (§8.3.4): `cm`, `q` / `Q` and
     /// form matrices; runs report user-space geometry through it.
     ctm: [f32; 6],
@@ -3087,6 +3117,7 @@ impl TextWalker {
             cur_decoder: None,
             cur_advance: None,
             form_depth: 0,
+            form_bytes_left: MAX_FORM_BYTES_PER_PAGE,
             ctm: identity(),
             runs: Vec::new(),
             run_mcids: Vec::new(),
@@ -3603,6 +3634,14 @@ impl TextWalker {
         if self.form_depth >= MAX_FORM_DEPTH {
             return;
         }
+        // Every invocation costs at least a little, so a page of
+        // empty forms is bounded too.
+        let cost = form.content.len().max(MIN_FORM_COST);
+        if cost > self.form_bytes_left {
+            self.form_bytes_left = 0;
+            return;
+        }
+        self.form_bytes_left -= cost;
         let _ = self.dispatch(b"q");
         // §8.10.1: the form matrix is concatenated with the CTM.
         self.ctm = mul(form.matrix, self.ctm);
@@ -3739,21 +3778,21 @@ impl TextWalker {
         // Inside a multi-glyph string the glyphs stand `Tc` apart:
         // when most of the text is in such strings, that spacing is
         // the line's tracking and a word gap is that much wider.
-        let ls = if tc_gap > 0.0 {
+        let mut tracked = false;
+        if tc_gap > 0.0 {
             let glyphs: usize = pieces.iter().map(|p| p.chars().count()).sum();
             let in_strings: usize = pieces
                 .iter()
                 .map(|p| p.chars().count())
                 .filter(|n| *n > 1)
                 .sum();
-            if in_strings * 2 >= glyphs {
-                ls.max(tc_gap)
-            } else {
-                ls
-            }
-        } else {
-            ls
-        };
+            tracked = in_strings * 2 >= glyphs;
+        }
+        let ls = if tracked { ls.max(tc_gap) } else { ls };
+        // Otherwise the kerns take the character spacing back between
+        // the (mostly single-glyph) strings, and the glyphs of the few
+        // longer strings really stand `Tc` apart: leader dots, say.
+        let spaced_inside = !tracked && tc_gap >= Self::WORD_BREAK_GAP + ls;
         let mut text = String::new();
         for (i, piece) in pieces.iter().enumerate() {
             if i > 0
@@ -3763,7 +3802,16 @@ impl TextWalker {
             {
                 text.push(' ');
             }
-            text.push_str(piece);
+            if spaced_inside {
+                for (k, c) in piece.chars().enumerate() {
+                    if k > 0 && !c.is_whitespace() && !text.ends_with(' ') {
+                        text.push(' ');
+                    }
+                    text.push(c);
+                }
+            } else {
+                text.push_str(piece);
+            }
         }
         // Record the run at the array's start origin, then advance Tm
         // through every element (glyph widths + per-element kerns,

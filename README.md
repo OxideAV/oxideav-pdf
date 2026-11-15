@@ -569,7 +569,11 @@ aborting, hanging, or OOMing:
 The corpus is seeded with in-tree fixtures; a hard parse-depth ceiling
 and cycle guards protect the resolver, the parser, and every page-tree
 walker, and expansion loops (`/W`, `/ToUnicode` bfrange spans) are
-bounded so a hostile CMap cannot spin the extractor. CI runs the suite
+bounded so a hostile CMap cannot spin the extractor. Fan-out is bounded
+as well as depth: forms painting forms draw from a per-page allowance
+(64 MiB of form content for text extraction; two million spliced nodes
+or image kibibytes for the scene reader, shared with tiling cells and
+Type 3 glyphs), past which a `Do` paints nothing. CI runs the suite
 daily.
 
 Three Criterion bench binaries under `benches/` measure the reader hot

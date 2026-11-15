@@ -38,8 +38,7 @@ use crate::pubsec::{
 };
 use crate::reader::content::{
     ColorSpaceKind, ResolvedImageXObject, ResolvedSoftMask, TilingPattern, Type3Font,
-    color_space_from_object, parse_content_stream_full_with_soft_masks,
-    parse_content_stream_full_with_tiling, parse_content_stream_full_with_type3,
+    color_space_from_object, parse_content_stream_in_page,
 };
 use crate::reader::image_decode::{
     decode_gray_plane, decode_image_to_rgba, decode_stencil_coverage, resample_nearest,
@@ -71,6 +70,11 @@ pub struct DocumentReader<'a> {
     /// container object number (not [`ObjectId`] — the generation of
     /// an ObjStm is always 0 per §7.5.7).
     objstm_cache: HashMap<u32, ObjStmDecoded>,
+    /// What the page being decoded may still splice with `Do`
+    /// ([`crate::reader::content::MAX_SPLICE_WEIGHT`], refilled per
+    /// page): shared by the page's content and everything it draws
+    /// through — forms, tiling patterns, Type 3 glyphs, soft masks.
+    splice_budget: std::cell::Cell<u64>,
 }
 
 /// Cached decoded ObjStm: the Flate-expanded payload + the parsed
@@ -110,6 +114,7 @@ impl<'a> DocumentReader<'a> {
             xref,
             cache: HashMap::new(),
             objstm_cache: HashMap::new(),
+            splice_budget: std::cell::Cell::new(crate::reader::content::MAX_SPLICE_WEIGHT),
             crypt,
         })
     }
@@ -131,6 +136,7 @@ impl<'a> DocumentReader<'a> {
             xref,
             cache: HashMap::new(),
             objstm_cache: HashMap::new(),
+            splice_budget: std::cell::Cell::new(crate::reader::content::MAX_SPLICE_WEIGHT),
             crypt,
         })
     }
@@ -151,6 +157,7 @@ impl<'a> DocumentReader<'a> {
             xref,
             cache: HashMap::new(),
             objstm_cache: HashMap::new(),
+            splice_budget: std::cell::Cell::new(crate::reader::content::MAX_SPLICE_WEIGHT),
             crypt,
         })
     }
@@ -1194,6 +1201,9 @@ fn decode_page(
     page_id: ObjectId,
     optional_content: Option<&crate::reader::ocg::OptionalContent>,
 ) -> Result<Page, PdfError> {
+    reader
+        .splice_budget
+        .set(crate::reader::content::MAX_SPLICE_WEIGHT);
     let page_obj = reader.resolve(page_id)?;
     let Object::Dict(page_dict) = page_obj else {
         return Err(PdfError::other(format!(
@@ -1330,7 +1340,7 @@ fn decode_page(
         None
     };
 
-    let parsed = parse_content_stream_full_with_soft_masks(
+    let parsed = parse_content_stream_in_page(
         &content_bytes,
         ext_gstate_dict.as_ref(),
         fonts_dict.as_ref(),
@@ -1344,6 +1354,7 @@ fn decode_page(
         soft_masks.as_ref(),
         transparency_groups.as_ref(),
         image_xobjects.as_ref(),
+        &reader.splice_budget,
     )?;
     let mut root = parsed.root;
 
@@ -1885,7 +1896,7 @@ fn resolve_one_tiling_pattern(
         None => None,
     };
 
-    let parsed = parse_content_stream_full_with_tiling(
+    let parsed = parse_content_stream_in_page(
         &content_bytes,
         ext_gstate_dict.as_ref(),
         fonts_dict.as_ref(),
@@ -1895,6 +1906,11 @@ fn resolve_one_tiling_pattern(
         nested_forms.as_ref(),
         pattern_dict.as_ref(),
         nested_tiling.as_ref(),
+        None,
+        None,
+        None,
+        None,
+        &reader.splice_budget,
     )?;
     if parsed.root.children.is_empty() {
         return Ok(None);
@@ -2175,7 +2191,7 @@ fn parse_glyph_description(
         None => None,
     };
 
-    let parsed = parse_content_stream_full_with_type3(
+    let parsed = parse_content_stream_in_page(
         content_bytes,
         ext_gstate_dict.as_ref(),
         fonts_dict.as_ref(),
@@ -2186,6 +2202,10 @@ fn parse_glyph_description(
         pattern_dict.as_ref(),
         tiling_patterns.as_ref(),
         nested_type3.as_ref(),
+        None,
+        None,
+        None,
+        &reader.splice_budget,
     )?;
     if parsed.root.children.is_empty() {
         return Ok(None);
@@ -3221,7 +3241,7 @@ fn resolve_one_form_xobject(
         None => None,
     };
 
-    let parsed = parse_content_stream_full_with_soft_masks(
+    let parsed = parse_content_stream_in_page(
         &content_bytes,
         ext_gstate_dict.as_ref(),
         fonts_dict.as_ref(),
@@ -3235,6 +3255,7 @@ fn resolve_one_form_xobject(
         soft_masks.as_ref(),
         transparency_groups.as_ref(),
         image_xobjects.as_ref(),
+        &reader.splice_budget,
     )?;
 
     // The content parser returns a root `Group` carrying any top-level

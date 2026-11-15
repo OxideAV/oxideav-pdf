@@ -85,6 +85,8 @@ use std::str;
 
 use std::rc::Rc;
 
+use std::cell::Cell;
+
 use oxideav_core::vector::{
     DashPattern, FillRule, GradientStop, Group, ImageRef, LineCap, LineJoin, LinearGradient,
     MaskKind, Node, Paint, Path, PathCommand, PathNode, Point, RadialGradient, Rect, Rgba,
@@ -424,6 +426,74 @@ pub fn parse_content_stream_full_with_tiling(
 /// `/FontMatrix`, the `/Encoding` code→glyph-name map, and every glyph
 /// description pre-parsed into a [`Group`] against the font's own
 /// `/Resources`.
+/// What the `Do` operators of one page may splice into the scene, in
+/// units of one node or one kibibyte of image samples.
+///
+/// A form painted by `Do` is copied into the scene, and so is an
+/// image's pixel data; forms that paint forms multiply the copies (a
+/// few kilobytes of `Do` operators nested a dozen deep ask for more
+/// nodes than memory holds). Past the allowance a `Do` paints nothing.
+/// Two million units is far beyond a real page — fifty full-page
+/// 300 dpi images, or every glyph of a dense page as its own form many
+/// times over.
+pub(crate) const MAX_SPLICE_WEIGHT: u64 = 2_000_000;
+
+/// The cost of splicing `group`: its nodes, plus a unit per kibibyte
+/// of image samples they hold.
+fn splice_weight(group: &Group) -> u64 {
+    let mut weight = 1u64;
+    for child in &group.children {
+        weight = weight.saturating_add(match child {
+            Node::Group(inner) => splice_weight(inner),
+            Node::Image(image) => {
+                let bytes: usize = image.frame.planes.iter().map(|p| p.data.len()).sum();
+                1 + (bytes as u64 >> 10)
+            }
+            _ => 1,
+        });
+    }
+    weight
+}
+
+/// [`parse_content_stream_full_with_soft_masks`] drawing its `Do`
+/// splices from `splice_budget`, the allowance of the page being
+/// decoded.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn parse_content_stream_in_page(
+    input: &[u8],
+    ext_gstate: Option<&Dict>,
+    font_resources: Option<&Dict>,
+    shading_resources: Option<&Dict>,
+    color_space_resources: Option<&Dict>,
+    properties_resources: Option<&Dict>,
+    xobject_forms: Option<&BTreeMap<String, Group>>,
+    pattern_resources: Option<&Dict>,
+    tiling_patterns: Option<&BTreeMap<String, TilingPattern>>,
+    type3_fonts: Option<&BTreeMap<String, Type3Font>>,
+    soft_masks: Option<&BTreeMap<String, ResolvedSoftMask>>,
+    transparency_groups: Option<&BTreeSet<String>>,
+    image_xobjects: Option<&BTreeMap<String, ResolvedImageXObject>>,
+    splice_budget: &Cell<u64>,
+) -> Result<ParsedContent, PdfError> {
+    let mut state = State::new(
+        ext_gstate,
+        font_resources,
+        shading_resources,
+        color_space_resources,
+        properties_resources,
+    )
+    .with_xobject_forms(xobject_forms)
+    .with_pattern_resources(pattern_resources)
+    .with_tiling_patterns(tiling_patterns)
+    .with_type3_fonts(type3_fonts)
+    .with_soft_masks(soft_masks)
+    .with_transparency_groups(transparency_groups)
+    .with_image_xobjects(image_xobjects)
+    .with_splice_budget(splice_budget);
+    state.parse(input)?;
+    Ok(state.finish())
+}
+
 // Internal: intermediate walker entry point (exposed for tests).
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
@@ -1026,6 +1096,11 @@ struct State<'a> {
     /// — they are surfaced through the dedicated
     /// [`crate::reader::images`] walker.
     xobject_forms: Option<&'a BTreeMap<String, Group>>,
+    /// What `Do` may still splice (see [`MAX_SPLICE_WEIGHT`]): the
+    /// page-wide allowance when the document reader supplied one, this
+    /// walker's own otherwise.
+    shared_splice_budget: Option<&'a Cell<u64>>,
+    own_splice_budget: Cell<u64>,
     /// Page's `/Resources /Pattern` subdictionary, if plumbed in. Each
     /// per-name entry is the pattern's resolved dictionary (for a
     /// `/PatternType 2` shading pattern, its `/Shading` subdictionary is
@@ -3217,6 +3292,8 @@ impl<'a> State<'a> {
             text_render_mode: 0,
             text_rise: 0.0,
             type3_depth: 0,
+            shared_splice_budget: None,
+            own_splice_budget: Cell::new(MAX_SPLICE_WEIGHT),
             soft_masks: None,
             active_smask: None,
             transparency_groups: None,
@@ -3280,6 +3357,26 @@ impl<'a> State<'a> {
     fn with_transparency_groups(mut self, groups: Option<&'a BTreeSet<String>>) -> Self {
         self.transparency_groups = groups;
         self
+    }
+
+    /// Draw `Do` splices from an allowance shared with the other
+    /// content streams of the page (its forms, patterns, glyphs).
+    fn with_splice_budget(mut self, budget: &'a Cell<u64>) -> Self {
+        self.shared_splice_budget = Some(budget);
+        self
+    }
+
+    /// Take `weight` from the splice allowance; `false` (and nothing
+    /// taken) when it does not fit.
+    fn charge_splice(&self, weight: u64) -> bool {
+        let budget = self.shared_splice_budget.unwrap_or(&self.own_splice_budget);
+        match budget.get().checked_sub(weight) {
+            Some(left) => {
+                budget.set(left);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Attach the pre-decoded Image XObjects (§8.9.5) so a `Do`
@@ -4107,6 +4204,12 @@ impl<'a> State<'a> {
                     // vertical flips cancel), making the node
                     // writer-round-trippable.
                     if let Some(img) = self.image_xobjects.and_then(|m| m.get(&name)) {
+                        // Every `Do` copies the pixels: bounded like
+                        // the form splices below.
+                        if !self.charge_splice(1 + (img.rgba.len() as u64 >> 10)) {
+                            self.operands.clear();
+                            return Ok(());
+                        }
                         let mut data = img.rgba.clone();
                         if img.stencil {
                             // §8.9.6.2 stencil masking: samples mark
@@ -4154,6 +4257,7 @@ impl<'a> State<'a> {
                     }
                     if let Some(form) = self.xobject_forms.and_then(|m| m.get(&name))
                         && !form.children.is_empty()
+                        && self.charge_splice(splice_weight(form))
                     {
                         let mut group = form.clone();
                         // §11.6.6 — a *transparency-group* XObject
@@ -4557,6 +4661,10 @@ impl<'a> State<'a> {
         if tile_count <= 0 || tile_count > MAX_TILING_CELLS {
             return false;
         }
+        // Every tile is a copy of the cell.
+        if !self.charge_splice(splice_weight(&pat.cell).saturating_mul(tile_count as u64)) {
+            return false;
+        }
         // The /BBox clip (pattern space) applied per tile.
         let bbox_clip = rect_path(pat.bbox[0], pat.bbox[1], pat.bbox[2], pat.bbox[3]);
         // An uncoloured (`/PaintType 2`) cell is a stencil poured with
@@ -4792,6 +4900,8 @@ impl<'a> State<'a> {
                 .get(&b)
                 .and_then(|n| font.glyphs.get(n).map(|g| (n, g)))
                 && !glyph.children.is_empty()
+                // Every shown character is a copy of its glyph.
+                && self.charge_splice(splice_weight(glyph))
             {
                 // group transform = Tm ∘ text_state ∘ FontMatrix
                 let outer = compose(tm, text_state);

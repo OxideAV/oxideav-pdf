@@ -171,6 +171,11 @@ fn character_spacing_taken_back_by_kerns_leaves_word_gaps() {
     let c = "BT /F0 1 Tf 10 0 0 10 60 700 Tm 0.503 Tc \
         [(R)508(T)499(C)499(P)172(P)535(a)508(c)540(k)536(e)507(t)144(F)595(o)508(r)499(m)500(a)508(t)] TJ ET";
     assert_eq!(default_text(&pages(&[c])), "RTCP Packet Format");
+    // The glyphs of a longer string in such a line stand the full
+    // character spacing apart.
+    let c = "BT /F0 1 Tf 10 0 0 10 60 700 Tm 0.503 Tc \
+        [(S)508(e)508(n)508(d)508(e)508(r)172(...)11(..)-429(2)508(9)] TJ ET";
+    assert_eq!(default_text(&pages(&[c])), "Sender . . . . . 29");
 }
 
 #[test]
@@ -344,4 +349,111 @@ fn to_unicode_null_destination_falls_back_to_the_encoding() {
         stream(cmap),
     ]);
     assert_eq!(default_text(&pdf), "Specification");
+}
+
+#[test]
+fn composite_font_widths_given_as_an_indirect_array_are_used() {
+    // `/W [ 0 7 0 R ]`: the width list is an object of its own. With
+    // the widths (300 per glyph) the two words stand apart; with the
+    // default width of 1000 the first would run over the second.
+    let cmap = "/CIDInit /ProcSet findresource begin begincmap\n\
+        1 begincodespacerange <0000> <FFFF> endcodespacerange\n\
+        1 beginbfrange <0000> <007F> <0000> endbfrange\nendcmap end";
+    let pdf = build(&[
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Count 1 /Kids [ 4 0 R ] >>".to_string(),
+        "<< /Type /Font /Subtype /Type0 /BaseFont /Demo /Encoding /Identity-H \
+         /DescendantFonts [ << /Type /Font /Subtype /CIDFontType2 /BaseFont /Demo \
+         /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+         /W [ 0 7 0 R ] >> ] /ToUnicode 6 0 R >>"
+            .to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F0 3 0 R >> >> /Contents 5 0 R >>"
+            .to_string(),
+        stream(
+            "BT /F0 10 Tf 1 0 0 1 60 700 Tm <0063006900720063> Tj \
+             1 0 0 1 72 700 Tm <007500690074> Tj ET",
+        ),
+        stream(cmap),
+        format!("[ {} ]", vec!["300"; 128].join(" ")),
+    ]);
+    let mut r = DocumentReader::open(&pdf).expect("open");
+    let ex = r.text_extraction().expect("extract");
+    assert_eq!(ex.runs[0].advance.0, 12.0);
+    assert_eq!(ex.flat_text(), "circuit");
+}
+
+#[test]
+fn pages_outside_the_structure_tree_keep_their_place() {
+    // Three pages; only the second is in the tree.
+    let page = |contents: u32| {
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F0 3 0 R >> >> /Contents {contents} 0 R >>"
+        )
+    };
+    let pdf = build(&[
+        "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>".to_string(),
+        "<< /Type /Pages /Count 3 /Kids [ 4 0 R 6 0 R 8 0 R ] >>".to_string(),
+        font(),
+        page(5),
+        stream("BT /F0 10 Tf 60 700 Td (Cover page) Tj ET"),
+        page(7),
+        stream("BT /F0 10 Tf 60 700 Td /P << /MCID 0 >> BDC (The body of the document) Tj EMC ET"),
+        page(9),
+        stream("BT /F0 10 Tf 60 700 Td (Back page) Tj ET"),
+        "<< /Type /StructTreeRoot /K << /Type /StructElem /S /P /Pg 6 0 R /K 0 >> >>".to_string(),
+    ]);
+    assert_eq!(
+        default_text(&pdf),
+        "Cover page\nThe body of the document\nBack page"
+    );
+}
+
+#[test]
+fn forms_invoking_forms_cannot_multiply_the_work_without_bound() {
+    // Seven forms, each painting the next two hundred times; the last
+    // shows a word. Unbounded, that is 200^6 shows.
+    let levels = 7;
+    let mut objs = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Count 1 /Kids [ 4 0 R ] >>".to_string(),
+        font(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F0 3 0 R >> /XObject << /X 6 0 R >> >> /Contents 5 0 R >>"
+            .to_string(),
+        stream("/X Do"),
+    ];
+    for level in 0..levels {
+        let body = if level + 1 == levels {
+            "0 0 m 10 10 l S BT /F0 10 Tf 60 700 Td (word) Tj ET".to_string()
+        } else {
+            "/X Do ".repeat(200)
+        };
+        let next = 7 + level;
+        let resources = if level + 1 == levels {
+            "/Font << /F0 3 0 R >>".to_string()
+        } else {
+            format!("/XObject << /X {next} 0 R >>")
+        };
+        objs.push(format!(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << {resources} >> \
+             /Length {} >>\nstream\n{body}\nendstream",
+            body.len()
+        ));
+    }
+    let pdf = build(&objs);
+    let mut r = DocumentReader::open(&pdf).expect("open");
+    let started = std::time::Instant::now();
+    let ex = r.text_extraction().expect("extract");
+    // The budget lets a few hundred thousand shows through, not 200^6.
+    assert!(!ex.runs.is_empty());
+    assert!(ex.runs.len() <= 262_144, "{} runs", ex.runs.len());
+    assert!(started.elapsed() < std::time::Duration::from_secs(120));
+    // The scene path copies a form's nodes at every `Do`: the same
+    // file must come back as a scene of bounded size.
+    let started = std::time::Instant::now();
+    let scene = oxideav_pdf::read_pdf_to_scene(&pdf).expect("scene");
+    assert_eq!(scene.pages.as_ref().map(Vec::len), Some(1));
+    assert!(started.elapsed() < std::time::Duration::from_secs(300));
 }
