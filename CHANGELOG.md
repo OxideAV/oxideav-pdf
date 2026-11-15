@@ -44,6 +44,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `#[non_exhaustive]` on the reader output records (`PdfAction`, `PdfAnnotation`, `AnnotationAppearance`, `ThreeDActivation`, `FixedPrint`, `PdfAttachment`, `HierarchyIssue`, `HierarchyReport`, `PdfImageXObject`, `SoftMaskImage`, `PdfInlineImage`, `ReadingOrderText`, `LinearizationParams`, `PdfLink`, `NamedDestination`, the optional-content `OptionalContentGroup` / `OcUsage` / `OcConfig` / `OptionalContent`, `OutlineNode`, `PdfOutline`, `PageLabelRange`, `PdfAConformance`, `PdfDocTimestamp`, `MarkedTextRun`, `PdfTextExtraction`, `PdfMarkedTextExtraction`, `PdfThread`, `PdfBead`, the `reader::content` records, `PubSecMatch`) and on the writer / encryption records that already have constructors (`Attachment`, `OutlineSpec`, `EncryptionConfig`, `EncryptionState`, `PubSecEncoderConfig`, `PubSecEncryptionState`, `PubSecCfGroup`, `PubSecKariConfig`, `KariRecipient`, `PubSecCredential`).
 - `#[non_exhaustive]` on the growable enums `PdfError`, `ActionTrigger`, `ActionKind`, both `AnnotationKind`s (reader and writer), `ThreeDViewSelector`, `reader::ColorSpace`, `InlineImageFilter`, `LayoutMode`, `IssueSeverity`, `PdfLinkTarget`, `LinkTarget`, `SigningAlgorithm`, `PubSecSubFilter`, `KariCurve`, `KariKdf`, `HashAlg`, `SignatureAlg` and `EcCurve`. Enums whose values ISO 32000 fixes (`Object`, `TextRenderMode`, `PageLabelStyle`, `OutlineDestination`, `AfRelationship`, `SoundEncoding`, `CaretSymbol`, `FreeTextQuadding`, `FieldJustification`, `FormField`, the `Oc*` policy / state / list enums, `BaseEncoding`, `XrefEntry`, `TextShowOp`, `MarkedContentOp`, `CryptMethod`, `CertRef`) stay exhaustive.
 
+- Text extraction is 2.3–2.5× faster on large documents (ISO 32000-1:
+  530 → 234 ms for 756 pages): fonts are shared by reference and bound
+  when the font changes rather than copied at every show, the
+  tokeniser reads matrix operands in place and converts short number
+  tokens exactly without the general decimal parser. Output unchanged.
+
 ### Fixed
 
 - `TJ` word gaps: character spacing (`Tc`) counts toward the gap

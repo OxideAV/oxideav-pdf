@@ -1024,7 +1024,7 @@ fn walk_pages_inner(
 }
 
 /// Per-font byte→Unicode decoders keyed by `/Resources /Font` slot.
-type PageFonts = HashMap<String, FontDecoder>;
+type PageFonts = HashMap<String, Rc<FontDecoder>>;
 
 /// Per-font horizontal advance metrics (glyph-space thousandths),
 /// used by the extraction walker to apply the §9.4.4 text-space
@@ -1465,7 +1465,7 @@ fn obj_as_i64(o: &Object) -> Option<i64> {
 /// per-font byte→Unicode decoders + the concatenated content stream.
 /// Returns `None` when the page has no `/Contents` (a perfectly valid
 /// blank page — emit nothing).
-type PageAdvances = HashMap<String, FontAdvance>;
+type PageAdvances = HashMap<String, Rc<FontAdvance>>;
 
 fn load_page_for_text(
     reader: &mut DocumentReader<'_>,
@@ -1506,7 +1506,7 @@ fn load_page_for_text(
 /// Decoders and advances of fonts already loaded in this document,
 /// keyed by the font dictionary's object — a font shared by many
 /// pages (or forms) parses its encoding and program once.
-type FontCache = HashMap<ObjectId, (FontDecoder, FontAdvance)>;
+type FontCache = HashMap<ObjectId, (Rc<FontDecoder>, Rc<FontAdvance>)>;
 
 /// Bound on open marked-content sequences tracked (§14.6).
 const MAX_MARKED_DEPTH: usize = 256;
@@ -1574,8 +1574,9 @@ fn load_scope(
             };
             // A font whose encoding resources fail to parse still
             // shows its bytes (Latin-1) rather than dropping the page.
-            let decoder = FontDecoder::from_dict(reader, &font_d).unwrap_or(FontDecoder::Latin1);
-            let advance = build_font_advance(reader, &font_d);
+            let decoder =
+                Rc::new(FontDecoder::from_dict(reader, &font_d).unwrap_or(FontDecoder::Latin1));
+            let advance = Rc::new(build_font_advance(reader, &font_d));
             if let Some(id) = id {
                 cache.insert(id, (decoder.clone(), advance.clone()));
             }
@@ -2935,6 +2936,10 @@ struct TextWalker {
     /// Per-font horizontal advance metrics (§9.4.4), keyed like
     /// `fonts`. Drives the post-show text-matrix advance.
     advances: Rc<PageAdvances>,
+    /// The current font's decoder and metrics, looked up when the
+    /// font or the resource scope changes rather than at every show.
+    cur_decoder: Option<Rc<FontDecoder>>,
+    cur_advance: Option<Rc<FontAdvance>>,
     /// Form XObjects the current scope can paint with `Do` (§8.10).
     forms: Rc<HashMap<String, Rc<FormXObject>>>,
     /// Named marked-content property lists of the current scope.
@@ -3079,6 +3084,8 @@ impl TextWalker {
             advances: scope.advances,
             forms: scope.forms,
             properties: scope.properties,
+            cur_decoder: None,
+            cur_advance: None,
             form_depth: 0,
             ctm: identity(),
             runs: Vec::new(),
@@ -3220,12 +3227,21 @@ impl TextWalker {
                     i = kw_end;
                     continue;
                 }
-                let s = str::from_utf8(&input[i..end]).map_err(|_| {
-                    PdfError::other(format!("PDF text walker: non-UTF-8 number at byte {i}"))
-                })?;
-                let f: f32 = s.parse().map_err(|_| {
-                    PdfError::other(format!("PDF text walker: invalid number `{s}` at byte {i}"))
-                })?;
+                let f = match short_decimal(&input[i..end]) {
+                    Some(f) => f,
+                    None => {
+                        let s = str::from_utf8(&input[i..end]).map_err(|_| {
+                            PdfError::other(format!(
+                                "PDF text walker: non-UTF-8 number at byte {i}"
+                            ))
+                        })?;
+                        s.parse().map_err(|_| {
+                            PdfError::other(format!(
+                                "PDF text walker: invalid number `{s}` at byte {i}"
+                            ))
+                        })?
+                    }
+                };
                 self.operands.push(TextOperand::Number(f));
                 i = end;
                 continue;
@@ -3272,6 +3288,7 @@ impl TextWalker {
                 if let Some(s) = self.saved.pop() {
                     self.ctm = s.ctm;
                     self.cur_font = s.font;
+                    self.bind_font();
                     self.cur_size = s.size;
                     self.tm = s.tm;
                     self.tlm = s.tlm;
@@ -3311,6 +3328,7 @@ impl TextWalker {
                 let size = self.pop_num().unwrap_or(0.0);
                 let name = self.pop_name().unwrap_or_default();
                 self.cur_font = name;
+                self.bind_font();
                 self.cur_size = size;
                 self.operands.clear();
             }
@@ -3511,6 +3529,12 @@ impl TextWalker {
         self.artifact_stack.push(outer || tag == Some("Artifact"));
     }
 
+    /// Look the current font up in the current resource scope.
+    fn bind_font(&mut self) {
+        self.cur_decoder = self.fonts.get(&self.cur_font).cloned();
+        self.cur_advance = self.advances.get(&self.cur_font).cloned();
+    }
+
     fn pop_num(&mut self) -> Option<f32> {
         match self.operands.pop()? {
             TextOperand::Number(n) => Some(n),
@@ -3557,15 +3581,16 @@ impl TextWalker {
             return None;
         }
         let split = self.operands.len() - n;
-        let tail: Vec<TextOperand> = self.operands.drain(split..).collect();
         let mut nums = [0.0f32; 6];
-        for (i, op) in tail.into_iter().enumerate() {
+        let mut all_numbers = true;
+        for (slot, op) in nums.iter_mut().zip(&self.operands[split..]) {
             match op {
-                TextOperand::Number(f) => nums[i] = f,
-                _ => return None,
+                TextOperand::Number(f) => *slot = *f,
+                _ => all_numbers = false,
             }
         }
-        Some(nums)
+        self.operands.truncate(split);
+        all_numbers.then_some(nums)
     }
 
     /// Walk a Form XObject's content (§8.10.1): its graphics state is
@@ -3590,6 +3615,7 @@ impl TextWalker {
                 std::mem::replace(&mut self.properties, scope.properties.clone()),
             )
         });
+        self.bind_font();
         self.form_depth += 1;
         let _ = self.parse(&form.content);
         self.form_depth -= 1;
@@ -3599,6 +3625,7 @@ impl TextWalker {
             self.forms = forms;
             self.properties = properties;
         }
+        self.bind_font();
         self.operands.clear();
         self.in_text = in_text;
         let _ = self.dispatch(b"Q");
@@ -3607,7 +3634,7 @@ impl TextWalker {
     /// Decode a single show-operand byte string through the current
     /// font's decoder (Latin-1 fallback when no font resolved).
     fn decode_bytes(&self, bytes: &[u8]) -> String {
-        match self.fonts.get(&self.cur_font) {
+        match &self.cur_decoder {
             Some(d) => d.decode(bytes),
             // No font resolved — fall back to Latin-1 bytes so the run
             // isn't dropped silently.
@@ -3853,10 +3880,12 @@ impl TextWalker {
         let tfs = self.cur_size;
         let th = self.horiz_scale;
         let tc = self.char_spacing;
-        let adv = self.advances.get(&self.cur_font).cloned();
-        let adv = adv.unwrap_or(FontAdvance::None);
+        // A handle on the metrics, so `self` stays free for the matrix
+        // updates below.
+        let adv = self.cur_advance.clone();
+        let adv: &FontAdvance = adv.as_deref().unwrap_or(&FontAdvance::None);
         let scale = adv.text_scale();
-        if let FontAdvance::Cid(cid) = &adv {
+        if let FontAdvance::Cid(cid) = adv {
             let vertical = cid.wmode == 1;
             // Codes at the CMap's codespace widths (§9.7.6.2), each
             // mapped to its CID for the §9.4.4 displacement. Word
@@ -3905,10 +3934,9 @@ impl TextWalker {
     /// horizontal writing per the §9.4.4 displacement equations).
     fn advance_kern(&mut self, adj: f32) {
         let vertical = self
-            .advances
-            .get(&self.cur_font)
-            .map(FontAdvance::is_vertical)
-            .unwrap_or(false);
+            .cur_advance
+            .as_deref()
+            .is_some_and(FontAdvance::is_vertical);
         if vertical {
             let ty = -adj / 1000.0 * self.cur_size;
             self.translate_tm_v(ty);
@@ -3956,6 +3984,47 @@ impl TextWalker {
 }
 
 // ────────────────────────── helpers ──────────────────────────
+
+/// The value of a PDF number token (§7.3.3: optional sign, digits, an
+/// optional point) with at most seven digits — exactly what
+/// `str::parse::<f32>` returns for it, without the general decimal
+/// conversion. Seven digits make an integer below 2²⁴, and ten to the
+/// number of fraction digits is a power of ten up to 10⁷, so both are
+/// exact in `f32` and their IEEE quotient is the correctly rounded
+/// value of the decimal. `None` for longer tokens, which take the
+/// general path.
+fn short_decimal(token: &[u8]) -> Option<f32> {
+    const POW10: [f32; 8] = [1.0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7];
+    let (negative, digits) = match token.split_first()? {
+        (b'-', rest) => (true, rest),
+        (b'+', rest) => (false, rest),
+        _ => (false, token),
+    };
+    if digits.is_empty() || digits.len() > 8 {
+        return None;
+    }
+    let mut mantissa = 0u32;
+    let mut count = 0usize;
+    let mut fraction: Option<usize> = None;
+    for &b in digits {
+        match b {
+            b'0'..=b'9' => {
+                mantissa = mantissa * 10 + u32::from(b - b'0');
+                count += 1;
+                if let Some(f) = fraction.as_mut() {
+                    *f += 1;
+                }
+            }
+            b'.' if fraction.is_none() => fraction = Some(0),
+            _ => return None,
+        }
+    }
+    if count == 0 || count > 7 {
+        return None;
+    }
+    let value = mantissa as f32 / POW10[fraction.unwrap_or(0)];
+    Some(if negative { -value } else { value })
+}
 
 /// Skip a `BI … ID … EI` inline image whose `BI` keyword ended at
 /// `after_bi`; returns the offset just past `EI` (or the end of the
@@ -4117,7 +4186,15 @@ fn decode_text_string_bytes(b: &[u8]) -> String {
 fn read_literal_string(input: &[u8], start: usize) -> Result<(usize, Vec<u8>), PdfError> {
     let mut end = start + 1;
     let mut depth = 1u32;
-    let mut decoded = Vec::new();
+    // The first closing parenthesis bounds the length of a string
+    // without nested or escaped ones (nearly all of them): one
+    // allocation instead of a growing buffer.
+    let likely_len = input[end.min(input.len())..]
+        .iter()
+        .take(4096)
+        .position(|&b| b == b')')
+        .unwrap_or(0);
+    let mut decoded = Vec::with_capacity(likely_len);
     while end < input.len() {
         let b = input[end];
         if b == b'\\' {
@@ -4503,6 +4580,53 @@ endbfchar
         };
         let s = decoder.decode(&[0x00, 0x41, 0x00, 0x42]);
         assert_eq!(s, "Hi");
+    }
+
+    #[test]
+    fn short_decimal_matches_the_general_parser() {
+        let mut tokens: Vec<String> = [
+            "0", "-0", "+0", "1", "-1", "12", "0.1", "-0.1", ".5", "-.5", "5.", "+5.", "0.0001",
+            "-0.0055", "291.5", "16.8873", "9999999", "999999.9", ".0000001", "0.503", "1234.567",
+            "00012.50", "8388607", "0.000001", "123456.7", "-10.3662", "595.276",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // A deterministic sweep over digit strings and point positions.
+        let mut state = 0x2545_f491u32;
+        for _ in 0..20_000 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let digits = 1 + (state % 7) as usize;
+            let value = (state >> 3) % 10u32.pow(digits as u32);
+            let text = format!("{value:0digits$}");
+            let point = ((state >> 20) as usize) % (digits + 2);
+            let mut token = if state & 1 == 1 {
+                "-".to_string()
+            } else {
+                String::new()
+            };
+            if point <= digits {
+                token.push_str(&text[..point]);
+                token.push('.');
+                token.push_str(&text[point..]);
+            } else {
+                token.push_str(&text);
+            }
+            tokens.push(token);
+        }
+        for token in &tokens {
+            let fast = short_decimal(token.as_bytes()).expect("short token");
+            let general: f32 = token.parse().expect("parses");
+            assert_eq!(fast.to_bits(), general.to_bits(), "token {token}");
+        }
+        // Outside the fast path.
+        assert_eq!(short_decimal(b"12345678"), None);
+        assert_eq!(short_decimal(b"1.2.3"), None);
+        assert_eq!(short_decimal(b"-"), None);
+        assert_eq!(short_decimal(b"."), None);
+        assert_eq!(short_decimal(b"1e5"), None);
     }
 
     #[test]

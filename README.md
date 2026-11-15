@@ -581,6 +581,28 @@ the bytes → `Scene` path.
 cargo bench -p oxideav-pdf --bench reader_open
 ```
 
+### Text extraction throughput
+
+`examples/profile_text.rs` times open → extract → layout on a document
+(`cargo run --release --example profile_text -- file.pdf 7`, medians of
+seven runs on an Apple M-series machine shared with other builds).
+Profiled first: before the changes below, 62 % of the time was the
+content-stream walk (a quarter of it copying the current font's
+metrics at every show), 17 % inflating streams, 8 % layout.
+
+| Document | Pages | Before | After |
+|---|---|---|---|
+| ISO 32000-1:2008 | 756 | 530 ms (1 426 pages/s) | 234 ms (3 225 pages/s) |
+| ISO 32000-2:2020 | 1 003 | 1 012 ms (991 pages/s) | 407 ms (2 463 pages/s) |
+
+Fonts (decoder and metrics) are parsed once per document and shared by
+reference between pages, forms and the walker, which binds them when
+the font changes instead of looking them up and copying them per show;
+matrix operands are read off the operand stack in place; string
+operands are sized in one allocation; number tokens of up to seven
+digits are converted by one exact division. The extracted runs and
+text are byte-identical before and after on 164 documents.
+
 ## Deferred
 
 - Writer-side `BT … Tj … ET` text emission for `Node::Text` (the
