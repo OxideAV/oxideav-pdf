@@ -7,10 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Reading order. `DocumentReader::text(&TextLayoutOptions)` returns the
+  document's text in the order of its logical structure tree when the
+  PDF is tagged (§14.8 — each page's artifacts and unmarked text after
+  its logical content, or dropped with `with_include_artifacts(false)`)
+  and in geometric reading order otherwise: columns are found from the
+  gutter between them and read one after the other, lines that span
+  the columns (titles, footers) cut the page into sections, table rows
+  stay together, rotated and vertical text is laid out in its own
+  frame, and pieces of a line painted out of order (link text shown
+  after the body, a number painted from its last digit group) rejoin
+  it. `TextOrder::{Structure, Geometric, Stream}` chooses;
+  `layout_page_text` does the same for a bare run list.
+- `TextLayoutOptions`: words hyphenated across a line end are joined,
+  Latin presentation-form ligatures are spelled out, render-mode-3
+  text can be dropped, the page separator is configurable.
+- `PdfTextExtraction::page_starts` / `pages()` / `text_with()`; pages
+  are laid out one by one, so text at the same coordinates on two
+  pages no longer shares a line.
+- Marked content: a `BDC` naming a property list from the resource
+  dictionary's `/Properties` (§14.6.2) yields its `/MCID` and
+  `/ActualText`; content nested in a marked-content item belongs to
+  it; `MarkedTextRun::artifact` flags `/Artifact` content.
+- Larger cuts of mathematical delimiters and operators
+  (`parenleftbig`, `summationdisplay`) read as their base glyph.
+
 ### Changed
+
+- `PdfTextExtraction::flat_text()` / `lines()` now return each page in
+  geometric reading order with the default clean-ups (they used to
+  follow painting order); `assemble_text` and
+  `TextOrder::Stream` keep the painting order.
 
 - `#[non_exhaustive]` on the reader output records (`PdfAction`, `PdfAnnotation`, `AnnotationAppearance`, `ThreeDActivation`, `FixedPrint`, `PdfAttachment`, `HierarchyIssue`, `HierarchyReport`, `PdfImageXObject`, `SoftMaskImage`, `PdfInlineImage`, `ReadingOrderText`, `LinearizationParams`, `PdfLink`, `NamedDestination`, the optional-content `OptionalContentGroup` / `OcUsage` / `OcConfig` / `OptionalContent`, `OutlineNode`, `PdfOutline`, `PageLabelRange`, `PdfAConformance`, `PdfDocTimestamp`, `MarkedTextRun`, `PdfTextExtraction`, `PdfMarkedTextExtraction`, `PdfThread`, `PdfBead`, the `reader::content` records, `PubSecMatch`) and on the writer / encryption records that already have constructors (`Attachment`, `OutlineSpec`, `EncryptionConfig`, `EncryptionState`, `PubSecEncoderConfig`, `PubSecEncryptionState`, `PubSecCfGroup`, `PubSecKariConfig`, `KariRecipient`, `PubSecCredential`).
 - `#[non_exhaustive]` on the growable enums `PdfError`, `ActionTrigger`, `ActionKind`, both `AnnotationKind`s (reader and writer), `ThreeDViewSelector`, `reader::ColorSpace`, `InlineImageFilter`, `LayoutMode`, `IssueSeverity`, `PdfLinkTarget`, `LinkTarget`, `SigningAlgorithm`, `PubSecSubFilter`, `KariCurve`, `KariKdf`, `HashAlg`, `SignatureAlg` and `EcCurve`. Enums whose values ISO 32000 fixes (`Object`, `TextRenderMode`, `PageLabelStyle`, `OutlineDestination`, `AfRelationship`, `SoundEncoding`, `CaretSymbol`, `FreeTextQuadding`, `FieldJustification`, `FormField`, the `Oc*` policy / state / list enums, `BaseEncoding`, `XrefEntry`, `TextShowOp`, `MarkedContentOp`, `CryptMethod`, `CertRef`) stay exhaustive.
+
+### Fixed
+
+- `TJ` word gaps: character spacing (`Tc`) counts toward the gap
+  between two strings, so a wide `Tc` taken back by a kern after every
+  glyph no longer hides the word ends; word gaps between short pieces
+  (`(Ful)(l) (r)(at)(e)`) are no longer mistaken for tracking.
+- An unassigned control code in a show string (a stray carriage
+  return) reads as nothing instead of U+FFFD.
+- A `/ToUnicode` destination of U+0000 (a producer's "no value" for a
+  ligature glyph) counts as unmapped, so the font's encoding or
+  embedded program supplies the text.
+- Lines of text drawn with a mirrored matrix or a negative font size
+  keep their top-to-bottom order.
 
 ## [0.2.2](https://github.com/OxideAV/oxideav-pdf/compare/v0.2.1...v0.2.2) - 2026-11-05
 

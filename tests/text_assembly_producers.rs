@@ -277,7 +277,12 @@ fn simple_font_to_unicode_with_two_byte_codespace_decodes_per_byte() {
         3 beginbfchar <1D> <FB01> <41> <0041> <70> <0070> endbfchar\nendcmap end";
     let content = b"BT /F0 10 Tf 72 700 Td (Ap\\035ne)Tj ET";
     let pdf = build_pdf(content, &[("F0", font)], &[tu]);
-    assert_eq!(flat(&pdf), "Ap\u{fb01}ne");
+    // The ToUnicode target is the ligature code point; the default
+    // layout spells it out.
+    let mut r = DocumentReader::open(&pdf).expect("open");
+    let ex = r.text_extraction().expect("extract");
+    assert_eq!(ex.runs[0].text, "Ap\u{fb01}ne");
+    assert_eq!(ex.flat_text(), "Apfine");
 }
 
 #[test]

@@ -45,6 +45,7 @@ use std::collections::{HashMap, HashSet};
 use crate::error::PdfError;
 use crate::objects::{Object, ObjectId};
 use crate::reader::document::DocumentReader;
+use crate::reader::reading::{TextLayoutOptions, TextOrder, layout_page_text};
 use crate::reader::text::{TextRun, extract_text, extract_text_marked};
 
 // ────────────────────────── public surface ──────────────────────────
@@ -87,6 +88,30 @@ impl<'a> DocumentReader<'a> {
     /// See [`read_in_logical_order`] for the full contract.
     pub fn read_in_logical_order(&mut self) -> Result<ReadingOrderText, PdfError> {
         read_in_logical_order(self)
+    }
+
+    /// The document's text, assembled as `opts` asks.
+    ///
+    /// With [`TextOrder::Structure`] (the default) a Tagged PDF is
+    /// read in the order of its logical structure tree (ISO 32000-1
+    /// §14.8), each page's artifacts (running headers, page numbers)
+    /// after its logical content, and any other document in geometric
+    /// reading order, page by page; see
+    /// [`TextLayoutOptions`] for the other choices.
+    ///
+    /// ```no_run
+    /// use oxideav_pdf::reader::{DocumentReader, TextLayoutOptions};
+    /// let bytes = std::fs::read("in.pdf").unwrap();
+    /// let mut doc = DocumentReader::open(&bytes).unwrap();
+    /// let text = doc.text(&TextLayoutOptions::new()).unwrap();
+    /// ```
+    pub fn text(&mut self, opts: &TextLayoutOptions) -> Result<String, PdfError> {
+        if opts.order() == TextOrder::Structure
+            && let Some(text) = structure_text(self, opts)?
+        {
+            return Ok(text);
+        }
+        Ok(self.text_extraction()?.text_with(opts))
     }
 }
 
@@ -150,15 +175,11 @@ pub fn read_in_logical_order(
 
     // Walk the structure tree.
     let mut out = Vec::new();
-    let mut visited = HashSet::new();
-    let mut ctx = StructWalkCtx {
-        out: &mut out,
-        buckets: &buckets,
-        visited: &mut visited,
-        cur_page: None,
-        depth: 0,
-    };
-    walk_struct_node(reader, &str_root_dict, &mut ctx)?;
+    for key in logical_keys(reader, &str_root_dict)? {
+        if let Some(runs) = buckets.get(&key) {
+            out.extend(runs.iter().cloned());
+        }
+    }
 
     // If the tree walk produced *no* runs but we did see tagged runs,
     // the structure tree is empty / malformed — fall back to raster
@@ -179,9 +200,143 @@ pub fn read_in_logical_order(
 
 // ────────────────────────── walker ──────────────────────────
 
+/// The marked-content items `(page object number, MCID)` the
+/// structure tree references, in logical order (§14.7.2: the order of
+/// the `/K` entries, depth first).
+fn logical_keys(
+    reader: &mut DocumentReader<'_>,
+    str_root: &crate::objects::Dict,
+) -> Result<Vec<(u32, u32)>, PdfError> {
+    let mut out = Vec::new();
+    let mut visited = HashSet::new();
+    let mut ctx = StructWalkCtx {
+        out: &mut out,
+        visited: &mut visited,
+        cur_page: None,
+        depth: 0,
+    };
+    walk_struct_node(reader, str_root, &mut ctx)?;
+    Ok(out)
+}
+
+/// The document's `/StructTreeRoot` dictionary, when it has one.
+fn struct_tree_root(reader: &mut DocumentReader<'_>) -> Option<crate::objects::Dict> {
+    let root_id = reader.xref().root().ok()?;
+    let Ok(Object::Dict(catalog)) = reader.resolve(root_id) else {
+        return None;
+    };
+    let entry = catalog
+        .entries()
+        .iter()
+        .find(|(k, _)| k == "StructTreeRoot")
+        .map(|(_, v)| v.clone())?;
+    match reader.deref(entry) {
+        Ok(Object::Dict(d)) => Some(d),
+        _ => None,
+    }
+}
+
+/// The document's text in the order of its logical structure tree
+/// (ISO 32000-1 §14.7, §14.8), or `None` when the document is not
+/// tagged or its tree does not account for most of the text (in which
+/// case the caller lays the pages out geometrically).
+///
+/// The marked-content items come out in the order the tree references
+/// them. Text the tree does not reference — artifacts (§14.8.2.2 —
+/// running headers, page numbers; dropped when the options say so)
+/// and unmarked content — is laid out geometrically after the logical
+/// content of its page.
+pub(crate) fn structure_text(
+    reader: &mut DocumentReader<'_>,
+    opts: &TextLayoutOptions,
+) -> Result<Option<String>, PdfError> {
+    let Some(root) = struct_tree_root(reader) else {
+        return Ok(None);
+    };
+    let marked = extract_text_marked(reader)?;
+    let keys = logical_keys(reader, &root)?;
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    // Runs of each marked-content item, by index into `marked.runs`.
+    let mut buckets: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+    for (i, mr) in marked.runs.iter().enumerate() {
+        if let Some(mcid) = mr.mcid
+            && !mr.artifact
+        {
+            buckets.entry((mr.page_obj_num, mcid)).or_default().push(i);
+        }
+    }
+    let weight = |i: usize| marked.runs[i].run.text.trim().chars().count();
+    let mut placed = vec![false; marked.runs.len()];
+    // (page index, runs) groups in logical order: consecutive items of
+    // one page form one group.
+    let mut groups: Vec<(u32, Vec<TextRun>)> = Vec::new();
+    let mut in_tree = 0usize;
+    for key in keys {
+        let Some(items) = buckets.remove(&key) else {
+            continue;
+        };
+        for i in items {
+            let mr = &marked.runs[i];
+            placed[i] = true;
+            in_tree += weight(i);
+            match groups.last_mut() {
+                Some((page, runs)) if *page == mr.page_index => runs.push(mr.run.clone()),
+                _ => groups.push((mr.page_index, vec![mr.run.clone()])),
+            }
+        }
+    }
+    let content: usize = (0..marked.runs.len())
+        .filter(|i| !marked.runs[*i].artifact)
+        .map(weight)
+        .sum();
+    // A tree that leaves most of the text out is not a description of
+    // this document's reading order.
+    if in_tree * 2 < content {
+        return Ok(None);
+    }
+    // Text outside the tree, per page.
+    let mut loose: HashMap<u32, Vec<TextRun>> = HashMap::new();
+    let mut loose_pages: Vec<u32> = Vec::new();
+    for (i, mr) in marked.runs.iter().enumerate() {
+        if !placed[i] && (opts.include_artifacts() || !mr.artifact) {
+            let slot = loose.entry(mr.page_index).or_default();
+            if slot.is_empty() {
+                loose_pages.push(mr.page_index);
+            }
+            slot.push(mr.run.clone());
+        }
+    }
+    let stream = opts.clone().with_order(TextOrder::Stream);
+    let geometric = opts.clone().with_order(TextOrder::Geometric);
+    let mut parts: Vec<String> = Vec::new();
+    let mut flush_loose = |page: u32, parts: &mut Vec<String>| {
+        if let Some(runs) = loose.remove(&page) {
+            parts.push(layout_page_text(&runs, &geometric));
+        }
+    };
+    // The page's loose text follows its last group.
+    let last_group: HashMap<u32, usize> = groups
+        .iter()
+        .enumerate()
+        .map(|(gi, (page, _))| (*page, gi))
+        .collect();
+    for (gi, (page, runs)) in groups.iter().enumerate() {
+        parts.push(layout_page_text(runs, &stream));
+        if last_group.get(page) == Some(&gi) {
+            flush_loose(*page, &mut parts);
+        }
+    }
+    for page in loose_pages {
+        flush_loose(page, &mut parts);
+    }
+    parts.retain(|p| !p.is_empty());
+    Ok(Some(parts.join("\n")))
+}
+
 struct StructWalkCtx<'a> {
-    out: &'a mut Vec<TextRun>,
-    buckets: &'a HashMap<(u32, u32), Vec<TextRun>>,
+    out: &'a mut Vec<(u32, u32)>,
     visited: &'a mut HashSet<ObjectId>,
     /// Current `/Pg` in scope. Inherited from ancestor StructElem when
     /// a child MCR doesn't override it. `None` when no ancestor has
@@ -194,6 +349,9 @@ struct StructWalkCtx<'a> {
 }
 
 const MAX_STRUCT_DEPTH: u32 = 64;
+
+/// Bound on marked-content references collected from one tree.
+const MAX_STRUCT_ITEMS: usize = 4_000_000;
 
 fn walk_struct_node(
     reader: &mut DocumentReader<'_>,
@@ -247,9 +405,9 @@ fn visit_k(
         Object::Integer(mcid) => {
             // Bare-integer MCID into ctx.cur_page.
             if let (Some(pg), Ok(mcid_u)) = (ctx.cur_page, u32::try_from(mcid))
-                && let Some(runs) = ctx.buckets.get(&(pg, mcid_u))
+                && ctx.out.len() < MAX_STRUCT_ITEMS
             {
-                ctx.out.extend(runs.iter().cloned());
+                ctx.out.push((pg, mcid_u));
             }
             Ok(())
         }
@@ -304,9 +462,9 @@ fn visit_k(
                             _ => None,
                         });
                     if let (Some(pg), Some(mcid)) = (pg, mcid)
-                        && let Some(runs) = ctx.buckets.get(&(pg, mcid))
+                        && ctx.out.len() < MAX_STRUCT_ITEMS
                     {
-                        ctx.out.extend(runs.iter().cloned());
+                        ctx.out.push((pg, mcid));
                     }
                     Ok(())
                 }

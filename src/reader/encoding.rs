@@ -95,6 +95,9 @@ impl BaseEncoding {
 #[derive(Clone, Debug)]
 pub struct EncodingMap {
     table: [String; 256],
+    /// One bit per code: the code selects a glyph, but nothing says
+    /// what text the glyph stands for.
+    unnamed_text: [u64; 4],
 }
 
 impl Default for EncodingMap {
@@ -107,15 +110,30 @@ impl EncodingMap {
     pub fn new() -> Self {
         Self {
             table: std::array::from_fn(|_| String::new()),
+            unnamed_text: [0; 4],
         }
+    }
+
+    /// Record that `code` selects a glyph whose text is unknown (a
+    /// `/Differences` name no glyph list maps): it decodes to U+FFFD
+    /// even where an unassigned code would read as nothing.
+    pub(crate) fn set_unknown_glyph(&mut self, code: u8) {
+        self.table[code as usize].clear();
+        self.unnamed_text[(code >> 6) as usize] |= 1 << (code & 63);
+    }
+
+    fn has_unknown_glyph(&self, code: u8) -> bool {
+        self.unnamed_text[(code >> 6) as usize] & (1 << (code & 63)) != 0
     }
 
     pub fn set_char(&mut self, code: u8, c: char) {
         self.table[code as usize] = String::from(c);
+        self.unnamed_text[(code >> 6) as usize] &= !(1 << (code & 63));
     }
 
     pub fn set_string(&mut self, code: u8, s: &str) {
         self.table[code as usize] = s.to_owned();
+        self.unnamed_text[(code >> 6) as usize] &= !(1 << (code & 63));
     }
 
     /// Look up one byte. Returns the empty slice when unassigned (caller
@@ -125,13 +143,18 @@ impl EncodingMap {
     }
 
     /// Decode a `Tj` / `TJ` byte string into Unicode by walking the
-    /// table. Unassigned codes become U+FFFD.
+    /// table. Unassigned codes become U+FFFD — except the control
+    /// codes below 0x20, which no encoding of Annex D assigns: a
+    /// stray carriage return or tab in a show string selects
+    /// `.notdef`, paints nothing and reads as nothing.
     pub fn decode(&self, bytes: &[u8]) -> String {
         let mut out = String::with_capacity(bytes.len());
         for &b in bytes {
             let slot = self.lookup(b);
             if slot.is_empty() {
-                out.push('\u{FFFD}');
+                if b >= 0x20 || self.has_unknown_glyph(b) {
+                    out.push('\u{FFFD}');
+                }
             } else {
                 out.push_str(slot);
             }
@@ -223,10 +246,10 @@ pub(crate) fn apply_encoding_differences_with(
     for ov in &differences.overrides {
         match glyph_name_to_unicode(&ov.glyph_name) {
             Some(s) => out.set_string(ov.code, s.as_ref()),
-            None => out.set_string(
-                ov.code,
-                fallback(&ov.glyph_name).as_deref().unwrap_or_default(),
-            ),
+            None => match fallback(&ov.glyph_name) {
+                Some(s) => out.set_string(ov.code, &s),
+                None => out.set_unknown_glyph(ov.code),
+            },
         }
     }
     out
@@ -248,7 +271,7 @@ pub fn apply_encoding_differences(
             // U+FFFD. We do NOT propagate the raw glyph name as text —
             // that would be worse than the replacement char (callers
             // running keyword search would match the literal name).
-            out.set_string(ov.code, "");
+            out.set_unknown_glyph(ov.code);
         }
     }
     out
@@ -302,8 +325,23 @@ pub fn glyph_name_to_unicode(name: &str) -> Option<Cow<'static, str>> {
             any = true;
         }
     }
-    any.then_some(Cow::Owned(out))
+    if any {
+        return Some(Cow::Owned(out));
+    }
+    // Mathematical extension fonts name the larger cuts of a delimiter
+    // or operator after the base glyph plus a size word
+    // (`parenleftbig`, `bracketrightBigg`, `summationdisplay`,
+    // `integraltext`): the character is the base glyph's.
+    SIZE_SUFFIXES
+        .iter()
+        .find_map(|suffix| base.strip_suffix(suffix))
+        .filter(|stem| !stem.is_empty())
+        .and_then(component_to_unicode)
 }
+
+/// Size words a glyph name may append to the name of the glyph it is
+/// a larger cut of (longest first, so `bigg` is tried before `big`).
+const SIZE_SUFFIXES: [&str; 6] = ["display", "Bigg", "bigg", "text", "Big", "big"];
 
 /// One AGL §2 component: the shipping overrides (ligatures written
 /// out, Greek Delta / Omega), the full Adobe Glyph List, then the
@@ -1408,6 +1446,16 @@ mod tests {
     #[test]
     fn agl_lookup_unknown() {
         assert!(glyph_name_to_unicode("notaglyphname").is_none());
+        // Larger cuts of a delimiter / operator read as the base glyph.
+        assert_eq!(glyph_name_to_unicode("parenleftbig").as_deref(), Some("("));
+        assert_eq!(
+            glyph_name_to_unicode("bracketrightBigg").as_deref(),
+            Some("]")
+        );
+        assert_eq!(
+            glyph_name_to_unicode("summationdisplay").as_deref(),
+            Some("\u{2211}")
+        );
     }
 
     #[test]
@@ -1604,7 +1652,10 @@ mod tests {
     #[test]
     fn unassigned_code_decodes_to_replacement() {
         let m = EncodingMap::from_base(BaseEncoding::Standard);
-        // StandardEncoding has nothing at 0x00 — must come back as FFFD.
-        assert_eq!(m.decode(&[0x00]), "\u{FFFD}");
+        // StandardEncoding has nothing at 0x80 — must come back as FFFD.
+        assert_eq!(m.decode(&[0x80]), "\u{FFFD}");
+        // An unassigned control code selects .notdef and reads as
+        // nothing.
+        assert_eq!(m.decode(b"end\r"), "end");
     }
 }

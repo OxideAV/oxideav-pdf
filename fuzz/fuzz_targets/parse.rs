@@ -58,7 +58,8 @@
 //!   * threads — §12.4.3 circular bead rings.
 //!   * image + inline images — §8.9 XObject and inline scanners.
 //!   * optional content — §8.11 `/OCProperties` graph.
-//!   * logical reading order — §14.7 struct tree.
+//!   * logical reading order — §14.7 struct tree; the geometric
+//!     page layout over the extracted runs.
 //!   * signatures + doc timestamps — §12.8 `/ByteRange` + CMS parse.
 //!   * PDF/A signals + hierarchy verify + XMP packet — catalog scan.
 
@@ -68,7 +69,7 @@ use oxideav_pdf::reader::content::parse_content_stream;
 use oxideav_pdf::reader::inline_images::extract_inline_images_from_stream;
 use oxideav_pdf::reader::linearize::parse_linearization_dict;
 use oxideav_pdf::reader::{
-    DocumentReader, actions, annotations, attachments, doc_timestamps, extract_text,
+    DocumentReader, TextLayoutOptions, TextOrder, actions, annotations, attachments, doc_timestamps, extract_text,
     image_xobjects, inline_images, links, named_destinations, optional_content, outline,
     page_label_ranges, page_labels, pdfa_signals, read_in_logical_order, signatures, threads,
     verify_hierarchy,
@@ -86,8 +87,16 @@ fuzz_target!(|data: &[u8]| {
         let _ = page_labels(&mut reader);
         let _ = page_label_ranges(&mut reader);
         // §9 text extraction + §14.7 logical order.
-        let _ = extract_text(&mut reader);
+        // The geometric layout (columns, rows, hyphen joins) runs on
+        // whatever geometry the runs carry — NaN, infinite and
+        // degenerate matrices included — and the structure-order path
+        // walks the §14.7 tree against the marked runs.
+        if let Ok(extraction) = extract_text(&mut reader) {
+            let _ = extraction.flat_text();
+            let _ = extraction.text_with(&TextLayoutOptions::new().with_order(TextOrder::Stream));
+        }
         let _ = read_in_logical_order(&mut reader);
+        let _ = reader.text(&TextLayoutOptions::new().with_include_artifacts(false));
         // §12.5 / §12.6 annotation, link, and action trees.
         let _ = annotations(&mut reader);
         let _ = links(&mut reader);

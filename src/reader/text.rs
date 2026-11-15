@@ -278,6 +278,11 @@ pub struct MarkedTextRun {
     pub page_obj_num: u32,
     /// Zero-based page index in walk order (0 for the first page found).
     pub page_index: u32,
+    /// Whether the show stood inside an `/Artifact` marked-content
+    /// sequence (ISO 32000-1 §14.8.2.2): running headers, page
+    /// numbers, background — not part of the document's logical
+    /// content.
+    pub artifact: bool,
 }
 
 /// All text runs collected from one page (or one whole document — the
@@ -286,6 +291,11 @@ pub struct MarkedTextRun {
 #[non_exhaustive]
 pub struct PdfTextExtraction {
     pub runs: Vec<TextRun>,
+    /// Index into [`Self::runs`] of the first run of each page, in
+    /// page order (a page without text repeats the next page's index).
+    /// Empty for a run list assembled by hand, which is then treated
+    /// as a single page.
+    pub page_starts: Vec<usize>,
 }
 
 /// All [`MarkedTextRun`]s collected from every page in walk order.
@@ -299,21 +309,46 @@ pub struct PdfMarkedTextExtraction {
 }
 
 impl PdfTextExtraction {
-    /// Concatenate every run's text with a single space between them.
-    /// Convenience for callers that only need a flat document-level
-    /// blob (e.g. keyword search). A real layout engine would walk the
-    /// individual runs + positions to reconstruct lines / paragraphs.
+    /// The document's text with the default
+    /// [`TextLayoutOptions`](crate::reader::TextLayoutOptions): each
+    /// page in geometric reading order (columns, then lines top to
+    /// bottom), words hyphenated across a line end joined, ligatures
+    /// spelled out. See [`Self::text_with`] for the other layouts.
     pub fn flat_text(&self) -> String {
-        assemble_text(&self.runs)
+        self.text_with(&crate::reader::reading::TextLayoutOptions::default())
     }
 
-    /// The runs assembled into lines — see [`assemble_text`] for the
-    /// word-gap and line-break rules.
+    /// The document's text assembled as `opts` asks, page by page.
+    pub fn text_with(&self, opts: &crate::reader::reading::TextLayoutOptions) -> String {
+        let mut out = String::new();
+        for (i, page) in self.pages().enumerate() {
+            if i > 0 {
+                out.push_str(opts.page_separator());
+            }
+            out.push_str(&crate::reader::reading::layout_page_text(page, opts));
+        }
+        out
+    }
+
+    /// The runs of each page, in page order (one slice holding every
+    /// run when the page boundaries are unknown).
+    pub fn pages(&self) -> impl Iterator<Item = &[TextRun]> {
+        let n = self.runs.len();
+        let starts: &[usize] = if self.page_starts.is_empty() {
+            &[0]
+        } else {
+            &self.page_starts
+        };
+        starts.iter().enumerate().map(move |(i, &a)| {
+            let b = starts.get(i + 1).copied().unwrap_or(n);
+            let a = a.min(n);
+            &self.runs[a..b.clamp(a, n)]
+        })
+    }
+
+    /// The lines of [`Self::flat_text`].
     pub fn lines(&self) -> Vec<String> {
-        assemble_text(&self.runs)
-            .split('\n')
-            .map(str::to_owned)
-            .collect()
+        self.flat_text().split('\n').map(str::to_owned).collect()
     }
 }
 
@@ -356,7 +391,21 @@ impl PdfTextExtraction {
 /// — the spec defines the geometry, not a word-break rule — and are
 /// shared with the `TJ` in-run kern rule ([`TextWalker::WORD_BREAK_GAP`]).
 pub fn assemble_text(runs: &[TextRun]) -> String {
-    // 1. Group into lines.
+    let lines = stream_lines(runs);
+    let mut out = String::new();
+    for (li, line) in lines.iter().enumerate() {
+        if li > 0 {
+            out.push('\n');
+        }
+        out.push_str(&reorder_bidi_line(&line_text(line)));
+    }
+    out
+}
+
+/// Group runs into lines in stream order: a line ends at a baseline
+/// shift or a backtrack (see [`assemble_text`]); overprinted copies of
+/// a show or of a whole line are dropped.
+pub(crate) fn stream_lines(runs: &[TextRun]) -> Vec<Vec<&TextRun>> {
     let mut lines: Vec<Vec<&TextRun>> = Vec::new();
     let mut cur: Vec<&TextRun> = Vec::new();
     for run in runs.iter().filter(|r| !r.text.is_empty()) {
@@ -375,59 +424,58 @@ pub fn assemble_text(runs: &[TextRun]) -> String {
     if !cur.is_empty() {
         push_line(&mut lines, cur);
     }
-    // 2. Words within each line.
-    let mut out = String::new();
-    for (li, line) in lines.iter().enumerate() {
-        if li > 0 {
-            out.push('\n');
-        }
-        let gaps: Vec<(f32, f32)> = line.windows(2).map(|w| run_gap(w[0], w[1])).collect();
-        let singles: Vec<bool> = line.iter().map(|r| is_single_glyph(&r.text)).collect();
-        // Letter spacing in user units: the estimate works in em
-        // fractions of each pair's smaller font, so normalise the gaps.
-        let rel: Vec<f32> = gaps
-            .iter()
-            .map(|(g, em)| if *em > 0.0 { g / em } else { 0.0 })
-            .collect();
-        let ls_em = letter_spacing_estimate(&singles, &rel, 1.0);
-        let mut text = String::new();
-        // A spacing accent drawn over the following glyph (TeX's
-        // `\"u`: the accent, then the letter backed up under it).
-        let mut pending_accent: Option<&'static str> = None;
-        for (i, run) in line.iter().enumerate() {
-            if i > 0 && pending_accent.is_none() {
-                let (gap, em) = gaps[i - 1];
-                if gap >= (WORD_GAP_EM + ls_em) * em
-                    && !text.ends_with(char::is_whitespace)
-                    && !run.text.starts_with(char::is_whitespace)
-                {
-                    text.push(' ');
-                }
-            }
-            if let Some(accent) = spacing_accent_name(&run.text)
-                && let Some(next) = line.get(i + 1)
-                && gaps[i].0 < 0.0
-                && composed_accent(&next.text, accent).is_some()
+    lines
+}
+
+/// The text of one line of runs in painting order: word gaps from the
+/// geometry, spacing accents composed, trailing spaces trimmed. Not
+/// yet reordered for right-to-left scripts.
+pub(crate) fn line_text(line: &[&TextRun]) -> String {
+    let gaps: Vec<(f32, f32)> = line.windows(2).map(|w| run_gap(w[0], w[1])).collect();
+    let singles: Vec<bool> = line.iter().map(|r| is_single_glyph(&r.text)).collect();
+    // Letter spacing in user units: the estimate works in em
+    // fractions of each pair's smaller font, so normalise the gaps.
+    let rel: Vec<f32> = gaps
+        .iter()
+        .map(|(g, em)| if *em > 0.0 { g / em } else { 0.0 })
+        .collect();
+    let ls_em = letter_spacing_estimate(&singles, &rel, 1.0);
+    let mut text = String::new();
+    // A spacing accent drawn over the following glyph (TeX's
+    // `\"u`: the accent, then the letter backed up under it).
+    let mut pending_accent: Option<&'static str> = None;
+    for (i, run) in line.iter().enumerate() {
+        if i > 0 && pending_accent.is_none() {
+            let (gap, em) = gaps[i - 1];
+            if gap >= (WORD_GAP_EM + ls_em) * em
+                && !text.ends_with(char::is_whitespace)
+                && !run.text.starts_with(char::is_whitespace)
             {
-                pending_accent = Some(accent);
-                continue;
+                text.push(' ');
             }
-            match pending_accent.take() {
-                Some(accent) => {
-                    if let Some((composed, rest)) = composed_accent(&run.text, accent) {
-                        text.push_str(&composed);
-                        text.push_str(rest);
-                    }
+        }
+        if let Some(accent) = spacing_accent_name(&run.text)
+            && let Some(next) = line.get(i + 1)
+            && gaps[i].0 < 0.0
+            && composed_accent(&next.text, accent).is_some()
+        {
+            pending_accent = Some(accent);
+            continue;
+        }
+        match pending_accent.take() {
+            Some(accent) => {
+                if let Some((composed, rest)) = composed_accent(&run.text, accent) {
+                    text.push_str(&composed);
+                    text.push_str(rest);
                 }
-                None => text.push_str(&run.text),
             }
+            None => text.push_str(&run.text),
         }
-        while text.ends_with(' ') {
-            text.pop();
-        }
-        out.push_str(&reorder_bidi_line(&text));
     }
-    out
+    while text.ends_with(' ') {
+        text.pop();
+    }
+    text
 }
 
 /// Distance, as a fraction of the larger em, within which the same
@@ -515,7 +563,7 @@ const MAX_LETTER_SPACING_EM: f32 = 0.3;
 
 /// Unit baseline direction and its perpendicular for a run, from the
 /// text matrix (the vertical-writing axis for a `WMode 1` run).
-fn run_axes(r: &TextRun) -> ((f32, f32), (f32, f32)) {
+pub(crate) fn run_axes(r: &TextRun) -> ((f32, f32), (f32, f32)) {
     let m = r.text_matrix;
     let (ax, ay) = if r.is_vertical() {
         // Vertical runs advance along -y of text space.
@@ -532,7 +580,7 @@ fn run_axes(r: &TextRun) -> ((f32, f32), (f32, f32)) {
     (u, (-u.1, u.0))
 }
 
-fn dot(a: (f32, f32), b: (f32, f32)) -> f32 {
+pub(crate) fn dot(a: (f32, f32), b: (f32, f32)) -> f32 {
     a.0 * b.0 + a.1 * b.1
 }
 
@@ -569,7 +617,7 @@ fn starts_new_line(p: &TextRun, r: &TextRun) -> bool {
 
 /// Gap along the baseline from `p`'s end to `r`'s origin (user units,
 /// rightward positive) and the pair's smaller em.
-fn run_gap(p: &TextRun, r: &TextRun) -> (f32, f32) {
+pub(crate) fn run_gap(p: &TextRun, r: &TextRun) -> (f32, f32) {
     let (u, _) = run_axes(p);
     let (_, em_small) = em_pair(p, r);
     (dot(r.position, u) - dot(p.end(), u), em_small)
@@ -620,7 +668,19 @@ fn letter_spacing_estimate(singles: &[bool], gaps: &[f32], em: f32) -> f32 {
         .into_iter()
         .filter(|g| *g > noise && *g <= cap)
         .collect();
-    if tracked.len() >= 2 { tracked[0] } else { 0.0 }
+    if tracked.len() < 2 {
+        return 0.0;
+    }
+    let spacing = tracked[0];
+    // Tracking opens every boundary of the line, not only those
+    // between single glyphs: when a fair share of the boundaries are
+    // closed, the open ones are word gaps between short pieces
+    // (`(Ful)(l) (r)(at)(e) (s)(peech)`), not tracking.
+    let closed = gaps.iter().filter(|g| **g < 0.5 * spacing).count();
+    if closed * 5 > gaps.len() {
+        return 0.0;
+    }
+    spacing
 }
 
 /// Gap, in em, below which a positive gap between glyphs is position
@@ -810,6 +870,7 @@ pub fn extract_text(reader: &mut DocumentReader<'_>) -> Result<PdfTextExtraction
     let mut out = PdfTextExtraction::default();
     let mut cache = FontCache::new();
     for leaf in leaves {
+        out.page_starts.push(out.runs.len());
         extract_page(reader, leaf, &mut out, &mut cache)?;
     }
     Ok(out)
@@ -1447,6 +1508,8 @@ fn load_page_for_text(
 /// pages (or forms) parses its encoding and program once.
 type FontCache = HashMap<ObjectId, (FontDecoder, FontAdvance)>;
 
+/// Bound on open marked-content sequences tracked (§14.6).
+const MAX_MARKED_DEPTH: usize = 256;
 /// Bound on Form XObjects prepared for one page (nesting included).
 const MAX_FORMS_PER_PAGE: usize = 256;
 /// Bound on Form XObject nesting (§8.10).
@@ -1459,7 +1522,17 @@ struct Scope {
     fonts: Rc<PageFonts>,
     advances: Rc<PageAdvances>,
     forms: Rc<HashMap<String, Rc<FormXObject>>>,
+    /// Named property lists (§14.6.2: `/Resources /Properties`) a
+    /// `BDC` can name instead of an inline dictionary: their `/MCID`
+    /// and `/ActualText`.
+    properties: Rc<HashMap<String, MarkedProps>>,
 }
+
+/// What text extraction reads from a marked-content property list.
+type MarkedProps = (Option<u32>, Option<String>);
+
+/// Bound on property lists read per resource dictionary.
+const MAX_PROPERTY_LISTS: usize = 4096;
 
 /// A Form XObject (§8.10) prepared for text extraction: its content
 /// and, when it carries one, its own resource scope (a form without
@@ -1561,10 +1634,32 @@ fn load_scope(
             );
         }
     }
+    let mut properties: HashMap<String, MarkedProps> = HashMap::new();
+    if let Some(pd) = resolve_dict(reader, &rdict, "Properties") {
+        for (name, val) in pd.entries().iter().take(MAX_PROPERTY_LISTS) {
+            let Ok(Object::Dict(d)) = reader.deref(val.clone()) else {
+                continue;
+            };
+            let mcid = match dict_get(&d, "MCID") {
+                Some(Object::Integer(n)) => u32::try_from(*n).ok(),
+                _ => None,
+            };
+            let actual = match dict_get(&d, "ActualText") {
+                Some(Object::LiteralString(b) | Object::HexString(b)) => {
+                    Some(decode_text_string_bytes(b))
+                }
+                _ => None,
+            };
+            if mcid.is_some() || actual.is_some() {
+                properties.insert(name.clone(), (mcid, actual));
+            }
+        }
+    }
     Scope {
         fonts: Rc::new(fonts),
         advances: Rc::new(advances),
         forms: Rc::new(forms),
+        properties: Rc::new(properties),
     }
 }
 
@@ -1646,15 +1741,15 @@ fn extract_page_marked(
         return Ok(());
     };
     let mut walker = TextWalker::new(scope);
-    walker.track_mcid = true;
     let _ = walker.parse(&content_bytes);
     let runs = walker.into_runs_with_mcid();
-    for (run, mcid) in runs {
+    for (run, mcid, artifact) in runs {
         out.runs.push(MarkedTextRun {
             run,
             mcid,
             page_obj_num: page_id.number,
             page_index,
+            artifact,
         });
     }
     Ok(())
@@ -2419,8 +2514,15 @@ impl CMap {
         Ok(cm)
     }
 
+    /// The text of a code. A destination of U+0000 is a producer's
+    /// placeholder for "no Unicode value known" (seen on ligature
+    /// glyphs), not text: it counts as unmapped, so the font's other
+    /// sources (§9.10.2) get their turn.
     fn lookup(&self, cid: u32) -> Option<&str> {
-        self.table.get(&cid).map(|s| s.as_str())
+        self.table
+            .get(&cid)
+            .map(|s| s.as_str())
+            .filter(|s| *s != "\0")
     }
 
     /// Find the codespace whose width-prefix of `bytes` matches per the
@@ -2835,6 +2937,8 @@ struct TextWalker {
     advances: Rc<PageAdvances>,
     /// Form XObjects the current scope can paint with `Do` (§8.10).
     forms: Rc<HashMap<String, Rc<FormXObject>>>,
+    /// Named marked-content property lists of the current scope.
+    properties: Rc<HashMap<String, MarkedProps>>,
     /// Nesting of `Do`-invoked forms being walked.
     form_depth: u32,
     /// Current transformation matrix (§8.3.4): `cm`, `q` / `Q` and
@@ -2842,10 +2946,16 @@ struct TextWalker {
     ctm: [f32; 6],
     runs: Vec<TextRun>,
     /// Parallel to `runs`: the MCID in scope at the moment of each
-    /// emit. Populated even when `track_mcid` is false (it's free —
+    /// emit. Always populated (it's free —
     /// just a `Vec<Option<u32>>` of `None`s). Round-29 marked-text
     /// extraction reads this; the round-22 raster path ignores it.
     run_mcids: Vec<Option<u32>>,
+    /// Parallel to `runs`: whether the show stood inside an
+    /// `/Artifact` marked-content sequence (§14.8.2.2).
+    run_artifacts: Vec<bool>,
+    /// One entry per open marked-content sequence: whether it (or an
+    /// enclosing one) is tagged `/Artifact`.
+    artifact_stack: Vec<bool>,
 
     // Operand stack — same shape as the path walker but text-flavoured
     // (we accept hex strings + literal strings as "string" operands and
@@ -2898,14 +3008,9 @@ struct TextWalker {
     saved: Vec<SavedTextState>,
 
     // ── marked-content state ────────────────────────────────────────
-    /// Round-29 toggle: when `true`, `BDC`/`BMC`/`EMC` push and pop
-    /// onto `mcid_stack` and emitted runs carry the top of the stack
-    /// in `run_mcids`. When `false`, BDC/BMC/EMC are still tolerated
-    /// (operands are dropped) but no per-run MCID is recorded.
-    track_mcid: bool,
-    /// Stack of `/MCID` integers (or `None` for `BDC` blocks whose
-    /// property dict has no MCID, and for `BMC` blocks). The top of
-    /// the stack is what `emit_show` stamps into `run_mcids`.
+    /// One entry per open marked-content sequence: the `/MCID` in
+    /// force there (its own, or the enclosing sequence's). The top of
+    /// the stack is what `push_run` stamps into `run_mcids`.
     mcid_stack: Vec<Option<u32>>,
     /// One frame per open `BDC` / `BMC` (always maintained, unlike
     /// `mcid_stack`): `Some` when the block declared `/ActualText`.
@@ -2973,10 +3078,13 @@ impl TextWalker {
             fonts: scope.fonts,
             advances: scope.advances,
             forms: scope.forms,
+            properties: scope.properties,
             form_depth: 0,
             ctm: identity(),
             runs: Vec::new(),
             run_mcids: Vec::new(),
+            run_artifacts: Vec::new(),
+            artifact_stack: Vec::new(),
             operands: Vec::new(),
             in_text: false,
             cur_font: String::new(),
@@ -2991,7 +3099,6 @@ impl TextWalker {
             horiz_scale: 1.0,
             run_advance: (0.0, 0.0),
             saved: Vec::new(),
-            track_mcid: false,
             mcid_stack: Vec::new(),
             actual_stack: Vec::new(),
         }
@@ -3001,8 +3108,13 @@ impl TextWalker {
         self.runs
     }
 
-    fn into_runs_with_mcid(self) -> Vec<(TextRun, Option<u32>)> {
-        self.runs.into_iter().zip(self.run_mcids).collect()
+    fn into_runs_with_mcid(self) -> Vec<(TextRun, Option<u32>, bool)> {
+        self.runs
+            .into_iter()
+            .zip(self.run_mcids)
+            .zip(self.run_artifacts)
+            .map(|((run, mcid), artifact)| (run, mcid, artifact))
+            .collect()
     }
 
     fn parse(&mut self, input: &[u8]) -> Result<(), PdfError> {
@@ -3330,12 +3442,16 @@ impl TextWalker {
                         actual_text = at;
                         mcid
                     }
-                    Some(TextOperand::Name(_)) => {
-                        // /Properties resource ref — round-29 doesn't
-                        // resolve indirect property dicts (the writer
-                        // never emits them; pdftotext likewise treats
-                        // unresolved property refs as MCID-less).
-                        None
+                    Some(TextOperand::Name(name)) => {
+                        // A property list named in the resource
+                        // dictionary's /Properties (§14.6.2).
+                        match self.properties.get(&name) {
+                            Some((mcid, at)) => {
+                                actual_text = at.clone();
+                                *mcid
+                            }
+                            None => None,
+                        }
                     }
                     Some(other) => {
                         self.operands.push(other);
@@ -3343,27 +3459,22 @@ impl TextWalker {
                     }
                     None => None,
                 };
-                let _tag = self.pop_name();
-                if self.track_mcid {
-                    self.mcid_stack.push(mcid);
-                }
+                let tag = self.pop_name();
+                self.open_marked_content(tag.as_deref(), mcid);
                 self.actual_stack
                     .push(actual_text.map(|text| ActualSpan { text, run: None }));
                 self.operands.clear();
             }
             b"BMC" => {
                 // tag BMC — no properties dict, no MCID.
-                let _tag = self.pop_name();
-                if self.track_mcid {
-                    self.mcid_stack.push(None);
-                }
+                let tag = self.pop_name();
+                self.open_marked_content(tag.as_deref(), None);
                 self.actual_stack.push(None);
                 self.operands.clear();
             }
             b"EMC" => {
-                if self.track_mcid {
-                    self.mcid_stack.pop();
-                }
+                self.mcid_stack.pop();
+                self.artifact_stack.pop();
                 self.actual_stack.pop();
                 self.operands.clear();
             }
@@ -3382,6 +3493,22 @@ impl TextWalker {
             }
         }
         Ok(())
+    }
+
+    /// Open a marked-content sequence (§14.6): content nested in a
+    /// sequence with an `/MCID` belongs to that marked-content item
+    /// unless it declares its own, and everything inside an
+    /// `/Artifact` is an artifact.
+    fn open_marked_content(&mut self, tag: Option<&str>, mcid: Option<u32>) {
+        // Bounded like the other stacks: a stream of unbalanced `BDC`s
+        // stops growing them.
+        if self.mcid_stack.len() >= MAX_MARKED_DEPTH {
+            return;
+        }
+        let inherited = self.mcid_stack.last().copied().flatten();
+        self.mcid_stack.push(mcid.or(inherited));
+        let outer = self.artifact_stack.last().copied().unwrap_or(false);
+        self.artifact_stack.push(outer || tag == Some("Artifact"));
     }
 
     fn pop_num(&mut self) -> Option<f32> {
@@ -3460,15 +3587,17 @@ impl TextWalker {
                 std::mem::replace(&mut self.fonts, scope.fonts.clone()),
                 std::mem::replace(&mut self.advances, scope.advances.clone()),
                 std::mem::replace(&mut self.forms, scope.forms.clone()),
+                std::mem::replace(&mut self.properties, scope.properties.clone()),
             )
         });
         self.form_depth += 1;
         let _ = self.parse(&form.content);
         self.form_depth -= 1;
-        if let Some((fonts, advances, forms)) = outer {
+        if let Some((fonts, advances, forms, properties)) = outer {
             self.fonts = fonts;
             self.advances = advances;
             self.forms = forms;
+            self.properties = properties;
         }
         self.operands.clear();
         self.in_text = in_text;
@@ -3545,14 +3674,23 @@ impl TextWalker {
         // letter-spacing estimate and the word-break rule.
         let mut pieces: Vec<String> = Vec::new();
         let mut gaps: Vec<f32> = Vec::new();
-        let mut pending_gap = 0.0f32;
+        // Character spacing (§9.3.2) follows every glyph, the last of
+        // a string included, so it is part of the gap to the next
+        // string: a producer may set a wide `Tc` and take it back with
+        // a kern after every glyph but the word ends.
+        let tc_gap = if self.cur_size.abs() > 1e-6 {
+            (self.char_spacing / self.cur_size * 1000.0).clamp(-2000.0, 2000.0)
+        } else {
+            0.0
+        };
+        let mut pending_gap = tc_gap;
         for item in arr {
             match item {
                 TJItem::Str(b) => {
                     if !pieces.is_empty() {
                         gaps.push(pending_gap);
                     }
-                    pending_gap = 0.0;
+                    pending_gap = tc_gap;
                     pieces.push(self.decode_bytes(b));
                 }
                 // Numeric adjustment: subtracted from the horizontal
@@ -3571,6 +3709,24 @@ impl TextWalker {
             &gaps,
             1000.0,
         );
+        // Inside a multi-glyph string the glyphs stand `Tc` apart:
+        // when most of the text is in such strings, that spacing is
+        // the line's tracking and a word gap is that much wider.
+        let ls = if tc_gap > 0.0 {
+            let glyphs: usize = pieces.iter().map(|p| p.chars().count()).sum();
+            let in_strings: usize = pieces
+                .iter()
+                .map(|p| p.chars().count())
+                .filter(|n| *n > 1)
+                .sum();
+            if in_strings * 2 >= glyphs {
+                ls.max(tc_gap)
+            } else {
+                ls
+            }
+        } else {
+            ls
+        };
         let mut text = String::new();
         for (i, piece) in pieces.iter().enumerate() {
             if i > 0
@@ -3677,6 +3833,8 @@ impl TextWalker {
         // Stamp the current MCID (top of stack) onto the run.
         let cur_mcid = self.mcid_stack.last().copied().unwrap_or(None);
         self.run_mcids.push(cur_mcid);
+        self.run_artifacts
+            .push(self.artifact_stack.last().copied().unwrap_or(false));
     }
 
     /// Advance the text matrix `Tm` by the §9.4.4 displacement of every
@@ -4163,6 +4321,7 @@ mod tests {
                 TextRun::new("Hello", (0.0, 0.0), "F0", 12.0).with_advance((30.0, 0.0)),
                 TextRun::new("World", (40.0, 0.0), "F0", 12.0).with_advance((30.0, 0.0)),
             ],
+            page_starts: Vec::new(),
         };
         assert_eq!(pe.flat_text(), "Hello World");
     }

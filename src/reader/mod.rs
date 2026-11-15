@@ -53,6 +53,7 @@ pub mod page_labels;
 #[doc(hidden)]
 pub mod parse;
 pub mod pdfa;
+pub mod reading;
 pub(crate) mod sfnt;
 pub mod sig;
 pub(crate) mod std14_metrics;
@@ -102,6 +103,7 @@ pub use page_labels::{
     PageLabelRange, PageLabelStyle, page_label_map, page_label_ranges, page_labels,
 };
 pub use pdfa::{PdfACatalogSignals, PdfAConformance, pdfa_signals};
+pub use reading::{TextLayoutOptions, TextOrder, layout_page_text};
 pub use sig::{PdfDocTimestamp, PdfSignature, doc_timestamps, signatures, signed_bytes};
 pub use text::{
     MarkedTextRun, PdfMarkedTextExtraction, PdfTextExtraction, TextRenderMode, TextRun,

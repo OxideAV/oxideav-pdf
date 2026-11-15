@@ -206,7 +206,21 @@ for an end-to-end verify.
   XObjects** (`Do`, §8.10 — watermarks, headers, imported pages) is
   extracted with the form's own resources, nested forms included;
   fonts load once per document. `/ActualText` spans (§14.9.4) replace the glyphs they
-  wrap. `flat_text()` / `lines()` assemble words and lines from the
+  wrap. **Reading order**: `DocumentReader::text(&TextLayoutOptions)`
+  reads a Tagged PDF in the order of its logical structure tree
+  (§14.8; marked-content items by `/MCID`, property lists named from
+  `/Properties`, each page's artifacts and unmarked text after its
+  logical content or dropped on request) and anything else in
+  geometric reading order: columns are found from the gutter between
+  them and read one after the other, lines spanning the columns
+  (titles, footers) cut the page into sections, table rows stay
+  together, rotated and vertical text is laid out in its own frame,
+  and pieces of a line painted out of order rejoin it. Words
+  hyphenated across a line end are joined, ligatures spelled out,
+  render-mode-3 text optionally dropped; `TextOrder::Stream` keeps the
+  painting order. `flat_text()` / `lines()` / `text_with()` on the
+  extraction do the geometric layout page by page.
+  Words and lines are assembled from the
   runs' geometry — one show per word, per word plus a space glyph, or
   per glyph (pdfTeX, cairo, Skia / Chrome) all rebuild the same text;
   letter-spaced lines keep their words (tracking is inferred only when
